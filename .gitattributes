@@ -1,0 +1,15 @@
+# Normalise to LF in the repository and on checkout.
+#
+# `rustfmt.toml` sets `newline_style = "Unix"`, so a checkout that converted to
+# CRLF would fail `cargo fmt --check` on a clean clone — on Windows only, which
+# is the worst place for a gate to disagree with itself. Setting it here rather
+# than relying on each developer's `core.autocrlf` keeps the rule with the code.
+* text=auto eol=lf
+
+# Shell scripts must keep LF whatever the platform: CRLF makes a `#!` line
+# unparseable and the failure ("bad interpreter") does not name the cause.
+*.sh text eol=lf
+
+# Binary, and diffing or converting them corrupts them.
+*.pem binary
+*.png binary

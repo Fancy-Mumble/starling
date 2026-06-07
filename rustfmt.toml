@@ -1,0 +1,11 @@
+# Pin the formatting style so `cargo fmt --check` is deterministic across
+# developer machines and CI.
+#
+# `max_width` is deliberately left at rustfmt's default (100), matching the
+# client and plugin-host workspaces so code moves between the three trees
+# without reformatting.
+edition = "2021"
+
+# CI runs on Linux while development happens on Windows; normalising to LF keeps
+# `--check` from disagreeing between the two.
+newline_style = "Unix"

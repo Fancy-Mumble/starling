@@ -1,0 +1,135 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain/proto",
+    "crates/domain/log",
+    "crates/kernel/bus",
+    "crates/domain/model",
+    "crates/domain/config",
+    "crates/domain/crypto",
+    "crates/domain/gate",
+    "crates/services/net",
+    "crates/services/state",
+    "crates/services/voice",
+    "crates/services/tls",
+    "crates/api",
+    "crates/edges/migrate",
+    "crates/cli",
+    "crates/features/permission-query",
+    "crates/features/query-users",
+    "crates/edges/starling",
+]
+
+# Crates introduced by later phases (see PORTING-PLAN.md §2.1) are added to
+# `members` at the phase that first needs them, so the tree never carries an
+# empty crate:
+#   starling-crypto   Phase 1   OCB2 CryptState, cert handling, password hashes
+#   starling-db       Phase 2   sqlx store, murmur-compatible schema
+#   starling-plugins  Phase 3   adapter to 3rdparty/mumble-plugin-host
+#   starling-rpc      Phase 6   gRPC admin API (the Ice replacement)
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+arc-swap = "1"
+bitflags = "2.13"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.10"
+aes = "0.8"
+async-trait = "0.1"
+socket2 = "0.6"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "any",
+    "sqlite",
+    "mysql",
+    "postgres",
+    "chrono",
+] }
+subtle = "2"
+chacha20 = "0.9"
+chacha20poly1305 = "0.10"
+inventory = "0.3"
+starling-proto = { path = "crates/domain/proto" }
+starling-log = { path = "crates/domain/log" }
+starling-bus = { path = "crates/kernel/bus" }
+starling-model = { path = "crates/domain/model" }
+starling-config = { path = "crates/domain/config" }
+starling-crypto = { path = "crates/domain/crypto" }
+starling-gate = { path = "crates/domain/gate" }
+starling-api = { path = "crates/api" }
+starling-migrate = { path = "crates/edges/migrate" }
+starling-cli = { path = "crates/cli" }
+starling-tls = { path = "crates/services/tls" }
+starling-net = { path = "crates/services/net" }
+starling-store = { path = "crates/services/store" }
+starling-voice = { path = "crates/services/voice" }
+starling-server = { path = "crates/services/state" }
+starling-feature-permission-query = { path = "crates/features/permission-query" }
+starling-feature-query-users = { path = "crates/features/query-users" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "signal"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+bytes = "1"
+prost = "0.14.3"
+prost-build = "0.14.3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+# -- Workspace-wide lints --------------------------------------------
+# Mirrors the FancyMumbleNext client and mumble-plugin-host workspaces so crates
+# compile cleanly with the same standards across all three trees.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unused_crate_dependencies = "warn"
+unused_results = "deny"
+missing_debug_implementations = "deny"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+cloned_instead_of_copied = "warn"
+implicit_clone = "warn"
+uninlined_format_args = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+unwrap_used = "deny"
+excessive_nesting = "deny"
+too_many_lines = "deny"
+allow_attributes_without_reason = "deny"
+branches_sharing_code = "deny"
+collapsible_else_if = "deny"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,198 @@
+name: CI
+
+# Mirrors the gates the client (FancyMumbleNext) and plugin-host workspaces
+# enforce, so code holds to the same standard in all three trees:
+#   fmt --check | clippy -D warnings | tests | cargo-deny | Miri
+#
+# Starling additionally gates the protobuf contract (check-proto-drift.sh) and
+# fuzzes the frame decoder, because unlike the client it decodes bytes from
+# unauthenticated peers.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ----------------------------------------------------------------
+  # The protobuf contract must not drift from the C++ server / client.
+  # ----------------------------------------------------------------
+  proto:
+    name: Protobuf contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Check for protobuf drift
+        run: scripts/check-proto-drift.sh
+
+  # ----------------------------------------------------------------
+  # The microkernel rule: the kernel must never depend on a feature.
+  # A build failure enforces what a design document could not.
+  # ----------------------------------------------------------------
+  layering:
+    name: Crate layering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Kernel depends on no feature crate
+        run: scripts/check-crate-layering.sh
+
+  # ----------------------------------------------------------------
+  # Format, lint and test.
+  # ----------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # starling-proto's build.rs compiles the .proto files via prost.
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+      # `cargo test --all-targets` skips doctests; the lint config denies
+      # broken intra-doc links, so run them too.
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+      - name: Documentation builds without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  # ----------------------------------------------------------------
+  # Dependency hygiene. Matters more here than in the client: this is a
+  # network server that terminates TLS for untrusted peers.
+  # ----------------------------------------------------------------
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # ----------------------------------------------------------------
+  # Miri (UB check).
+  #
+  # `unsafe_code = "deny"` in [workspace.lints.rust] means Starling's own code
+  # contains no unsafe at all. Miri still earns its keep: it interprets the
+  # unsafe inside dependencies (bytes, prost, hashbrown) along the paths our
+  # tests actually exercise, which is where a UB regression would come from.
+  #
+  # Socket and async-runtime tests cannot run under Miri (no real I/O, and
+  # tokio's scheduler uses unsupported syscalls), so those modules are skipped.
+  # Skips are module-anchored; inclusion filters match substrings and silently
+  # over-select.
+  # ----------------------------------------------------------------
+  miri:
+    name: Miri (UB check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Miri setup
+        run: cargo +nightly miri setup
+
+      - name: Miri (starling-proto — framing and version encoding)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo +nightly miri test -p starling-proto --lib
+
+      - name: Miri (starling-model — pure logic, no I/O)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo +nightly miri test -p starling-model --lib
+
+      - name: Miri (starling-server — handlers only)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: >
+          cargo +nightly miri test -p starling-server --lib --
+          --skip "listener::" --skip "core::"
+
+  # ----------------------------------------------------------------
+  # Fuzz the frame decoder. It is the first thing an unauthenticated peer
+  # reaches, so it gets a short run on every PR and must never panic.
+  # ----------------------------------------------------------------
+  fuzz:
+    name: Fuzz (frame decoder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz decode
+        run: cargo +nightly fuzz run decode -- -max_total_time=60
+        working-directory: crates/starling-proto
