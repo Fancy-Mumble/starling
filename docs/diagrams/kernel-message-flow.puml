@@ -1,0 +1,83 @@
+@startuml kernel-message-flow
+!theme plain
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+title How knowledge moves — one pchat message, every hop over the bus
+
+header
+<b>DESIGN TARGET — Phase 2.</b> The bus has send() and take() today; call() is not built and will **await**
+rather than block (priority inheritance needs CAP_SYS_NICE). Nothing is wired to the bus yet, and
+starling-net, pchat, audit and the Persist/Publish effects are not written.
+endheader
+
+actor Client
+participant "net service" as N
+participant "**starling-bus**\n«the only path»" as BUS
+participant "pchat\n«feature»" as P
+participant "state service\n«single writer»" as S
+participant "dyn Permissions\n«starling-model»" as PM
+participant "audit\n«feature»" as A
+database "storage service" as DB
+
+Client -> N : PluginMessage (TCP)
+N -> BUS : send(pchat port, Feature lane)
+BUS -> P : deliver
+activate P
+
+P -> BUS : call(state port)\n"may user X text in channel Y?"
+BUS -> S : deliver **on the caller's lane**
+S -> PM : allows(user, channel, TEXT_MESSAGE)
+PM --> S : true
+S --> BUS : reply(**true**) — an answer, not a reference
+BUS --> P : reply(true)
+
+note over S, PM
+  **Permissions never left the domain.** ""dyn Permissions""
+  computes; the state service only *serves* the question and
+  owns the ""Box<dyn Permissions>"". That hop is in-process,
+  not a bypass: an evaluator is a pure function owned by the
+  service, not a component with a port. The reply carries a
+  ""bool"" — a ""&dyn Permissions"" could not cross.
+end note
+
+== Effects: routed by target, not funnelled through one service ==
+
+P -> BUS : Persist
+BUS -> DB : write-behind
+P -> BUS : Publish(MessageStored)
+BUS -> A : deliver
+deactivate P
+
+activate A
+A -> BUS : Persist — audit record
+BUS -> DB
+deactivate A
+
+P -> BUS : Send { to: Channel(Y) }
+BUS -> S : deliver — **needs state to resolve**
+activate S
+S -> BUS : send(net port) — one per resolved session
+deactivate S
+BUS -> N : deliver
+N -> Client : message
+
+note over BUS, S
+  **Only two effects reach the state service.** ""Send"" needs
+  the channel and user registries to turn ""Recipients"" into
+  sessions (""core/broadcast.rs::resolve""); ""Disconnect"" needs
+  the connection registry. ""Persist"", ""Publish"" and ""Log""
+  need no state, so the bus takes them straight to their port.
+
+  Funnelling them through the writer would make it a mail hub
+  and fail its own admission test — *belongs here only if it
+  must be atomic with a state mutation* (""docs/CRATES.md"" §2).
+end note
+
+note over P, A
+  pchat and audit never call each other, and neither can name
+  the state service. They know a ""PortId"" and the bus; the bus
+  knows a lane and opaque ""Bytes"".
+end note
+
+@enduml
