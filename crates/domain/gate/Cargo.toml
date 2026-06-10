@@ -1,0 +1,13 @@
+[package]
+name = "starling-gate"
+description = "Feature gating by announced Fancy Mumble version — one table, no guessing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Nothing. Deciding what a peer may do is arithmetic on a version number.
+[dependencies]
+
+[lints]
+workspace = true
