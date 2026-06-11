@@ -1,0 +1,95 @@
+# Starling configuration.
+#
+#   starling --config starling.toml
+#
+# Every key is optional; omitting one keeps the built-in default. Unknown keys
+# are rejected at startup rather than ignored, so a typo fails loudly instead of
+# silently leaving a limit at its default.
+#
+# Migrating from murmur? `starling migrate-config mumble-server.ini` prints the
+# equivalent of an existing .ini on stdout. The murmur key each setting replaces
+# is named in the comments below.
+
+[server]
+# Address to bind. (murmur: host)
+host = "0.0.0.0"
+# TCP port. From Phase 1 this is also the UDP voice port. (murmur: port)
+port = 64738
+# Public server name. Also the name of the root channel.
+# (murmur: registerName - note murmur's case-sensitive camelCase spelling)
+name = "Starling"
+# Shown to clients on connect. HTML is allowed when features.allow_html is true.
+# (murmur: welcometext)
+welcome_text = ""
+# Password required to connect. Empty means no password. (murmur: serverpassword)
+password = ""
+
+[limits]
+# Maximum concurrent users. Also sizes the session-id pool. (murmur: users)
+max_users = 100
+# Total bandwidth budget in bits/sec, reported to clients in ServerSync.
+# (murmur: bandwidth)
+max_bandwidth = 72000
+# Longest chat message accepted, in bytes. (murmur: textmessagelength)
+max_text_message_bytes = 5000
+# Longest image message accepted, in bytes. Images arrive base64-embedded in
+# HTML, so this bounds a considerably larger encoded payload.
+# (murmur: imagemessagelength)
+max_image_message_bytes = 131072
+
+[features]
+# Whether chat messages may contain HTML. (murmur: allowhtml)
+allow_html = true
+# Whether clients may announce that they are recording.
+allow_recording = true
+
+[tls]
+# Certificate chain and private key, PEM. If neither exists, Starling generates
+# a self-signed pair here on first boot and reuses it on every restart - Mumble
+# clients identify a server by certificate fingerprint, so the pair must be
+# stable. If exactly one of the two exists, Starling refuses to start rather
+# than regenerate and silently change the server's identity.
+certificate = "starling-data/cert.pem"
+key = "starling-data/key.pem"
+
+# -- Not yet implemented ----------------------------------------------------
+#
+# Settings for subsystems later phases add (see PORTING-PLAN.md §4). They are
+# listed here so the shape is known, but are not accepted yet - adding one now
+# is a startup error.
+#
+# [database]        # Phase 2: url = "sqlite://starling-data/starling.db"
+# [security]        # Phase 1: policy = "compatibility-first" | "modern-only"
+# [plugins]         # Phase 3
+# [pchat]           # Phase 4
+# [webrtc]          # Phase 6
+
+# -- Logging ----------------------------------------------------------------
+# Where server events go. Every destination listed here receives every record
+# that clears `level` and `categories`; they compose, so "everything to a file,
+# warnings to the console" is two entries, not a special mode.
+[logging]
+# Minimum severity to record: debug | info | notice | warning | error | critical
+level = "info"
+# Categories to record. Empty means all of them.
+#   server, session, channel, message, permission, security, plugin, admin
+categories = []
+# How many records may be queued for the writer thread. Records beyond this are
+# dropped, counted, and reported in the log itself - never silently lost.
+queue = 4096
+
+[logging.console]
+# Write human-readable lines to stderr.
+enabled = true
+
+[logging.file]
+# Empty disables file logging.
+path = "starling-data/starling.log"
+# Rotate past this size, keeping `keep` old generations. 0 disables rotation.
+max_bytes = 10485760
+keep = 5
+
+[logging.memory]
+# A ring buffer the admin API can read without touching disk.
+enabled = true
+records = 1000
