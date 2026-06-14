@@ -1,0 +1,76 @@
+@startuml net-internals
+!theme plain
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 20
+skinparam ranksep 50
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title starling-net — five parts, one of them visible
+
+header
+<b>net is the only component that touches a socket, and the only one that encrypts.</b>
+Everything else sees a frame and cannot tell whether it travelled as plaintext, OCB2 or XChaCha20.
+endheader
+
+component "**starling-bus**" as bus #FFE9D6
+
+package "starling-net" as NET #E6F0FA {
+  component "**event loop**  «reactor»\nthe one place that awaits socket readiness,\nand **the only part the bus can see**" as loop #FFFFFF
+  component "**listener**\nTCP accept · TLS handshake\nmints the connection id" as listener #FFFFFF
+  component "**connection**  [0..*]\none TLS stream · control framing\n«type u16 + len u32»\n—\n**two bounded queues, two policies:**\ncontrol full -> **disconnect**\naudio full -> **drop oldest, count**" as conn #FFFFFF
+  component "**udp socket**\none shared datagram socket,\ndemuxed to a connection id\nby source address" as udp #FFFFFF
+  component "**cipher**  «trait»\nOCB2 · XChaCha20 · plaintext,\nchosen per connection" as cipher #FFF0F0
+}
+
+loop <..> bus : frames, **opaque**
+
+loop --> listener : accept readiness
+loop --> conn     : read · write readiness
+loop --> udp      : read · write readiness
+listener *-- conn : on accept
+
+udp --> cipher : seal · open
+note right of cipher #FFF0F0
+  **Datagrams only.**
+  Audio arriving over **UDPTunnel** is already inside
+  TLS and must be passed on **plain**. Sealing it a
+  second time gives a client that hears silence, with
+  nothing in any log to say why — this has already
+  cost one debugging session.
+end note
+
+note bottom of loop
+  **Why the loop is separate from the wire format.**
+  "Await readiness and pump the bus" and "speak Mumble's
+  framing" are two jobs. Fused, they become one file that
+  nobody can review — which is the shape net had before.
+end note
+
+note bottom of conn
+  **Fan-out lives here.** Voice publishes one frame plus a
+  recipient set; net decides per recipient whether that
+  means a datagram or a tunnelled TCP frame, because only
+  net knows who has a working UDP path.
+end note
+
+note left of conn #E8F5E9
+  **Why the two policies differ.** Dropping a control
+  message desyncs that client permanently and
+  silently — it renders the wrong world forever with
+  nothing in any log. Queueing without a bound is a
+  memory DoS. Disconnecting is the only outcome that
+  is both bounded and honest, and reconnect already
+  re-syncs from scratch.
+  A late **audio** frame, by contrast, is worthless —
+  so drop it, and count what was dropped.
+end note
+
+legend bottom
+| solid, one arrowhead | a direct call inside net |
+| dashed, two arrowheads | bus traffic |
+| filled diamond | creates and owns |
+endlegend
+
+@enduml
