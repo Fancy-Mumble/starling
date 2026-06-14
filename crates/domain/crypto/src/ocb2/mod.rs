@@ -29,7 +29,7 @@ mod block;
 mod core;
 mod iv;
 
-pub use block::{Block, BLOCK_LEN};
+pub use block::{BLOCK_LEN, Block};
 pub use core::TAG_LEN;
 pub use iv::{Arrival, NonceError};
 

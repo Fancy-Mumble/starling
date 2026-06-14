@@ -119,9 +119,10 @@ mod tests {
         // A filtered record is a decision, not a failure; reporting it as an
         // error would make a fanout look broken.
         let (mut sink, _) = filtered(Severity::Error);
-        assert!(sink
-            .write(&event(Severity::Debug, Category::Server))
-            .is_ok());
+        assert!(
+            sink.write(&event(Severity::Debug, Category::Server))
+                .is_ok()
+        );
     }
 
     #[test]

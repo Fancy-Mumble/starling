@@ -168,11 +168,13 @@ mod tests {
                 ..Default::default()
             }),
         );
-        assert!(state
-            .connection(ConnId(1))
-            .expect("connection")
-            .fancy_version
-            .is_some());
+        assert!(
+            state
+                .connection(ConnId(1))
+                .expect("connection")
+                .fancy_version
+                .is_some()
+        );
     }
 
     #[test]

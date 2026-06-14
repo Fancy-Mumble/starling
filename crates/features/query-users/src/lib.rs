@@ -61,11 +61,11 @@ impl Handler for QueryUsersHandler {
             }
         }
         for name in &query.names {
-            if let Some(user) = state.users().find_by_name(name) {
-                if let Some(uid) = user.user_id {
-                    reply.ids.push(uid.0);
-                    reply.names.push(user.name.clone());
-                }
+            if let Some(user) = state.users().find_by_name(name)
+                && let Some(uid) = user.user_id
+            {
+                reply.ids.push(uid.0);
+                reply.names.push(user.name.clone());
             }
         }
 
@@ -101,7 +101,7 @@ starling_api::register_feature!(QueryUsersFeature);
 mod tests {
     use super::*;
     use starling_api::{Effect, ServerConfig, Sessions, World};
-    use starling_model::{ChannelId, Permissions, User, UserId, ROOT_CHANNEL};
+    use starling_model::{ChannelId, Permissions, ROOT_CHANNEL, User, UserId};
     use starling_server::ServerState;
 
     fn state_with_registered_user() -> (ServerState, ConnId) {

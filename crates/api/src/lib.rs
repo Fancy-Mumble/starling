@@ -44,7 +44,7 @@ pub use audio::{AudioSink, AudioSource, Datagrams, NoAudio, NoDatagrams};
 pub use authority::{Authority, Sessions, Settings, World};
 pub use connection::Connection;
 pub use effects::{ConnId, Effect, Effects, Recipients};
-pub use feature::{registered, Feature};
+pub use feature::{Feature, registered};
 pub use handler::{Access, Handler};
 pub use outbound::{FrameSink, NoOutbound, Outbound, Stuck};
 pub use starling_config::{Limits, ServerConfig};

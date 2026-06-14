@@ -69,8 +69,8 @@ impl CertificateSource for SelfSigned {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TempDir;
     use crate::PemFiles;
+    use crate::testing::TempDir;
 
     #[test]
     fn generation_writes_both_files() {

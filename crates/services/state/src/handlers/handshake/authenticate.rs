@@ -1,7 +1,7 @@
 //! `Authenticate` — the entry point to session establishment.
 
 use starling_log::{Category, LogEvent};
-use starling_model::{User, ROOT_CHANNEL};
+use starling_model::{ROOT_CHANNEL, User};
 use starling_proto::proto::tcp;
 use starling_proto::{ControlMessage, TcpMessageType, Version};
 use tracing::{info, warn};

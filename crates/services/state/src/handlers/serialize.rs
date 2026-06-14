@@ -62,7 +62,7 @@ fn set_legacy_temporary(msg: &mut tcp::ChannelState, temporary: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starling_model::{ChannelId, SessionId, UserId, ROOT_CHANNEL};
+    use starling_model::{ChannelId, ROOT_CHANNEL, SessionId, UserId};
 
     fn user() -> User {
         User::new(SessionId(7), "alice", ROOT_CHANNEL)

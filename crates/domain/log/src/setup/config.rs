@@ -18,8 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::setup::{
-    FileSpec, LogSpec, DEFAULT_KEEP_FILES, DEFAULT_MAX_FILE_BYTES, DEFAULT_MEMORY_RECORDS,
-    DEFAULT_QUEUE,
+    DEFAULT_KEEP_FILES, DEFAULT_MAX_FILE_BYTES, DEFAULT_MEMORY_RECORDS, DEFAULT_QUEUE, FileSpec,
+    LogSpec,
 };
 use crate::{Severity, UnknownSeverity};
 

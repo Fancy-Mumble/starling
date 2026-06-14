@@ -30,9 +30,10 @@ mod tests {
     fn every_record_is_accepted_and_discarded() {
         let mut sink = NullSink;
         for severity in [Severity::Debug, Severity::Critical] {
-            assert!(sink
-                .write(&LogEvent::new(severity, Category::Server, "x"))
-                .is_ok());
+            assert!(
+                sink.write(&LogEvent::new(severity, Category::Server, "x"))
+                    .is_ok()
+            );
         }
     }
 

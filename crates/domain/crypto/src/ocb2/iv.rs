@@ -25,10 +25,10 @@
 //! peer and drops nothing. It is safe to differ because the sender never learns
 //! which packets were dropped — this is UDP, and there is no acknowledgement.
 
-/// A full OCB2 nonce, and the machinery to keep it in step with a peer's.
-use super::block::Block;
 #[cfg(test)]
 use super::block::BLOCK_LEN;
+/// A full OCB2 nonce, and the machinery to keep it in step with a peer's.
+use super::block::Block;
 
 /// How far behind the expected value a packet may be and still be accepted.
 ///
@@ -83,7 +83,7 @@ impl SendNonce {
     /// A 128-bit little-endian increment: carry propagates from byte 0 upward,
     /// which is why the wire byte is byte 0 and why it changes every packet.
     pub(super) fn advance(&mut self) -> Block {
-        for byte in &mut self.0 .0 {
+        for byte in &mut self.0.0 {
             *byte = byte.wrapping_add(1);
             if *byte != 0 {
                 break;

@@ -46,9 +46,9 @@ pub mod varint;
 mod testing;
 
 pub use bridge::VoiceBridge;
-pub use packet::{codec_for, AudioCodec, AudioPacket, Datagram, PacketError, Ping, ServerDetails};
+pub use packet::{AudioCodec, AudioPacket, Datagram, PacketError, Ping, ServerDetails, codec_for};
 pub use peer::VoicePeer;
 pub use router::{Router, RouterStats};
-pub use routing::{RoutingSnapshot, Target, REGULAR_SPEECH, SERVER_LOOPBACK};
-pub use service::{report_periodically, AudioCommand, ControlCommand, VoiceHandle, VoiceService};
-pub use targets::{ShoutTarget, TargetError, TargetRegistry, VoiceTarget, MAX_TARGET};
+pub use routing::{REGULAR_SPEECH, RoutingSnapshot, SERVER_LOOPBACK, Target};
+pub use service::{AudioCommand, ControlCommand, VoiceHandle, VoiceService, report_periodically};
+pub use targets::{MAX_TARGET, ShoutTarget, TargetError, TargetRegistry, VoiceTarget};

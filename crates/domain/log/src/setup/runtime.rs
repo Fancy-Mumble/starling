@@ -112,8 +112,8 @@ impl LogRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::FileSpec;
     use crate::Severity;
+    use crate::setup::FileSpec;
 
     fn spec_with_memory() -> LogSpec {
         LogSpec {

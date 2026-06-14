@@ -190,9 +190,11 @@ mod tests {
             listeners: vec![(SessionId(9), LOBBY)],
             ..lobby_view()
         });
-        assert!(snapshot
-            .recipients(ALICE, Target::Normal)
-            .contains(&SessionId(9)));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Normal)
+                .contains(&SessionId(9))
+        );
     }
 
     #[test]
@@ -214,9 +216,11 @@ mod tests {
                 include_children: false,
             }),
         );
-        assert!(snapshot
-            .recipients(ALICE, Target::Whisper(3))
-            .contains(&BOB));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Whisper(3))
+                .contains(&BOB)
+        );
     }
 
     #[test]

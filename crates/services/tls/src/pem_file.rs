@@ -74,8 +74,8 @@ impl CertificateSource for PemFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TempDir;
     use crate::SelfSigned;
+    use crate::testing::TempDir;
 
     fn generated(dir: &TempDir) -> (PathBuf, PathBuf) {
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));

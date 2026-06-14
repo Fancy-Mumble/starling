@@ -23,7 +23,7 @@ use starling_gate::UdpFormat;
 use starling_model::SessionId;
 use starling_proto::ControlMessage;
 
-use crate::packet::{codec_for, AudioCodec};
+use crate::packet::{AudioCodec, codec_for};
 
 /// Everything the packet path needs about one connected client.
 pub struct VoicePeer {

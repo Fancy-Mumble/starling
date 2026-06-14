@@ -99,7 +99,9 @@ fn main() {
         println!("    The Realtime lane IS justified.");
     } else {
         println!("    3 lanes blows the budget, but a separate lane does not meaningfully");
-        println!("    fix it ({ratio:.1}x). The bottleneck is elsewhere — investigate before adding a lane.");
+        println!(
+            "    fix it ({ratio:.1}x). The bottleneck is elsewhere — investigate before adding a lane."
+        );
     }
 }
 

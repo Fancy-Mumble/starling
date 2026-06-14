@@ -1,8 +1,8 @@
 //! The tail of session establishment: tree push, roster, and sync.
 
-use starling_model::{SessionId, ROOT_CHANNEL};
-use starling_proto::proto::tcp;
+use starling_model::{ROOT_CHANNEL, SessionId};
 use starling_proto::ControlMessage;
+use starling_proto::proto::tcp;
 use tracing::warn;
 
 use crate::handlers::serialize;

@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use starling_api::{ConnId, Datagrams, FrameSink, Stuck};
-use starling_crypto::ocb2::{Block, Ocb2};
 use starling_crypto::VoiceCipher;
+use starling_crypto::ocb2::{Block, Ocb2};
 use starling_gate::UdpFormat;
 use starling_model::SessionId;
 

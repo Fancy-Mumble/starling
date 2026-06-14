@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use starling_model::SessionId;
-use starling_proto::{codec, ControlMessage};
+use starling_proto::{ControlMessage, codec};
 use tracing::warn;
 
 use crate::state::ServerState;
@@ -95,7 +95,7 @@ mod tests {
     use crate::testing::{TestRegistry, TestSink};
     use starling_api::ServerConfig;
     use starling_api::{Sessions, World};
-    use starling_model::{ChannelId, User, ROOT_CHANNEL};
+    use starling_model::{ChannelId, ROOT_CHANNEL, User};
     use starling_proto::proto::tcp;
     use std::net::SocketAddr;
     use tokio::sync::mpsc;
