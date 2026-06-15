@@ -34,6 +34,8 @@ pub(crate) struct Server {
     voice_addr: String,
     /// Kept so the counters can be polled on a timer.
     voice_handle: starling_voice::VoiceHandle,
+    /// Opened in [`Self::run`], because connecting is fallible and async.
+    database_url: String,
     logging: LogRuntime,
 }
 
@@ -93,6 +95,7 @@ impl Server {
             max_bandwidth: settings.server.limits.max_bandwidth,
         };
         let voice_addr = format!("{}:{}", settings.server.host, settings.server.port);
+        let database_url = settings.server.database_url.clone();
         let (voice, voice_handle) = VoiceService::new(Box::new(starling_api::NoDatagrams), details);
         let audio = VoiceBridge::new(voice_handle.control(), voice_handle.clone());
 
@@ -118,8 +121,39 @@ impl Server {
             audio,
             voice_addr,
             voice_handle,
+            database_url,
             logging,
         })
+    }
+
+    /// Connect to the configured database, or persist nothing.
+    ///
+    /// An empty URL is not a missing setting to be defaulted — it is the
+    /// setting. Creating a database file nobody asked for is a worse surprise
+    /// than not having one, and the e2e suite runs this way deliberately.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupError::Database`] if a URL *was* configured and the database
+    /// cannot be reached or its schema cannot be created. Starting anyway would
+    /// accept registrations and silently drop them.
+    async fn open_store(url: &str) -> Result<Box<dyn starling_api::Store>, StartupError> {
+        if url.is_empty() {
+            tracing::warn!(
+                "no database configured; registrations, channels and bans will not                  survive a restart"
+            );
+            return Ok(Box::new(starling_store::NoStore));
+        }
+
+        // Virtual server 1. Several in one process is P2, and will mean several
+        // stores over this same connection rather than a parameter on every call.
+        let store = starling_store::SqlStore::open(url, 1)
+            .await
+            .map_err(|source| StartupError::Database {
+                url: redact(url),
+                source,
+            })?;
+        Ok(Box::new(store))
     }
 
     /// The stock handler set, plus every feature linked into this build.
@@ -155,6 +189,13 @@ impl Server {
     /// [`StartupError::Listen`] if the socket cannot be bound or serving fails.
     /// `Ctrl-C` is a clean stop, not an error.
     pub(crate) async fn run(self) -> Result<(), StartupError> {
+        // Before anything accepts a connection: a server that cannot reach its
+        // database should say so and stop, not start, take registrations, and
+        // lose them. The one case that is *not* an error is no database being
+        // configured at all, which is a deliberate way to run.
+        let store = Self::open_store(&self.database_url).await?;
+        info!(backend = store.backend(), "persistence ready");
+
         // The voice port shares the control port's number, as Mumble requires:
         // a client sends UDP to the address it connected to.
         let socket = match self.voice_addr.parse() {
@@ -208,5 +249,45 @@ impl Server {
         // Consumes the runtime: health is reported while the writer is still up.
         self.logging.finish();
         result
+    }
+}
+
+/// A connection URL with its password removed.
+///
+/// URLs reach logs and error messages, and a database password in either is a
+/// credential leak that outlives the incident it was logged during.
+fn redact(url: &str) -> String {
+    // `scheme://user:password@host/...` — everything between the last colon of
+    // the credentials and the `@`.
+    let Some((prefix, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((credentials, host)) = rest.split_once('@') else {
+        return url.to_owned();
+    };
+    match credentials.split_once(':') {
+        Some((user, _)) => format!("{prefix}://{user}:***@{host}"),
+        None => url.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn a_password_never_reaches_a_log_line() {
+        assert_eq!(
+            redact("postgres://starling:hunter2@db.local/starling"),
+            "postgres://starling:***@db.local/starling"
+        );
+    }
+
+    #[test]
+    fn a_url_without_credentials_is_left_alone() {
+        // Nothing to hide, and mangling it would make the error less useful.
+        for url in ["sqlite://starling.db", "postgres://db.local/starling"] {
+            assert_eq!(redact(url), url);
+        }
     }
 }

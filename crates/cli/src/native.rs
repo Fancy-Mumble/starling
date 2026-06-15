@@ -26,6 +26,21 @@ pub struct NativeConfig {
     pub tls: TlsSection,
     /// Where log records go.
     pub logging: Option<LogConfig>,
+    /// Where persistent state lives.
+    pub database: DatabaseSection,
+}
+
+/// `[database]`
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DatabaseSection {
+    /// A sqlx connection URL: `sqlite://`, `mysql://` or `postgres://`.
+    ///
+    /// Absent means persist nothing. That is deliberate rather than an
+    /// oversight: defaulting to a file would create a database next to the
+    /// binary the first time anyone ran the server, and then keep using it
+    /// without ever having been asked for.
+    pub url: Option<String>,
 }
 
 /// `[server]`
@@ -99,6 +114,11 @@ impl NativeConfig {
                 welcome_text: Some(server.limits.welcome_text.clone()),
                 password: Some(server.server_password.clone()),
             },
+            database: DatabaseSection {
+                // `None` when nothing is configured, so a rendered file does not
+                // grow a `url = ""` that reads as a deliberate empty setting.
+                url: (!server.database_url.is_empty()).then(|| server.database_url.clone()),
+            },
             limits: LimitsSection {
                 max_users: Some(server.limits.max_users),
                 max_bandwidth: Some(server.limits.max_bandwidth),
@@ -135,6 +155,7 @@ impl ConfigSource for NativeConfig {
                 port: self.server.port.unwrap_or(base.port),
                 register_name: self.server.name.clone().unwrap_or(base.register_name),
                 server_password: self.server.password.clone().unwrap_or(base.server_password),
+                database_url: self.database.url.clone().unwrap_or(base.database_url),
                 limits: Limits {
                     max_users: self.limits.max_users.unwrap_or(base.limits.max_users),
                     max_bandwidth: self

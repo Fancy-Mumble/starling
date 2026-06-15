@@ -31,6 +31,21 @@ impl std::fmt::Display for PortId {
 pub struct Envelope {
     /// Where it is going.
     pub to: PortId,
+    /// Where a reply should go, if one is expected.
+    ///
+    /// This is what makes request/reply work without a `call` primitive. A
+    /// requester posts and carries on; the I/O service does the work and posts
+    /// the completion back here; the requester's loop resumes on it. That is the
+    /// reactor pattern, and it is why nothing on this bus ever blocks waiting
+    /// for an answer.
+    ///
+    /// An *address*, not payload, so it belongs beside `to` rather than inside
+    /// the bytes: the bus routes, and routing is the bus's business. Keeping it
+    /// here also lets the bus refuse a reply addressed to a port that has since
+    /// unregistered, which a reply buried in an opaque payload could not.
+    ///
+    /// `None` for a post that wants no answer, which is most of them.
+    pub reply_to: Option<PortId>,
     /// Opaque bytes. The bus never looks inside — **a bus that cannot parse
     /// cannot couple**, which is the mechanical form of the opacity rule.
     ///
@@ -43,14 +58,40 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    /// Address an envelope to a port.
+    /// Address an envelope to a port, expecting no reply.
     #[must_use]
     pub fn new(to: PortId, payload: impl Into<Bytes>) -> Self {
         Self {
             to,
+            reply_to: None,
             payload: payload.into(),
             enqueued_at: Instant::now(),
         }
+    }
+
+    /// Address an envelope to a port, asking for the answer at `reply_to`.
+    ///
+    /// The requester does not wait: it posts this and returns to its loop. The
+    /// answer arrives later as an ordinary envelope addressed to `reply_to`,
+    /// which is the reactor pattern and the reason this bus needs no synchronous
+    /// call.
+    #[must_use]
+    pub fn request(to: PortId, reply_to: PortId, payload: impl Into<Bytes>) -> Self {
+        Self {
+            to,
+            reply_to: Some(reply_to),
+            payload: payload.into(),
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    /// Answer a request, addressed wherever it asked to be answered.
+    ///
+    /// `None` when the request wanted no reply — posting one anyway would send
+    /// it to whatever port happened to be there.
+    #[must_use]
+    pub fn reply_to_request(&self, payload: impl Into<Bytes>) -> Option<Self> {
+        self.reply_to.map(|to| Self::new(to, payload))
     }
 
     /// How long this envelope has waited in the bus so far.

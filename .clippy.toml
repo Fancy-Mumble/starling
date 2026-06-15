@@ -14,6 +14,6 @@ doc-valid-idents = [
     "CryptSetup", "CodecVersion", "ChannelState", "UserState", "UserRemove",
     "TextMessage", "UDPTunnel", "VoiceTarget", "PermissionDenied",
     "PluginRegistry", "PluginDataTransmission", "RejectType",
-    "OCB2", "ZeroC", "SQLite", "PostgreSQL", "MySQL", "WebRTC", "TOTP",
+    "OCB2", "ZeroC", "SQLite", "PostgreSQL", "MySQL", "MariaDB", "WebRTC", "TOTP",
     "..",
 ]

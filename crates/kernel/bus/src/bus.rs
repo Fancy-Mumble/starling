@@ -37,18 +37,24 @@ pub trait MessageBus: Send + Sync + std::fmt::Debug {
     /// The lane a port is registered on, if any.
     fn lane_of(&self, port: PortId) -> Option<Lane>;
 
-    // MISSING: `call(&self, env, timeout) -> Result<Envelope, CallError>`.
+    // There is deliberately no `call(&self, env) -> Envelope`.
     //
-    // The design requires that nothing bypass the bus, which means a
-    // synchronous query — "may this user text in this channel?" — must be a
-    // message. `send` cannot express it: it posts and returns.
+    // An earlier note here argued one was required, because "nothing bypasses
+    // the bus" seemed to mean a synchronous query — "load the channel tree",
+    // "may this user text here?" — had to be a blocking round trip. It then
+    // spent a paragraph on how to make that safe without priority inheritance,
+    // which needs `CAP_SYS_NICE` that the deployment budget forbids.
     //
-    // The shape is QNX's `MsgSend`/`MsgReply` — but *awaiting*, not blocking.
-    // QNX runs the server at the caller's priority for the duration; we cannot,
-    // because raising a thread's priority needs `CAP_SYS_NICE` and the
-    // deployment budget forbids requiring it (`RESULTS.md` line 92). So the
-    // caller yields its executor thread instead of parking it, and priority
-    // stays in the lane queues, which are ours. See `docs/ARCHITECTURE.md` §6.1.
+    // That was solving the wrong problem. This is a reactor: a requester posts
+    // an envelope naming `Envelope::reply_to` and returns to its loop; the
+    // service does the work and posts the answer back; the requester resumes on
+    // it as an ordinary received message. Nothing waits, so no lane is held, no
+    // thread parks, and the priority question never arises.
+    //
+    // Where an answer is needed *often*, it should not be a request at all —
+    // it should be a published snapshot the reader consults locally, which is
+    // what `Lane::Realtime` already does for routing and what permissions will
+    // do. The bus carries changes, not questions.
     //
     // The reply must not travel as an ordinary lane post, or a busy lane would
     // delay every reply on it.

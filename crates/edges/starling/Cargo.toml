@@ -18,6 +18,7 @@ starling-net.workspace = true
 starling-voice.workspace = true
 starling-proto.workspace = true
 starling-server.workspace = true
+starling-store.workspace = true
 starling-feature-permission-query.workspace = true
 starling-feature-query-users.workspace = true
 starling-log.workspace = true
