@@ -217,10 +217,10 @@ I/O and gives us per-handler tests with no socket, runtime or database.
 feature respectively.
 
 **Planned change: `&mut ServerState` becomes `&mut dyn Authority`.** The concrete
-struct on this boundary is a design defect (`docs/CRATES.md` §2): handler
+struct on this boundary is a design defect: handler
 implementations use 11 of its 23 methods, while `remove_connection`,
 `channels_mut` and `add_connection` stay in reach of every handler, including
-`Ping`. See the work queue in `docs/CRATES.md` §2.
+`Ping`.
 
 ---
 
@@ -345,8 +345,9 @@ WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 | R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners — `Messages.cpp:775` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
 | R5 | The `messagelimit`/`messageburst` leaky bucket **silently drops** messages (see `fixtures/mumble-server.ini`). Getting this subtly wrong breaks WebRTC signalling in ways that look like client bugs. | Medium | Port the token bucket first (`TokenBucketRateLimiter.cpp` is already isolated), unit-test it against the C++ behaviour, and log drops at `debug` rather than dropping silently. |
 | R6 | Two servers to maintain during the transition. | Medium | Phases are gated on the *same* e2e suite, so both stay honest. Fixture picks the implementation via one env var. |
-| R8 | **Every bus measurement is Windows-only, on 24 unconstrained cores.** Thread wake-up is the dominant cold-path cost (18 of 18.2 us), and the deployment target is one Linux container, plausibly CPU-limited. | **High** | Re-run all three experiments on Linux under a cgroup quota before Phase 1. `crates/kernel/bus/RESULTS.md` §4.1 A1. |
-| R9 | **No handler's hold time has been measured**, yet hold time is what RESULTS.md §3.3 identifies as the thing that breaks the frame budget. The longest handler is the effective p99 floor for every other request. | **High** | Measure per-handler hold time as part of the `Authority` refactor, and assert a ceiling in tests. §4.1 A2. |
+| R8 | **The gRPC hop cost has never been measured on the target platform.** The bus experiments it replaces were Windows-only on 24 unconstrained cores; the target is Linux containers, plausibly CPU-limited. A hop that is free on a workstation is not automatically free under a cgroup quota. | **High** | Measure gateway-to-service round-trip on Linux under quota, over both a Unix socket and TCP, before the first service ships. |
+| R9 | **Audio bypassing the gateway is an assumption, not a measurement.** The design rests on voice binding its own UDP socket on the same port as the gateway's TCP socket, in a different process. murmur binds them separately (`Server.cpp:125` vs `:193`) so it should hold — but it has never been tried across process boundaries, and legacy clients cannot be redirected if it fails. | **High** | Prove two processes can hold TCP:64738 and UDP:64738 on every target OS before anything else is built. If it fails, voice becomes a gateway sidecar and the deployment story changes. |
+| R11 | **A restarted service has cold caches and no way to say so.** Voice holds ciphers and membership; audio arriving before it re-subscribes is dropped silently. This is the failure mode with no log line. | **High** | `/readyz` gates on cache warm-up and is distinct from `/healthz`. An e2e test restarts voice mid-call and asserts audio resumes without loss beyond the drain window. |
 | R10 | A blocking `call()` can **deadlock** on a cycle (A calls B, B calls A); `send` could not. No rule or mechanism exists. | Medium | Decide the rule before `call()` ships — either a documented acyclic port order or a depth/timeout guard. §4.2 B1. |
 | R7 | Plugin host was built against the C++ FFI contract; removing `ffi.rs` may surface assumptions baked into `context.rs`. | Low | Phase 3 starts by running the existing host test suite against a Rust-native `HostFacade` impl before wiring any real server state. |
 
@@ -444,7 +445,8 @@ here. There are two.
 
 ### Phase 0 clean-up queue — not started
 
-Ordered, from `docs/CRATES.md` §2. None of it is begun.
+None of it is begun, and the service split in `docs/ARCHITECTURE.md` supersedes
+most of it.
 
 - [ ] 1. Extract `security/` into `starling-crypto`
 - [ ] 2. Narrow the handler signature to `&mut dyn Authority` *(shape not yet confirmed)*

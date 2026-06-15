@@ -1,484 +1,524 @@
 # Starling architecture
 
-> **Thesis: look like a monolith from the outside, be a microkernel on the
-> inside.**
+> **Thesis: a gateway in front, services behind it, and the realtime plane never
+> touch the gateway at all.**
 
-The hard constraint is not throughput. It is that a user runs one container and
-has a working server. Every pattern below is judged against that first.
+Starling is a set of independent processes speaking gRPC, fronted by one
+**gateway** that owns the client's TCP connection. Audio and screen-share media
+bypass the gateway entirely and reach their service directly. Bulk transfer goes
+over plain HTTP.
 
----
+Diagrams: `diagrams/services.puml` for the whole picture,
+`diagrams/gateway-internals.puml` for the gateway, `diagrams/deployment.puml`
+for the container topology.
 
-## 1. What Starling already is
-
-Worth naming before choosing anything new, because most of the answer is
-"finish what is already there".
-
-| Element | Status | Where |
-|---|---|---|
-| **Microkernel** — core owns sessions/channels/permissions/routing, features are plugins | ~80% | plugin host + `HANDOVER-audit-opaque.md`'s opacity rule |
-| **Actor core** — one authoritative state owner, no locks | done | `ServerCore`, `PORTING-PLAN.md` §2.3 |
-| **Command pattern** in | done | `Command` enum over one `mpsc` |
-| **Effects** out — pure handlers, `fn(&mut State, msg) -> Effects` | done | `Effect::Send/Disconnect/Log`, `Persist` planned |
-| **CQRS-shaped** — RAM read model, write-behind durable record | done, unnamed | `docs/STORAGE.md` D1/L7 |
-| **Ports & adapters** — traits on every boundary | done | `Handler`, `Outbound`, `ChannelStore`, `LogSink`, `SecurityPolicy` |
-| **Event-driven fan-out to plugins** | **missing** | see §4.1 |
-| **Single deployment surface** | **missing** | see §4.2 |
-
-So the architecture is not an open question. It is a **microkernel with an actor
-core and an effect pipeline**, and two pieces are unfinished.
+This supersedes the microkernel / in-process-bus design entirely. There is no
+bus, no lanes, no envelopes and no `starling-api` trait hub.
 
 ---
 
-## 2. Verdicts on the named patterns
+## 1. Why the gateway can route without understanding anything
 
-### Microkernel — **yes, this is the architecture**
+The Mumble control frame is `type: u16 ‖ len: u32 ‖ payload`, and **the type is
+in the framing, not in the protobuf** — `vendor/server/src/murmur/Server.cpp:2040`
+writes it with `qToBigEndian(static_cast<quint16>(…))`.
 
-Already ruled in by the maintainer's opacity principle: the server may provide
-generic capabilities (sessions, permissions, config, messaging, storage) and
-never know a plugin's name, schema or semantics. Persistent chat joining the
-plugin side (decided 2026-07-25) leaves a genuinely small core: config, channel
-tree, accounts, ACL, bans, blobs, routing.
+So the gateway reads two bytes, looks up a route, and forwards the payload
+**verbatim**. It never parses a protobuf field, never links a service's generated
+stubs, and never recompiles when a service is added.
 
-The important qualifier: **plugins are in-process, not services.** Native (FFI)
-or sandboxed (WASM), both loaded into the same binary. Microkernel is a *coupling*
-pattern here, not a *deployment* pattern.
+### One outer type per service, nested envelope inside
 
-### Event-driven — **yes, in-process only**
+Upstream types (0–26) are flat and frozen forever. Every Fancy service instead
+gets **one** outer type, and its payload is a service-owned envelope carrying its
+own `oneof`:
 
-The core should publish domain events (`session.established`, `channel.created`,
-`user.moved`, `message.sent`) that plugins subscribe to by pattern. That is
-exactly the "feature-agnostic server-event fan-out" the audit handover asks for,
-and it is the missing half of the microkernel (§4.1).
-
-What is explicitly *not* wanted: a broker, a queue product, or cross-process
-events. The bus is a function call over a subscriber list, and it lives in the
-same process as everything else.
-
-### CQRS — **already true; do not add ceremony**
-
-Reads are served from the RAM-resident model; writes go through the core and are
-persisted write-behind. That is CQRS's essential shape and it is worth naming so
-nobody "adds CQRS" later.
-
-What must **not** follow: separate read/write databases, eventual consistency
-between them, projection rebuild tooling. Those solve a scale problem this
-workload does not have, and every one of them is a thing an operator has to
-understand.
-
-### Event sourcing — **no for the core; already used where it belongs**
-
-Tempting because the audit plugin already hash-chains its events — but that is
-event sourcing applied to the one domain that genuinely needs an immutable
-ledger, and it lives in a plugin. Applying it to the core would mean snapshots,
-projections and versioned event schemas to manage a channel tree that fits in a
-few hundred kilobytes.
-
-The single thing that would justify it is multi-node replication of one virtual
-server. murmur has never done that, it is not on the roadmap, and it would be a
-research project rather than an architecture choice. Revisit only if that
-changes.
-
-### Orchestrator / microservices — **no**
-
-`ServerCore` is already the orchestrator, in-process. The distributed reading of
-the pattern is directly opposed to the deployment constraint: it turns one
-container into a compose file, a service mesh and a set of failure modes an
-operator has to reason about, in exchange for scale-out that a voice server —
-bounded by UDP fan-out at roughly a thousand users per instance — does not need.
-
-Horizontal scale, when wanted, is *many virtual servers* (which the multi-tenant
-schema already models) or *many independent instances*, not one server split into
-services.
-
----
-
-## 3. The deployment simplicity budget
-
-A rule with a pass/fail test, because "keep it simple" is not enforceable:
-
-> `docker run -p 64738:64738/tcp -p 64738:64738/udp starling` must yield a
-> working server with chat, voice and every bundled plugin.
-
-Which means:
-
-| Budget | Limit | Today |
-|---|---|---|
-| Required config keys | **0** | 0 ✅ (Phase 0 runs with no `--config`) |
-| Required external services | **0** | 0 ✅ (SQLite default) |
-| Required exposed ports | **1** (+ its UDP twin) | **6** ❌ |
-| Manual setup steps | **0** | 0 ✅ (self-signed cert auto-generated) |
-
-Any architectural choice that adds a required port, a required external service,
-or a required config key fails the budget and needs an explicit exception.
-
----
-
-## 4. The two gaps
-
-### 4.1 No event fan-out to plugins
-
-The Rust plugin API offers `on_load`, `on_unload`, `on_client_connected`,
-`on_client_disconnected`, `on_plugin_data`, `on_plugin_message` — and nothing
-else. There is no way for a plugin to learn that a channel was created or a user
-moved, which is why the audit feature needed a server-side bridge with hardcoded
-knowledge of the audit plugin. That bridge is exactly what the handover ruled
-wrong.
-
-The C++ side grew `ServerEventDistributor` (`EventSubscriber`,
-`registerSubscriber`) toward this, but it never reached the Rust plugin API.
-
-**Design.** The core already produces `Effects`. Add one variant:
-
-```rust
-Effect::Publish(DomainEvent)     // alongside Send / Disconnect / Log / Persist
+```protobuf
+// starling-proto-fancy/pchat.proto — owned entirely by the pchat service
+message PchatEnvelope {
+  oneof body {
+    PchatMessage       message      = 1;
+    PchatFetch         fetch        = 2;
+    PchatKeyAnnounce   key_announce = 3;
+    // ... unbounded, and adding one touches nothing outside this file
+  }
+}
 ```
 
-`DomainEvent` is a small, stable, **feature-agnostic** vocabulary — subject,
-verb, ids, and an opaque detail payload. Plugins subscribe by pattern at load
-time. The core never names a plugin; plugins never name each other.
+This is strictly better than allocating blocks of the flat `u16` space:
 
-This keeps handlers pure (they return the event, they do not dispatch it), and it
-means adding an audit-like feature requires **no core change at all** — which is
-the property the handover was actually asking for.
+* **message types per service are unbounded** — no block size to get wrong
+* **the gateway's routing table is one line per service**, not one per message
+* **adding a message type needs no config change and no coordination.** With a
+  flat space, every new type edits a central registry that every service shares.
+  Here a service's types are private to it
+* **it costs nothing.** The gateway forwards verbatim either way, and the service
+  was going to decode a protobuf regardless — the `oneof` tag is one extra varint
 
-### 4.2 Six ports
+The trade-off is that a packet capture shows `type 1002` rather than
+`PchatMessage`; the inner tag is the payload's first field, so tooling recovers
+the name from one nested read.
 
-| Port | Purpose | Fate |
-|---|---|---|
-| 64738/tcp | Mumble control | keep |
-| 64738/udp | Voice | keep |
-| 64739/tcp | file-server plugin HTTP | **fold into the core surface** |
-| 64740/tcp | live-doc plugin WebSocket | **fold into the core surface** |
-| 6502/tcp | ZeroC Ice admin | **replaced** by the admin API (`PORTING-PLAN.md` §6) |
-| 10000/udp | WebRTC SFU media | keep — genuinely different traffic |
+### Type allocation
 
-Plugins currently bind their own listeners, which leaks straight into every
-operator's firewall rules, reverse proxy and compose file. Instead: **the core
-owns one HTTP/WS listener and plugins mount routes on it** through a capability,
-the same way they will get storage and events.
-
-That takes the required-port count from six to two, and the admin API arrives
-without adding a third.
-
----
-
-## 5. The shape, end to end
-
-```text
-                        ┌──────────────── one process, one container ─────────────────┐
-   Mumble clients ──TLS─┤                                                             │
-   (TCP 64738)          │   read tasks ──► ServerCore (1 writer, serialises writes)   │
-                        │                    │        ▲                               │
-   Voice (UDP 64738) ───┤   ArcSwap routing ─┘        │ Commands                      │
-                        │                             │                               │
-                        │        Effects: Send │ Disconnect │ Log │ Persist │ Publish │
-                        │                  │        │        │       │         │      │
-                        │            write tasks    │     LogSink   DB      event bus │
-                        │                           │        │       │         │      │
-                        │                        (close)  sinks   sqlx      plugins   │
-                        │                                                    │   │    │
-                        │  HTTP/WS surface (one port) ◄── route capability ──┘   │    │
-                        │  plugin_kv (one table)      ◄── storage capability ────┘    │
-                        └─────────────────────────────────────────────────────────────┘
-```
-
-Five capabilities, one process: **messaging, permissions, events, storage,
-routes.** A plugin uses those and nothing else; the core knows no plugin's name.
-
----
-
-## 6. The kernel boundary
-
-Diagrams (render with `plantuml -Playout=smetana`, see
-[`diagrams/README.md`](diagrams/README.md)):
-
-| Diagram | Question it answers |
+| Range | Use |
 |---|---|
-| [`kernel-structure.puml`](diagrams/kernel-structure.puml) | Who may depend on whom? |
-| [`kernel-internals.puml`](diagrams/kernel-internals.puml) | What may a feature touch? |
-| [`kernel-message-flow.puml`](diagrams/kernel-message-flow.puml) | How does one message actually flow? |
+| **0–99** | upstream Mumble, flat, **frozen** (0–26 in use) |
+| **100–999** | **burned.** The old interleaved Fancy flat types shipped in released clients; never reused, so a stale client's message can never be misread as a new service's |
+| **1000+** | one outer type per service, nested envelope. 64 500 services available |
 
-> **Single writer is not a single owner.** `ServerCore` holds no domain data of
-> its own. It holds `ServerState`, which holds `config`, `Connections` and four
-> trait objects — `dyn ChannelStore`, `dyn UserRegistry`, `dyn Permissions`,
-> `dyn SecurityPolicy` — each owning its own slice. `ServerState` cannot read a
-> channel tree except by asking the store.
->
-> What `ServerCore` guarantees is **ordering**: one mutation at a time, on one
-> thread. Nothing in the system has full access to everything — not the bus,
-> whose payload is opaque `Bytes`; not the domain crates, which hold values and
-> no mechanism; and not the core. Describing the core as a god object made the
-> design look like the thing it was built to avoid.
+Why 100–999 is burned rather than reclaimed: today's Fancy numbering is
+*interleaved*, not blocked — `WebRtcSignal` is 120, sitting between pchat's
+100–119 and 121, and pchat's pins are at 128–130. Range routing cannot work on
+it, and reusing those numbers risks a deployed client's message landing on the
+wrong service. See `PROTOCOL-COMPATIBILITY.md`.
 
-### 6.1 Everything is a message — two shapes of one mechanism
+## 2. What only the gateway can do
 
-An earlier draft of this section said *"the mistake to avoid is making everything
-a message"*, and gave reads a `&dyn StateQuery` that went straight to the state
-service. That was a bus bypass, and it was wrong. Corrected: **nothing bypasses
-the bus.**
+**It is the single writer to each client socket.** It physically holds the TCP
+connection, so per-client ordering is preserved by construction: a client cannot
+receive the `UserState` naming a channel before the `ChannelState` creating it,
+whatever order the services produced them in. The in-process design needed a lane
+rule and a version counter for this. Here it is free.
 
-The objection had been that a query-as-message costs "a round trip". That
-conflates a message with a *queued asynchronous* message. QNX — the reference
-this design keeps invoking — routes `read()`, `write()` and `open()` through
-message passing and is still hard-realtime, because `MsgSend()` is not a queue
-post:
+**It owns rate limiting, per route.** murmur runs one shared leaky bucket per
+user — 1 msg/s sustained, burst 5, **silent drop** (`RATELIMIT` in
+`vendor/server/src/murmur/Messages.cpp`). Starting a screen share legitimately
+emits several signalling messages back to back, and this silently ate the
+loopback-viewer SDP offer in most runs: the client logged success, the server
+logged nothing. So limits are per route, and **a throttled message is never
+silently dropped** — Fancy clients are told; legacy clients keep the silence they
+expect.
 
-| QNX | What it does | Here |
+**It owns backpressure toward the client** — see §5.
+
+## 3. Four planes
+
+| Plane | Transport | Path |
 |---|---|---|
-| `MsgSend()` | sender **blocks**; kernel hands the message directly to the server thread; server **inherits the sender's priority**; `MsgReply()` returns straight to the blocked sender | `call()` |
-| `MsgSendPulse()` | non-blocking notification, no reply | `send()` |
+| **control** | TCP 64738 + TLS | client → gateway → gRPC → service |
+| **realtime** | UDP 64738, WebRTC/ICE | client → **service directly** |
+| **bulk** | HTTPS | client → **http service directly**, signed URL |
+| **admin** | HTTPS + REST | operator → **operator-api** → gRPC → service |
 
-A rendezvous is not a round trip through a buffer. It is a direct thread-to-thread
-transfer costing roughly a function call plus a context switch — and the priority
-inheritance is what stops a `Realtime` caller from being stalled behind a
-`Feature`-lane server.
+### Audio needs no hop
 
-So the four directions become:
+murmur already binds TCP and UDP as two independent sockets on one port number —
+`Server.cpp:125` calls `listen()`, `Server.cpp:193` calls `::bind()`. Two
+sockets, one port, and **they can live in different processes.**
 
-| Direction | Primitive | Shape |
+The voice service binds UDP:64738 and clients send audio straight to it. The
+kernel does the demux; no gateway hop, no serialisation, no fan-out
+amplification. The only audio reaching the control plane is `UDPTunnel` (type 1),
+the fallback for UDP-blocked clients, which is per-client not per-listener.
+
+Screen share has the same shape — signalling through the gateway, media
+client↔SFU. Two contract constraints, each of which cost a debugging session:
+
+* the str0m SFU is **ICE-lite**: it ignores trickled candidates and its own rides
+  in the SDP answer. Never trickle ICE through the control plane
+* **SDP offers retry until answered**, because of the rate limit above
+
+### Bulk must leave the control stream
+
+Mumble has no file transfer; `RequestBlob` (23) moves avatars and comments over
+the control connection. Anything large there head-of-line blocks every control
+message behind it — and the control-overflow-disconnects rule would then kill
+clients mid-upload.
+
+So the http service gets its own listener. The gateway hands out a **short-lived
+signed URL** over the control channel and bytes move over HTTP: shared files,
+avatars, comments, plugin binaries, link-preview thumbnails, audit exports.
+
+Being HTTP, it can sit behind a Kubernetes `Ingress` and get TLS termination and a
+CDN for free. `operator-api` is the other HTTP surface, but wants the opposite
+exposure — a private ingress, or none at all.
+
+### The admin plane is HTTP, in its own process
+
+The operator surface — the replacement for Ice — can create users, rewrite ACLs,
+ban, and read the database. It is the highest-privilege surface in the system.
+
+**It is plain HTTP with an OpenAPI description**, for two reasons. An admin client
+becomes trivial to write in any language, including a browser panel and `curl`.
+And authentication becomes **whatever the operator already runs** rather than
+something we invent:
+
+| Mode | Use |
+|---|---|
+| **`oidc`** | Keycloak, Authentik, Auth0, Entra — JWT validated against the issuer's JWKS |
+| **`jwt`** | a bare token signed by a key you hold, for setups without an IdP |
+| **`mtls`** | client certificates, when a PKI already exists |
+| **`token`** | a static API token, for a script or a one-box install |
+
+Token claims map to Starling scopes in the TOML, so an existing Keycloak role
+becomes an authorisation without code. That is a Strategy per DESIGN.md §3: a new
+mode is a new implementation, never a new arm in a `match`.
+
+Against Ice, which is what this replaces:
+
+| | Ice today | Starling |
 |---|---|---|
-| Feature **reads** authoritative state | `bus.call(..)` | blocks for a reply, cannot mutate |
-| Feature **changes** anything | returns `Effects` | travel as a reply payload; applied by the state service |
-| State service **notifies** features | `bus.send(..)` | fire-and-forget, no reply |
-| Feature **uses** a service | `bus.call(..)` | same primitive, different port |
+| credential | `icesecret`, one static string in the config file | OIDC / JWT / mTLS / token, configured |
+| identity | none — the secret *is* the identity | per operator, so actions attribute |
+| scope | `icesecretread` / `icesecretwrite` | per service and per operation, from claims |
+| rotation | edit the config, restart | issue and revoke at the IdP, no downtime |
+| exposure | wherever the Ice endpoint was bound | **default off**, localhost unless configured |
 
-`StateQuery` and `Capabilities` survive as **client-side facades** over
-`bus.call()` — they exist so a feature does not hand-assemble envelopes, not as a
-way around the bus. Their implementations live on the feature side of the
-boundary and hold nothing but a `PortId` and a `&dyn MessageBus`.
+**It is not a second policy implementation.** `operator-api` calls the same gRPC
+methods the gateway does, carrying an operator identity and its scopes instead of
+a session. The invariant is that no service accepts an unauthenticated call, and
+that is enforced by inter-service auth (§8) — not by funnelling every plane
+through one process.
 
-#### Two views of the same state, for two kinds of caller
+**Why its own process rather than a listener on the gateway.** An OIDC client, a
+JWKS cache, JSON and OpenAPI routing are a large dependency surface to load into
+the process that holds every client's TCP socket; a bug in the admin stack must
+not drop live calls. Admin traffic is tiny and bursty where client traffic is
+steady, and in Kubernetes the two want opposite exposure — a private ingress
+versus a public `LoadBalancer`. Co-locating them is still possible via
+`--all-in-one` for a single-box install.
 
-`StateQuery` is the **feature** view: it crosses the bus, so every method returns
-an owned answer. Handlers inside the state service are not features — they run in
-the writer's own thread — so they get a second, in-process view where borrows are
-fine:
+**Fail closed on audit.** Every operator action is recorded, and a request is
+refused if it cannot be recorded. `audit` is an optional service (§4) and the
+highest-privilege plane must not depend on one, so `operator-api` writes this
+record itself.
 
-| | `StateQuery` | `Authority` *(planned)* |
+`vendor/channelviewer` is an existing Ice consumer (`getDefaultConf`), so a shim
+is required for it — see `PORTING-PLAN.md` R1 and §6.
+
+## 4. Services and tiers
+
+`tier` is not documentation — the gateway reads it and behaves accordingly.
+
+| Tier | Services | Down means |
 |---|---|---|
-| caller | a feature, in another component | a handler, inside the service |
-| reaches it by | `bus.call()` | direct `&mut` |
-| returns | owned values only | borrows are fine |
-| surface | questions answered | 11 methods + 3 config reads |
+| **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config | reject logins |
+| **core** | voice, text, pchat, moderation | that feature is dead; server runs |
+| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, **operator-api** | nobody notices |
 
-Both are narrow views onto the same `ServerState`. Neither is a bypass: the
-feature's path is the bus, and the handler is already inside the component the
-bus would deliver to. `Authority` does not exist yet — see the work queue in
-`docs/CRATES.md` §2.
+### Session is two services, because it is two responsibilities
 
-#### Blocking rendezvous or awaiting one? The reactor question
+**`session-lifecycle` owns a connection's existence.** Negotiate the version,
+authenticate, hand over `CryptSetup`, answer `Ping`, notice a timeout, tear down.
+It is a state machine per connection, and it is the only half a client ever talks
+to.
 
-Asked as "would a reactor pattern be better suited". Two parts, and only the
-second is a live decision.
+**`session-view` owns the composed read model** the rest of the domain asks
+questions of. It never talks to a client and **has no client-facing message
+type**, which keeps it internal by construction rather than by convention.
 
-**A reactor is not an alternative to the bus — it is already underneath it.**
-Tokio *is* a reactor (epoll/IOCP) plus a work-stealing scheduler, and
-`listener.rs` sits on it. `ServerCore::run` is itself reactor-shaped:
-`while let Some(cmd) = rx.recv().await { self.handle(cmd) }` demultiplexes one
-event source and dispatches by message type through `Dispatcher`, with handlers
-that must not block. What a reactor does *not* provide is priority: `epoll`
-returns ready handles in arbitrary order. The Realtime-lane result — 0% missed
-frames against 99.8% (`RESULTS.md` §2) — came from priority queues. So lanes sit
-*on* a reactor; they are not replaced by one.
+Splitting them matters because they change for different reasons: the first
+changes when the handshake changes, the second when a service needs a new fact.
 
-**The live decision is whether `call()` blocks or awaits.** And here the
-deployment budget settles it:
+### `session-view` is the edge of the domain
 
-| | blocking rendezvous (QNX) | awaiting call (reactor discipline) |
-|---|---|---|
-| thread while waiting | parked | released |
-| needs priority inheritance | **yes**, to be safe under contention | no |
-| privilege required | **`CAP_SYS_NICE`** to raise a thread's priority | none |
-| cold-path cost | 18.2 us, mostly wake-up (`RESULTS.md` §3.2) | no wake — the executor is already running |
-| deadlock on a cycle | hangs *and* consumes a thread | hangs; a timeout is natural |
+Every service in the control, core and realtime groups reads through `session-view`
+and nowhere else. Without it each would depend on userdata, permissions, metadata
+and server-config — N×4 edges, and four caches each to keep warm.
 
-**QNX can inherit priority because it is the kernel.** We are an unprivileged
-process in a container, and `RESULTS.md` line 92 already records that elevated
-thread priority requires `CAP_SYS_NICE`, "which the deployment budget says must
-never be required". Three files nonetheless advertised priority inheritance as a
-bus feature. That was a requirement on a mechanism this design forbids itself.
+Two rules stop it becoming the god service:
 
-So: **`call()` awaits, it does not block.** Priority stays where it can actually
-be enforced — in the lane queues, which are ours — and not in the OS scheduler,
-which we may not touch.
+**It forwards, but never decides.** Hot facts come from its composed view;
+anything else it routes to the owning service untouched. It writes nothing, and
+the four authorities stay authoritative. Note the distinction that makes a strict
+edge workable: *forwarding* a cold query is routing, whereas *caching* the
+`(user, channel)` ACL cross product would make it a second ACL engine. It does
+the first and never the second.
 
-**What this does not fix.** Hold time. A handler spinning for 25 ms still owns
-its executor thread, so `RESULTS.md` §3.3 stands unchanged — and cooperative
-scheduling makes it *worse*, because there is no preemption at all. The
-"no I/O or unbounded work" invariant is therefore **more** load-bearing under an
-awaiting `call()`, not less. Nothing about a reactor rescues a handler that
-refuses to yield.
+**It is a subscription hub, not a proxy.** Services subscribe to a snapshot
+stream and keep their own copy rather than calling per request, so the rule that
+nothing on the audio path may make a request still holds. Voice subscribes *once*
+instead of to three services.
 
-**One unprivileged trick worth remembering.** Lowering a thread's priority is
-free; only raising it is gated. So relative priority *is* available by starting
-every thread at the default and nice-ing the `Feature` and `Io` workers *down*.
-That buys static priority, not inheritance — and it does not address §3.3, where
-the serving thread was already mid-request.
+The cost is one extra hop for the cold cases — an ACL query about a channel the
+user is not in, or a lookup of an offline account. Neither is on a hot path:
+whisper setup is not per-packet and moderation is not per-frame.
 
-#### What the bus is missing
+**A stale deny is safe; a stale grant is a security bug.** So a revocation
+invalidates the composed view before it is acknowledged, while a grant may arrive
+lazily.
 
-`MessageBus` today has `send` and `take` and no reply primitive, so a synchronous
-query genuinely cannot go over it. `Lane::Feature`'s own doc comment already
-promises "request/reply" — a promise the API does not keep. Two things have to be
-added before the design above is real, and both need measuring the way the lane
-design was measured:
+**The admin plane is the one exception**, and it has to be: `session-view` is a
+view of *connected* users, while an operator edits registered accounts, offline
+bans and server config. `operator-api` therefore calls the authorities directly.
 
-1. **`fn call(&self, env: Envelope, timeout: Duration) -> Result<Envelope, CallError>`**
-   — a blocking rendezvous. The reply must not be a normal lane post, or a busy
-   lane would delay every reply on it.
-2. **Priority inheritance for the duration of a call.** The serving port runs at
-   the caller's lane priority, or a `Realtime` caller blocking on a `Feature`
-   server is a priority inversion — precisely the failure
-   `examples/realtime.rs` was written to expose.
+### Voice mints the ciphers, not session-lifecycle
 
-Until those exist and are measured, the diagrams marked *DESIGN TARGET* are
-describing a bus that cannot yet do what they show.
+`CryptSetup` (15) is a control message, so `session-lifecycle` delivers it — but
+the key is used by voice to seal UDP. So **voice generates it** and
+`session-lifecycle` asks for a ready-made payload to forward. Key material never
+crosses a service boundary, and a client-requested resync takes the same path.
 
-> This section is also a worked example of the length-of-justification rule: the
-> bypass needed a paragraph to defend, and the paragraph was the tell.
+### There are two config layers, and only one of them is a service
 
-### 6.2 The traits
+murmur keeps both in one `Config` table. Starling splits them, because they have
+different lifetimes:
 
-> **Why not `KernelQuery`.** It was named that when `starling-state` was the
-> kernel. The kernel is now the bus, and the bus knows nothing of users,
-> channels or permissions. It queries the authoritative state, so it is
-> `StateQuery`.
->
-> **Who answers "may user X text in channel Y".** Three parties, and it is worth
-> being exact because two rewrites of the diagrams blurred it:
->
-> | | |
-> |---|---|
-> | **computes** the answer | `dyn Permissions` in `starling-model` — one implementation, unchanged |
-> | **serves** the question | the state service, which owns the `Box<dyn Permissions>` |
-> | **asks** | a feature, via `bus.call()` on the state service's port |
->
-> Permissions did **not** move out of the domain. The state service asking its
-> own `dyn Permissions` is a direct call, not a bus hop, and that is not a
-> bypass: `dyn Permissions` is a pure function owned by the service, not a
-> component with a port. It is the same reason the domain layer never sits on
-> the bus (`scripts/check-crate-layering.sh`). The bus mediates *between*
-> components, not inside one.
->
-> **Is the in-process call to `dyn Permissions` a bypass?** Not today — `AllowAll`
-> is stateless. But the trait's signature takes only `(UserId, ChannelId)`, and
-> real evaluation needs the ancestor chain, per-channel ACLs and group membership
-> (`src/ACL.cpp:104`). An implementation given only ids must **fetch**, and
-> `ChannelStore` is SQL-backed from Phase 2 — so it would block inside the single
-> writer. The signature invites exactly the bypass it looks innocent of.
->
-> Two ways out, and the choice matters:
->
-> | | |
-> |---|---|
-> | make it a **bus-mediated service** with its own port | needs its own copy of the channel tree — a second source of truth for the tree — plus a rendezvous on the hottest operation in the server |
-> | keep it a **genuinely pure evaluator** | the state service assembles the data and passes it in; no fetch, no I/O, no port, no bypass |
->
-> The second. The first reintroduces the duplicated-permission-state problem this
-> design exists to avoid. Recorded as a Phase 2 gate on the trait itself, in
-> `crates/domain/model/src/perm/policy.rs` — the signature must change before the
-> real evaluator is written, and the memo cache belongs to the state service, not
-> to the evaluator.
+**Deployment config lives in the TOML** — service endpoints, listen ports, TLS
+paths, storage URLs, tiers and routes. Changing any of it needs a restart anyway,
+so it is read once at startup and injected at construction. No late-subscriber
+problem, no service to be down.
 
-> This also retires the earlier "hand out the evaluator rather than wrap it"
-> decision. The worry it addressed — two ways to ask the same question — is
-> answered better here: there is one evaluator, behind one port. Handing out a
-> reference was only ever possible while features were bypassing the bus.
+**Operational config lives in the `server-config` service** — everything murmur
+lets an operator change live: `bandwidth`, `messagelimit`/`messageburst`, `users`,
+`welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`,
+`listenersperchannel`, `certrequired`, `logdays`. One actor per virtual server,
+published as a snapshot that readers cache — the same pattern as metadata's
+membership.
 
+That is why it is **essential**: the gateway cannot rate-limit without
+`messagelimit` and the handshake cannot complete without the config the client is
+sent. A cold start with it down must reject logins rather than quietly serve on
+defaults the operator never chose. Once caches are warm a restart is survivable,
+like every other service.
 
-```rust
-// starling-api — traits only, no logic. Both sides depend on this; neither
-// depends on the other.
+**Account settings are userdata**, not settings. They are per-user profile data
+and belong with the profile.
 
-/// Read-only view of kernel state. Handed to a feature for the duration of one
-/// call. Cannot mutate — that is what makes features testable and the
-/// single-owner invariant safe.
-pub trait StateQuery {
-    /// Answers the question. It cannot hand out `&dyn Permissions`: a borrow
-    /// into the state service's memory does not fit in an envelope.
-    fn allows(&self, user: Option<UserId>, ch: ChannelId, need: Perm) -> bool;
+A small server runs five processes; a large one runs twenty-four. "Don't run what
+you don't want" beats murmur's compile-time flags.
 
-    /// Batched, because each call is a rendezvous rather than a pointer deref.
-    /// One `TextMessage` is checked against every channel it targets, so the
-    /// unbatched shape turns one client message into N round trips.
-    fn allows_each(&self, user: Option<UserId>, chs: &[ChannelId], need: Perm)
-        -> Vec<bool>;
+**Each service owns its own schema.** No service reads another's tables. A shared
+database service would keep the schema coupling *and* add a hop — the
+anti-pattern this architecture exists to avoid. One migration tool, many schemas;
+see `STORAGE.md`.
 
-    /// Owned snapshots, not borrows, for the same reason.
-    fn channel(&self, id: ChannelId) -> Option<Channel>;
-    fn user(&self, session: SessionId) -> Option<User>;
-    fn sessions_in(&self, ch: ChannelId) -> Vec<SessionId>;
-}
+## 5. Ordering and backpressure
 
-/// A feature. Statically linked or wasm-hosted — the kernel cannot tell.
-pub trait Feature: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn handles(&self) -> &[MessageKind];
-    fn subscribes(&self) -> &[EventKind] { &[] }
+**Ordering is per-stream and comes from single-writer sources.** Metadata is one
+actor and the sole writer of channel state, so the order it applies mutations is
+a total order; the gateway is the sole writer to a client socket, so that order
+survives to the wire. Nothing further is required.
 
-    fn handle(&self, q: &dyn StateQuery, c: &dyn Capabilities,
-              conn: ConnId, msg: Message) -> Effects;
+**A slow consumer never backpressures a shared producer.** If metadata publishes
+to a thousand clients and one has a bad connection, blocking would head-of-line
+block all of them. That client is disconnected instead.
 
-    fn on_event(&self, _q: &dyn StateQuery, _e: &DomainEvent) -> Effects {
-        Effects::none()
-    }
-}
+| Path | Full means |
+|---|---|
+| control to a client | **disconnect that client** |
+| audio to a client | drop oldest, count it |
+| UDP would block | drop, never queue |
+| service to service | the gRPC deadline reports it |
+
+Dropping a control message desyncs that client permanently and silently — it
+renders the wrong world forever with nothing in any log — and unbounded queueing
+is a memory DoS. Disconnecting is the only outcome both bounded and honest, and
+reconnect already re-syncs from scratch. A late audio frame is worthless.
+
+gRPC streams carry HTTP/2 flow control, so a service pushing faster than the
+gateway can write is throttled by the transport rather than by hand-rolled queue
+accounting.
+
+**Everything lost is counted:** audio frames dropped, clients disconnected for
+control overflow, requests expired.
+
+### Shard keys are decided now, not at deployment
+
+A shard key cannot be retrofitted — it changes every caller. `scaling.puml` has
+the per-service table; three of them are load-bearing:
+
+**`voice` shards by channel, never by client.** Audio routing is per channel, so
+a channel's members must share a pod. Client affinity (`sessionAffinity: ClientIP`)
+is actively wrong: it scatters a channel across pods, and there is no inter-pod
+audio path. Discord assigns a voice *channel* to a voice server and tells the
+client which one; Mumble has no such field, and **a legacy client sends UDP to the
+port it made TCP to**, so it cannot be redirected. Legacy therefore scales
+vertically only. Handing Fancy clients an explicit endpoint in `ServerSync` is the
+one option that scales.
+
+**`session-view` shards by session id.** It holds a composed view per connected
+session and updates all of them on every change — unsharded, that is one actor
+performing every domain read, which is Discord's guild-process bottleneck
+relocated. It is also the hardest to fix later, because every service calls it.
+
+**`metadata` and `server-config` shard by virtual server** — the guild-process
+pattern, and simultaneously the answer to running several virtual servers.
+
+### Reliability mechanisms that are not optional
+
+**RESUME.** Restart a gateway holding 10 000 clients and every one reconnects and
+pulls a full flood of every `ChannelState` and `UserState` at once — a
+self-inflicted DDoS on `metadata` and `session-view`. With a sequence number per
+session a client replays only the gap. That requires the sequence and its replay
+buffer to **outlive the gateway pod**, so a resuming client can land on another
+one. **zstd** on the Fancy control stream shrinks the same transfer.
+
+**Legacy clients can never RESUME**, so staggered drain and jittered reconnect
+hints are required regardless of whether the store exists. The store optimises a
+path that must already survive without it.
+
+#### The session store is not a service, and that is a gap in the tier model
+
+`tier` decides one thing: what the gateway does when a dependency is down. For
+the session store, both answers are wrong. **essential** would reject logins over
+a lost *optimisation*. **optional** claims nobody notices — false, since its
+absence bites at the worst possible moment, and the resulting reconnect herd can
+saturate `metadata`, which *is* essential.
+
+The resolution is that it is not a service. No client reaches it, it has no
+message type or gRPC surface, and it is never scaled independently: it is the
+gateway's own durable state, externalised so a pod can die. Closer to the
+gateway's TLS keys than to `userdata`.
+
+It therefore has no tier, and is reported in readiness as a **warning**, never as
+unready. Worth recording the general shape, because a second component like this
+will appear: **a dependency whose failure is deferred and amplifying does not fit
+a taxonomy built around immediate behaviour.**
+
+Two things about it are still undesigned, and both change the shape rather than
+tune it:
+
+* **frames or events?** Storing per-client *frames* lets the gateway replay
+  verbatim, but one broadcast to 1000 clients becomes 1000 buffer writes for one
+  logical event — roughly 200 MB for 10 000 clients × 100 frames. Storing the
+  event stream once and re-deriving per client is far cheaper and much more
+  complex.
+* **it sits on the control hot path.** The gateway stamps the sequence, so a naive
+  implementation writes to the store on every outbound frame. Buffer locally and
+  flush asynchronously; a crash then loses the tail, which is harmless because the
+  client simply resumes from further back.
+
+**Circuit breakers, not just deadlines.** A saturated service otherwise makes
+every caller wait its full deadline and *then* fail, burning gateway capacity
+throughout. Trip the breaker and shed at the door, using the same `tier` the
+readiness logic uses.
+
+**Bounded mailboxes everywhere.** An unbounded inbox converts one slow consumer
+into an OOM — the specific failure Discord hit with Erlang process mailboxes under
+fanout. Every actor gets a bound and a shed policy.
+
+**UUIDv7 for anything with history** — pchat messages, pins, reactions, offline
+queues, text history, audit entries. Coordination-free and time-sortable, which is
+what Discord's Snowflake buys them. A central sequence is a bottleneck; UUIDv4
+destroys index locality.
+
+### Two realtime invariants
+
+**Opus is forwarded, never transcoded.** Starling is an SFU, not an MCU. A
+transcode blows a 10 ms budget on the first frame, and it is the sort of thing
+added for "server-side mixing" without anyone measuring.
+
+**Audio payloads are refcounted, never copied per listener.** The real per-packet
+cost is **N seals, not one** — each listener needs the frame under their own key,
+and that number sizes the pod.
+
+### The measured budget
+
+Carried over from the bus experiments, which are gone with the bus:
+
+* **one 10 ms audio frame is the budget** — an absolute figure, not a ratio
+* 17.8 µs of overhead against that is three orders of magnitude clear, so
+  per-message cost on the *control* plane is not where audio dies
+* **the failure mode was refusal, not latency** — 392 of 400 slow publications
+  were refused outright rather than delayed. Watch refusals, not percentiles
+
+The surviving conclusion: a gRPC hop is affordable on the control plane and fatal
+on audio fan-out. Hence §3.
+
+## 6. What was taken from Discord
+
+**Stateful gateway, state in separate processes.** Their gateway holds the socket
+and fans out; guild state lives in separate processes rather than being read from
+the database per event. That is the gateway + metadata split, and why voice caches
+membership instead of querying it.
+
+**One process per guild → one actor per virtual server.** Metadata runs one actor
+per virtual server, sharded by server id — a better answer to multiple virtual
+servers than either previous design had.
+
+**Lazy subscriptions.** Discord clients declare what they are viewing and get
+only that. Mumble broadcasts all channel and user state to everyone, which is
+exactly the fanout Discord engineered away. Legacy clients need the full flood and
+keep it; **Fancy clients subscribe.** Same protocol, opt-in scaling.
+
+**Sequence numbers and resume.** Their gateway stamps each event with a sequence
+number; a dropped client reconnects with its last seen value and replays the gap.
+Here that makes the ordering guarantee observable and lets a Fancy client skip the
+flood on reconnect.
+
+**Request coalescing.** Their Rust data services collapse concurrent identical
+reads into one query so a hot partition cannot be stampeded. The analogue is
+**permissions**: ACL evaluation walks the channel tree and a busy channel produces
+many identical in-flight queries. Coalescing beats a cache, because a cache needs
+invalidation and coalescing does not.
+
+## 7. Crates
+
+```
+crates/
+  runtime/            starling-runtime       the one common standalone crate
+  proto/              starling-proto         upstream Mumble.proto, FROZEN
+  proto-fancy/        starling-proto-fancy   one envelope per service
+  gateway/            starling-gateway
+  services/
+    session-lifecycle/  session-view/
+    permissions/  metadata/  userdata/  server-config/
+    voice/  text/  pchat/  moderation/
+    screenshare/  files/  plugins/  push/  audit/
+    onboarding/  social/  link-preview/  context-actions/
+  operator-api/       starling-operator-api  REST + OpenAPI, pluggable auth
 ```
 
-`handle` and `on_event` have the same signature shape as the `Handler` trait
-already shipping in Phase 0 — pure, no I/O, returns `Effects`. Feature crates get
-the property the core already has: **testable in microseconds without a socket,
-a runtime or a database.**
+Splitting the proto in two makes "never break native Mumble" structural rather
+than a rule someone remembers.
 
-### 6.3 Why effects are queued, not applied recursively
+### `starling-runtime`
 
-An event subscriber returns effects, which may include another `Publish`. Applied
-recursively that is unbounded stack growth and a re-entrancy hazard — precisely
-what the single-actor design exists to avoid.
+Each service is a library crate plus a one-line binary:
 
-Instead the kernel keeps **one effect queue per command**. Subscriber effects are
-appended with an incremented depth counter, and a depth ceiling turns a runaway
-cascade into a logged error rather than a crash. The actor still processes one
-command to completion before the next, so the transaction boundary survives.
+```rust
+fn main() -> anyhow::Result<()> { starling_runtime::serve::<TextService>() }
+```
 
-### 6.4 The rule, and how it is enforced
+The runtime provides, once, what every service needs and Kubernetes requires:
 
-> Feature crates depend on `starling-api`. The kernel depends on `starling-api`.
-> **The kernel never depends on a feature crate.**
+* TOML config with env override, so a ConfigMap works without templating
+* tonic bootstrap over TCP or a Unix socket
+* `/healthz` and `/readyz`, **distinct** — readiness fails while caches warm
+* **SIGTERM → graceful drain.** Non-negotiable; K8s kills you 30 s later anyway
+* OTel tracing, request id threaded through every hop
+* a metrics endpoint
+* endpoint discovery from env, which K8s DNS fills in for free
 
-This is checkable rather than aspirational — a `cargo tree` assertion in CI
-fails the build on any edge from `starling-state` to `starling-feature-*`. It
-is the check that would have caught `AuditLogBridge` mechanically, where a stated
-principle did not.
+It also provides `--all-in-one`: every service in one process, in-process calls.
+Same code, two deployment modes — one binary for a VPS, twenty-four processes for
+isolation or per-service scaling. It also exercises the boundaries both ways.
 
-### 6.5 The lanes are measured, not assumed
+## 8. What separate processes cost
 
-`crates/kernel/bus/` implements the design and
-[`RESULTS.md`](../crates/kernel/bus/RESULTS.md) records two experiments.
+Things the in-process design got for free and now must be built:
 
-* **Lane separation protects the control plane:** ~900x better p99 (13 ms → 6 us
-  median) with the feature lane saturated.
-* **The `Realtime` lane is justified:** under a control storm, folding it into
-  `Control` loses **99.8%** of routing-table publications — and the failure mode
-  is *refusal at send*, not slowness, because `Control`'s overflow policy is
-  `DisconnectPeer`.
+* **request tracing** — or a hung permission check is unattributable
+* **health and readiness** — the gateway must know what is up and degrade per §4
+* **restart semantics** — a restarted service has cold caches. Voice must
+  re-subscribe and refetch membership *before* routing, or it silently drops
+  audio. Readiness gates on cache warm-up, not on the process being alive
+* **inter-service auth** — Unix socket permissions locally, mTLS across hosts
+* **schema skew** — twenty-four processes deploy at different times, so gRPC
+  contracts must tolerate a version skew one process never had
 
-The second result reverses the "start with three lanes" note this document
-previously carried. It also produced a rule worth keeping: **a lane's overflow
-policy is part of its latency profile**, and an experiment that measures only
-delivered messages reports a flattering number computed over the survivors.
+## 9. Deployment
 
-## 7. What this costs
+**One image, many deployments.** A single image whose entrypoint takes the
+service name; K8s runs `args: ["text"]`. Twenty-four Dockerfiles is twenty-four
+things to keep in sync, and it makes `--all-in-one` a matter of arguments rather
+than a separate build.
 
-Stated plainly, because the pattern list above is easy to read as free:
+Two things are genuinely awkward:
 
-* **In-process plugins share a fate.** A native plugin that panics or corrupts
-  memory takes the server with it. WASM plugins do not — which is the argument
-  for making WASM the default loader and native the opt-in, and it is the main
-  reason the WASM path deserves the storage capability it currently lacks.
-* **One process is one scaling unit.** Fine for a voice server; a hard ceiling if
-  Starling is ever wanted as a chat backend at a scale voice never reaches.
-* **The event bus is a coupling surface.** Once plugins depend on
-  `DomainEvent`'s vocabulary, changing it breaks them. It needs the same
-  versioning discipline as the wire protocol, and it should start deliberately
-  small.
+**The gateway cannot use a Kubernetes `Ingress`.** `Ingress` is HTTP-only and
+Mumble is raw TCP+TLS, so it needs `Service type=LoadBalancer` or Gateway API
+`TCPRoute`. This is also why the front component is the **gateway** and not
+`ingress`: naming it after a resource it can never use is a trap.
+
+**Voice under UDP load balancing.** A TCP connection pins a client to a gateway
+pod; UDP has nothing to pin. Discord solves this by *telling* the client which
+voice server to use. Mumble has no such field, and **a legacy client sends UDP to
+the same host:port it made TCP to.** So:
+
+* legacy clients need voice reachable at the gateway's address — a sidecar in the
+  same pod, or a UDP load balancer with source-IP affinity
+* Fancy clients can be handed an explicit voice endpoint in `ServerSync`, a
+  protocol extension on the upgrade path already maintained

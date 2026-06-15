@@ -1,0 +1,85 @@
+@startuml scaling
+!theme plain
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 20
+skinparam ranksep 46
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title What scales horizontally, and what does not
+
+header
+<b>A shard key is a design decision, not a deployment one.</b>  Retrofitting one means changing every caller, so each service below
+declares its unit now.  <b>Green scales out.  Amber scales out within a bound.  Red does not scale out at all</b> — and the red one is
+red because of the wire protocol, not the implementation.
+endheader
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**scales out freely** — stateless over its own store" as FREE #C8E6C9 {
+  component "**permissions**\nshard: **stateless**\n—\nACL evaluation walks the tree, and a busy\nchannel produces many identical in-flight\nqueries. **Coalesce them** rather than cache:\na cache needs invalidation, coalescing\ndoes not. «Discord's data-services trick»" as perms #FFFFFF
+  component "**userdata** · **text** · **pchat**\n**moderation** · **social** · **audit**\n**push** · **files/http** · **operator-api**\nshard: **stateless**\n—\nHistory-bearing services key rows by\n**UUIDv7**: coordination-free and\ntime-sortable. A central sequence is a\nbottleneck; UUIDv4 destroys index locality." as rest #FFFFFF
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**scales out, bounded by the key**" as BOUND #FFF9C4 {
+  component "**gateway**\nshard: **connection**\n—\nAny pod takes any connection. A client's\nTCP socket pins it for that connection's\nlifetime; **RESUME** lets it land elsewhere\nafter a restart." as gw #FFFFFF
+  component "**session-lifecycle**\nshard: **connection**\n—\nOne state machine per connection,\nindependent of every other." as slife #FFFFFF
+  component "**session-view**\nshard: **session id — from day one**\n—\nHolds a composed view per connected\nsession and updates all of them on every\nchange. Unsharded, that is one actor doing\nevery domain read —\n**Discord's guild-process bottleneck, relocated.**" as sview #FFE082
+  component "**metadata** · **server-config**\nshard: **virtual server**\n—\nOne actor per virtual server, the Discord\nguild-process pattern. Within one virtual\nserver it scales **vertically only** — which\nis also the answer to multiple virtual\nservers in one deployment." as meta #FFFFFF
+  component "**screenshare**\nshard: **SFU session**\n—\nEach broadcast is independent, and Fancy\nclients learn their SFU endpoint from the\nanswer, so placement is free." as share #FFFFFF
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**does not scale out for legacy clients**" as PINNED #FFCDD2 {
+  component "**voice**\nshard: **channel, never client**" as voice #FFFFFF
+}
+
+note bottom of PINNED #FFCDD2
+  **Audio routing is per channel, so a channel's members must share a pod.**
+  Client affinity — `sessionAffinity: ClientIP` — is actively wrong: it scatters
+  a channel across pods, and there is **no inter-pod audio path** in this design.
+  Discord assigns a voice *channel* to a voice server and **tells** the client
+  which one. Mumble has no such field, and
+  **a legacy client sends UDP to the port it made TCP to.**
+  It cannot be redirected.
+  Three ways out, and only the last scales:
+  · **one voice pod per virtual server** — vertical only, simplest, honest
+  · **a forwarding mesh between voice pods** — scales, costs a hop inside a 10 ms budget
+  · **shard by channel and hand Fancy clients an explicit endpoint** in ServerSync —
+    real scaling for Fancy, legacy pinned to the advertised pod
+end note
+
+note right of sview #FFE082
+  **Why this one is amber and not green.**
+  10 000 sessions means 10 000 composed views, all
+  maintained by one actor. Sharding by session id
+  makes it green; not choosing a key now makes it
+  the first thing to fall over, and the hardest to
+  fix, because every service in the domain calls it.
+end note
+
+note bottom of BOUND #FFFFFF
+  **Every actor mailbox is bounded and has a shed policy.**
+  An unbounded inbox converts one slow consumer into an OOM — the
+  specific failure Discord hit with Erlang process mailboxes under
+  fanout. Applies to session-view per session and metadata per
+  virtual server alike.
+end note
+
+note bottom of FREE #FFFFFF
+  **Deadlines are not enough on their own.** A saturated service
+  makes every caller wait its full deadline and *then* fail, burning
+  capacity the whole time. A **circuit breaker** per service plus
+  load shedding at the gateway fails fast instead.
+end note
+
+legend bottom
+|= colour |= meaning |
+|<#C8E6C9>   | scales out freely — add pods |
+|<#FFF9C4>   | scales out along a declared key |
+|<#FFE082>   | scales out **only if** the key is designed in now |
+|<#FFCDD2>   | cannot scale out; a protocol limit, not a code one |
+endlegend
+
+@enduml
