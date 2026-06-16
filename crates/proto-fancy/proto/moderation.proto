@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+// Bans and kicks. A ban outlives the session it was issued against, which is
+// why it is stored here and not in session-view.
+package starling.moderation.v1;
+
+import "common.proto";
+
+service Moderation {
+  // Called by the gateway on accept, before anything is spent on a peer that
+  // is not allowed in.
+  rpc CheckBan(BanCheck) returns (BanVerdict);
+  rpc Ban(BanRequest) returns (BanResult);
+  rpc Unban(UnbanRequest) returns (BanResult);
+  rpc ListBans(starling.common.v1.Scope) returns (BanList);
+  rpc Kick(KickRequest) returns (BanResult);
+}
+
+message BanCheck {
+  starling.common.v1.Scope scope = 1;
+  bytes address = 2;
+  bytes cert_hash = 3;
+  string name = 4;
+}
+
+message BanVerdict {
+  bool banned = 1;
+  string reason = 2;
+  uint64 expires_at_ms = 3;
+}
+
+message Ban {
+  uint64 id = 1;
+  bytes address = 2;
+  uint32 prefix_len = 3;
+  string name = 4;
+  bytes cert_hash = 5;
+  string reason = 6;
+  uint64 start_ms = 7;
+  // 0 is permanent, as it is in murmur's BanTable.
+  uint32 duration_s = 8;
+}
+
+message BanRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  Ban ban = 3;
+  // The session to drop as part of the ban, when one is connected.
+  uint32 session = 4;
+}
+
+message UnbanRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint64 id = 3;
+}
+
+message BanList {
+  repeated Ban bans = 1;
+}
+
+message KickRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 session = 3;
+  string reason = 4;
+}
+
+message BanResult {
+  bool applied = 1;
+  string refused = 2;
+  repeated Ban bans = 3;
+}

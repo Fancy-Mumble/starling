@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+// Bulk transfer. Mumble moves avatars and comments over the control connection
+// with RequestBlob (23), where anything large head-of-line blocks every control
+// message behind it. So bytes move over HTTP and the control channel carries
+// only a short-lived signed URL — docs/ARCHITECTURE.md §3.
+package starling.files.v1;
+
+import "common.proto";
+
+service Files {
+  rpc Sign(SignRequest) returns (SignedUrl);
+  rpc Stat(StatRequest) returns (ObjectInfo);
+  rpc Delete(StatRequest) returns (starling.common.v1.Ack);
+}
+
+message SignRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  enum Op {
+    GET = 0;
+    PUT = 1;
+  }
+  Op op = 3;
+  string key = 4;
+  string content_type = 5;
+  uint64 max_bytes = 6;
+}
+
+message SignedUrl {
+  string url = 1;
+  uint64 expires_at_ms = 2;
+  string method = 3;
+}
+
+message StatRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  string key = 3;
+}
+
+message ObjectInfo {
+  bool exists = 1;
+  uint64 size = 2;
+  string content_type = 3;
+  uint64 created_at_ms = 4;
+  bytes sha256 = 5;
+}

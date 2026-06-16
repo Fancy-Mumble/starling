@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+// Chat that is not end-to-end encrypted: TextMessage (11) fan-out and the
+// history behind it. Rows are keyed by UUIDv7 — coordination-free and
+// time-sortable, so a page is one index range scan (docs/STORAGE.md L3).
+package starling.text.v1;
+
+import "common.proto";
+
+service Text {
+  rpc History(HistoryRequest) returns (HistoryPage);
+  rpc Purge(PurgeRequest) returns (starling.common.v1.Ack);
+}
+
+message HistoryRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 channel = 2;
+  uint32 limit = 3;
+  // A UUIDv7, 16 bytes. Empty means "the newest page".
+  bytes before = 4;
+}
+
+message StoredMessage {
+  bytes id = 1;
+  uint32 channel = 2;
+  uint64 sender_account = 3;
+  string sender_name = 4;
+  string body = 5;
+  uint64 sent_at_ms = 6;
+}
+
+message HistoryPage {
+  repeated StoredMessage messages = 1;
+  bool more = 2;
+}
+
+message PurgeRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 channel = 3;
+  uint64 older_than_ms = 4;
+}

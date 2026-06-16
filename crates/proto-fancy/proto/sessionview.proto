@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+// The composed live view of every connected session: the edge of the domain.
+//
+// Every service in the control, core and realtime groups reads here and
+// nowhere else (docs/ARCHITECTURE.md §4). It forwards but never decides, and
+// it is a subscription hub rather than a proxy — so nothing on the audio path
+// makes a request.
+package starling.sessionview.v1;
+
+import "common.proto";
+
+service SessionView {
+  rpc Subscribe(SubscribeRequest) returns (stream ViewEvent);
+  rpc Get(GetRequest) returns (Session);
+  rpc List(SubscribeRequest) returns (Sessions);
+
+  // session-lifecycle is the only writer: it owns a connection's existence.
+  rpc Announce(Announcement) returns (starling.common.v1.Ack);
+
+  // Cold queries are routed to the owning service untouched. Caching the
+  // (user, channel) ACL cross product here would make this a second ACL
+  // engine, which is exactly the line §4 draws.
+  rpc Cold(ColdQuery) returns (ColdAnswer);
+}
+
+message SubscribeRequest {
+  starling.common.v1.Scope scope = 1;
+  string subscriber = 2;
+}
+
+message GetRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message Session {
+  uint32 session = 1;
+  uint64 conn = 2;
+  string gateway_id = 3;
+  uint64 account = 4;
+  string name = 5;
+  uint32 channel = 6;
+  repeated uint32 listening = 7;
+  bool self_mute = 8;
+  bool self_deaf = 9;
+  bool mute = 10;
+  bool deaf = 11;
+  bool suppress = 12;
+  bool priority_speaker = 13;
+  bool recording = 14;
+  uint64 fancy_version = 15;
+  string address = 16;
+  bytes cert_hash = 17;
+  uint64 connected_at_ms = 18;
+  uint32 max_bandwidth = 19;
+}
+
+message Sessions {
+  uint64 version = 1;
+  repeated Session sessions = 2;
+}
+
+message ViewEvent {
+  oneof event {
+    Sessions snapshot = 1;
+    Session upsert = 2;
+    Gone gone = 3;
+    // Republished whenever an authority changes something the view composes,
+    // so a subscriber never has to poll.
+    uint64 config_version = 4;
+  }
+}
+
+message Gone {
+  uint32 session = 1;
+  string reason = 2;
+}
+
+message Announcement {
+  starling.common.v1.Scope scope = 1;
+  oneof what {
+    Session up = 2;
+    Gone down = 3;
+    Session changed = 4;
+  }
+}
+
+message ColdQuery {
+  starling.common.v1.Scope scope = 1;
+  oneof query {
+    AclQuery acl = 2;
+    AccountQuery account = 3;
+  }
+}
+
+message AclQuery {
+  uint32 session = 1;
+  uint32 channel = 2;
+  uint32 permission = 3;
+}
+
+message AccountQuery {
+  oneof by {
+    uint64 id = 1;
+    string name = 2;
+  }
+}
+
+message ColdAnswer {
+  oneof answer {
+    starling.common.v1.Decision decision = 1;
+    Account account = 2;
+  }
+}
+
+message Account {
+  uint64 id = 1;
+  string name = 2;
+  bool found = 3;
+}

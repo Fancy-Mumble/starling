@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+// Types shared by more than one inter-service contract.
+//
+// Deliberately small: a shared type is a coupling, and a service contract that
+// needs a new field should grow its own message rather than widen one everyone
+// depends on.
+package starling.common.v1;
+
+// Nothing to say beyond "it happened".
+message Ack {}
+
+// Which virtual server an operation is scoped to. Every stored row and every
+// actor is keyed by this — docs/ARCHITECTURE.md §4.
+message Scope {
+  uint32 virtual_server = 1;
+}
+
+// Who is asking, for authorisation and for the audit record.
+//
+// A call carries exactly one of these. `operator` is how operator-api reaches
+// the same methods the gateway does without a session — ARCHITECTURE §3.
+message Actor {
+  oneof who {
+    uint32 session = 1;
+    Operator operator = 2;
+    Internal internal = 3;
+  }
+}
+
+message Operator {
+  string subject = 1;
+  repeated string scopes = 2;
+}
+
+// A service acting on its own behalf: a retention sweep, a cache warm-up.
+message Internal {
+  string service = 1;
+}
+
+// A permission decision, in the shape every caller wants it.
+message Decision {
+  bool allowed = 1;
+  // The permission bit that was missing, for the PermissionDenied message.
+  uint32 missing = 2;
+  string reason = 3;
+}

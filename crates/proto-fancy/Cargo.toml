@@ -1,0 +1,18 @@
+[package]
+name = "starling-proto-fancy"
+description = "Fancy envelopes (one outer type per service) and the inter-service gRPC contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true

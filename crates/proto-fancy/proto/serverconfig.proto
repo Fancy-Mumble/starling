@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+// Operational configuration: everything murmur lets an operator change while
+// the server runs. Deployment configuration is the TOML and is not here —
+// docs/CONFIGURATION.md.
+package starling.serverconfig.v1;
+
+import "common.proto";
+
+service ServerConfig {
+  rpc Get(GetRequest) returns (Snapshot);
+  rpc Set(SetRequest) returns (Snapshot);
+  // Readers cache a snapshot rather than calling per request; this is the
+  // subscription that keeps it fresh.
+  rpc Watch(GetRequest) returns (stream Snapshot);
+}
+
+message GetRequest {
+  starling.common.v1.Scope scope = 1;
+}
+
+message SetRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  // Only the fields named here are written, so two operators editing different
+  // settings do not overwrite each other.
+  repeated string fields = 3;
+  Snapshot values = 4;
+}
+
+// One version per virtual server, bumped on every accepted Set.
+//
+// A reader compares versions to know whether it missed an update; the value is
+// meaningless across virtual servers.
+message Snapshot {
+  uint32 virtual_server = 1;
+  uint64 version = 2;
+
+  string welcome_text = 10;
+  string password = 11;
+  uint32 max_users = 12;
+  uint32 max_bandwidth = 13;
+  uint32 text_message_length = 14;
+  uint32 image_message_length = 15;
+  bool allow_html = 16;
+  bool allow_recording = 17;
+  uint32 channel_nesting_limit = 18;
+  uint32 channel_count_limit = 19;
+  uint32 listeners_per_channel = 20;
+  uint32 listeners_per_user = 21;
+  bool cert_required = 22;
+  uint32 log_days = 23;
+  // murmur's leaky bucket, which silently drops when it is wrong
+  // (PORTING-PLAN.md R5). Carried here so the gateway can size its buckets.
+  uint32 message_limit = 24;
+  uint32 message_burst = 25;
+  uint32 plugin_message_limit = 26;
+  uint32 plugin_message_burst = 27;
+  string registry_name = 28;
+  bool obfuscate_ips = 29;
+  // Settings a later service adds, so an operator-facing knob does not need a
+  // proto release to exist.
+  map<string, string> extra = 40;
+}

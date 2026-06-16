@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+// The plugin host, and the storage capability plugins reach it through.
+//
+// Plugins are opaque to the server: it shuttles opaque data and offers generic
+// callbacks, and never learns a plugin's message schema or feature semantics
+// (docs/STORAGE.md L6). That principle is why the payloads below are bytes.
+package starling.plugins.v1;
+
+import "common.proto";
+
+service Plugins {
+  rpc List(starling.common.v1.Scope) returns (PluginList);
+  rpc Enable(EnableRequest) returns (PluginResult);
+  rpc Install(InstallRequest) returns (PluginResult);
+  rpc Uninstall(UninstallRequest) returns (PluginResult);
+  // Opaque plugin traffic, in both directions.
+  rpc Deliver(PluginMessage) returns (starling.common.v1.Ack);
+
+  // Ordered, namespaced key/value with atomic batches — docs/STORAGE.md §5.4.
+  // The namespace is implicit: the host knows which plugin is calling.
+  rpc KvGet(KvGetRequest) returns (KvValue);
+  rpc KvScan(KvScanRequest) returns (KvPage);
+  rpc KvWrite(KvWriteRequest) returns (starling.common.v1.Ack);
+}
+
+message Plugin {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  bool enabled = 4;
+  bool wasm = 5;
+  repeated string capabilities = 6;
+}
+
+message PluginList {
+  repeated Plugin plugins = 1;
+}
+
+message EnableRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  string id = 3;
+  bool enabled = 4;
+}
+
+message InstallRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  string id = 3;
+  // Where the binary is fetched from — a files-service key, never inline bytes
+  // on the control plane.
+  string source_key = 4;
+  bytes sha256 = 5;
+}
+
+message UninstallRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  string id = 3;
+}
+
+message PluginResult {
+  bool applied = 1;
+  string refused = 2;
+  Plugin plugin = 3;
+}
+
+message PluginMessage {
+  starling.common.v1.Scope scope = 1;
+  string plugin = 2;
+  uint32 session = 3;
+  bytes payload = 4;
+  repeated uint32 recipients = 5;
+}
+
+message KvGetRequest {
+  starling.common.v1.Scope scope = 1;
+  string plugin = 2;
+  bytes key = 3;
+}
+
+message KvValue {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message KvScanRequest {
+  starling.common.v1.Scope scope = 1;
+  string plugin = 2;
+  bytes start = 3;
+  bytes end = 4;
+  uint32 limit = 5;
+  bool reverse = 6;
+}
+
+message KvPair {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message KvPage {
+  repeated KvPair pairs = 1;
+}
+
+message KvOp {
+  bytes key = 1;
+  // Absent means delete: that is what makes a batch able to maintain a
+  // secondary index, which is the one thing KV genuinely costs a plugin.
+  optional bytes value = 2;
+}
+
+message KvWriteRequest {
+  starling.common.v1.Scope scope = 1;
+  string plugin = 2;
+  repeated KvOp ops = 3;
+}

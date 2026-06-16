@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+// The channel tree and who is in it. One actor per virtual server — the
+// guild-process pattern of docs/ARCHITECTURE.md §6 — so the order it applies
+// mutations is a total order.
+package starling.metadata.v1;
+
+import "common.proto";
+
+service Metadata {
+  rpc GetTree(TreeRequest) returns (Tree);
+  // Snapshot first, then deltas. A subscriber keeps its own copy; nothing on
+  // the audio path makes a request.
+  rpc Watch(TreeRequest) returns (stream TreeEvent);
+
+  rpc Create(CreateRequest) returns (ChannelResult);
+  rpc Update(UpdateRequest) returns (ChannelResult);
+  rpc Remove(RemoveRequest) returns (ChannelResult);
+  rpc Link(LinkRequest) returns (ChannelResult);
+
+  // Membership. Metadata owns it because it owns the tree the answer is about.
+  rpc Enter(EnterRequest) returns (EnterResult);
+  rpc Leave(LeaveRequest) returns (starling.common.v1.Ack);
+  rpc Listen(ListenRequest) returns (starling.common.v1.Ack);
+}
+
+message TreeRequest {
+  starling.common.v1.Scope scope = 1;
+}
+
+message Tree {
+  uint64 version = 1;
+  repeated Channel channels = 2;
+  repeated Membership members = 3;
+}
+
+message Channel {
+  uint32 id = 1;
+  // Absent on the root channel, and only there.
+  optional uint32 parent = 2;
+  string name = 3;
+  string description = 4;
+  bytes description_hash = 5;
+  int32 position = 6;
+  uint32 max_users = 7;
+  // hidden | temporary | detached (inherit_acl off) | structural
+  uint32 flags = 8;
+  repeated uint32 links = 9;
+  uint32 expiry_mode = 10;
+  uint32 expiry_duration_s = 11;
+  uint64 created_at_ms = 12;
+}
+
+message Membership {
+  uint32 session = 1;
+  uint32 channel = 2;
+  repeated uint32 listening = 3;
+}
+
+message TreeEvent {
+  oneof event {
+    Tree snapshot = 1;
+    Channel upsert = 2;
+    uint32 removed = 3;
+    Membership moved = 4;
+  }
+}
+
+message CreateRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  Channel channel = 3;
+  // Temporary channels vanish when the last member leaves; murmur signals them
+  // with the deprecated ChannelState.temporary, which stock clients still read.
+  bool temporary = 4;
+}
+
+message UpdateRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 channel = 3;
+  repeated string fields = 4;
+  Channel values = 5;
+}
+
+message RemoveRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 channel = 3;
+}
+
+message LinkRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 channel = 3;
+  repeated uint32 link = 4;
+  repeated uint32 unlink = 5;
+}
+
+message ChannelResult {
+  bool applied = 1;
+  string refused = 2;
+  Channel channel = 3;
+  uint64 version = 4;
+}
+
+message EnterRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+  uint32 channel = 3;
+}
+
+message EnterResult {
+  bool applied = 1;
+  string refused = 2;
+  uint32 channel = 3;
+  // The channel the session left, when it had one.
+  optional uint32 previous = 4;
+  // Set when leaving emptied a temporary channel, which then no longer exists.
+  optional uint32 collected = 5;
+}
+
+message LeaveRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message ListenRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+  repeated uint32 listen = 3;
+  repeated uint32 unlisten = 4;
+}
