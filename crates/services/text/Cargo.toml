@@ -1,6 +1,6 @@
 [package]
-name = "starling-voice"
-description = "audio routing: its own UDP socket, the ciphers, and no gateway hop"
+name = "starling-text"
+description = "chat fan-out and its UUIDv7-keyed history"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,14 +10,10 @@ publish.workspace = true
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
-starling-crypto.workspace = true
-starling-gate.workspace = true
-bytes.workspace = true
+sqlx.workspace = true
 
 async-trait.workspace = true
 prost.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 

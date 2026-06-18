@@ -1,23 +1,19 @@
 [package]
-name = "starling-voice"
-description = "audio routing: its own UDP socket, the ciphers, and no gateway hop"
+name = "starling-session-view"
+description = "the composed live view of every connected session: the edge of the domain"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
-starling-crypto.workspace = true
-starling-gate.workspace = true
-bytes.workspace = true
+serde.workspace = true
 
 async-trait.workspace = true
-prost.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 

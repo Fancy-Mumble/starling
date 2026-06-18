@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
-use starling_api::{AudioSource, ConnId, Datagrams};
-use starling_model::SessionId;
+use crate::ports::{AudioSource, ConnId, Datagrams};
+use crate::ports::SessionId;
 use tracing::debug;
 
 use crate::packet::{AudioCodec as _, AudioPacket, Datagram, ProtobufCodec, ServerDetails};
@@ -467,7 +467,7 @@ mod tests {
     use crate::packet::codec_for;
     use crate::testing::{RecordingDatagrams, TestPeer};
     use starling_gate::UdpFormat;
-    use starling_model::ChannelId;
+    use crate::ports::ChannelId;
 
     const LOBBY: ChannelId = ChannelId(0);
     const ALICE: SessionId = SessionId(1);
@@ -499,8 +499,8 @@ mod tests {
         let sent = RecordingDatagrams::new();
         let mut router = Router::new(Box::new(sent.clone()), details());
 
-        let alice = TestPeer::new(ConnId(1), ALICE, UdpFormat::Protobuf);
-        let bob = TestPeer::new(ConnId(2), BOB, UdpFormat::Protobuf);
+        let alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
+        let bob = TestPeer::new(2, BOB, UdpFormat::Protobuf);
         router.attach(alice.attach(), addr(0).ip());
         router.attach(bob.attach(), addr(0).ip());
         router.publish(
@@ -604,7 +604,7 @@ mod tests {
             &alice.speak(b"moved"),
         );
 
-        assert_eq!(router.by_addr.get(&addr(ALICE_AT + 1)), Some(&ConnId(1)));
+        assert_eq!(router.by_addr.get(&addr(ALICE_AT + 1)), Some(&1));
         assert_eq!(
             router.by_addr.get(&addr(ALICE_AT)),
             None,
@@ -618,7 +618,7 @@ mod tests {
         // Everyone behind a restrictive firewall depends on this.
         let (mut router, sent, mut alice, bob) = lobby();
         let frame = alice.speak_tunnelled(b"tunnelled");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &frame);
+        router.accept(AudioSource::Tunnel(1), &frame);
 
         assert!(
             sent.is_empty(),
@@ -671,8 +671,8 @@ mod tests {
         let sent = RecordingDatagrams::new();
         let mut router = Router::new(Box::new(sent.clone()), details());
 
-        let mut alice = TestPeer::new(ConnId(1), ALICE, UdpFormat::Protobuf);
-        let mut bob = TestPeer::new(ConnId(2), BOB, UdpFormat::Legacy);
+        let mut alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
+        let mut bob = TestPeer::new(2, BOB, UdpFormat::Legacy);
         router.attach(alice.attach(), addr(0).ip());
         router.attach(bob.attach(), addr(0).ip());
         router.publish(
@@ -682,7 +682,7 @@ mod tests {
         );
 
         let frame = alice.speak_tunnelled(b"crossformat");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &frame);
+        router.accept(AudioSource::Tunnel(1), &frame);
         let heard = bob.hear_tunnelled();
         assert_eq!(heard.opus, Bytes::from_static(b"crossformat"));
         assert_eq!(heard.sender, ALICE);
@@ -726,11 +726,11 @@ mod tests {
     fn detaching_clears_every_index() {
         let (mut router, _, mut alice, _) = lobby_on_udp();
         router.accept(AudioSource::Datagram(addr(ALICE_AT)), &alice.speak(b"x"));
-        router.detach(ConnId(1));
+        router.detach(1);
 
-        assert!(!router.has(ConnId(1)));
+        assert!(!router.has(1));
         assert!(
-            !router.by_addr.values().any(|bound| *bound == ConnId(1)),
+            !router.by_addr.values().any(|bound| *bound == 1),
             "address index leaked"
         );
         assert!(
@@ -741,7 +741,7 @@ mod tests {
             router
                 .by_host
                 .values()
-                .all(|known| !known.contains(&ConnId(1))),
+                .all(|known| !known.contains(&1)),
             "host index leaked"
         );
     }
@@ -749,24 +749,24 @@ mod tests {
     #[test]
     fn detaching_one_peer_leaves_another_at_the_same_host() {
         let (mut router, _, _, _) = lobby();
-        router.detach(ConnId(1));
-        assert!(router.has(ConnId(2)));
+        router.detach(1);
+        assert!(router.has(2));
         assert_eq!(router.attached(), 1);
     }
 
     #[test]
     fn detaching_an_unknown_connection_is_harmless() {
         let (mut router, _, _, _) = lobby();
-        router.detach(ConnId(99));
+        router.detach(99);
         assert_eq!(router.attached(), 2);
     }
 
     #[test]
     fn audio_for_a_departed_peer_is_dropped_not_delivered_elsewhere() {
         let (mut router, sent, mut alice, _) = lobby();
-        router.detach(ConnId(2));
+        router.detach(2);
         let frame = alice.speak_tunnelled(b"x");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &frame);
+        router.accept(AudioSource::Tunnel(1), &frame);
         assert!(sent.is_empty());
     }
 
@@ -791,7 +791,7 @@ mod tests {
     fn a_frame_that_decrypts_but_does_not_parse_is_counted() {
         let (mut router, sent, mut alice, _) = lobby();
         router.accept(
-            AudioSource::Tunnel(ConnId(1)),
+            AudioSource::Tunnel(1),
             &alice.seal_raw(&[0xFF, 0xFF]),
         );
         assert_eq!(router.stats().malformed, 1);
@@ -804,8 +804,8 @@ mod tests {
         // its frames are dropped rather than queued.
         let sent = RecordingDatagrams::new();
         let mut router = Router::new(Box::new(sent.clone()), details());
-        let mut alice = TestPeer::new(ConnId(1), ALICE, UdpFormat::Protobuf);
-        let bob = TestPeer::new(ConnId(2), BOB, UdpFormat::Protobuf);
+        let mut alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
+        let bob = TestPeer::new(2, BOB, UdpFormat::Protobuf);
         router.attach(alice.attach(), addr(0).ip());
         router.attach(bob.attach_stuck(), addr(0).ip());
         router.publish(
@@ -815,7 +815,7 @@ mod tests {
         );
 
         let frame = alice.speak_tunnelled(b"unheard");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &frame);
+        router.accept(AudioSource::Tunnel(1), &frame);
 
         assert_eq!(router.stats().dropped, 1);
         assert_eq!(router.stats().delivered, 0);
@@ -831,7 +831,7 @@ mod tests {
         // every aggregate counter still looks healthy.
         let (mut router, _, mut alice, bob) = lobby();
         let plain = alice.speak_tunnelled(b"in the clear");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &plain);
+        router.accept(AudioSource::Tunnel(1), &plain);
 
         assert_eq!(
             router.stats().routed,
@@ -848,7 +848,7 @@ mod tests {
         // and it must not be mistaken for audio.
         let (mut router, _, mut alice, bob) = lobby();
         let sealed = alice.speak(b"wrongly sealed");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &sealed);
+        router.accept(AudioSource::Tunnel(1), &sealed);
 
         assert_eq!(router.stats().routed, 0);
         assert!(bob.tunnelled().is_empty());
@@ -861,7 +861,7 @@ mod tests {
         // silence, and one that would look like a protocol error somewhere else.
         let (mut router, _, mut alice, bob) = lobby();
         let plain = alice.speak_tunnelled(b"framed");
-        router.accept(AudioSource::Tunnel(ConnId(1)), &plain);
+        router.accept(AudioSource::Tunnel(1), &plain);
 
         let frames = bob.tunnelled();
         let framed = frames.first().expect("nothing was tunnelled");

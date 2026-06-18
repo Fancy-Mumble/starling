@@ -1,6 +1,6 @@
 [package]
-name = "starling-voice"
-description = "audio routing: its own UDP socket, the ciphers, and no gateway hop"
+name = "starling-permissions"
+description = "ACL evaluation, with request coalescing rather than a cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,16 +10,13 @@ publish.workspace = true
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
-starling-crypto.workspace = true
-starling-gate.workspace = true
-bytes.workspace = true
+bitflags.workspace = true
 
 async-trait.workspace = true
 prost.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

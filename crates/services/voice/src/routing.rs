@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use starling_model::{ChannelId, SessionId};
+use crate::ports::{ChannelId, SessionId};
 
 use crate::targets::{ShoutTarget, TargetRegistry, VoiceTarget};
 

@@ -17,10 +17,10 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use starling_api::{ConnId, FrameSink};
+use crate::ports::{ConnId, FrameSink};
 use starling_crypto::{VoiceCipher, VoiceError};
 use starling_gate::UdpFormat;
-use starling_model::SessionId;
+use crate::ports::SessionId;
 use starling_proto::ControlMessage;
 
 use crate::packet::{AudioCodec, codec_for};
@@ -157,13 +157,13 @@ mod tests {
     fn a_new_peer_has_no_udp_path() {
         // So its first frames tunnel, until one of its datagrams proves
         // otherwise. Assuming UDP works would silence every firewalled client.
-        let peer = TestPeer::new(ConnId(1), SessionId(1), UdpFormat::Protobuf).attach();
+        let peer = TestPeer::new(1, SessionId(1), UdpFormat::Protobuf).attach();
         assert_eq!(peer.udp_addr(), None);
     }
 
     #[test]
     fn binding_records_the_address() {
-        let mut peer = TestPeer::new(ConnId(1), SessionId(1), UdpFormat::Protobuf).attach();
+        let mut peer = TestPeer::new(1, SessionId(1), UdpFormat::Protobuf).attach();
         let addr = "203.0.113.1:5000".parse().expect("address");
         peer.bind(addr);
         assert_eq!(peer.udp_addr(), Some(addr));
@@ -175,14 +175,14 @@ mod tests {
             (UdpFormat::Legacy, "legacy"),
             (UdpFormat::Protobuf, "protobuf"),
         ] {
-            let peer = TestPeer::new(ConnId(1), SessionId(1), format).attach();
+            let peer = TestPeer::new(1, SessionId(1), format).attach();
             assert_eq!(peer.codec().name(), name);
         }
     }
 
     #[test]
     fn it_prints_no_cipher_state() {
-        let peer = TestPeer::new(ConnId(1), SessionId(7), UdpFormat::Protobuf).attach();
+        let peer = TestPeer::new(1, SessionId(7), UdpFormat::Protobuf).attach();
         let printed = format!("{peer:?}");
         assert!(printed.contains("session"), "{printed}");
         assert!(!printed.contains("cipher"), "{printed}");

@@ -11,11 +11,11 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use starling_api::{ConnId, Datagrams, FrameSink, Stuck};
+use crate::ports::{ConnId, Datagrams, FrameSink, Stuck};
 use starling_crypto::VoiceCipher;
 use starling_crypto::ocb2::{Block, Ocb2};
 use starling_gate::UdpFormat;
-use starling_model::SessionId;
+use crate::ports::SessionId;
 
 use crate::packet::{AudioPacket, Ping};
 use crate::peer::VoicePeer;
@@ -305,33 +305,6 @@ impl TestPeer {
             Box::new(Ocb2::new(self.key, self.client_nonce, self.server_nonce)),
             Box::new(self.tunnelled.clone()),
         )
-    }
-
-    /// Register this peer's connection and keys with a running service.
-    ///
-    /// Two commands, in the order the real server sends them: the sink at the
-    /// TLS handshake, the keys at authentication.
-    pub(crate) fn join(&self, handle: &crate::service::VoiceHandle, host: std::net::IpAddr) {
-        handle
-            .send(crate::service::ControlCommand::Connected {
-                conn: self.conn,
-                sink: Box::new(self.tunnelled.clone()),
-            })
-            .expect("connected");
-        self.attach_to(handle, host);
-    }
-
-    /// Send only the keys, without having registered a connection.
-    pub(crate) fn attach_to(&self, handle: &crate::service::VoiceHandle, host: std::net::IpAddr) {
-        handle
-            .send(crate::service::ControlCommand::Attach {
-                conn: self.conn,
-                session: self.session,
-                host,
-                format: self.format,
-                cipher: Box::new(Ocb2::new(self.key, self.client_nonce, self.server_nonce)),
-            })
-            .expect("attach");
     }
 
     /// A server-side peer whose outbound queue is permanently full.
