@@ -1,50 +1,111 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/domain/proto",
-    "crates/domain/log",
-    "crates/kernel/bus",
-    "crates/domain/model",
-    "crates/domain/config",
-    "crates/domain/crypto",
-    "crates/domain/gate",
-    "crates/services/net",
-    "crates/services/state",
-    "crates/services/store",
+    # Wire and security primitives — no I/O, no state.
+    "crates/proto",
+    "crates/proto-fancy",
+    "crates/gate",
+    "crates/crypto",
+
+    # The one common standalone crate every service is built on.
+    "crates/runtime",
+
+    # The only component that holds a client's socket.
+    "crates/gateway",
+
+    # Services, in the tiers of docs/ARCHITECTURE.md §4.
+    "crates/services/session-lifecycle",
+    "crates/services/session-view",
+    "crates/services/permissions",
+    "crates/services/metadata",
+    "crates/services/userdata",
+    "crates/services/server-config",
     "crates/services/voice",
-    "crates/services/tls",
-    "crates/api",
-    "crates/edges/migrate",
-    "crates/cli",
-    "crates/features/permission-query",
-    "crates/features/query-users",
-    "crates/edges/starling",
+    "crates/services/text",
+    "crates/services/pchat",
+    "crates/services/moderation",
+    "crates/services/screenshare",
+    "crates/services/files",
+    "crates/services/plugins",
+    "crates/services/push",
+    "crates/services/audit",
+    "crates/services/onboarding",
+    "crates/services/social",
+    "crates/services/link-preview",
+    "crates/services/context-actions",
+
+    # The admin plane, and the entrypoint every deployment runs.
+    "crates/operator-api",
+    "crates/migrate",
+    "crates/starling",
 ]
 
-# Crates introduced by later phases (see PORTING-PLAN.md §2.1) are added to
-# `members` at the phase that first needs them, so the tree never carries an
-# empty crate:
-#   starling-crypto   Phase 1   OCB2 CryptState, cert handling, password hashes
-#   starling-db       Phase 2   sqlx store, murmur-compatible schema
-#   starling-plugins  Phase 3   adapter to 3rdparty/mumble-plugin-host
-#   starling-rpc      Phase 6   gRPC admin API (the Ice replacement)
-
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
-arc-swap = "1"
-bitflags = "2.13"
-zeroize = { version = "1", features = ["zeroize_derive"] }
-sha2 = "0.10"
-hkdf = "0.12"
-rand = "0.10"
-aes = "0.8"
-async-trait = "0.1"
-socket2 = "0.6"
+# -- internal ---------------------------------------------------------------
+starling-proto = { path = "crates/proto" }
+starling-proto-fancy = { path = "crates/proto-fancy" }
+starling-gate = { path = "crates/gate" }
+starling-crypto = { path = "crates/crypto" }
+starling-runtime = { path = "crates/runtime" }
+starling-gateway = { path = "crates/gateway" }
+starling-session-lifecycle = { path = "crates/services/session-lifecycle" }
+starling-session-view = { path = "crates/services/session-view" }
+starling-permissions = { path = "crates/services/permissions" }
+starling-metadata = { path = "crates/services/metadata" }
+starling-userdata = { path = "crates/services/userdata" }
+starling-server-config = { path = "crates/services/server-config" }
+starling-voice = { path = "crates/services/voice" }
+starling-text = { path = "crates/services/text" }
+starling-pchat = { path = "crates/services/pchat" }
+starling-moderation = { path = "crates/services/moderation" }
+starling-screenshare = { path = "crates/services/screenshare" }
+starling-files = { path = "crates/services/files" }
+starling-plugins = { path = "crates/services/plugins" }
+starling-push = { path = "crates/services/push" }
+starling-audit = { path = "crates/services/audit" }
+starling-onboarding = { path = "crates/services/onboarding" }
+starling-social = { path = "crates/services/social" }
+starling-link-preview = { path = "crates/services/link-preview" }
+starling-context-actions = { path = "crates/services/context-actions" }
+starling-operator-api = { path = "crates/operator-api" }
+starling-migrate = { path = "crates/migrate" }
+
+# -- wire -------------------------------------------------------------------
+bytes = "1"
+prost = "0.14.3"
+prost-build = "0.14.3"
+tonic = { version = "0.14", features = ["router", "transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+
+# -- runtime ----------------------------------------------------------------
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "macros",
+    "time",
+    "io-util",
+    "signal",
+    "fs",
+] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+axum = "0.8"
+
+# -- data -------------------------------------------------------------------
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
@@ -52,47 +113,38 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "mysql",
     "postgres",
-    "chrono",
 ] }
-subtle = "2"
+uuid = { version = "1", features = ["v7"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+zstd = "0.13"
+
+# -- crypto -----------------------------------------------------------------
+aes = "0.8"
 chacha20 = "0.9"
 chacha20poly1305 = "0.10"
-inventory = "0.3"
-starling-proto = { path = "crates/domain/proto" }
-starling-log = { path = "crates/domain/log" }
-starling-bus = { path = "crates/kernel/bus" }
-starling-model = { path = "crates/domain/model" }
-starling-config = { path = "crates/domain/config" }
-starling-crypto = { path = "crates/domain/crypto" }
-starling-gate = { path = "crates/domain/gate" }
-starling-api = { path = "crates/api" }
-starling-migrate = { path = "crates/edges/migrate" }
-starling-cli = { path = "crates/cli" }
-starling-tls = { path = "crates/services/tls" }
-starling-net = { path = "crates/services/net" }
-starling-store = { path = "crates/services/store" }
-starling-voice = { path = "crates/services/voice" }
-starling-server = { path = "crates/services/state" }
-starling-feature-permission-query = { path = "crates/features/permission-query" }
-starling-feature-query-users = { path = "crates/features/query-users" }
+hkdf = "0.12"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+jsonwebtoken = "9"
+base64 = "0.22"
 
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "signal"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
-rcgen = "0.13"
-bytes = "1"
-prost = "0.14.3"
-prost-build = "0.14.3"
+# -- diagnostics ------------------------------------------------------------
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-postcard = { version = "1", features = ["alloc"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+arc-swap = "1"
+bitflags = "2.13"
+async-trait = "0.1"
+socket2 = "0.6"
 
-# -- Workspace-wide lints --------------------------------------------
-# Mirrors the FancyMumbleNext client and mumble-plugin-host workspaces so crates
+# -- Workspace-wide lints ---------------------------------------------------
+# Mirrors the FancyMumble client and mumble-plugin-host workspaces so crates
 # compile cleanly with the same standards across all three trees.
 [workspace.lints.rust]
 unsafe_code = "deny"

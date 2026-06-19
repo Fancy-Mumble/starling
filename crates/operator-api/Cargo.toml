@@ -1,0 +1,26 @@
+[package]
+name = "starling-operator-api"
+description = "The admin plane: REST + OpenAPI, pluggable auth, fail-closed audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
