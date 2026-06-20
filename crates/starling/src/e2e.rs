@@ -73,7 +73,12 @@ impl Deployment {
             }
         }
 
-        let gateway_ctx = context("gateway", Arc::clone(&config), broker.clone(), shutdown.clone());
+        let gateway_ctx = context(
+            "gateway",
+            Arc::clone(&config),
+            broker.clone(),
+            shutdown.clone(),
+        );
         handles.push(
             crate::units::spawn("gateway", gateway_ctx).expect("\"gateway\" is a known unit"),
         );
@@ -314,10 +319,22 @@ async fn handshake(client: &mut Client, username: &str) -> u32 {
         .await;
 
     let (before_sync, sync_payload) = client.recv_until(5).await;
-    assert!(before_sync.contains(&15), "CryptSetup must precede ServerSync");
-    assert!(before_sync.contains(&21), "CodecVersion must precede ServerSync");
-    assert!(before_sync.contains(&7), "the channel tree must precede ServerSync");
-    assert!(before_sync.contains(&9), "the client's own UserState must precede ServerSync");
+    assert!(
+        before_sync.contains(&15),
+        "CryptSetup must precede ServerSync"
+    );
+    assert!(
+        before_sync.contains(&21),
+        "CodecVersion must precede ServerSync"
+    );
+    assert!(
+        before_sync.contains(&7),
+        "the channel tree must precede ServerSync"
+    );
+    assert!(
+        before_sync.contains(&9),
+        "the client's own UserState must precede ServerSync"
+    );
     let sync = tcp::ServerSync::decode(sync_payload.as_slice()).expect("a well-formed ServerSync");
     let session = sync.session.expect("ServerSync carries the session id");
 
@@ -386,4 +403,21 @@ async fn two_clients_complete_the_handshake_and_exchange_text() {
     assert_eq!(pong.timestamp, Some(7));
 
     deployment.stop().await;
+}
+
+#[cfg(test)]
+mod example_config {
+    use starling_runtime::config::Config;
+
+    #[test]
+    fn the_shipped_example_configuration_loads() {
+        // `deny_unknown_fields` means a stale example is a startup failure for
+        // whoever copies it, and they find out at deploy time.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../starling.example.toml");
+        let config = Config::load(&path).expect("the shipped example must load");
+        config
+            .validate()
+            .expect("the shipped example must be a valid routing table");
+    }
 }

@@ -81,7 +81,9 @@ impl FromStr for ByteSize {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let text = text.trim();
-        let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+        let split = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
         let (value, unit) = text.split_at(split);
         let value: u64 = value
             .parse()
@@ -91,7 +93,11 @@ impl FromStr for ByteSize {
             "KiB" | "K" => 1024,
             "MiB" | "M" => 1024 * 1024,
             "GiB" | "G" => 1024 * 1024 * 1024,
-            other => return Err(format!("unknown size unit {other:?}: use B, KiB, MiB or GiB")),
+            other => {
+                return Err(format!(
+                    "unknown size unit {other:?}: use B, KiB, MiB or GiB"
+                ));
+            }
         };
         Ok(Self(value * scale))
     }
@@ -153,7 +159,10 @@ mod tests {
 
     #[test]
     fn sizes_are_binary_because_the_suffix_says_so() {
-        assert_eq!("512MiB".parse::<ByteSize>().map(ByteSize::get), Ok(536_870_912));
+        assert_eq!(
+            "512MiB".parse::<ByteSize>().map(ByteSize::get),
+            Ok(536_870_912)
+        );
         assert_eq!("1024".parse::<ByteSize>().map(ByteSize::get), Ok(1024));
         assert!("512MB".parse::<ByteSize>().is_err());
     }

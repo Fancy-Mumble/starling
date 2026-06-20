@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
-serde.workspace = true
 
 async-trait.workspace = true
 tokio.workspace = true

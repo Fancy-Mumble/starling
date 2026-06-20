@@ -155,7 +155,10 @@ mod tests {
         // A screen-share start emits several messages back to back; on murmur's
         // single bucket that silently ate the SDP offer.
         let limits = GatewayConfig::default().limits;
-        let signalling = limits.get("signalling").copied().expect("signalling bucket");
+        let signalling = limits
+            .get("signalling")
+            .copied()
+            .expect("signalling bucket");
         assert!(signalling.rate.as_per_second() > 1.0);
         assert!(signalling.burst > 5);
     }

@@ -236,9 +236,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(&format!("sqlite:file:push-test-{id}?mode=memory&cache=shared"), 1)
-            .await
-            .expect("in-memory database");
+        let store = Store::open(
+            &format!("sqlite:file:push-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(PushService {
             store,
@@ -267,7 +270,10 @@ mod tests {
         }
         let subscriptions = service.subscriptions(1, 5).await;
         assert_eq!(subscriptions.len(), 1);
-        assert_eq!(subscriptions.first().map(|r| r.platform.as_str()), Some("ios"));
+        assert_eq!(
+            subscriptions.first().map(|r| r.platform.as_str()),
+            Some("ios")
+        );
     }
 
     #[tokio::test]

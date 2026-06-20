@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use starling_proto_fancy::control::client_plane_server::{ClientPlane, ClientPlaneServer};
-use starling_proto_fancy::control::{ClientEvent, Opened, ServerAction, client_event, server_action};
+use starling_proto_fancy::control::{
+    ClientEvent, Opened, ServerAction, client_event, server_action,
+};
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status, Streaming};

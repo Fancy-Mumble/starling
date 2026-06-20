@@ -151,7 +151,10 @@ mod tests {
             &["whiteboard_max_strokes".to_owned()],
         );
         assert_eq!(
-            current.extra.get("whiteboard_max_strokes").map(String::as_str),
+            current
+                .extra
+                .get("whiteboard_max_strokes")
+                .map(String::as_str),
             Some("500")
         );
     }

@@ -25,10 +25,10 @@
 //! the way out, or any peer could impersonate any other by writing someone
 //! else's id. Those two fields are the whole reason for this module.
 
+use crate::ports::SessionId;
 use bytes::Bytes;
 use prost::Message as _;
 use starling_gate::UdpFormat;
-use crate::ports::SessionId;
 use starling_proto::proto::udp as mumble_udp;
 
 use crate::varint::{Reader, VarintError, Writer};

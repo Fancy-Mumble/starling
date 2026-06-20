@@ -92,13 +92,14 @@ impl Connections {
     /// Record what a peer announced in its `Version`.
     pub fn record_version(&self, conn: u64, version: &tcp::Version) {
         if let Ok(mut inner) = self.inner.lock()
-            && let Some(pending) = inner.get_mut(&conn) {
-                pending.mumble_version = version
-                    .version_v2
-                    .or_else(|| version.version_v1.map(u64::from))
-                    .unwrap_or_default();
-                pending.fancy_version = fancy_version(version);
-            }
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.mumble_version = version
+                .version_v2
+                .or_else(|| version.version_v1.map(u64::from))
+                .unwrap_or_default();
+            pending.fancy_version = fancy_version(version);
+        }
     }
 
     /// Allocate a session id for a connection that has authenticated.
@@ -122,23 +123,28 @@ impl Connections {
     /// One connection.
     #[must_use]
     pub fn get(&self, conn: u64) -> Option<PendingConnection> {
-        self.inner.lock().ok().and_then(|inner| inner.get(&conn).cloned())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.get(&conn).cloned())
     }
 
     /// Record that a connection is still alive.
     pub fn touch(&self, conn: u64) {
         if let Ok(mut inner) = self.inner.lock()
-            && let Some(pending) = inner.get_mut(&conn) {
-                pending.last_seen_ms = now_ms();
-            }
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.last_seen_ms = now_ms();
+        }
     }
 
     /// Record which channel a session is in.
     pub fn set_channel(&self, conn: u64, channel: u32) {
         if let Ok(mut inner) = self.inner.lock()
-            && let Some(pending) = inner.get_mut(&conn) {
-                pending.channel = channel;
-            }
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.channel = channel;
+        }
     }
 
     /// Apply self-mute and self-deafen, returning the session they belong to.

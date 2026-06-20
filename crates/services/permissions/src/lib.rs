@@ -121,7 +121,10 @@ impl PermissionsRpc for PermissionsGrpc {
         ))
     }
 
-    async fn set_acl(&self, request: Request<SetAclRequest>) -> Result<Response<AclResult>, Status> {
+    async fn set_acl(
+        &self,
+        request: Request<SetAclRequest>,
+    ) -> Result<Response<AclResult>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
         let Some(acls) = req.acls else {
@@ -220,7 +223,11 @@ impl PermissionsService {
             permissions: Some(granted),
             flush: Some(false),
         };
-        vec![to_conn(inbound.conn, PERMISSION_QUERY, reply.encode_to_vec())]
+        vec![to_conn(
+            inbound.conn,
+            PERMISSION_QUERY,
+            reply.encode_to_vec(),
+        )]
     }
 
     fn on_acl_query(&self, inbound: &Inbound) -> Actions {
@@ -350,7 +357,9 @@ mod tests {
             .await
             .expect("set");
 
-        let invalidation = invalidations.try_recv().expect("an invalidation was published");
+        let invalidation = invalidations
+            .try_recv()
+            .expect("an invalidation was published");
         assert!(invalidation.everything);
     }
 }

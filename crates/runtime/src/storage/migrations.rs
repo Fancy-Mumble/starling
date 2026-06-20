@@ -91,7 +91,10 @@ mod tests {
         // would never come back up.
         let store = memory_store().await;
         store.migrate(SCHEMA).await.expect("first apply");
-        store.migrate(SCHEMA).await.expect("second apply is a no-op");
+        store
+            .migrate(SCHEMA)
+            .await
+            .expect("second apply is a no-op");
 
         let applied = applied_names(&store).await.expect("read back");
         assert_eq!(applied, vec!["0001_example".to_owned()]);

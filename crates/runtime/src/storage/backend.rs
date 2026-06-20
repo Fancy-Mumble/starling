@@ -33,9 +33,9 @@
 
 use std::time::Duration;
 
+use crate::storage::StoreError;
 use sqlx::AnyPool;
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
-use crate::storage::StoreError;
 
 use crate::storage::dialect::{Dialect, SqlDialect};
 

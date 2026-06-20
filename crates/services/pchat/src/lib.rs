@@ -260,9 +260,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(&format!("sqlite:file:pchat-test-{id}?mode=memory&cache=shared"), 1)
-            .await
-            .expect("in-memory database");
+        let store = Store::open(
+            &format!("sqlite:file:pchat-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(PchatService {
             store,

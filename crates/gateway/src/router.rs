@@ -52,7 +52,10 @@ impl Router {
                     Route {
                         service: name.clone(),
                         tier: service.tier,
-                        bucket: service.limits.clone().unwrap_or_else(|| "control".to_owned()),
+                        bucket: service
+                            .limits
+                            .clone()
+                            .unwrap_or_else(|| "control".to_owned()),
                     },
                 );
             }
@@ -120,7 +123,10 @@ mod tests {
     #[test]
     fn a_service_envelope_routes_on_its_outer_type_alone() {
         let router = router();
-        assert_eq!(router.route(1006).map(|r| r.service.as_str()), Some("pchat"));
+        assert_eq!(
+            router.route(1006).map(|r| r.service.as_str()),
+            Some("pchat")
+        );
         assert_eq!(
             router.route(1015).map(|r| r.service.as_str()),
             Some("social")
@@ -145,7 +151,10 @@ mod tests {
             router().route(1008).map(|r| r.bucket.as_str()),
             Some("signalling")
         );
-        assert_eq!(router().route(11).map(|r| r.bucket.as_str()), Some("control"));
+        assert_eq!(
+            router().route(11).map(|r| r.bucket.as_str()),
+            Some("control")
+        );
     }
 
     #[test]

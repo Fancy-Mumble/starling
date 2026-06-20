@@ -78,11 +78,12 @@ impl ServerConfigService {
             .await
             .insert(snapshot.virtual_server, snapshot.clone());
         if let Some(store) = &self.store
-            && let Err(error) = persist(store, &snapshot).await {
-                // Reported rather than swallowed: an operator whose change
-                // vanishes must not learn about it from the next restart.
-                tracing::error!(%error, "could not persist a configuration change");
-            }
+            && let Err(error) = persist(store, &snapshot).await
+        {
+            // Reported rather than swallowed: an operator whose change
+            // vanishes must not learn about it from the next restart.
+            tracing::error!(%error, "could not persist a configuration change");
+        }
         let _ = self.updates.send(snapshot);
     }
 }

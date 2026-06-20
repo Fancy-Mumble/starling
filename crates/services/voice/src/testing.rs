@@ -10,12 +10,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
+use crate::ports::SessionId;
 use crate::ports::{ConnId, Datagrams, FrameSink, Stuck};
+use bytes::Bytes;
 use starling_crypto::VoiceCipher;
 use starling_crypto::ocb2::{Block, Ocb2};
 use starling_gate::UdpFormat;
-use crate::ports::SessionId;
 
 use crate::packet::{AudioPacket, Ping};
 use crate::peer::VoicePeer;

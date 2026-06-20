@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
 use tonic::service::Routes;
 use tonic::transport::Server;
 
@@ -70,10 +70,11 @@ pub async fn serve_routes(
         }
         Endpoint::Unix(path) => {
             prepare_socket_path(path)?;
-            let listener = tokio::net::UnixListener::bind(path).map_err(|source| ListenError::Bind {
-                what: format!("unix:{}", path.display()),
-                source,
-            })?;
+            let listener =
+                tokio::net::UnixListener::bind(path).map_err(|source| ListenError::Bind {
+                    what: format!("unix:{}", path.display()),
+                    source,
+                })?;
             let stream = UnixListenerStream::new(listener).map(|conn| conn.map(LocalStream::new));
             Server::builder()
                 .add_routes(routes)
@@ -143,8 +144,14 @@ mod tests {
 
     #[test]
     fn an_http_endpoint_yields_the_authority_to_bind() {
-        assert_eq!(tcp_address("http://0.0.0.0:50051").ok(), Some("0.0.0.0:50051".to_owned()));
-        assert_eq!(tcp_address("http://text:50051/").ok(), Some("text:50051".to_owned()));
+        assert_eq!(
+            tcp_address("http://0.0.0.0:50051").ok(),
+            Some("0.0.0.0:50051".to_owned())
+        );
+        assert_eq!(
+            tcp_address("http://text:50051/").ok(),
+            Some("text:50051".to_owned())
+        );
     }
 
     #[test]

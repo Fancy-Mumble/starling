@@ -332,14 +332,19 @@ impl Trees {
                     member.listening.push(*channel);
                 }
             }
-            member.listening.retain(|channel| !unlisten.contains(channel));
+            member
+                .listening
+                .retain(|channel| !unlisten.contains(channel));
             state.version += 1;
             ChannelResult::default()
         });
     }
 
     fn with<T>(&self, scope: u32, read: impl FnOnce(&TreeState) -> T) -> Option<T> {
-        self.inner.lock().ok().and_then(|inner| inner.get(&scope).map(read))
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.get(&scope).map(read))
     }
 
     fn mutate<T: Default>(&self, scope: u32, write: impl FnOnce(&mut TreeState) -> T) -> T {
@@ -445,7 +450,11 @@ mod tests {
         let snapshot = trees.snapshot(1);
         assert!(!snapshot.channels.iter().any(|c| c.id == child_id));
         assert_eq!(
-            snapshot.members.iter().find(|m| m.session == 42).map(|m| m.channel),
+            snapshot
+                .members
+                .iter()
+                .find(|m| m.session == 42)
+                .map(|m| m.channel),
             Some(0)
         );
     }

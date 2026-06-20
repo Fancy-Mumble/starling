@@ -154,7 +154,12 @@ impl ServiceError {
 
 /// Build a context for `name` from `config`.
 #[must_use]
-pub fn context(name: &str, config: Arc<Config>, broker: Broker, shutdown: Shutdown) -> ServiceContext {
+pub fn context(
+    name: &str,
+    config: Arc<Config>,
+    broker: Broker,
+    shutdown: Shutdown,
+) -> ServiceContext {
     ServiceContext {
         name: name.to_owned(),
         resolver: Resolver::new(Arc::clone(&config), broker.clone()),
@@ -252,9 +257,10 @@ fn load_config() -> Result<Config, ConfigError> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--config"
-            && let Some(path) = args.next() {
-                return Config::load(std::path::Path::new(&path));
-            }
+            && let Some(path) = args.next()
+        {
+            return Config::load(std::path::Path::new(&path));
+        }
     }
     let mut config = Config::with_defaults(std::path::Path::new("/run/starling"));
     crate::config::apply_environment(&mut config, &std::env::vars().collect::<Vec<_>>())?;
@@ -288,7 +294,10 @@ mod tests {
     #[test]
     fn the_default_database_is_per_service_not_shared() {
         // No service reads another's tables, and one file would invite it.
-        assert_ne!(ctx("pchat").default_storage_url(), ctx("audit").default_storage_url());
+        assert_ne!(
+            ctx("pchat").default_storage_url(),
+            ctx("audit").default_storage_url()
+        );
         assert!(ctx("pchat").default_storage_url().contains("pchat"));
     }
 }

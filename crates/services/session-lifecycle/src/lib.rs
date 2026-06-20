@@ -34,13 +34,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto::proto::tcp;
+use starling_proto_fancy::control::{Opened, ServerAction, server_action};
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
-use starling_proto_fancy::control::{Opened, ServerAction, server_action};
 
 /// Upstream types this service answers for.
 const VERSION: u16 = 0;
@@ -81,7 +81,11 @@ impl ClientService for SessionLifecycleService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
             VERSION => self.on_version(&inbound),
-            AUTHENTICATE => self.handshake.authenticate(&self.connections, &inbound).await,
+            AUTHENTICATE => {
+                self.handshake
+                    .authenticate(&self.connections, &inbound)
+                    .await
+            }
             PING => self.on_ping(&inbound),
             USER_STATE => self.on_user_state(&inbound).await,
             id if id == ServiceKind::SessionLifecycle.outer_type() => {
@@ -156,18 +160,23 @@ impl SessionLifecycleService {
         let Ok(state) = tcp::UserState::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
-        if state.session.is_some_and(|session| session != inbound.session) {
+        if state
+            .session
+            .is_some_and(|session| session != inbound.session)
+        {
             // Muting somebody else is a moderation action and takes a
             // permission check this service does not perform.
             return Actions::new();
         }
-        let updated = self
-            .connections
-            .set_self_flags(inbound.conn, state.self_mute, state.self_deaf);
+        let updated =
+            self.connections
+                .set_self_flags(inbound.conn, state.self_mute, state.self_deaf);
         let Some(session) = updated else {
             return Actions::new();
         };
-        self.handshake.announce_changed(&self.connections, inbound.conn).await;
+        self.handshake
+            .announce_changed(&self.connections, inbound.conn)
+            .await;
 
         let echo = tcp::UserState {
             session: Some(session),

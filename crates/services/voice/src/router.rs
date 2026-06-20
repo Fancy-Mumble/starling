@@ -28,9 +28,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
-use bytes::Bytes;
-use crate::ports::{AudioSource, ConnId, Datagrams};
 use crate::ports::SessionId;
+use crate::ports::{AudioSource, ConnId, Datagrams};
+use bytes::Bytes;
 use tracing::debug;
 
 use crate::packet::{AudioCodec as _, AudioPacket, Datagram, ProtobufCodec, ServerDetails};
@@ -465,9 +465,9 @@ const fn context_for(target: Target) -> u8 {
 mod tests {
     use super::*;
     use crate::packet::codec_for;
+    use crate::ports::ChannelId;
     use crate::testing::{RecordingDatagrams, TestPeer};
     use starling_gate::UdpFormat;
-    use crate::ports::ChannelId;
 
     const LOBBY: ChannelId = ChannelId(0);
     const ALICE: SessionId = SessionId(1);
@@ -738,10 +738,7 @@ mod tests {
             "session index leaked"
         );
         assert!(
-            router
-                .by_host
-                .values()
-                .all(|known| !known.contains(&1)),
+            router.by_host.values().all(|known| !known.contains(&1)),
             "host index leaked"
         );
     }
@@ -790,10 +787,7 @@ mod tests {
     #[test]
     fn a_frame_that_decrypts_but_does_not_parse_is_counted() {
         let (mut router, sent, mut alice, _) = lobby();
-        router.accept(
-            AudioSource::Tunnel(1),
-            &alice.seal_raw(&[0xFF, 0xFF]),
-        );
+        router.accept(AudioSource::Tunnel(1), &alice.seal_raw(&[0xFF, 0xFF]));
         assert_eq!(router.stats().malformed, 1);
         assert!(sent.is_empty());
     }

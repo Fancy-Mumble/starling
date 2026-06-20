@@ -53,7 +53,6 @@ mod pem_file;
 pub use generated::SelfSigned;
 pub use pem_file::PemFiles;
 
-
 use tracing::info;
 
 /// Failures while obtaining a TLS identity.

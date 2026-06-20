@@ -137,12 +137,13 @@ impl Resolver {
         // `connect_lazy` rather than `connect`: a service that is not up yet is
         // a startup ordering fact, not an error. Readiness, not construction,
         // is where "is it there" is answered.
-        let endpoint = tonic::transport::Endpoint::from_shared(uri.to_owned()).map_err(|source| {
-            ChannelError::Transport {
-                service: service.to_owned(),
-                source,
-            }
-        })?;
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(uri.to_owned()).map_err(|source| {
+                ChannelError::Transport {
+                    service: service.to_owned(),
+                    source,
+                }
+            })?;
         Ok(endpoint.connect_lazy())
     }
 
@@ -153,19 +154,20 @@ impl Resolver {
     ) -> Result<Channel, ChannelError> {
         // The URI is required by HTTP/2 and ignored by the connector: the
         // socket path decides where the bytes go.
-        let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
-            .map_err(|source| ChannelError::Transport {
-                service: service.to_owned(),
-                source,
-            })?;
-        let channel = endpoint
-            .connect_with_connector_lazy(service_fn(move |_: Uri| {
-                let path = path.clone();
-                async move {
-                    let stream = retry_dial(|| tokio::net::UnixStream::connect(&path)).await?;
-                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+        let endpoint =
+            tonic::transport::Endpoint::try_from("http://[::]:50051").map_err(|source| {
+                ChannelError::Transport {
+                    service: service.to_owned(),
+                    source,
                 }
-            }));
+            })?;
+        let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
+            let path = path.clone();
+            async move {
+                let stream = retry_dial(|| tokio::net::UnixStream::connect(&path)).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }));
         Ok(channel)
     }
 
@@ -175,10 +177,12 @@ impl Resolver {
         name: String,
     ) -> Result<Channel, ChannelError> {
         let broker = self.broker.clone();
-        let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
-            .map_err(|source| ChannelError::Transport {
-                service: service.to_owned(),
-                source,
+        let endpoint =
+            tonic::transport::Endpoint::try_from("http://[::]:50051").map_err(|source| {
+                ChannelError::Transport {
+                    service: service.to_owned(),
+                    source,
+                }
             })?;
         let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
             let broker = broker.clone();

@@ -77,7 +77,10 @@ impl Metrics {
         };
         let mut out = String::new();
         for (name, counter) in counters.iter() {
-            out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", counter.get()));
+            out.push_str(&format!(
+                "# TYPE {name} counter\n{name} {}\n",
+                counter.get()
+            ));
         }
         out
     }
@@ -100,7 +103,9 @@ mod tests {
     #[test]
     fn the_export_names_every_counter_that_has_been_touched() {
         let metrics = Metrics::new();
-        metrics.counter("starling_control_overflow_disconnects").inc();
+        metrics
+            .counter("starling_control_overflow_disconnects")
+            .inc();
         let rendered = metrics.render();
         assert!(rendered.contains("starling_control_overflow_disconnects 1"));
         assert!(rendered.contains("# TYPE"));

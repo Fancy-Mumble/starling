@@ -34,7 +34,10 @@ pub fn env_key(path: &[&str]) -> String {
 ///
 /// [`ConfigError::Environment`] when a value does not fit the key it overrides
 /// — a port that is not a number is a startup failure, not a default.
-pub fn apply_environment(config: &mut Config, vars: &[(String, String)]) -> Result<(), ConfigError> {
+pub fn apply_environment(
+    config: &mut Config,
+    vars: &[(String, String)],
+) -> Result<(), ConfigError> {
     fn find<'a>(vars: &'a [(String, String)], key: &str) -> Option<&'a str> {
         vars.iter()
             .find(|(name, _)| name == key)
@@ -138,7 +141,10 @@ mod tests {
         let mut config = Config::with_defaults(Path::new("/run/starling"));
         let err = apply_environment(
             &mut config,
-            &[("STARLING_GATEWAY_CONTROL_QUEUE".to_owned(), "lots".to_owned())],
+            &[(
+                "STARLING_GATEWAY_CONTROL_QUEUE".to_owned(),
+                "lots".to_owned(),
+            )],
         )
         .expect_err("a non-numeric queue size must fail");
         assert!(matches!(err, ConfigError::Environment { .. }));

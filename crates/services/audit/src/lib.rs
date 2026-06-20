@@ -239,7 +239,10 @@ impl Audit for AuditRpc {
         Ok(Response::new(self.0.query(scope, &req).await))
     }
 
-    async fn verify(&self, request: Request<VerifyRequest>) -> Result<Response<VerifyResult>, Status> {
+    async fn verify(
+        &self,
+        request: Request<VerifyRequest>,
+    ) -> Result<Response<VerifyResult>, Status> {
         let req = request.into_inner();
         let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
         Ok(Response::new(self.0.verify(scope).await))
@@ -333,9 +336,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(&format!("sqlite:file:audit-test-{id}?mode=memory&cache=shared"), 1)
-            .await
-            .expect("in-memory database");
+        let store = Store::open(
+            &format!("sqlite:file:audit-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(AuditService {
             store,

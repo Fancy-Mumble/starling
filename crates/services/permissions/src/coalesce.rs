@@ -61,9 +61,10 @@ impl Coalescer {
 
         let answer = evaluate();
         if let Ok(mut inflight) = self.inflight.lock()
-            && let Some(sender) = inflight.remove(&key) {
-                let _ = sender.send(answer);
-            }
+            && let Some(sender) = inflight.remove(&key)
+        {
+            let _ = sender.send(answer);
+        }
         answer
     }
 
@@ -81,7 +82,10 @@ impl Coalescer {
     /// How many distinct questions are in flight, for metrics.
     #[must_use]
     pub fn inflight(&self) -> usize {
-        self.inflight.lock().map(|map| map.len()).unwrap_or_default()
+        self.inflight
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or_default()
     }
 }
 

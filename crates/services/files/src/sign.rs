@@ -58,9 +58,10 @@ pub fn verify(
 pub fn secret(data_dir: &std::path::Path) -> Result<Vec<u8>, ServiceError> {
     let path = data_dir.join("files-signing.key");
     if let Ok(existing) = std::fs::read(&path)
-        && existing.len() >= 32 {
-            return Ok(existing);
-        }
+        && existing.len() >= 32
+    {
+        return Ok(existing);
+    }
     let mut key = vec![0_u8; 32];
     {
         use rand::Rng as _;

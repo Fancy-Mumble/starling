@@ -76,7 +76,10 @@ impl Attachments {
     /// The link for `service`, if it has been attached.
     #[must_use]
     pub fn get(&self, service: &str) -> Option<ServiceLink> {
-        self.links.lock().ok().and_then(|links| links.get(service).cloned())
+        self.links
+            .lock()
+            .ok()
+            .and_then(|links| links.get(service).cloned())
     }
 
     /// Announce a new connection to every service, so a service that cares
@@ -232,7 +235,9 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
             if let Some(handle) = ctx.registry.by_conn(disconnect.conn) {
                 tracing::debug!(conn = handle.conn, reason = %disconnect.reason, "service asked for a disconnect");
                 ctx.registry.remove(handle.conn);
-                ctx.metrics.counter("starling_gateway_service_disconnects").inc();
+                ctx.metrics
+                    .counter("starling_gateway_service_disconnects")
+                    .inc();
             }
         }
         Some(server_action::Action::SessionUp(up)) => {
@@ -251,7 +256,11 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
 /// Write one `Send` to every addressed client this gateway holds.
 fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
     let type_id = send.r#type as u16;
-    let lane = if send.audio { Lane::Audio } else { Lane::Control };
+    let lane = if send.audio {
+        Lane::Audio
+    } else {
+        Lane::Control
+    };
 
     let targets = if !send.conns.is_empty() {
         send.conns

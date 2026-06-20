@@ -384,7 +384,10 @@ registerName=Fancy Mumble e2e
         // Better than refusing to boot on one malformed key, and the warning
         // says which one.
         let config = Ini::parse("port=not-a-number").to_config();
-        assert_eq!(config.virtual_servers[0].port, VirtualServer::default().port);
+        assert_eq!(
+            config.virtual_servers[0].port,
+            VirtualServer::default().port
+        );
     }
 
     #[test]
