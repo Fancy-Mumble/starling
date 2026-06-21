@@ -3,6 +3,7 @@ name = "starling-operator-api"
 description = "The admin plane: REST + OpenAPI, pluggable auth, fail-closed audit"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -10,7 +11,6 @@ publish.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
-async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

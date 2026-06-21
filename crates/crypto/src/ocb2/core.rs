@@ -40,16 +40,25 @@ pub(super) fn encrypt(cipher: &BlockCipher, nonce: Block, plain: &[u8]) -> (Vec<
     let mut checksum = Block::ZERO;
     let mut out = Vec::with_capacity(plain.len());
 
-    // Strictly greater: the loop stops with one block still in hand, because
-    // the final block always goes through the partial path even when it is
-    // full. That path is what folds the length into the tag.
-    let mut at = 0;
-    while plain.len() - at > BLOCK_LEN {
-        let mut block = Block::from_padded(&plain[at..at + BLOCK_LEN]);
+    // One block is always held back: the final block goes through the partial
+    // path below even when it is full, because that path is what folds the
+    // length into the tag. Hence `len - 1` — a length that is an exact multiple
+    // of BLOCK_LEN still leaves a full block as the tail, not an empty one.
+    let (body, tail) = plain.split_at(plain.len().saturating_sub(1) / BLOCK_LEN * BLOCK_LEN);
+    let (blocks, remainder) = body.as_chunks::<BLOCK_LEN>();
+    debug_assert!(
+        remainder.is_empty(),
+        "the split is a whole number of blocks"
+    );
 
-        // The mitigation, and only where the attack can reach: the block that
-        // will be second-to-last, meaning one block or less follows it.
-        if plain.len() - at - BLOCK_LEN <= BLOCK_LEN && block.is_zero_but_last() {
+    // The block that will be second-to-last overall — one block or less follows
+    // it — is the last one here, by construction of the split above.
+    let mitigated = blocks.len().wrapping_sub(1);
+    for (index, chunk) in blocks.iter().enumerate() {
+        let mut block = Block::from_padded(chunk);
+
+        // The mitigation, and only where the attack can reach.
+        if index == mitigated && block.is_zero_but_last() {
             block = block.flip_low_bit();
         }
 
@@ -57,11 +66,8 @@ pub(super) fn encrypt(cipher: &BlockCipher, nonce: Block, plain: &[u8]) -> (Vec<
         let masked = cipher.encrypt(block.xor(offset));
         out.extend_from_slice(&offset.xor(masked).0);
         checksum = checksum.xor(block);
-        at += BLOCK_LEN;
     }
 
-    // Whatever the loop left: the trailing partial block, or the final full one.
-    let tail = &plain[at..];
     offset = offset.times2();
     let pad = cipher.encrypt(Block::length_encoding(tail.len()).xor(offset));
 
@@ -87,20 +93,24 @@ pub(super) fn decrypt(cipher: &BlockCipher, nonce: Block, encrypted: &[u8]) -> D
     let mut checksum = Block::ZERO;
     let mut out = Vec::with_capacity(encrypted.len());
 
-    // Mirrors the encrypting loop's bound, or the two would disagree about
+    // Mirrors the encrypting loop's split, or the two would disagree about
     // which block is the final one and nothing would authenticate.
-    let mut at = 0;
-    while encrypted.len() - at > BLOCK_LEN {
+    let (body, tail) =
+        encrypted.split_at(encrypted.len().saturating_sub(1) / BLOCK_LEN * BLOCK_LEN);
+    let (blocks, remainder) = body.as_chunks::<BLOCK_LEN>();
+    debug_assert!(
+        remainder.is_empty(),
+        "the split is a whole number of blocks"
+    );
+
+    for chunk in blocks {
         offset = offset.times2();
-        let unmasked =
-            cipher.decrypt(Block::from_padded(&encrypted[at..at + BLOCK_LEN]).xor(offset));
+        let unmasked = cipher.decrypt(Block::from_padded(chunk).xor(offset));
         let plain = offset.xor(unmasked);
         out.extend_from_slice(&plain.0);
         checksum = checksum.xor(plain);
-        at += BLOCK_LEN;
     }
 
-    let tail = &encrypted[at..];
     offset = offset.times2();
     let pad = cipher.encrypt(Block::length_encoding(tail.len()).xor(offset));
 

@@ -3,6 +3,7 @@ name = "starling-proto"
 description = "Mumble wire protocol: protobuf types, TCP framing and version encoding"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

@@ -3,6 +3,7 @@ name = "starling-session-view"
 description = "the composed live view of every connected session: the edge of the domain"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -10,7 +11,6 @@ publish.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
-async-trait.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

@@ -49,12 +49,17 @@ pub fn encode(msg: &ControlMessage) -> Bytes {
 /// Returns `Ok(None)` when more bytes are needed; the caller should read more
 /// and try again. On `Ok(Some(_))` the frame has been consumed from `buf`.
 pub fn decode(buf: &mut BytesMut) -> Result<Option<ControlMessage>> {
-    if buf.len() < HEADER_SIZE {
+    // `split_first_chunk` folds the length check into the read, so the header
+    // fields come from arrays the compiler knows are the right size rather than
+    // from indexing that a future edit to the bound above could leave dangling.
+    let Some((type_id, rest)) = buf.split_first_chunk::<2>() else {
         return Ok(None);
-    }
-
-    let type_id = u16::from_be_bytes([buf[0], buf[1]]);
-    let payload_len = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+    };
+    let Some((payload_len, _)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let type_id = u16::from_be_bytes(*type_id);
+    let payload_len = u32::from_be_bytes(*payload_len);
 
     // Rule 1: bound before allocating. Checked against the declared length, so a
     // peer claiming a 4 GiB frame is rejected without reserving anything.
@@ -138,11 +143,15 @@ pub fn frame(type_id: u16, payload: &[u8]) -> Bytes {
 /// against [`MAX_PAYLOAD_SIZE`] before anything is reserved, because this runs
 /// on bytes from an unauthenticated peer.
 pub fn decode_raw(buf: &mut BytesMut) -> Result<Option<RawFrame>> {
-    if buf.len() < HEADER_SIZE {
+    // As in `decode`: the bound and the read are one operation.
+    let Some((type_id, rest)) = buf.split_first_chunk::<2>() else {
         return Ok(None);
-    }
-    let type_id = u16::from_be_bytes([buf[0], buf[1]]);
-    let payload_len = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+    };
+    let Some((payload_len, _)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let type_id = u16::from_be_bytes(*type_id);
+    let payload_len = u32::from_be_bytes(*payload_len);
     if payload_len > MAX_PAYLOAD_SIZE {
         return Err(Error::PayloadTooLarge(payload_len));
     }

@@ -3,6 +3,7 @@ name = "starling-server-config"
 description = "runtime-mutable operational settings, per virtual server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -11,7 +12,6 @@ starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 sqlx.workspace = true
 
-async-trait.workspace = true
 prost.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
