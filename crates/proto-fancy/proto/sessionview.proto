@@ -54,6 +54,14 @@ message Session {
   bytes cert_hash = 17;
   uint64 connected_at_ms = 18;
   uint32 max_bandwidth = 19;
+  // Whether `account` above names a real account.
+  //
+  // Mumble uses `-1` for "not registered" and a uint64 cannot carry it, so this
+  // is the presence bit and `account` means nothing without it — an anonymous
+  // guest is written as `account = 0, registered = false`, and 0 is also the
+  // SuperUser's id. Interpret the pair through
+  // `starling_proto_fancy::identity`, never by comparing `account` directly.
+  bool registered = 20;
 }
 
 message Sessions {

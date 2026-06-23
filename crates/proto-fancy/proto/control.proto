@@ -44,6 +44,14 @@ message Opened {
   // The chain validated against a configured CA, not merely presented.
   bool strong_cert = 4;
   uint32 virtual_server = 5;
+  // The chain as presented, leaf first, DER-encoded.
+  //
+  // Carried in full as well as hashed because the two answer different
+  // questions: `cert_hash` is what an account or a ban is keyed by, and this is
+  // what a client's Information window renders. A hash cannot be shown to
+  // anybody, so without this the certificate is unviewable even to the user it
+  // belongs to.
+  repeated bytes certificates = 6;
 }
 
 message Frame {
