@@ -32,11 +32,40 @@ With no `--config`, built-in defaults are used and a self-signed certificate is
 generated in `starling-data/` on first boot — Mumble clients identify a server by
 certificate fingerprint, so the pair is then stable across restarts.
 
+**Linux, macOS and Windows.** Services on one host reach each other over the
+platform's own local IPC — a Unix domain socket, or a named pipe on Windows — and
+the built-in defaults pick whichever this build can serve, so the quick start
+above needs no configuration file on any of the three. A hand-written `unix:`
+endpoint is a startup error on Windows rather than a substitution, because the
+two are different permission boundaries and only one of them exists per build;
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#endpoints) has the table.
+
+## In containers
+
+One image, one entrypoint, and `command` decides which service a container is.
+[`docker-compose.yml`](docker-compose.yml) is the twenty-container deployment of
+`docs/ARCHITECTURE.md`, configured by [`deploy/starling.toml`](deploy/starling.toml):
+
+```sh
+docker compose up -d --wait --build                  # build, start in tier order, block
+docker compose --profile admin up -d --wait --build  # ... plus operator-api, on loopback
+docker compose up -d --wait --build starling         # instead: one container, in-process
+```
+
+Keep the `--build`. Compose builds only when the image is *missing*, so a stale
+`starling:local` is reused however far the source has moved — and since every
+container runs the same binary picked by `command`, that surfaces as a service
+exiting with `no service named "…"` rather than as anything about the image.
+
+Then connect a Mumble client to `localhost:64738`. `--wait` returns once every
+container is healthy, which is a TCP connect — this build has no HTTP `/healthz`
+to probe, so it means the listener is up rather than the caches are warm.
+
 ## The shape of it
 
 ```text
               ┌──────────┐   gRPC    ┌─────────────────────────────┐
- client ─TCP─►│ gateway  │──────────►│ 19 services, tiered         │
+ client ─TCP─►│ gateway  │──────────►│ 20 services, tiered         │
               │  TLS     │           │ essential · core · optional │
               │ framing  │           └─────────────────────────────┘
               │ limits   │
@@ -62,7 +91,8 @@ recompiles when a service is added — a new service is a TOML block.
 | `starling-crypto` | Voice ciphers, TLS identity, suite negotiation |
 | `starling-runtime` | The one common crate: config, serving, health, drain, telemetry, storage, the client plane |
 | `starling-gateway` | The only component that holds a client's socket |
-| `crates/services/*` | Nineteen services, one per row of `docs/ARCHITECTURE.md` §4 |
+| `crates/services/*` | Twenty services, one per row of `docs/ARCHITECTURE.md` §4 |
+| `starling-directory` | Outbound only: the hourly announcement to the public Mumble server list |
 | `starling-operator-api` | The admin plane: REST + OpenAPI, pluggable auth, fail-closed audit |
 | `starling-migrate` | murmur `.ini` → `starling.toml` |
 | `starling` | One image, one entrypoint: a service name, or `--all-in-one` |
@@ -75,7 +105,7 @@ recompiles when a service is added — a new service is a TOML block.
 |---|---|---|
 | **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config | reject logins |
 | **core** | voice, text, pchat, moderation | that feature is dead; the server runs |
-| **optional** | screenshare, files, plugins, push, audit, onboarding, social, link-preview, context-actions, operator-api | nobody notices |
+| **optional** | screenshare, files, plugins, push, audit, onboarding, social, link-preview, context-actions, directory, operator-api | nobody notices |
 
 ## Quality gates
 

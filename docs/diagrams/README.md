@@ -16,7 +16,35 @@ Prose lives in `../ARCHITECTURE.md`, `../PROTOCOL-COMPATIBILITY.md` and
 `../CONFIGURATION.md`. Diagrams carry structure; rationale goes in the docs, so
 neither has to repeat the other.
 
-**These are the plan, not the build.** Nothing here is implemented.
+## What of this is built
+
+These started as the plan. Much of it now exists, so the diagrams mark the
+difference rather than claiming either extreme — a picture that overstates is
+worse than one that admits a gap, because the gap is what a reader needs to know
+before trusting the rest.
+
+**Built and exercised end to end.** The gateway: TLS, framing, the type-keyed
+routing table, the per-route limiter, the circuit breaker, the resume ring. All
+twenty services exist and serve gRPC. The handshake carries a real client from
+`Version` to `SuggestConfig`, and the `starling` binary's own e2e test drives it
+over a real TCP+TLS socket. Storage is real — `sqlx` over SQLite, MySQL or
+PostgreSQL, one schema per service. Permissions evaluates ACLs. Voice binds its
+own UDP socket, mints the ciphers and answers the server-browser ping. `directory`
+announces to the public server list. The operator log and `operator-api` are
+running surfaces, not sketches.
+
+**Drawn here but not built.** Marked `«not built»` in the diagrams:
+
+| What | State |
+|---|---|
+| Audio routing | The router, codecs and fan-out are written and tested; nothing attaches a peer to it yet, so no audio flows |
+| The screen-share SFU | No `str0m` dependency exists; `screenshare` is signalling only |
+| A durable session store | The resume ring is in-process, so it does **not** outlive a gateway pod and RESUME cannot cross one |
+| `zstd` on the Fancy stream | A workspace dependency no source file uses |
+| Sharding | Every shard key below is a design decision. Nothing is sharded yet |
+
+Rationale for each still lives in `../ARCHITECTURE.md`; this table is only about
+what a reader can rely on today.
 
 ## Rendering
 

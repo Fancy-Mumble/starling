@@ -19,10 +19,11 @@ endheader
 actor "legacy Mumble\nclient" as legacy #EEEEEE
 actor "Fancy client" as fancy #E3F2FD
 actor "**operator**" as oper #F3E5F5
+cloud "**publist.mumble.info**\nthe public server list" as publist #EDE7F6
 
 component "**gateway**\nTLS · framing · rate limit\n**single writer per client socket**\nroutes by type, config-driven" as gw #FFE9D6
 
-database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring,\n**outliving any gateway pod**\nno client, no message type, no tier" as sstore #FFE0B2
+database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring\nno client, no message type, no tier\n—\n**«not built»: the ring is in-process**, so it does\nnot outlive a pod and RESUME cannot cross one" as sstore #FFE0B2
 
 ' ═══════════════════════════════════════════════════════════════════════════
 package "**control plane** — gRPC only; no client reaches these directly" as CTRL #FAFAFA {
@@ -32,14 +33,14 @@ package "**control plane** — gRPC only; no client reaches these directly" as C
     component "**session-view**\n«the domain edge»\nthe composed live view of\nevery connected session.\nThe whole domain reads here.\nOwns nothing, writes nothing.\n**no client-facing type**" as sview #FFF9C4
     component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms #FFFFFF
     component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta #FFFFFF
-    component "**userdata**\nprofiles\naccount settings\n8,9,14,18,22 + **1003**" as users #FFFFFF
+    component "**userdata**\nprofiles · accounts · blobs\n**SuperUser is account 0**\n9,14,18,22,23 + **1003**" as users #FFFFFF
     component "**server-config**\nruntime-mutable,\nper virtual server\n24,25 + **1013**" as scfg #FFFFFF
   }
 
   package "core — a feature dies" as CORE #FFF8E1 {
     component "**text**\nhistory: **UUIDv7**\n11 + **1005**" as text #FFFFFF
     component "**pchat**\nE2EE · key mgmt\nhistory: **UUIDv7**\n**1006**" as pchat #FFFFFF
-    component "**moderation**\nbans · kicks\n10 + **1007**" as mod #FFFFFF
+    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n8,10 + **1007**" as mod #FFFFFF
   }
 
   package "optional — nobody notices" as OPT #E8F5E9 {
@@ -49,8 +50,8 @@ package "**control plane** — gRPC only; no client reaches these directly" as C
 
 ' ═══════════════════════════════════════════════════════════════════════════
 package "**realtime plane** — UDP / WebRTC, client connects **directly**" as RT #FFEBEE {
-  component "**voice**  «core»\nSFU · routing · **mints the ciphers**\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n—\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied" as voice #FFFFFF
-  component "**screenshare**  «optional»\nstr0m SFU · own ICE ports\n**1008**" as share #FFFFFF
+  component "**voice**  «core»\n**mints the ciphers** · answers the ping\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n—\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied\n—\naudio routes both ways: a datagram on its own\nsocket, or **UDPTunnel** through the gateway for\na UDP-blocked client. Membership is read from a\n`session-view` subscription, never asked per packet\n—\n**«not built»**: whisper/shout — `VoiceTarget` (19)\nis still a stub, so only channel speech routes" as voice #FFFFFF
+  component "**screenshare**  «optional»\nsignalling only\n**1008**\n—\n**«not built»: no SFU.** There is no str0m\ndependency; media has nowhere to go" as share #FFFFFF
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
@@ -59,20 +60,26 @@ package "**HTTP plane** — plain HTTPS, client connects **directly**" as HTTP #
   component "**operator-api**  «admin»\nREST + OpenAPI\nauth **pluggable**: OIDC · JWT\nmTLS · token\ndefault **off**, localhost-bound" as opapi #F3E5F5
 }
 
+' ═══════════════════════════════════════════════════════════════════════════
+package "**outward plane** — this server talking about itself" as OUT #EDE7F6 {
+  component "**directory**  «optional»\nhourly announcement to the\npublic Mumble server list\n—\n**no client, no wire type, no endpoint**\nnothing dials it; it dials out" as dirsvc #FFFFFF
+}
+
 ' ══════════════════════ control: TCP through the gateway ═══════════════════
 legacy -[#000000]-> gw : **TCP 64738**\nTLS + framing
-fancy  -[#000000]-> gw : **TCP 64738**\n+ **zstd** stream
+fancy  -[#000000]-> gw : **TCP 64738**\n+ **zstd** stream «not built»
 
 gw -[#1565C0]-> CTRL  : gRPC
 gw -[#1565C0]-> RT : gRPC — signalling\nand UDPTunnel only
 gw -[#1565C0]-> files : gRPC — mint a signed URL
 note on link #E3F2FD
   Payload forwarded **verbatim** — already protobuf, never
-  re-encoded. Unix socket when co-located, TCP when not.
+  re-encoded. A **local socket** when co-located — a Unix socket,
+  or a named pipe on Windows — and TCP when not.
   **Circuit breaker per service**, inbound shed by `tier`.
-  **RESUME**: a sequence number per session in a store that
-  outlives the pod, so a rolling deploy is not 10 000
-  simultaneous full floods.
+  **RESUME**: a sequence number per session, so a rolling deploy
+  is not 10 000 simultaneous full floods. **«not built»**: the
+  ring is in-process, so it does not survive the pod it is in.
 end note
 
 gw -[#F57C00]-> sstore : stamp · replay
@@ -118,6 +125,32 @@ end note
 fancy  -[#2E7D32]-> files : **HTTPS**, signed URL
 legacy -[#2E7D32]-> files : **HTTPS**
 oper   -[#6A1B9A]-> opapi : **HTTPS + REST**
+
+' ══════════════════════ outward: the only edge that leaves ═════════════════
+dirsvc -[#4527A0]-> publist : **HTTPS POST**, hourly
+note on link #EDE7F6
+  The only connection Starling **opens** to the internet, and the
+  only place it publishes anything about itself. Authenticated by
+  the server's **own TLS certificate as a client certificate**, so
+  the list keys an entry to the same fingerprint clients pin and
+  nobody can update somebody else's listing.
+  Refused unless the operator set a name, a secret and a URL, and
+  **never** for a password-protected server — a public list is a
+  directory of servers people can join. Both rules are murmur's.
+  The count comes from **session-view**, not from a gateway: with
+  two gateways either one sees a fraction.
+end note
+
+legacy -[#C62828].-> voice : **UDP ping**, unauthenticated
+note on link #FFEBEE
+  How a server browser measures a server it has never connected
+  to: version, users, limits. Answered from the packet path, so
+  the numbers are **pushed in on a timer** — a fetch per ping
+  would make an open UDP port a lever on session-view.
+  murmur's `allowping` gates **this** ping only. Gating the
+  connectivity ping a connected peer sends would silently push
+  every client onto tunnelled audio.
+end note
 
 ' ══════════════════════ the two halves of session ══════════════════════════
 slife -[#1565C0].-> sview : session up · down · moved · flags
@@ -165,6 +198,13 @@ end note
 note bottom of ESS #FFFFFF
   **Each service owns its own schema.** No service reads
   another's tables. One migration tool, many schemas.
+  Built: `sqlx` over the `Any` driver, so the backend is chosen
+  by URL scheme — **SQLite, MySQL or PostgreSQL**. With no
+  `[storage]` block a service gets its own SQLite file named
+  after it, under the shared data directory.
+  Eleven services keep one: userdata, metadata, server-config,
+  text, pchat, moderation, audit, push, files, plugins,
+  onboarding. The rest hold no durable state at all.
 end note
 
 legend bottom
@@ -173,7 +213,10 @@ legend bottom
 | <color:#C62828>**red**</color> | realtime | UDP or WebRTC, **direct to the service** |
 | <color:#2E7D32>**green**</color> | bulk | HTTPS, signed URL, out of band |
 | <color:#6A1B9A>**purple**</color> | admin | HTTPS + REST in, gRPC out, pluggable auth, default off |
+| <color:#4527A0>**indigo**</color> | outward | HTTPS out to the public server list — the only edge Starling opens |
 | <color:#1565C0>**blue**</color> | internal | gRPC — solid is a call, dotted is a cached subscription |
+Anything marked **«not built»** is drawn because the design depends on it, and
+labelled because it does not exist yet. See `README.md` in this directory.
 endlegend
 
 @enduml

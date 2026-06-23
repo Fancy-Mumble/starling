@@ -54,10 +54,16 @@ note right of res #FFE0B2
   of every ChannelState and UserState — a self-inflicted DDoS on
   the services behind. A client that resumes from its last
   sequence number replays only the gap.
-  The buffer therefore lives **outside** this process, so a
-  resuming client can land on any pod. Legacy clients cannot
-  resume and take the full flood; zstd on the Fancy stream
-  shrinks the same transfer.
+  The buffer is therefore *meant* to live **outside** this
+  process, so a resuming client can land on any pod.
+  **«not built»: today it is a `HashMap` in this process.** It
+  survives a reconnect to the same pod and nothing more, so with
+  more than one gateway RESUME does not help the case it exists
+  for. `zstd` on the Fancy stream is likewise a dependency no
+  source file uses yet.
+  Legacy clients cannot resume either way and take the full
+  flood, which is why staggered drain and jittered reconnect
+  hints are required regardless of this buffer.
 end note
 
 note right of router #FFF9C4

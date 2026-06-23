@@ -195,7 +195,35 @@ is required for it — see `PORTING-PLAN.md` R1 and §6.
 |---|---|---|
 | **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config | reject logins |
 | **core** | voice, text, pchat, moderation | that feature is dead; server runs |
-| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, **operator-api** | nobody notices |
+| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, **directory**, **operator-api** | nobody notices |
+
+### The outward-facing plane is one service, and it is optional
+
+`directory` is the replacement for murmur's `Register.cpp`: an hourly
+announcement to the public Mumble server list. It has **no wire type, no gRPC
+surface and no endpoint** — nothing dials it, it dials out — which makes it
+internal by construction the way `session-view` is, for the opposite reason.
+
+It is not part of `server-config`, which owns the settings it reads. That service
+is **essential**, and a scheduled outbound HTTPS client with a TLS trust store
+and an XML payload does not belong in the process a handshake cannot proceed
+without. Being listed is the definition of optional: nobody notices for an hour,
+which is the interval anyway.
+
+Two couplings in it are worth stating, because both are easy to get subtly wrong:
+
+* **the announced fingerprint must be the one clients are shown.** It is the
+  SHA-1 of the *gateway's* certificate, so `directory` reads the same file by the
+  same rule and never generates one — a second convention here would publish an
+  identity nobody is ever presented with.
+* **the user count must be the whole server's.** It comes from `session-view`,
+  not from any one gateway or voice pod, each of which sees a fraction once there
+  is more than one.
+
+The unauthenticated UDP ping is the other half of the same story and lives
+somewhere else, because it has to: `voice` owns the socket it arrives on. Both
+are gated by one operational setting, `allow_ping` — and registration refuses to
+run without it, since a listing the list cannot measure is a dead entry.
 
 ### Session is two services, because it is two responsibilities
 
@@ -458,6 +486,7 @@ crates/
     voice/  text/  pchat/  moderation/
     screenshare/  files/  plugins/  push/  audit/
     onboarding/  social/  link-preview/  context-actions/
+    directory/        starling-directory     the public server list, outbound only
   operator-api/       starling-operator-api  REST + OpenAPI, pluggable auth
 ```
 
