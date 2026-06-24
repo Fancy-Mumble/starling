@@ -3,6 +3,7 @@ name = "starling-permissions"
 description = "ACL evaluation, with request coalescing rather than a cache"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -10,13 +11,14 @@ publish.workspace = true
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
-bitflags.workspace = true
+# ACL tables are durable: a grant an operator makes has to survive a restart.
+sqlx.workspace = true
 
-async-trait.workspace = true
 prost.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

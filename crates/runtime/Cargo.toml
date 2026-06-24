@@ -3,13 +3,16 @@ name = "starling-runtime"
 description = "What every Starling service needs: config, serving, health, drain, telemetry, storage"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 
 async-trait.workspace = true
+prost.workspace = true
 
 
 hyper-util.workspace = true

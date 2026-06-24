@@ -27,16 +27,52 @@ pub struct PendingConnection {
     pub address: String,
     /// SHA-1 of the peer's leaf certificate, empty if it presented none.
     pub cert_hash: Vec<u8>,
+    /// The chain the peer presented, leaf first, DER-encoded.
+    ///
+    /// Kept alongside the hash because they serve different readers: the hash
+    /// identifies an account or a ban, and this is the only form that can be
+    /// shown to a human in the client's Information window.
+    pub certificates: Vec<Vec<u8>>,
     /// Whether the chain validated against a configured CA.
     pub strong_cert: bool,
     /// The Mumble version the peer announced.
     pub mumble_version: u64,
+    /// The client build it announced, e.g. "Mumble 1.5.735".
+    ///
+    /// Kept because it is most of what the Information window is *for*: "which
+    /// client is this person running" is the first question asked of a user
+    /// reporting something nobody else sees.
+    pub release: String,
+    /// The operating system it announced.
+    pub os: String,
+    /// That operating system's version.
+    pub os_version: String,
+    /// Whether the peer offered Opus.
+    ///
+    /// Read from `Authenticate`, which is where a client announces it
+    /// (`vendor/server/src/murmur/Messages.cpp:538`). Not from `CodecVersion`:
+    /// that message travels server→client, so waiting for one to arrive means
+    /// waiting forever and reporting every client as having no Opus.
+    pub opus: bool,
+    /// What the peer last reported about its own link, from its `Ping`.
+    ///
+    /// The client measures these, not the server
+    /// (`vendor/server/src/murmur/Messages.cpp:2918`) — round trips it timed,
+    /// packets it received, packets it found late or missing. The server's part
+    /// is to remember the last set so that *other* clients can be shown them.
+    pub reported: ReportedStats,
     /// The Fancy version the peer announced, 0 for a stock client.
     pub fancy_version: u64,
     /// The session id, once one has been allocated.
     pub session: u32,
-    /// The account, once authenticated.
-    pub account: u64,
+    /// The registered account, once authenticated. `None` for a guest.
+    ///
+    /// An `Option` and not a `u64` on purpose: the SuperUser's account id is
+    /// **0**, so a guest flattened to `0` is indistinguishable from the
+    /// administrator, and every reader has to remember a rule it cannot see.
+    /// Here the compiler asks the question instead
+    /// (`starling_proto_fancy::identity`).
+    pub account: Option<u64>,
     /// The name it authenticated as.
     pub name: String,
     /// Its channel.
@@ -45,10 +81,57 @@ pub struct PendingConnection {
     pub self_mute: bool,
     /// Self-deafen.
     pub self_deaf: bool,
+    /// Muted by a moderator, as distinct from [`Self::self_mute`].
+    ///
+    /// Separate because they mean different things and are undone by different
+    /// people: a user may lift their own self-mute at any time and must not be
+    /// able to lift this one.
+    pub mute: bool,
+    /// Deafened by a moderator.
+    pub deaf: bool,
+    /// Suppressed by the server for lacking `Speak` in this channel.
+    ///
+    /// Server-set only. murmur refuses a client that tries to set it
+    /// (`vendor/server/src/murmur/Messages.cpp:1135`), because it is the
+    /// server's own statement about a permission, not a moderator's decision.
+    pub suppress: bool,
+    /// Heard over everyone else, and exempt from ducking.
+    pub priority_speaker: bool,
     /// When it connected.
     pub connected_at_ms: u64,
     /// When it was last heard from, for the timeout sweep.
     pub last_seen_ms: u64,
+}
+
+/// What a client last told the server about its own side of the link.
+///
+/// Every field here is the *client's* measurement. The server cannot compute
+/// them: only the client knows when it sent a ping and when the reply came
+/// back, and only the client can count what it did not receive. Reporting them
+/// is therefore repeating a claim, not making one — which is exactly what
+/// murmur does with the same numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReportedStats {
+    /// Packets the client received intact.
+    pub good: u32,
+    /// Packets that arrived too late to use.
+    pub late: u32,
+    /// Packets that never arrived.
+    pub lost: u32,
+    /// Nonce resyncs the client needed.
+    pub resync: u32,
+    /// UDP packets the client received.
+    pub udp_packets: u32,
+    /// TCP packets the client received.
+    pub tcp_packets: u32,
+    /// Mean UDP round trip, in milliseconds.
+    pub udp_ping_avg: f32,
+    /// Variance of the UDP round trip.
+    pub udp_ping_var: f32,
+    /// Mean TCP round trip, in milliseconds.
+    pub tcp_ping_avg: f32,
+    /// Variance of the TCP round trip.
+    pub tcp_ping_var: f32,
 }
 
 /// Every connection this process is holding.
@@ -80,6 +163,7 @@ impl Connections {
                     scope: opened.virtual_server.max(1),
                     address: opened.peer_addr.clone(),
                     cert_hash: opened.cert_hash.clone(),
+                    certificates: opened.certificates.clone(),
                     strong_cert: opened.strong_cert,
                     connected_at_ms: now,
                     last_seen_ms: now,
@@ -98,8 +182,39 @@ impl Connections {
                 .version_v2
                 .or_else(|| version.version_v1.map(u64::from))
                 .unwrap_or_default();
+            pending.release = version.release.clone().unwrap_or_default();
+            pending.os = version.os.clone().unwrap_or_default();
+            pending.os_version = version.os_version.clone().unwrap_or_default();
             pending.fancy_version = fancy_version(version);
         }
+    }
+
+    /// Record whether a peer announced Opus, from its `Authenticate`.
+    pub fn record_opus(&self, conn: u64, opus: bool) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.opus = opus;
+        }
+    }
+
+    /// Record what a peer reported about its own link in a `Ping`.
+    pub fn record_reported(&self, conn: u64, reported: ReportedStats) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.reported = reported;
+        }
+    }
+
+    /// The connection holding `session`.
+    #[must_use]
+    pub fn by_session(&self, session: u32) -> Option<PendingConnection> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .values()
+            .find(|pending| pending.session == session && session != 0)
+            .cloned()
     }
 
     /// Allocate a session id for a connection that has authenticated.
@@ -107,7 +222,7 @@ impl Connections {
     /// Returns `None` when the pool is exhausted, which refuses the connection
     /// rather than growing — murmur does the same (`Server.cpp:1625`), and an
     /// unbounded pool would mean an unbounded server.
-    pub fn allocate(&self, conn: u64, account: u64, name: &str) -> Option<u32> {
+    pub fn allocate(&self, conn: u64, account: Option<u64>, name: &str) -> Option<u32> {
         let session = {
             let mut sessions = self.sessions.lock().ok()?;
             sessions.allocate()?.0
@@ -129,6 +244,38 @@ impl Connections {
             .and_then(|inner| inner.get(&conn).cloned())
     }
 
+    /// An authenticated connection that collides with `account`/`name`.
+    ///
+    /// murmur's predicate, from `Messages.cpp:418` — the same registered
+    /// account, *or* the same name compared case-insensitively. Case matters:
+    /// without folding, "Alice" and "alice" are two users whom every client
+    /// renders as the same person.
+    ///
+    /// Only authenticated connections are considered. One still mid-handshake
+    /// has no name to collide with, and treating it as one would let a peer
+    /// that connects and says nothing block a name indefinitely.
+    #[must_use]
+    pub fn duplicate_of(
+        &self,
+        conn: u64,
+        account: Option<u64>,
+        name: &str,
+    ) -> Option<PendingConnection> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .values()
+            .find(|other| {
+                other.conn != conn
+                    && other.session != 0
+                    // `is_some`, not `!= 0`: two guests must not be matched to
+                    // each other by both holding "no account", and the
+                    // administrator must not be excluded by holding account 0.
+                    && ((account.is_some() && other.account == account)
+                        || other.name.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+    }
+
     /// Record that a connection is still alive.
     pub fn touch(&self, conn: u64) {
         if let Ok(mut inner) = self.inner.lock()
@@ -145,6 +292,55 @@ impl Connections {
         {
             pending.channel = channel;
         }
+    }
+
+    /// Apply a moderator's speak-state change, returning the session it hit.
+    ///
+    /// The couplings are murmur's (`Messages.cpp:1303`): deafening implies
+    /// muting, and un-muting clears deafen. Without them a user can be left
+    /// un-muted but still deaf, which every client renders as a contradiction
+    /// and no moderator asked for.
+    pub fn set_speak_state(
+        &self,
+        conn: u64,
+        mute: Option<bool>,
+        deaf: Option<bool>,
+        priority_speaker: Option<bool>,
+    ) -> Option<u32> {
+        let mut inner = self.inner.lock().ok()?;
+        let pending = inner.get_mut(&conn)?;
+        if let Some(deaf) = deaf {
+            pending.deaf = deaf;
+            if deaf {
+                pending.mute = true;
+            }
+        }
+        if let Some(mute) = mute {
+            pending.mute = mute;
+            if !mute {
+                pending.deaf = false;
+            }
+        }
+        if let Some(priority) = priority_speaker {
+            pending.priority_speaker = priority;
+        }
+        (pending.session != 0).then_some(pending.session)
+    }
+
+    /// Record the account a connection has just been registered as.
+    ///
+    /// Returns the session it belongs to, so a caller that has to announce the
+    /// change does not look the connection up a second time.
+    ///
+    /// Registration is the **only** moment a live connection's identity moves.
+    /// Everywhere else `account` is settled during the handshake and read for
+    /// the rest of the connection, which is why this is a named operation
+    /// rather than a general setter: what it does is worth finding in a search.
+    pub fn set_account(&self, conn: u64, account: u64) -> Option<u32> {
+        let mut inner = self.inner.lock().ok()?;
+        let pending = inner.get_mut(&conn)?;
+        pending.account = Some(account);
+        (pending.session != 0).then_some(pending.session)
     }
 
     /// Apply self-mute and self-deafen, returning the session they belong to.
@@ -212,6 +408,7 @@ mod tests {
             conn,
             peer_addr: "127.0.0.1:1234".to_owned(),
             cert_hash: Vec::new(),
+            certificates: Vec::new(),
             strong_cert: false,
             virtual_server: 1,
         }
@@ -223,11 +420,11 @@ mod tests {
         // holding ten clients.
         let connections = Connections::new(2);
         connections.opened(&opened(1), "gw");
-        let first = connections.allocate(1, 0, "a").expect("a session id");
+        let first = connections.allocate(1, None, "a").expect("a session id");
         assert_eq!(connections.close(1), Some(first));
 
         connections.opened(&opened(2), "gw");
-        assert!(connections.allocate(2, 0, "b").is_some());
+        assert!(connections.allocate(2, None, "b").is_some());
     }
 
     #[test]
@@ -236,7 +433,7 @@ mod tests {
         // transmitting into a room they cannot hear.
         let connections = Connections::new(4);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, 0, "a");
+        let _ = connections.allocate(1, None, "a");
         let _ = connections.set_self_flags(1, None, Some(true));
         let pending = connections.get(1).expect("the connection");
         assert!(pending.self_mute);
@@ -251,7 +448,7 @@ mod tests {
         }
         let mut granted = 0;
         for conn in 1..=4 {
-            if connections.allocate(conn, 0, "x").is_some() {
+            if connections.allocate(conn, None, "x").is_some() {
                 granted += 1;
             }
         }
@@ -265,5 +462,239 @@ mod tests {
             ..tcp::Version::default()
         };
         assert_eq!(fancy_version(&stock), 0);
+    }
+
+    #[test]
+    fn a_name_already_in_use_is_found_whatever_its_case() {
+        // Two sessions called "Alice" and "alice" are one person to every
+        // client that renders them, so the collision has to be found without
+        // regard to case (`Messages.cpp:422`).
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "Alice");
+
+        connections.opened(&opened(2), "gw");
+        let found = connections
+            .duplicate_of(2, None, "alice")
+            .expect("the same name in another case is the same name");
+        assert_eq!(found.conn, 1);
+    }
+
+    #[test]
+    fn a_connection_does_not_collide_with_itself() {
+        // Re-authenticating on one connection must not find its own entry and
+        // decide the user is a ghost of themselves.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "alice");
+        assert!(connections.duplicate_of(1, None, "alice").is_none());
+    }
+
+    #[test]
+    fn two_guests_are_not_matched_to_each_other_by_both_being_guests() {
+        // Both carry `None` for an account. Comparing that as equality would
+        // make every guest a duplicate of every other guest and let the first
+        // one in lock everybody else out.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "alice");
+
+        connections.opened(&opened(2), "gw");
+        assert!(connections.duplicate_of(2, None, "bob").is_none());
+    }
+
+    #[test]
+    fn the_same_account_collides_under_a_different_name() {
+        // murmur matches on the account first (`Messages.cpp:422`): one
+        // registration is one person, whatever they typed in the name box.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, Some(7), "alice");
+
+        connections.opened(&opened(2), "gw");
+        let found = connections
+            .duplicate_of(2, Some(7), "someone-else")
+            .expect("the same account is the same user");
+        assert_eq!(found.conn, 1);
+    }
+
+    #[test]
+    fn a_connection_still_mid_handshake_holds_no_name() {
+        // It has no session yet, so it has not claimed anything. Treating it as
+        // a collision would let a peer that connects and never authenticates
+        // hold a name indefinitely.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        assert!(connections.duplicate_of(2, None, "alice").is_none());
+    }
+
+    #[test]
+    fn a_session_resolves_back_to_its_connection() {
+        // What `UserStats` needs: a client names a session, and the answer has
+        // to come from that session's connection state.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let session = connections.allocate(1, None, "alice").expect("a session");
+        assert_eq!(connections.by_session(session).map(|p| p.conn), Some(1));
+    }
+
+    #[test]
+    fn session_zero_never_resolves_to_a_connection() {
+        // Zero means "not authenticated yet", and every mid-handshake entry
+        // carries it — so looking it up must not return an arbitrary one.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        assert!(connections.by_session(0).is_none());
+    }
+
+    #[test]
+    fn the_client_build_is_kept_because_it_is_what_information_shows() {
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.record_version(
+            1,
+            &tcp::Version {
+                version_v2: Some(0x0001_0005_0000),
+                release: Some("Mumble 1.5.735".to_owned()),
+                os: Some("Windows".to_owned()),
+                os_version: Some("11".to_owned()),
+                ..tcp::Version::default()
+            },
+        );
+        let pending = connections.get(1).expect("the connection");
+        assert_eq!(pending.release, "Mumble 1.5.735");
+        assert_eq!(pending.os, "Windows");
+        assert_eq!(pending.os_version, "11");
+    }
+
+    #[test]
+    fn deafening_someone_also_mutes_them() {
+        // murmur's coupling (`Messages.cpp:1303`). Without it a user ends up
+        // deaf but not muted, which every client renders as a contradiction.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "victim");
+
+        let _ = connections.set_speak_state(1, None, Some(true), None);
+        let pending = connections.get(1).expect("the connection");
+        assert!(pending.deaf);
+        assert!(pending.mute, "deafening implies muting");
+    }
+
+    #[test]
+    fn un_muting_someone_also_un_deafens_them() {
+        // The other half of the same coupling: leaving someone un-muted but
+        // still deaf means a moderator who lifted a mute has not actually
+        // given the user their ears back.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "victim");
+        let _ = connections.set_speak_state(1, None, Some(true), None);
+
+        let _ = connections.set_speak_state(1, Some(false), None, None);
+        let pending = connections.get(1).expect("the connection");
+        assert!(!pending.mute);
+        assert!(!pending.deaf, "un-muting clears deafen");
+    }
+
+    #[test]
+    fn priority_speaker_is_independent_of_mute() {
+        // They travel in one message and share one permission, but they are not
+        // the same switch: making somebody a priority speaker must not quietly
+        // un-mute them.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "speaker");
+        let _ = connections.set_speak_state(1, Some(true), None, None);
+
+        let _ = connections.set_speak_state(1, None, None, Some(true));
+        let pending = connections.get(1).expect("the connection");
+        assert!(pending.priority_speaker);
+        assert!(pending.mute, "a priority speaker who was muted stays muted");
+    }
+
+    #[test]
+    fn registering_a_guest_gives_the_live_connection_its_account() {
+        // The connection has to carry the account immediately, not after a
+        // reconnect: everything downstream — the ACL evaluation that puts them
+        // in `@auth`, the announcement to session-view — reads it from here.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let session = connections.allocate(1, None, "guest").expect("a session");
+        assert!(
+            connections.get(1).expect("the connection").account.is_none(),
+            "a guest starts with no account"
+        );
+
+        assert_eq!(connections.set_account(1, 4), Some(session));
+        assert_eq!(connections.get(1).expect("the connection").account, Some(4));
+    }
+
+    #[test]
+    fn registering_the_account_numbered_zero_is_not_read_as_registering_nobody() {
+        // Account 0 is the SuperUser and `None` is a guest. Storing the pair as
+        // an `Option` is what keeps those apart, and a zero that collapsed to
+        // `None` would silently leave the user a guest.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "someone");
+
+        let _ = connections.set_account(1, 0);
+        assert_eq!(connections.get(1).expect("the connection").account, Some(0));
+    }
+
+    #[test]
+    fn a_moderator_mute_is_not_the_users_own_self_mute() {
+        // Two separate flags on purpose: a user may lift their own self-mute
+        // whenever they like, and must not be able to lift a moderator's.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "victim");
+        let _ = connections.set_speak_state(1, Some(true), None, None);
+
+        let _ = connections.set_self_flags(1, Some(false), Some(false));
+        let pending = connections.get(1).expect("the connection");
+        assert!(!pending.self_mute);
+        assert!(
+            pending.mute,
+            "clearing your own self-mute must not clear a moderator's mute"
+        );
+    }
+
+    #[test]
+    fn a_channel_move_is_recorded_so_the_rest_of_the_server_agrees() {
+        // `set_channel` existed and nothing ever called it, so every session
+        // read as being in the root however many times it moved — which is
+        // what `UserStats` and the same-channel disclosure rule key off.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let session = connections.allocate(1, None, "alice").expect("a session");
+        assert_eq!(connections.get(1).expect("the connection").channel, 0);
+
+        connections.set_channel(1, 7);
+        assert_eq!(connections.get(1).expect("the connection").channel, 7);
+        assert_eq!(
+            connections
+                .by_session(session)
+                .expect("the session")
+                .channel,
+            7,
+            "the session view of it has to move too, not just the connection"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_has_gone_quiet_is_reported_as_timed_out() {
+        // The sweep this feeds was dead code, which is why a client that
+        // vanished without its socket noticing stayed in the tree forever.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, None, "alice");
+
+        assert!(
+            connections.timed_out(0).is_empty(),
+            "a connection just heard from is not timed out"
+        );
+        assert_eq!(connections.timed_out(now_ms() + 1), vec![1]);
     }
 }

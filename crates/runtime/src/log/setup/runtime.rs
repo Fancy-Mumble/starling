@@ -76,6 +76,25 @@ impl LogRuntime {
         }
     }
 
+    /// Start from an operator's `[logging]` section.
+    ///
+    /// [`Self::start`] takes a resolved [`LogSpec`]; this takes the unresolved
+    /// [`LogConfig`] and carries its fallback warnings — a misspelled level, an
+    /// unknown category — into the log itself. Resolving in the composition root
+    /// instead would mean every entry point remembering to report them, and the
+    /// one that forgot would log at the wrong level in silence.
+    #[must_use]
+    pub fn start_from(config: &crate::log::LogConfig) -> Self {
+        let (spec, warnings) = config.to_spec();
+        let runtime = Self::start(&spec);
+        for warning in warnings {
+            runtime
+                .logger
+                .log(LogEvent::warning(Category::Server, warning));
+        }
+        runtime
+    }
+
     /// A handle for anything that needs to emit records.
     ///
     /// Clone it freely: every clone feeds the same writer.

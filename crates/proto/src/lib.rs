@@ -67,4 +67,4 @@ pub mod version;
 
 pub use error::{Error, Result};
 pub use message::{ControlMessage, TcpMessageType};
-pub use version::Version;
+pub use version::{MUMBLE_VERSION, Version};

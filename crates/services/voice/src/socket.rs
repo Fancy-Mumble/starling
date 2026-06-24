@@ -128,6 +128,25 @@ impl Datagrams for UdpSender {
     }
 }
 
+/// The write half of a deployment that has no UDP socket.
+///
+/// Not a degenerate case to be tolerated — it is a supported configuration. A
+/// voice service with no `udp_listen` serves every client over the tunnel, and
+/// the router needs *a* transport at construction time either way. Handing it
+/// this rather than leaving the router unbuilt is what keeps tunnelled audio
+/// working when there is no socket: the alternative was no packet path at all,
+/// so a firewalled client and an un-socketed deployment were both silent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDatagrams;
+
+impl Datagrams for NoDatagrams {
+    fn send_to(&self, _addr: SocketAddr, _bytes: Bytes) {
+        // Nothing to drop a counter for: no peer can have a proven UDP address
+        // without a socket to have proven it on, so the router never routes
+        // here in the first place.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

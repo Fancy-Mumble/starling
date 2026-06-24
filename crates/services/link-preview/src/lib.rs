@@ -15,12 +15,12 @@ use tokio as _;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{
     LinkPreviewEnvelope, Preview, PreviewError, link_preview_envelope,
 };
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
@@ -119,9 +119,9 @@ fn is_private(host: &str) -> bool {
 #[derive(Debug)]
 pub struct LinkPreviewService {
     fanout: Fanout,
+    logger: Logger,
 }
 
-#[async_trait]
 impl ClientService for LinkPreviewService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::LinkPreview.outer_type();
@@ -129,6 +129,15 @@ impl ClientService for LinkPreviewService {
             return Actions::new();
         }
         let Ok(envelope) = LinkPreviewEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable LinkPreviewEnvelope"
+            );
             return Actions::new();
         };
         let Some(link_preview_envelope::Body::Request(request)) = envelope.body else {
@@ -136,12 +145,39 @@ impl ClientService for LinkPreviewService {
         };
 
         let reply = match vet(&request.url) {
-            Err(refusal) => LinkPreviewEnvelope {
-                body: Some(link_preview_envelope::Body::Error(PreviewError {
-                    request_id: request.request_id,
-                    reason: refusal.reason().to_owned(),
-                })),
-            },
+            Err(refusal) => {
+                // A client asking the server to fetch a loopback or metadata
+                // address is an SSRF attempt, whether or not it knows it. The
+                // guard already refuses; this is what makes it visible, and it
+                // records the session so a repeat offender is attributable.
+                if matches!(refusal, Refusal::PrivateAddress) {
+                    tracing::warn!(
+                        session = inbound.session,
+                        url = %request.url,
+                        "link preview refused: the target is inside the deployment"
+                    );
+                    self.logger.log(
+                        LogEvent::warning(
+                            Category::Security,
+                            "link preview refused: private address",
+                        )
+                        .with("session", inbound.session)
+                        .with("url", request.url.clone()),
+                    );
+                } else {
+                    tracing::debug!(
+                        session = inbound.session,
+                        reason = refusal.reason(),
+                        "link preview refused"
+                    );
+                }
+                LinkPreviewEnvelope {
+                    body: Some(link_preview_envelope::Body::Error(PreviewError {
+                        request_id: request.request_id,
+                        reason: refusal.reason().to_owned(),
+                    })),
+                }
+            }
             Ok(()) => LinkPreviewEnvelope {
                 body: Some(link_preview_envelope::Body::Preview(Preview {
                     request_id: request.request_id,
@@ -154,18 +190,18 @@ impl ClientService for LinkPreviewService {
     }
 }
 
-#[async_trait]
 impl Serve for LinkPreviewService {
     const NAME: &'static str = "link-preview";
 
-    async fn build(_ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
+    async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         Ok(Arc::new(Self {
             fanout: Fanout::default(),
+            logger: ctx.logger,
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 }

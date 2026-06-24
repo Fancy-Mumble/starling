@@ -101,13 +101,22 @@ impl KvStore {
         limit: u32,
         reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
-        let order = if reverse { "DESC" } else { "ASC" };
-        let sql = format!(
-            "SELECT k, v FROM plugin_kv \
+        // Two whole literals rather than one string with the direction
+        // interpolated. sqlx 0.9 refuses a dynamically built query unless it is
+        // wrapped in `AssertSqlSafe`, and reaching for that here would spend
+        // the one escape hatch on the one case that does not need it: the
+        // difference is a single keyword chosen by a `bool`. Keeping the
+        // statements literal means the assertion stays available for somewhere
+        // it is actually unavoidable, and keeps the lint worth listening to.
+        const SCAN_ASC: &str = "SELECT k, v FROM plugin_kv \
              WHERE plugin_id = ? AND server_id = ? AND k >= ? AND k < ? \
-             ORDER BY k {order} LIMIT ?"
-        );
-        let rows = sqlx::query(&sql)
+             ORDER BY k ASC LIMIT ?";
+        const SCAN_DESC: &str = "SELECT k, v FROM plugin_kv \
+             WHERE plugin_id = ? AND server_id = ? AND k >= ? AND k < ? \
+             ORDER BY k DESC LIMIT ?";
+
+        let sql = if reverse { SCAN_DESC } else { SCAN_ASC };
+        let rows = sqlx::query(sql)
             .bind(plugin)
             .bind(i64::from(server))
             .bind(start)

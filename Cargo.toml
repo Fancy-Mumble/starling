@@ -1,5 +1,8 @@
 [workspace]
-resolver = "2"
+# v3 is the edition-2024 default for packages, but a virtual manifest has to
+# opt in by hand or it silently stays on v2. v3 is what makes `rust-version`
+# below bind: a dependency needing a newer compiler is not selected.
+resolver = "3"
 members = [
     # Wire and security primitives — no I/O, no state.
     "crates/proto",
@@ -34,6 +37,9 @@ members = [
     "crates/services/link-preview",
     "crates/services/context-actions",
 
+    # Outward-facing: what this server tells the world about itself.
+    "crates/services/directory",
+
     # The admin plane, and the entrypoint every deployment runs.
     "crates/operator-api",
     "crates/migrate",
@@ -43,6 +49,10 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
+# Matches rust-toolchain.toml. Kept in step with it deliberately: this is the
+# version the resolver holds dependencies to, so letting it drift below the
+# pin would admit crates the pinned compiler cannot build.
+rust-version = "1.95"
 license = "MIT"
 publish = false
 
@@ -73,6 +83,7 @@ starling-onboarding = { path = "crates/services/onboarding" }
 starling-social = { path = "crates/services/social" }
 starling-link-preview = { path = "crates/services/link-preview" }
 starling-context-actions = { path = "crates/services/context-actions" }
+starling-directory = { path = "crates/services/directory" }
 starling-operator-api = { path = "crates/operator-api" }
 starling-migrate = { path = "crates/migrate" }
 
@@ -99,14 +110,14 @@ tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
-rcgen = "0.13"
+rcgen = "0.14.8"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
 axum = "0.8"
 
 # -- data -------------------------------------------------------------------
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
     "any",
@@ -117,22 +128,22 @@ sqlx = { version = "0.8", default-features = false, features = [
 uuid = { version = "1", features = ["v7"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = "1.1.3+spec-1.1.0"
 zstd = "0.13"
 
 # -- crypto -----------------------------------------------------------------
-aes = "0.8"
-chacha20 = "0.9"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
+aes = "0.9.2"
+chacha20 = "0.10.1"
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
 rand = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
-jsonwebtoken = "9"
-base64 = "0.22"
+jsonwebtoken = "11"
+base64 = "0.23"
 
 # -- diagnostics ------------------------------------------------------------
 thiserror = "2"
@@ -180,6 +191,60 @@ allow_attributes_without_reason = "deny"
 branches_sharing_code = "deny"
 collapsible_else_if = "deny"
 expect_used = "warn"
+
+# -- Bugs that are silent when they happen ----------------------------------
+# Each of these was measured to fire zero times when it was added, so they cost
+# nothing today and exist to keep it that way.
+debug_assert_with_mut_call = "deny"  # the side effect disappears in release
+read_zero_byte_vec = "deny"          # `read` into an empty Vec reads nothing
+path_buf_push_overwrite = "deny"     # pushing an absolute path drops the base
+fallible_impl_from = "deny"          # `From` must not panic; `TryFrom` exists
+panic_in_result_fn = "deny"          # completes unwrap_used/expect_used above
+mem_forget = "deny"
+rc_mutex = "deny"
+rc_buffer = "warn"
+mutex_atomic = "warn"
+
+# -- Hygiene: never wanted in a shipped server ------------------------------
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+exit = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# -- Consistency this tree already keeps ------------------------------------
+# `string_to_string` is not here: it was removed in 1.95, folded into
+# `implicit_clone` above.
+str_to_string = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_type_annotations = "warn"
+unnecessary_self_imports = "warn"
+try_err = "warn"
+unneeded_field_pattern = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+empty_drop = "warn"
+trailing_empty_array = "warn"
+pathbuf_init_then_push = "warn"
+if_then_some_else_none = "warn"
+missing_assert_message = "warn"
+verbose_file_reads = "warn"
+filetype_is_file = "warn"
+create_dir = "warn"
+lossy_float_literal = "warn"
+while_float = "warn"
+suspicious_xor_used_as_pow = "warn"
+
+# -- Correctness, cleared before being turned on ----------------------------
+float_cmp = "warn"
+unwrap_in_result = "warn"
+checked_conversions = "warn"
+unnested_or_patterns = "warn"
+needless_continue = "warn"
+string_slice = "warn"
+iter_over_hash_type = "warn"
+redundant_clone = "warn"
+unused_async = "deny"
 
 [profile.release]
 lto = "thin"

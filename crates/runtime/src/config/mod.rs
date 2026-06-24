@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use starling_proto_fancy::ServiceKind;
 
+use crate::log::LogConfig;
 use crate::tier::Tier;
 
 /// Everything a process needs to know before it starts.
@@ -39,6 +40,13 @@ pub struct Config {
     pub gateway: GatewayConfig,
     /// Where traces, metrics and logs go.
     pub telemetry: TelemetryConfig,
+    /// The operator event log: who connected, what was refused.
+    ///
+    /// Separate from [`telemetry`](Self::telemetry) because the two answer to
+    /// different people. `RUST_LOG` is a developer's dial and may be turned
+    /// down to nothing; this is the record an operator is entitled to keep, and
+    /// it has its own level, categories and destinations.
+    pub logging: LogConfig,
     /// Every service, by name.
     pub services: BTreeMap<String, ServiceConfig>,
     /// Virtual servers, in murmur's sense. Metadata runs one actor per entry.
@@ -175,10 +183,13 @@ impl Config {
         Ok(config)
     }
 
-    /// The built-in defaults, with every service pointed at a Unix socket.
+    /// The built-in defaults, with every service on a local endpoint.
     ///
     /// This is what a first boot with no file gets, and what `--all-in-one`
-    /// starts from.
+    /// starts from. Which local mechanism that is belongs to
+    /// [`crate::transport::local_endpoint`] — a Unix socket, or a named pipe on
+    /// Windows — so that a first boot works on the platform it happens on
+    /// without an operator having to allocate a port per service.
     #[must_use]
     pub fn with_defaults(run_dir: &Path) -> Self {
         let mut config = Self {
@@ -186,9 +197,8 @@ impl Config {
             ..Self::default()
         };
         for kind in ServiceKind::all() {
-            let socket = run_dir.join(format!("{}.sock", kind.name()));
             let mut service = ServiceConfig::new(
-                &format!("unix:{}", socket.display()),
+                &crate::transport::local_endpoint(run_dir, kind.name()),
                 default_tier(*kind),
                 &default_types(*kind),
             );
@@ -203,10 +213,24 @@ impl Config {
         // real endpoint, because every other service subscribes to it over
         // gRPC — the same self-discovery gap that a bare `ServiceKind` loop
         // cannot fill.
-        let socket = run_dir.join("session-view.sock");
         let _ = config.services.insert(
             "session-view".to_owned(),
-            ServiceConfig::new(&format!("unix:{}", socket.display()), Tier::Essential, &[]),
+            ServiceConfig::new(
+                &crate::transport::local_endpoint(run_dir, "session-view"),
+                Tier::Essential,
+                &[],
+            ),
+        );
+        // Also not a `ServiceKind`, and for the opposite reason to session-view:
+        // it needs no endpoint at all. Nothing dials the announcer — it dials the
+        // public server list — so this entry exists only so that an operator can
+        // switch it off or point it at a different trust store.
+        let _ = config.services.insert(
+            "directory".to_owned(),
+            ServiceConfig {
+                tier: Tier::Optional,
+                ..ServiceConfig::default()
+            },
         );
         config
     }
@@ -266,10 +290,20 @@ fn default_tier(kind: ServiceKind) -> Tier {
 /// again: `docs/diagrams/services.puml` is the same table in picture form.
 fn default_types(kind: ServiceKind) -> Vec<u16> {
     let upstream: &[u16] = match kind {
-        ServiceKind::SessionLifecycle => &[0, 2, 3, 4, 5, 15, 21],
+        // UserState (9) and UserStats (22) are connection state, and both were
+        // routed to userdata — which has no arm for either and returned
+        // nothing. A frame with no handler is dropped silently, because an
+        // unroutable frame is normally harmless, so both simply did nothing:
+        // right-click → Information never opened a window, and self-mute and
+        // self-deafen never took effect. The handlers for both live here, on
+        // the service that owns a connection's existence.
+        ServiceKind::SessionLifecycle => &[0, 2, 3, 4, 5, 9, 15, 21, 22],
         ServiceKind::Permissions => &[12, 13, 20],
         ServiceKind::Metadata => &[6, 7],
-        ServiceKind::Userdata => &[9, 14, 18, 22, 23],
+        // 18 is `UserList`, the registered-account list, which is genuinely
+        // userdata's — it is simply not implemented yet, unlike the two above,
+        // which were implemented and merely unreachable.
+        ServiceKind::Userdata => &[14, 18, 23],
         ServiceKind::Voice => &[1, 19],
         ServiceKind::Text => &[11],
         // UserRemove (8) is a kick or a ban, which is moderation's, not userdata's.
@@ -289,6 +323,12 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
     match kind {
         ServiceKind::Screenshare => Some("signalling"),
         ServiceKind::Plugins => Some("plugin"),
+        // Tunnelled audio is fifty frames a second, so the control bucket —
+        // murmur's 1/s — throttles a talking client off the air within one
+        // second of speech. Upstream does not charge it at all: `UDPTunnel` is
+        // handled and returned from at the top of `Server::message`
+        // (`Server.cpp:1905`), before the message-rate check further down.
+        ServiceKind::Voice => Some("audio"),
         _ => None,
     }
 }
@@ -296,6 +336,33 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_types_a_client_uses_go_to_the_service_that_implements_them() {
+        // Routing a type to a service with no arm for it is invisible: the
+        // frame is accepted, dropped, and never answered, so the feature just
+        // does nothing. It happened to `UserState` and `UserStats`, which sat
+        // on userdata while their handlers sat unreachable on
+        // session-lifecycle — self-mute did nothing and right-click →
+        // Information opened no window.
+        let config = Config::with_defaults(Path::new("/run/starling"));
+        for (type_id, expected, what) in [
+            (9_u16, "session-lifecycle", "UserState / self-mute"),
+            (22, "session-lifecycle", "UserStats / Information"),
+            (21, "session-lifecycle", "CodecVersion"),
+            (11, "text", "TextMessage"),
+            (7, "metadata", "ChannelState"),
+            (8, "moderation", "UserRemove / kick"),
+            (14, "userdata", "QueryUsers"),
+            (23, "userdata", "RequestBlob"),
+        ] {
+            assert_eq!(
+                config.route(type_id).map(|(name, _)| name),
+                Some(expected),
+                "type {type_id} ({what}) must be routed to {expected}"
+            );
+        }
+    }
 
     #[test]
     fn every_service_gets_a_route_and_a_tier_by_default() {

@@ -17,7 +17,6 @@ pub use sign::{Signature, sign, verify};
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::files::{FilesEnvelope, Grant, Refused, files_envelope};
@@ -26,6 +25,7 @@ use starling_proto_fancy::files::{ObjectInfo, SignRequest, SignedUrl, StatReques
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::config::ByteSize;
 use starling_runtime::ids::now_ms;
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
@@ -54,6 +54,7 @@ pub struct FilesService {
     ttl_ms: u64,
     max_upload: u64,
     fanout: Fanout,
+    logger: Logger,
 }
 
 impl FilesService {
@@ -85,6 +86,14 @@ impl Files for FilesRpc {
         let req = request.into_inner();
         let op = sign_request::Op::try_from(req.op).unwrap_or(sign_request::Op::Get);
         if matches!(op, sign_request::Op::Put) && req.max_bytes > self.0.max_upload {
+            // The client is told, but the operator is the one who can raise the
+            // limit — and cannot if the refusal never reaches them.
+            self.0.logger.log(
+                LogEvent::notice(Category::Permission, "upload refused: over the size limit")
+                    .with("key", req.key.clone())
+                    .with("requested", req.max_bytes)
+                    .with("limit", self.0.max_upload),
+            );
             return Err(Status::invalid_argument(format!(
                 "an upload may be at most {} bytes",
                 self.0.max_upload
@@ -95,6 +104,7 @@ impl Files for FilesRpc {
         } else {
             "GET"
         };
+        tracing::debug!(key = %req.key, method, "signed url granted");
         Ok(Response::new(self.0.grant(method, &req.key)))
     }
 
@@ -127,16 +137,35 @@ impl Files for FilesRpc {
     async fn delete(&self, request: Request<StatRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
         let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
-        let _ = sqlx::query("DELETE FROM object WHERE server_id = ? AND k = ?")
+        let result = sqlx::query("DELETE FROM object WHERE server_id = ? AND k = ?")
             .bind(i64::from(scope))
             .bind(&req.key)
             .execute(self.0.store.pool())
             .await;
+        match result {
+            Ok(done) if done.rows_affected() > 0 => {
+                self.0.logger.log(
+                    LogEvent::notice(Category::Admin, "object deleted")
+                        .with("key", req.key.clone())
+                        .with("scope", scope),
+                );
+            }
+            Ok(_) => tracing::debug!(key = %req.key, "delete for an object that does not exist"),
+            Err(error) => {
+                // Acknowledged either way, so without this the caller believes
+                // a file is gone that is still there.
+                tracing::error!(key = %req.key, %error, "could not delete an object");
+                self.0.logger.log(
+                    LogEvent::error(Category::Admin, "object could not be deleted")
+                        .with("key", req.key.clone())
+                        .with("error", error.to_string()),
+                );
+            }
+        }
         Ok(Response::new(Ack {}))
     }
 }
 
-#[async_trait]
 impl ClientService for FilesService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Files.outer_type();
@@ -188,7 +217,6 @@ impl ClientService for FilesService {
     }
 }
 
-#[async_trait]
 impl Serve for FilesService {
     const NAME: &'static str = "files";
 
@@ -208,11 +236,12 @@ impl Serve for FilesService {
                 .map_or(900_000, |ttl| ttl.get().as_millis() as u64),
             max_upload: service.max_upload.map_or(512 * 1024 * 1024, ByteSize::get),
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(FilesServer::new(FilesRpc(Arc::clone(&self))))
             .add_service(plane)
@@ -244,6 +273,7 @@ mod tests {
             ttl_ms: 900_000,
             max_upload: 1024,
             fanout: Fanout::default(),
+            logger: Logger::null(),
         })
     }
 

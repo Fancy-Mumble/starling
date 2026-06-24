@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto::proto::tcp;
 use starling_proto_fancy::fancy::feature::{
@@ -67,27 +66,40 @@ impl ContextActionsService {
     }
 }
 
-#[async_trait]
 impl ClientService for ContextActionsService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::ContextActions.outer_type();
         match inbound.type_id {
             CONTEXT_ACTION => {
                 let Ok(action) = tcp::ContextAction::decode(inbound.payload.as_slice()) else {
+                    tracing::debug!(conn = inbound.conn, "undecodable ContextAction");
                     return Actions::new();
                 };
                 // An action nobody registered is dropped rather than relayed:
                 // forwarding it would let a client invent menu entries for
                 // plugins that never offered them.
                 if self.owner(&action.action).is_none() {
+                    // The user clicked a menu entry and nothing happened, which
+                    // is indistinguishable from a broken plugin without this.
+                    tracing::debug!(
+                        session = inbound.session,
+                        action = %action.action,
+                        "context action for an unregistered entry dropped"
+                    );
                     return Actions::new();
                 }
+                tracing::debug!(
+                    session = inbound.session,
+                    action = %action.action,
+                    "context action triggered"
+                );
                 Actions::new()
             }
             CONTEXT_ACTION_MODIFY => Actions::new(),
             id if id == outer => {
                 let Ok(envelope) = ContextActionsEnvelope::decode(inbound.payload.as_slice())
                 else {
+                    tracing::debug!(conn = inbound.conn, "undecodable ContextActionsEnvelope");
                     return Actions::new();
                 };
                 match envelope.body {
@@ -105,7 +117,6 @@ impl ClientService for ContextActionsService {
     }
 }
 
-#[async_trait]
 impl Serve for ContextActionsService {
     const NAME: &'static str = "context-actions";
 
@@ -117,7 +128,7 @@ impl Serve for ContextActionsService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 }

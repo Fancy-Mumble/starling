@@ -108,7 +108,12 @@ impl Store {
     ///
     /// [`StoreError::Query`] with the statement's first line for context.
     pub async fn execute(&self, sql: &str) -> Result<(), StoreError> {
-        sqlx::query(sql)
+        // `AssertSqlSafe` because sqlx 0.9 will only take a `&'static str`
+        // otherwise, and this is schema work: every caller passes a `Migration`
+        // constant compiled into the binary. No value from a client reaches
+        // here — a migration is not somewhere user data is interpolated — which
+        // is exactly the audit the assertion is asking for.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(self.pool())
             .await
             .map(|_| ())

@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{Flow, OnboardingEnvelope, onboarding_envelope};
 use starling_proto_fancy::types::ServiceKind;
@@ -70,7 +69,6 @@ impl OnboardingService {
     }
 }
 
-#[async_trait]
 impl ClientService for OnboardingService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Onboarding.outer_type();
@@ -78,6 +76,15 @@ impl ClientService for OnboardingService {
             return Actions::new();
         }
         let Ok(envelope) = OnboardingEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable OnboardingEnvelope"
+            );
             return Actions::new();
         };
 
@@ -114,7 +121,6 @@ impl ClientService for OnboardingService {
     }
 }
 
-#[async_trait]
 impl Serve for OnboardingService {
     const NAME: &'static str = "onboarding";
 
@@ -129,7 +135,7 @@ impl Serve for OnboardingService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 }

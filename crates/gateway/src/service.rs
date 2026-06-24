@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use tonic::service::Routes;
 
@@ -19,7 +18,6 @@ pub struct GatewayService {
     gateway: Arc<Gateway>,
 }
 
-#[async_trait]
 impl Serve for GatewayService {
     const NAME: &'static str = "gateway";
 
@@ -34,6 +32,7 @@ impl Serve for GatewayService {
             Arc::clone(&ctx.config),
             ctx.metrics.clone(),
             ctx.health.clone(),
+            ctx.logger.clone(),
         )
         .map_err(|error| ServiceError::service(error.to_string()))?;
         Ok(Arc::new(Self {

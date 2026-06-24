@@ -30,6 +30,8 @@ pub mod varint;
 
 pub mod service;
 pub mod socket;
+pub mod tunnel;
+pub mod view;
 
 #[cfg(test)]
 mod testing;
@@ -42,3 +44,5 @@ pub use routing::{REGULAR_SPEECH, RoutingSnapshot, SERVER_LOOPBACK, Target};
 pub use service::VoiceService;
 pub use socket::VoiceSocket;
 pub use targets::{MAX_TARGET, ShoutTarget, TargetError, TargetRegistry, VoiceTarget};
+pub use tunnel::GatewayTunnel;
+pub use view::SessionCache;

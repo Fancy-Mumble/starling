@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::feature::{
@@ -26,6 +25,7 @@ use starling_proto_fancy::plugins::{
     KvWriteRequest, Plugin, PluginList, PluginMessage, PluginResult, UninstallRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
@@ -42,6 +42,7 @@ pub struct PluginsService {
     installed: Mutex<HashMap<String, Plugin>>,
     kv: KvStore,
     fanout: Fanout,
+    logger: Logger,
 }
 
 impl PluginsService {
@@ -92,6 +93,18 @@ impl Plugins for PluginsRpc {
             }));
         };
         plugin.enabled = req.enabled;
+        tracing::info!(id = %req.id, enabled = req.enabled, "plugin enablement changed");
+        self.0.logger.log(
+            LogEvent::notice(
+                Category::Plugin,
+                if req.enabled {
+                    "plugin enabled"
+                } else {
+                    "plugin disabled"
+                },
+            )
+            .with("plugin", req.id.clone()),
+        );
         Ok(Response::new(PluginResult {
             applied: true,
             refused: String::new(),
@@ -122,6 +135,15 @@ impl Plugins for PluginsRpc {
             wasm: true,
             capabilities: Vec::new(),
         };
+        // Installing a plugin is adding code to the server. It is recorded at
+        // notice whether or not anyone is watching, because "when did this
+        // appear" is unanswerable afterwards.
+        self.0.logger.log(
+            LogEvent::notice(Category::Plugin, "plugin installed")
+                .with("plugin", plugin.id.clone())
+                .with("source", req.source_key)
+                .with("wasm", plugin.wasm),
+        );
         self.0.install(plugin.clone());
         Ok(Response::new(PluginResult {
             applied: true,
@@ -135,8 +157,17 @@ impl Plugins for PluginsRpc {
         request: Request<UninstallRequest>,
     ) -> Result<Response<PluginResult>, Status> {
         let req = request.into_inner();
-        if let Ok(mut installed) = self.0.installed.lock() {
-            let _ = installed.remove(&req.id);
+        let removed = self
+            .0
+            .installed
+            .lock()
+            .is_ok_and(|mut installed| installed.remove(&req.id).is_some());
+        if removed {
+            self.0.logger.log(
+                LogEvent::notice(Category::Plugin, "plugin uninstalled").with("plugin", req.id),
+            );
+        } else {
+            tracing::debug!(id = %req.id, "uninstall for a plugin that is not installed");
         }
         Ok(Response::new(PluginResult {
             applied: true,
@@ -226,17 +257,12 @@ impl Plugins for PluginsRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for PluginsService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Plugins.outer_type();
         match inbound.type_id {
             // Opaque client-to-client data: relayed, never inspected.
-            PLUGIN_DATA => vec![to_sessions(
-                Vec::new(),
-                PLUGIN_DATA,
-                inbound.payload.clone(),
-            )],
+            PLUGIN_DATA => vec![to_sessions(Vec::new(), PLUGIN_DATA, inbound.payload)],
             id if id == outer => {
                 let Ok(envelope) = PluginsEnvelope::decode(inbound.payload.as_slice()) else {
                     return Actions::new();
@@ -290,7 +316,6 @@ impl ClientService for PluginsService {
     }
 }
 
-#[async_trait]
 impl Serve for PluginsService {
     const NAME: &'static str = "plugins";
 
@@ -301,11 +326,12 @@ impl Serve for PluginsService {
             installed: Mutex::new(HashMap::new()),
             kv,
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(PluginsServer::new(PluginsRpc(Arc::clone(&self))))
             .add_service(plane)
@@ -336,6 +362,7 @@ mod tests {
             installed: Mutex::new(HashMap::new()),
             kv,
             fanout: Fanout::default(),
+            logger: Logger::null(),
         })
     }
 

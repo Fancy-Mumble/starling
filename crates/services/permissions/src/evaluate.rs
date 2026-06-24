@@ -14,9 +14,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use starling_proto::proto::tcp;
+use starling_proto_fancy::identity;
 use starling_proto_fancy::permissions::{AclSet, Subject};
 
 use crate::perm::Perm;
+
+/// The root channel's id, which is zero on every Mumble server.
+const ROOT_CHANNEL: u32 = 0;
 
 /// Every channel's ACL set, by virtual server.
 #[derive(Debug, Clone, Default)]
@@ -54,6 +58,21 @@ impl Acls {
                 acls: Vec::new(),
                 groups: Vec::new(),
             })
+    }
+
+    /// Forget a channel that no longer exists.
+    ///
+    /// Both tables, because a leak here is unbounded: a server that creates and
+    /// deletes temporary channels all day would otherwise accumulate one entry
+    /// per channel for the life of the process. Worse than the memory, a later
+    /// channel reusing the id would inherit the dead one's ACL set.
+    pub fn forget(&self, scope: u32, channel: u32) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.remove(&(scope, channel));
+        }
+        if let Ok(mut parents) = self.parents.lock() {
+            let _ = parents.remove(&(scope, channel));
+        }
     }
 
     /// Record the tree shape the walk needs.
@@ -96,7 +115,10 @@ impl Acls {
     #[must_use]
     pub fn groups_of(&self, scope: u32, subject: &Subject, channel: u32) -> Vec<String> {
         let mut groups = vec!["all".to_owned()];
-        if subject.authenticated {
+        // `@auth` is `iId >= 0` upstream (`vendor/server/src/Group.cpp:154`) —
+        // *registered*, not "connected". Reading it as the latter puts every
+        // anonymous guest in the group an operator granted to their members.
+        if identity::is_authenticated(subject.registered) {
             groups.push("auth".to_owned());
         }
         for id in self.ancestry(scope, channel) {
@@ -118,24 +140,47 @@ impl Acls {
 /// The superuser is granted everything before any walk happens, exactly as
 /// murmur does: an ACL table that has locked its own administrator out is a
 /// server nobody can repair.
+///
+/// The check goes through [`identity::is_superuser`] rather than comparing
+/// `account` here, and that indirection is load-bearing in both directions. This
+/// function used to hold `const SUPERUSER: u64 = 1`, which granted every
+/// permission to the first ordinary registered account while leaving the real
+/// administrator — account 0 — subject to its own ACLs. Changing the constant to
+/// 0 without also requiring registration would have been worse still, because an
+/// unregistered guest is written as `account = 0`.
 #[must_use]
 pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32 {
-    const SUPERUSER: u64 = 1;
-    if subject.account == SUPERUSER {
-        return Perm::ALL.bits();
+    if identity::is_superuser(subject.registered, subject.account) {
+        return Perm::SUPERUSER.bits();
     }
 
     let groups = acls.groups_of(scope, subject, channel);
     let chain = acls.ancestry(scope, channel);
-    let mut granted = Perm::NONE;
+    // murmur seeds the walk with a default set rather than with nothing
+    // (`vendor/server/src/ACL.cpp:130`). Starting from `NONE` made an
+    // unconfigured server grant nobody anything at all — every client showing
+    // every action greyed out, with no ACL entry anywhere to explain it.
+    let mut granted = Perm::DEFAULT;
 
     for (depth, id) in chain.iter().enumerate() {
         let set = acls.get(scope, *id);
         let is_target = depth + 1 == chain.len();
         if !set.inherit {
-            // Inheritance off: this channel starts from nothing, which is what
-            // makes a "detached" channel a real boundary rather than a hint.
-            granted = Perm::NONE;
+            // Inheritance off resets to the *default* set, not to nothing
+            // (`vendor/server/src/ACL.cpp:141` assigns `def` here, the same
+            // value the walk started from). A detached channel is still a
+            // channel people can enter and speak in; what it detaches from is
+            // its parents' ACL entries, not from being usable at all.
+            granted = Perm::DEFAULT;
+        }
+
+        // Registered users — not the SuperUser, which returned above, and not
+        // guests — can read the account directory from the root by default, so
+        // an offline user can be resolved and invited
+        // (`vendor/server/src/ACL.cpp:147`). Seeded before this channel's own
+        // entries, so a root ACL denying it can still take it away.
+        if *id == ROOT_CHANNEL && identity::account(subject.registered, subject.account).is_some() {
+            granted |= Perm::READ_REGISTER;
         }
         for entry in &set.acls {
             let applies = if is_target {
@@ -268,11 +313,19 @@ mod tests {
                 groups: Vec::new(),
             },
         );
-        assert_eq!(evaluate(&acls, 1, &Subject::default(), 0), 0);
+        let granted = Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 0));
+        assert!(!granted.contains(Perm::SPEAK), "deny must win over grant");
+        // The rest of the default set survives: denying one permission takes
+        // that one away, not everything.
+        assert!(granted.contains(Perm::TEXT_MESSAGE));
     }
 
     #[test]
-    fn a_channel_with_inheritance_off_starts_from_nothing() {
+    fn a_channel_with_inheritance_off_starts_from_the_default_set() {
+        // Not from nothing, which is what this asserted before and what murmur
+        // does not do (`ACL.cpp:141` reassigns the same `def` the walk began
+        // with). Detaching a channel drops its parents' *entries*; it does not
+        // make the channel unusable.
         let acls = Acls::new();
         acls.set_parent(1, 5, 0);
         acls.set(
@@ -280,7 +333,7 @@ mod tests {
             AclSet {
                 channel: 0,
                 inherit: true,
-                acls: vec![allow("all", Perm::SPEAK, true)],
+                acls: vec![allow("all", Perm::MAKE_CHANNEL, true)],
                 groups: Vec::new(),
             },
         );
@@ -293,13 +346,117 @@ mod tests {
                 groups: Vec::new(),
             },
         );
-        assert_eq!(evaluate(&acls, 1, &Subject::default(), 5), 0);
+
+        let granted = Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 5));
+        assert!(
+            !granted.contains(Perm::MAKE_CHANNEL),
+            "the parent's grant must not carry into a detached channel"
+        );
+        assert!(
+            granted.contains(Perm::SPEAK) && granted.contains(Perm::ENTER),
+            "but the default set is still there: {granted:?}"
+        );
     }
 
     #[test]
-    fn the_superuser_is_never_locked_out_by_an_acl_table() {
-        // A server whose administrator cannot get in is a server nobody can
-        // repair.
+    fn an_acl_on_a_parent_reaches_its_children() {
+        // Inheritance, which needs the parent table to be populated. Until the
+        // tree subscription existed nothing wrote it outside tests, so every
+        // channel evaluated as a root and an entry on a parent reached nothing —
+        // visibly present in the ACL editor, silently never consulted.
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![allow("all", Perm::MAKE_CHANNEL, true)],
+                groups: Vec::new(),
+            },
+        );
+
+        let granted = Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 5));
+        assert!(
+            granted.contains(Perm::MAKE_CHANNEL),
+            "a grant on the root must apply in a child channel: {granted:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_channel_leaves_nothing_behind() {
+        // A leak here is unbounded on a server that churns temporary channels,
+        // and worse than the memory: a later channel reusing the id would
+        // inherit the dead one's ACL set.
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: false,
+                acls: vec![allow("all", Perm::MAKE_CHANNEL, true)],
+                groups: Vec::new(),
+            },
+        );
+        assert!(
+            Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 5))
+                .contains(Perm::MAKE_CHANNEL)
+        );
+
+        acls.forget(1, 5);
+
+        assert_eq!(acls.ancestry(1, 5), vec![5], "the parent link must be gone");
+        assert!(
+            !Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 5))
+                .contains(Perm::MAKE_CHANNEL),
+            "a new channel reusing the id must not inherit the old one's grants"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_server_lets_people_talk() {
+        // The regression this exists for: starting the walk from `NONE` made a
+        // server with no ACL table grant nobody anything — every action greyed
+        // out in every client, with no entry anywhere to blame. murmur seeds
+        // the walk with these six (`ACL.cpp:130`).
+        let granted = Perm::from_bits_truncate(evaluate(&Acls::new(), 1, &Subject::default(), 0));
+        for expected in [
+            Perm::TRAVERSE,
+            Perm::ENTER,
+            Perm::SPEAK,
+            Perm::WHISPER,
+            Perm::TEXT_MESSAGE,
+            Perm::LISTEN,
+        ] {
+            assert!(granted.contains(expected), "missing {expected:?}");
+        }
+        // And nothing administrative comes for free.
+        assert!(!granted.contains(Perm::WRITE));
+        assert!(!granted.contains(Perm::MAKE_CHANNEL));
+        assert!(!granted.contains(Perm::KICK));
+    }
+
+    #[test]
+    fn a_registered_user_can_read_the_account_directory_from_the_root() {
+        // Seeded at the root for registered users so an offline account can be
+        // resolved and invited (`ACL.cpp:147`). A guest does not get it.
+        let registered = Subject {
+            account: 7,
+            registered: true,
+            ..Subject::default()
+        };
+        let granted = Perm::from_bits_truncate(evaluate(&Acls::new(), 1, &registered, 0));
+        assert!(granted.contains(Perm::READ_REGISTER));
+
+        let guest = Perm::from_bits_truncate(evaluate(&Acls::new(), 1, &Subject::default(), 0));
+        assert!(!guest.contains(Perm::READ_REGISTER));
+    }
+
+    /// An ACL table that denies everything to everyone, at the root.
+    ///
+    /// The table an administrator has to be able to survive.
+    fn denies_everything() -> Acls {
         let acls = Acls::new();
         acls.set(
             1,
@@ -316,25 +473,91 @@ mod tests {
                 groups: Vec::new(),
             },
         );
-        let superuser = Subject {
-            account: 1,
-            authenticated: true,
-            ..Subject::default()
-        };
-        assert_eq!(evaluate(&acls, 1, &superuser, 0), Perm::ALL.bits());
+        acls
     }
 
     #[test]
-    fn an_authenticated_subject_is_in_auth_and_an_anonymous_one_is_not() {
+    fn the_superuser_is_never_locked_out_by_an_acl_table() {
+        // A server whose administrator cannot get in is a server nobody can
+        // repair. Note `registered: true` — this test used to assert the same
+        // thing about `account: 1`, which is why nothing caught the evaluator
+        // and userdata disagreeing about which account this is.
+        let superuser = Subject {
+            account: identity::SUPERUSER,
+            registered: true,
+            ..Subject::default()
+        };
+        let granted = Perm::from_bits_truncate(evaluate(&denies_everything(), 1, &superuser, 0));
+
+        // Everything administrative, through a table that denies all of it.
+        for expected in [
+            Perm::WRITE,
+            Perm::MAKE_CHANNEL,
+            Perm::KICK,
+            Perm::BAN,
+            Perm::REGISTER,
+        ] {
+            assert!(granted.contains(expected), "missing {expected:?}");
+        }
+        // But **not** speaking or whispering — murmur excludes exactly those
+        // two (`ACL.cpp:106`), so an operator who logs in to fix something is
+        // not silently transmitting into whatever channel they land in.
+        assert!(!granted.contains(Perm::SPEAK));
+        assert!(!granted.contains(Perm::WHISPER));
+        assert_eq!(granted, Perm::SUPERUSER);
+    }
+
+    #[test]
+    fn an_unregistered_subject_is_not_the_superuser() {
+        // The hole this pair of tests exists for. An absent account goes on the
+        // wire as 0 and 0 is the SuperUser's id, so a bypass that checks only
+        // the number hands every anonymous guest the entire server.
+        let guest = Subject {
+            account: identity::SUPERUSER,
+            registered: false,
+            ..Subject::default()
+        };
+        assert_eq!(
+            evaluate(&denies_everything(), 1, &guest, 0),
+            0,
+            "an unregistered subject must be subject to the ACL table"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_registered_user_is_not_the_superuser() {
+        // The other direction: account 1 held every permission on the server.
+        let user = Subject {
+            account: 1,
+            registered: true,
+            ..Subject::default()
+        };
+        assert_eq!(
+            evaluate(&denies_everything(), 1, &user, 0),
+            0,
+            "only the SuperUser bypasses evaluation"
+        );
+    }
+
+    #[test]
+    fn only_a_registered_subject_is_in_the_auth_group() {
+        // `@auth` is `iId >= 0` upstream — registered. It was read as "has a
+        // session", which every connected client does, so anonymous guests were
+        // getting whatever an operator granted to `@auth`.
         let acls = Acls::new();
-        let anonymous = acls.groups_of(1, &Subject::default(), 0);
-        assert!(anonymous.contains(&"all".to_owned()));
-        assert!(!anonymous.contains(&"auth".to_owned()));
+
+        let guest = acls.groups_of(1, &Subject::default(), 0);
+        assert!(guest.contains(&"all".to_owned()));
+        assert!(
+            !guest.contains(&"auth".to_owned()),
+            "an unregistered guest must not be in @auth"
+        );
 
         let registered = acls.groups_of(
             1,
             &Subject {
-                authenticated: true,
+                account: 7,
+                registered: true,
                 ..Subject::default()
             },
             0,

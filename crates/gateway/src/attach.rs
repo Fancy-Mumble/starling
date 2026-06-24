@@ -166,7 +166,7 @@ async fn run_attachment(
     ctx: AttachContext,
 ) {
     loop {
-        let channel = match ctx.resolver.channel(&service).await {
+        let channel = match ctx.resolver.channel(&service) {
             Ok(channel) => channel,
             Err(error) => {
                 tracing::warn!(service = %service, %error, "cannot resolve service; retrying");
@@ -233,8 +233,20 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
         Some(server_action::Action::Send(send)) => deliver(send, ctx),
         Some(server_action::Action::Disconnect(disconnect)) => {
             if let Some(handle) = ctx.registry.by_conn(disconnect.conn) {
-                tracing::debug!(conn = handle.conn, reason = %disconnect.reason, "service asked for a disconnect");
-                ctx.registry.remove(handle.conn);
+                tracing::info!(
+                    conn = handle.conn,
+                    session = handle.session(),
+                    reason = %disconnect.reason,
+                    "service asked for a disconnect"
+                );
+                // Close the socket rather than only forgetting the entry. This
+                // used to be a bare `registry.remove`, which left the client
+                // connected and still sending, and — because `finish` never
+                // ran — never told any service the session had ended, so a
+                // kicked or banned user went on being rendered by everyone
+                // else. The close makes the read loop break, and the ordinary
+                // disconnect path does the removal and the broadcast.
+                handle.close();
                 ctx.metrics
                     .counter("starling_gateway_service_disconnects")
                     .inc();

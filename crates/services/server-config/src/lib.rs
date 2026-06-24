@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::fancy::domain::{
@@ -174,7 +173,6 @@ impl ServerConfigRpc for ConfigRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for ServerConfigService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::ServerConfig.outer_type();
@@ -182,6 +180,15 @@ impl ClientService for ServerConfigService {
             return Actions::new();
         }
         let Ok(envelope) = ServerConfigEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable ServerConfigEnvelope"
+            );
             return Actions::new();
         };
         match envelope.body {
@@ -204,7 +211,6 @@ impl ClientService for ServerConfigService {
     }
 }
 
-#[async_trait]
 impl Serve for ServerConfigService {
     const NAME: &'static str = "server-config";
 
@@ -243,7 +249,7 @@ impl Serve for ServerConfigService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(ServerConfigServer::new(ConfigRpc(Arc::clone(&self))))
             .add_service(plane)

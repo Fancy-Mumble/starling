@@ -24,7 +24,20 @@ pub const REQUEST_ID_HEADER: &str = "x-starling-request-id";
 /// `--all-in-one` starts many services in one process and each of them would
 /// otherwise try.
 pub fn install(config: &TelemetryConfig) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `warn`, not `info`, when `RUST_LOG` says nothing.
+    //
+    // Both this and `crate::log` write to stderr, and at `info` they narrated
+    // the same events twice in two different shapes — the operator log's
+    // `INFO session client connected …` next to tracing's
+    // `INFO starling_gateway::listener: client connected …`. The operator log
+    // is the one meant to be *read*: it is curated, categorised, and covers
+    // startup, connections and refusals. This one is a developer's dial.
+    //
+    // So the default is the level at which a developer's dial is worth
+    // interrupting an operator: something went wrong. `RUST_LOG=debug` brings
+    // back the per-connection detail, `trace` every frame, and
+    // `RUST_LOG=starling_voice=trace` one service's worth.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     let installed = match config.log_format {
         LogFormat::Json => builder.json().try_init().is_ok(),

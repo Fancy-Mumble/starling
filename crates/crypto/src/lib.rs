@@ -52,6 +52,7 @@ pub mod identity;
 pub mod keys;
 pub mod modern;
 pub mod ocb2;
+pub mod peer_cert;
 mod policy;
 pub mod profile;
 pub mod session;
@@ -66,6 +67,7 @@ pub use keys::{
     VoiceSecrets,
 };
 pub use modern::XChaCha20Voice;
+pub use peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 pub use ocb2::Ocb2;
 pub use policy::{CompatibilityFirst, ModernOnly, SecurityPolicy};
 pub use profile::{

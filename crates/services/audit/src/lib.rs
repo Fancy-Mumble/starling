@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use starling_proto_fancy::audit::audit_server::{Audit, AuditServer};
@@ -22,6 +21,7 @@ use starling_proto_fancy::audit::{
 use starling_proto_fancy::fancy::feature::{AuditEnvelope, AuditRecord, Page, audit_envelope};
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
@@ -50,6 +50,7 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
 pub struct AuditService {
     store: Store,
     fanout: Fanout,
+    logger: Logger,
 }
 
 /// The hash of one entry, given the hash before it.
@@ -204,15 +205,37 @@ impl AuditService {
             let expected = chain_hash(&previous, &entry);
             let stored: Vec<u8> = row.try_get("entry_hash").unwrap_or_default();
             if expected != stored {
+                let broken_at: Vec<u8> = row.try_get("id").unwrap_or_default();
+                // The audit chain not matching means rows were altered under
+                // the server. Nothing else in this system is worth an `error`
+                // more than this, and it must not depend on whoever called
+                // `verify` bothering to read the result.
+                tracing::error!(
+                    checked,
+                    scope,
+                    "the audit chain is broken; entries have been altered"
+                );
+                self.logger.log(
+                    LogEvent::error(Category::Security, "the audit chain is broken")
+                        .with("scope", scope)
+                        .with("verified", checked)
+                        .with(
+                            "broken_at",
+                            Uuid7::from_slice(&broken_at)
+                                .map(|id| id.to_string())
+                                .unwrap_or_default(),
+                        ),
+                );
                 return VerifyResult {
                     intact: false,
                     checked,
-                    broken_at: row.try_get("id").unwrap_or_default(),
+                    broken_at,
                 };
             }
             previous = stored;
             checked += 1;
         }
+        tracing::info!(checked, scope, "the audit chain verified intact");
         VerifyResult {
             intact: true,
             checked,
@@ -249,7 +272,6 @@ impl Audit for AuditRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for AuditService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Audit.outer_type();
@@ -304,7 +326,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[async_trait]
 impl Serve for AuditService {
     const NAME: &'static str = "audit";
 
@@ -314,11 +335,12 @@ impl Serve for AuditService {
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(AuditServer::new(AuditRpc(Arc::clone(&self))))
             .add_service(plane)
@@ -346,6 +368,7 @@ mod tests {
         Arc::new(AuditService {
             store,
             fanout: Fanout::default(),
+            logger: Logger::null(),
         })
     }
 
