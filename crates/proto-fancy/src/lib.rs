@@ -118,6 +118,11 @@ generated!(
     plugins,
     "starling.plugins.v1"
 );
+generated!(
+    /// Context-menu entries and the triggers back. Ice's `ServerContextCallback`.
+    contextactions,
+    "starling.contextactions.v1"
+);
 
 /// Client-facing envelopes, one module per owning service.
 pub mod fancy {

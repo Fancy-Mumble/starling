@@ -9,6 +9,35 @@ package MumbleProto;
 
 option optimize_for = SPEED;
 
+// ---------------------------------------------------------------------------
+// Fancy field numbering: **every Fancy-added field starts at 100.**
+//
+// This file is upstream Mumble's, extended. Upstream keeps adding fields to its
+// own messages, and it numbers them consecutively from where it left off — so a
+// Fancy field sitting immediately above upstream's highest number is standing
+// where upstream will step next. When that happens the two definitions disagree
+// about what a number means and neither side errors: protobuf reads the wrong
+// field as the right one, or silently skips it on a type mismatch. There is no
+// symptom to notice.
+//
+// So Fancy takes 100+, leaving upstream ~76 free numbers in the tightest case
+// (`UserState`, whose upstream max is 24). `Authenticate` and `ChannelState`
+// were already written this way; the rest were not, and were moved here.
+// Numbering *within* the Fancy range restarts at 100 per message, because these
+// are independent number spaces and a shared counter would only invite the same
+// consecutive-allocation habit.
+//
+// **The vacated numbers are deliberately not `reserved`.** Reserving them would
+// stop this file from ever adopting the upstream field that lands there, which
+// is the whole thing being made room for. They are free, and upstream owns them.
+//
+// The one exception is `Version.fancy_version = 6`, which stays put: it is the
+// field every shipped Fancy peer reads to decide whether extensions exist at
+// all. Moving it would not break loudly, it would make this server look like
+// plain Mumble to every one of them. `Version.fancy_protocol` is what carries
+// the numbering forward from here — see docs/PROTOCOL-COMPATIBILITY.md §2a.
+// ---------------------------------------------------------------------------
+
 message Version {
 	// Legacy version number format.
 	optional uint32 version_v1 = 1;
@@ -17,6 +46,27 @@ message Version {
 	optional uint64 version_v2 = 5;
     // Fancy Mumble version string.
     optional uint64 fancy_version = 6;
+
+    // Which Fancy *wire* numbering this peer speaks.
+    //
+    // Separate from `fancy_version` on purpose. That field is a product
+    // version: it answers "which features exist", and a peer can infer from it
+    // that some message was implemented. It cannot express "I renumbered the
+    // wire", so a client that trusts it will happily send a type the peer can
+    // route nowhere — which is exactly what happened when Starling kept the
+    // upstream types and moved every Fancy message to a new range.
+    //
+    //   absent / 0  epoch 0: the historical interleaved 100-999 layout, which
+    //               is every Fancy build shipped to date.
+    //   1           epoch 1: upstream 0-99 stays flat and frozen; every Fancy
+    //               service is reached through one outer type >= 1000 carrying
+    //               a service-owned envelope.
+    //
+    // A peer speaks exactly one epoch. When the other side does not know it,
+    // the Fancy extensions are off and the connection degrades to plain Mumble
+    // — plus anything relayable through PluginDataTransmission, which works
+    // through any Mumble server and is therefore epoch-independent.
+    optional uint32 fancy_protocol = 100;
 
 	// Client release name.
 	optional string release = 2;
@@ -363,7 +413,7 @@ message UserState {
 		// Client supports E2EE persistent chat (pchat).
 		FEATURE_PCHAT_E2EE = 0;
 	}
-	repeated ClientFeature client_features = 24;
+	repeated ClientFeature client_features = 100;
 }
 
 // Relays information on the bans. The client may send the BanList message to
@@ -408,15 +458,15 @@ message TextMessage {
 	// The UTF-8 encoded message. May be HTML if the server allows.
 	required string message = 5;
 	// unique identifier for this message
-	optional string message_id = 6;
+	optional string message_id = 100;
 	// message timestamp
-	optional uint64 timestamp = 7;
+	optional uint64 timestamp = 101;
 	// When set, this message is an edit replacing the message with this ID.
-	optional string edit_id = 8;
+	optional string edit_id = 102;
 	// When set, pin or unpin the message with this ID in the channel.
-	optional string pin_target = 9;
+	optional string pin_target = 103;
 	// When true combined with pin_target, unpin instead of pin.
-	optional bool unpin = 10;
+	optional bool unpin = 104;
 }
 
 message PermissionDenied {
@@ -488,13 +538,13 @@ message ACL {
 		// Users inherited, identified by user_id.
 		repeated uint32 inherited_members = 7;
 		// FancyMumble: optional CSS color string for role chip (e.g. "#5865F2").
-		optional string color = 8;
+		optional string color = 100;
 		// FancyMumble: optional raw icon image bytes (PNG/JPEG) for the role.
-		optional bytes icon = 9;
+		optional bytes icon = 101;
 		// FancyMumble: optional named visual style preset id.
-		optional string style_preset = 10;
+		optional string style_preset = 102;
 		// FancyMumble: arbitrary key-value metadata for client-side extensions.
-		repeated KeyValue metadata = 11;
+		repeated KeyValue metadata = 103;
 	}
 	message ChanACL {
 		// True if this ACL applies to the current channel.
@@ -595,13 +645,13 @@ message UserList {
 		optional string last_seen = 3;
 		optional uint32 last_channel = 4;
 		// Registered user avatar (PNG/JPEG bytes).
-		optional bytes texture = 5;
+		optional bytes texture = 100;
 		// SHA-1 hash of the comment when len >= 128; empty otherwise.
 		// If set without comment, the client must request the full text
 		// via RequestBlob.user_id_comment.
-		optional bytes comment_hash = 6;
+		optional bytes comment_hash = 101;
 		// Full comment text when len < 128, or in blob responses.
-		optional string comment = 7;
+		optional string comment = 102;
 	}
 	// A list of registered users.
 	repeated User users = 1;
@@ -739,7 +789,7 @@ message RequestBlob {
 	// channel_ids of the requested ChannelState descriptions.
 	repeated uint32 channel_description = 3;
 	// registered user_ids whose comment should be fetched (offline support).
-	repeated uint32 user_id_comment = 4;
+	repeated uint32 user_id_comment = 100;
 }
 
 // Sent by the server when it informs the clients on server configuration
@@ -761,7 +811,7 @@ message ServerConfig {
 	optional bool recording_allowed = 7;
 	// True when the server has a WebRTC SFU module loaded and can
 	// relay screen-share streams server-side.
-	optional bool webrtc_sfu_available = 8;
+	optional bool webrtc_sfu_available = 100;
 	// Optional public base URL of the Fancy Mumble REST API (file
 	// server, custom emotes, capabilities, ...). Set this when the
 	// server's HTTP interface is exposed under a different hostname
@@ -769,7 +819,7 @@ message ServerConfig {
 	// or Kubernetes ingress. Clients should prefer this URL over any
 	// per-plugin `base_url` when contacting the REST API. Empty /
 	// unset means "no override; use whatever the plugin advertises".
-	optional string fancy_rest_api_url = 9;
+	optional string fancy_rest_api_url = 101;
 }
 
 // Sent by the server to inform the clients of suggested client configuration
