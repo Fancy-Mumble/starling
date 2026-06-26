@@ -8,16 +8,24 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+starling-crypto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+h3-webtransport.workspace = true
+rustls.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
