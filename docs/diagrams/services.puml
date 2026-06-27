@@ -29,18 +29,18 @@ database "**session store**\n«gateway infrastructure, not a service»\nsequence
 package "**control plane** — gRPC only; no client reaches these directly" as CTRL #FAFAFA {
 
   package "essential — down means nobody logs in" as ESS #FFEBEE {
-    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeouts\n0,2,3,4,5,15,21 + **1000**" as slife #FFF9C4
+    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeout sweep\n—\n**UserState (9)** — moves, self-mute,\nmoderator mute/deafen, priority\nspeaker, registration\n**UserStats (22)** — uptime, idle,\nclient build, certificate\n«both were routed to userdata,\nwhich had no handler for either»\n0,2,3,4,5,**9**,15,21,**22** + **1000**" as slife #FFF9C4
     component "**session-view**\n«the domain edge»\nthe composed live view of\nevery connected session.\nThe whole domain reads here.\nOwns nothing, writes nothing.\n**no client-facing type**" as sview #FFF9C4
     component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms #FFFFFF
     component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta #FFFFFF
-    component "**userdata**\nprofiles · accounts · blobs\n**SuperUser is account 0**\n9,14,18,22,23 + **1003**" as users #FFFFFF
+    component "**userdata**\nprofiles · accounts · blobs\n**SuperUser is account 0**, so a\nguest is `None`, never `0`\n**no password ⇒ not claimable**\n**by name alone**\n14,18,23 + **1003**" as users #FFFFFF
     component "**server-config**\nruntime-mutable,\nper virtual server\n24,25 + **1013**" as scfg #FFFFFF
   }
 
   package "core — a feature dies" as CORE #FFF8E1 {
     component "**text**\nhistory: **UUIDv7**\n11 + **1005**" as text #FFFFFF
     component "**pchat**\nE2EE · key mgmt\nhistory: **UUIDv7**\n**1006**" as pchat #FFFFFF
-    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n8,10 + **1007**" as mod #FFFFFF
+    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n—\nchecked on the **root** channel:\nremoval is from the server, not\na room. `Ban` to ban, `Ban` **or**\n`Kick` to kick. Keyed to **address**\n**and certificate** — either alone\nis trivially evaded\n8,10 + **1007**" as mod #FFFFFF
   }
 
   package "optional — nobody notices" as OPT #E8F5E9 {
@@ -195,6 +195,20 @@ note on link #F3E5F5
   **Fail closed on audit.**
 end note
 
+note as OPLOG #FFE0B2
+  **The operator log — every service writes it, no service owns it.**
+  Distinct from `tracing`, which is a developer's dial and defaults
+  to `warn`. This is the record an operator keeps — **who connected,**
+  **what was refused, what an administrator changed** — categorised
+  (server · session · channel · message · permission · security ·
+  plugin · admin) and levelled independently of `RUST_LOG`.
+  Configured under `[logging]`, written by a **dedicated OS thread**
+  behind a bounded queue so a slow disk cannot stall the voice path,
+  and **overflow is counted, never silent**.
+  It is not on this diagram as a component because it is not one:
+  every service holds a handle, and the writer is process-wide.
+end note
+
 note bottom of ESS #FFFFFF
   **Each service owns its own schema.** No service reads
   another's tables. One migration tool, many schemas.
@@ -202,9 +216,12 @@ note bottom of ESS #FFFFFF
   by URL scheme — **SQLite, MySQL or PostgreSQL**. With no
   `[storage]` block a service gets its own SQLite file named
   after it, under the shared data directory.
-  Eleven services keep one: userdata, metadata, server-config,
+  Twelve services keep one: userdata, metadata, server-config,
   text, pchat, moderation, audit, push, files, plugins,
-  onboarding. The rest hold no durable state at all.
+  onboarding, permissions. The rest hold no durable state at all.
+  `permissions` is the newest, and the one whose store is
+  **optional**: it starts without one and says so, because an
+  unreachable database must not mean an unauthorised server.
 end note
 
 legend bottom
