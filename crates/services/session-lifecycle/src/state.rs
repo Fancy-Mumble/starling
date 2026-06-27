@@ -14,6 +14,26 @@ use starling_runtime::ids::now_ms;
 use crate::ids::SessionId;
 use crate::session::{SessionAllocator, SessionSource as _};
 
+/// Who a peer turned out to be, once `userdata` has answered.
+///
+/// A struct rather than the tuple the handshake used to pass around: it now
+/// carries two `Vec<u8>` that would otherwise sit side by side unnamed, where
+/// swapping a comment for an avatar compiles cleanly and renders a user's
+/// biography as a broken image.
+#[derive(Debug, Clone, Default)]
+pub struct Identity {
+    /// The account it holds, or `None` for a guest.
+    pub account: Option<u64>,
+    /// The name to use — the account's own spelling when there is an account,
+    /// so a login as "alice" shows up as the registered "Alice".
+    pub name: String,
+    /// The account's stored comment, as a content hash. Empty for a guest, who
+    /// has no account to have stored one on.
+    pub comment_hash: Vec<u8>,
+    /// The account's stored avatar, as a content hash. Empty for a guest.
+    pub texture_hash: Vec<u8>,
+}
+
 /// Everything known about a connection that has not finished the handshake.
 #[derive(Debug, Clone, Default)]
 pub struct PendingConnection {
@@ -73,6 +93,16 @@ pub struct PendingConnection {
     /// Here the compiler asks the question instead
     /// (`starling_proto_fancy::identity`).
     pub account: Option<u64>,
+    /// The account's stored comment, as a content hash. Empty for a guest.
+    ///
+    /// Read once, at authentication, and carried for the life of the
+    /// connection: it is needed in three places that each build a `UserState`
+    /// (the peer's own, everyone else's roster entry, and the join broadcast),
+    /// and a lookup in each would be three round trips to say what the login
+    /// already answered.
+    pub comment_hash: Vec<u8>,
+    /// The account's stored avatar, as a content hash. Empty for a guest.
+    pub texture_hash: Vec<u8>,
     /// The name it authenticated as.
     pub name: String,
     /// Its channel.
@@ -222,7 +252,12 @@ impl Connections {
     /// Returns `None` when the pool is exhausted, which refuses the connection
     /// rather than growing — murmur does the same (`Server.cpp:1625`), and an
     /// unbounded pool would mean an unbounded server.
-    pub fn allocate(&self, conn: u64, account: Option<u64>, name: &str) -> Option<u32> {
+    ///
+    /// Takes the whole [`Identity`] rather than its parts: everything the login
+    /// established is written onto the record here, and this is the only place
+    /// that does it, so a field that arrives at the handshake and never reaches
+    /// the record has exactly one place to have been dropped.
+    pub fn allocate(&self, conn: u64, identity: &Identity) -> Option<u32> {
         let session = {
             let mut sessions = self.sessions.lock().ok()?;
             sessions.allocate()?.0
@@ -230,8 +265,10 @@ impl Connections {
         let mut inner = self.inner.lock().ok()?;
         let pending = inner.get_mut(&conn)?;
         pending.session = session;
-        pending.account = account;
-        pending.name = name.to_owned();
+        pending.account = identity.account;
+        pending.name = identity.name.clone();
+        pending.comment_hash = identity.comment_hash.clone();
+        pending.texture_hash = identity.texture_hash.clone();
         Some(session)
     }
 
@@ -414,17 +451,25 @@ mod tests {
         }
     }
 
+    /// An unregistered peer under `name`: no account, and so no stored profile.
+    fn guest(name: &str) -> Identity {
+        Identity {
+            name: name.to_owned(),
+            ..Identity::default()
+        }
+    }
+
     #[test]
     fn a_session_id_is_returned_to_the_pool_when_its_connection_ends() {
         // Otherwise a server that has been up for a week runs out of ids while
         // holding ten clients.
         let connections = Connections::new(2);
         connections.opened(&opened(1), "gw");
-        let first = connections.allocate(1, None, "a").expect("a session id");
+        let first = connections.allocate(1, &guest("a")).expect("a session id");
         assert_eq!(connections.close(1), Some(first));
 
         connections.opened(&opened(2), "gw");
-        assert!(connections.allocate(2, None, "b").is_some());
+        assert!(connections.allocate(2, &guest("b")).is_some());
     }
 
     #[test]
@@ -433,7 +478,7 @@ mod tests {
         // transmitting into a room they cannot hear.
         let connections = Connections::new(4);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "a");
+        let _ = connections.allocate(1, &guest("a"));
         let _ = connections.set_self_flags(1, None, Some(true));
         let pending = connections.get(1).expect("the connection");
         assert!(pending.self_mute);
@@ -448,7 +493,7 @@ mod tests {
         }
         let mut granted = 0;
         for conn in 1..=4 {
-            if connections.allocate(conn, None, "x").is_some() {
+            if connections.allocate(conn, &guest("x")).is_some() {
                 granted += 1;
             }
         }
@@ -471,7 +516,7 @@ mod tests {
         // regard to case (`Messages.cpp:422`).
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "Alice");
+        let _ = connections.allocate(1, &guest("Alice"));
 
         connections.opened(&opened(2), "gw");
         let found = connections
@@ -486,7 +531,7 @@ mod tests {
         // decide the user is a ghost of themselves.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "alice");
+        let _ = connections.allocate(1, &guest("alice"));
         assert!(connections.duplicate_of(1, None, "alice").is_none());
     }
 
@@ -497,7 +542,7 @@ mod tests {
         // one in lock everybody else out.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "alice");
+        let _ = connections.allocate(1, &guest("alice"));
 
         connections.opened(&opened(2), "gw");
         assert!(connections.duplicate_of(2, None, "bob").is_none());
@@ -509,7 +554,14 @@ mod tests {
         // registration is one person, whatever they typed in the name box.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, Some(7), "alice");
+        let _ = connections.allocate(
+            1,
+            &Identity {
+                account: Some(7),
+                name: "alice".to_owned(),
+                ..Identity::default()
+            },
+        );
 
         connections.opened(&opened(2), "gw");
         let found = connections
@@ -534,7 +586,7 @@ mod tests {
         // to come from that session's connection state.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let session = connections.allocate(1, None, "alice").expect("a session");
+        let session = connections.allocate(1, &guest("alice")).expect("a session");
         assert_eq!(connections.by_session(session).map(|p| p.conn), Some(1));
     }
 
@@ -573,7 +625,7 @@ mod tests {
         // deaf but not muted, which every client renders as a contradiction.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "victim");
+        let _ = connections.allocate(1, &guest("victim"));
 
         let _ = connections.set_speak_state(1, None, Some(true), None);
         let pending = connections.get(1).expect("the connection");
@@ -588,7 +640,7 @@ mod tests {
         // given the user their ears back.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "victim");
+        let _ = connections.allocate(1, &guest("victim"));
         let _ = connections.set_speak_state(1, None, Some(true), None);
 
         let _ = connections.set_speak_state(1, Some(false), None, None);
@@ -604,7 +656,7 @@ mod tests {
         // un-mute them.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "speaker");
+        let _ = connections.allocate(1, &guest("speaker"));
         let _ = connections.set_speak_state(1, Some(true), None, None);
 
         let _ = connections.set_speak_state(1, None, None, Some(true));
@@ -620,9 +672,13 @@ mod tests {
         // in `@auth`, the announcement to session-view — reads it from here.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let session = connections.allocate(1, None, "guest").expect("a session");
+        let session = connections.allocate(1, &guest("guest")).expect("a session");
         assert!(
-            connections.get(1).expect("the connection").account.is_none(),
+            connections
+                .get(1)
+                .expect("the connection")
+                .account
+                .is_none(),
             "a guest starts with no account"
         );
 
@@ -637,7 +693,7 @@ mod tests {
         // `None` would silently leave the user a guest.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "someone");
+        let _ = connections.allocate(1, &guest("someone"));
 
         let _ = connections.set_account(1, 0);
         assert_eq!(connections.get(1).expect("the connection").account, Some(0));
@@ -649,7 +705,7 @@ mod tests {
         // whenever they like, and must not be able to lift a moderator's.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "victim");
+        let _ = connections.allocate(1, &guest("victim"));
         let _ = connections.set_speak_state(1, Some(true), None, None);
 
         let _ = connections.set_self_flags(1, Some(false), Some(false));
@@ -668,7 +724,7 @@ mod tests {
         // what `UserStats` and the same-channel disclosure rule key off.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let session = connections.allocate(1, None, "alice").expect("a session");
+        let session = connections.allocate(1, &guest("alice")).expect("a session");
         assert_eq!(connections.get(1).expect("the connection").channel, 0);
 
         connections.set_channel(1, 7);
@@ -689,7 +745,7 @@ mod tests {
         // vanished without its socket noticing stayed in the tree forever.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        let _ = connections.allocate(1, None, "alice");
+        let _ = connections.allocate(1, &guest("alice"));
 
         assert!(
             connections.timed_out(0).is_empty(),

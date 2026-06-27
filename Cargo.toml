@@ -110,11 +110,21 @@ tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
+# QUIC and HTTP/3, for the WebTransport half of the live channel.
+# quinn default features drag in rustls-platform-verifier and, through it, jni:
+# this dials nothing and verifies no peer, so a trust store is dead weight.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+# : WebTransport requires the client and server to agree on datagram
+# support, and h3-quinn does not implement the extension without it.
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
 rcgen = "0.14.8"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
 axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # -- data -------------------------------------------------------------------
 sqlx = { version = "0.9", default-features = false, features = [

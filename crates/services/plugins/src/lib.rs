@@ -257,12 +257,85 @@ impl Plugins for PluginsRpc {
     }
 }
 
+/// The largest `data` a plugin message may carry (`Messages.cpp:3409`).
+const MAX_PLUGIN_DATA: usize = 8 * 1024 * 1024;
+/// The largest `dataID` a plugin message may carry (`Messages.cpp:3414`).
+const MAX_PLUGIN_DATA_ID: usize = 256;
+
+impl PluginsService {
+    /// Relay one `PluginDataTransmission` to the receivers it names.
+    ///
+    /// The payload stays opaque — the server never parses what a plugin sent —
+    /// but the *envelope* is not opaque, and treating it as such was a bug in
+    /// two directions (`vendor/server/src/murmur/Messages.cpp:3384`):
+    ///
+    /// **`senderSession` is overwritten, never trusted.** murmur is explicit
+    /// that reading it from the message "would allow spoofing the sender's
+    /// session". It is also what makes the field *useful*: a Fancy client
+    /// relays its extension messages through here when the server has no native
+    /// type for them, and the receiver reconstructs `actor` from
+    /// `senderSession` (`mumble-protocol/src/fancy_codec.rs:236`). Relaying the
+    /// message untouched left it unset, so a typing indicator arrived attributed
+    /// to nobody and no client rendered it.
+    ///
+    /// **`receiverSessions` is a delivery list, not a hint.** Broadcasting to
+    /// everyone sends a plugin's private message to the whole server. murmur
+    /// delivers only to the sessions named, and strips the field on the way out
+    /// because the receiver has no use for the guest list.
+    ///
+    /// Every field here is `deprecated` in the upstream proto, superseded by
+    /// `PluginMessage`. Suppressed rather than avoided, exactly as murmur does
+    /// with `MUMBLE_DEPRECATED_PUSH` around its own handler and for the same
+    /// reason: the message is what shipped clients actually send, so the bridge
+    /// has to keep relaying it. New code sends `PluginMessage`.
+    #[allow(deprecated, reason = "the legacy bridge shipped clients still use")]
+    fn on_plugin_data(&self, inbound: &Inbound) -> Actions {
+        let Ok(mut message) =
+            starling_proto::proto::tcp::PluginDataTransmission::decode(inbound.payload.as_slice())
+        else {
+            tracing::debug!(conn = inbound.conn, "undecodable PluginDataTransmission");
+            return Actions::new();
+        };
+
+        // A message with no data or no id cannot be acted on by any plugin, so
+        // murmur drops it before it costs a fan-out.
+        let (Some(data), Some(data_id)) = (message.data.as_ref(), message.data_id.as_ref()) else {
+            return Actions::new();
+        };
+        if data.len() > MAX_PLUGIN_DATA || data_id.len() > MAX_PLUGIN_DATA_ID {
+            tracing::info!(
+                session = inbound.session,
+                data = data.len(),
+                id = data_id.len(),
+                "dropping an oversized plugin message"
+            );
+            return Actions::new();
+        }
+
+        // Deduplicated, because a receiver named twice would be sent the
+        // message twice, and order is preserved so a plugin that cares about
+        // it sees what the sender wrote.
+        let mut receivers: Vec<u32> = Vec::with_capacity(message.receiver_sessions.len());
+        for session in &message.receiver_sessions {
+            if !receivers.contains(session) {
+                receivers.push(*session);
+            }
+        }
+        if receivers.is_empty() {
+            return Actions::new();
+        }
+
+        message.sender_session = Some(inbound.session);
+        message.receiver_sessions.clear();
+        vec![to_sessions(receivers, PLUGIN_DATA, message.encode_to_vec())]
+    }
+}
+
 impl ClientService for PluginsService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Plugins.outer_type();
         match inbound.type_id {
-            // Opaque client-to-client data: relayed, never inspected.
-            PLUGIN_DATA => vec![to_sessions(Vec::new(), PLUGIN_DATA, inbound.payload)],
+            PLUGIN_DATA => self.on_plugin_data(&inbound),
             id if id == outer => {
                 let Ok(envelope) = PluginsEnvelope::decode(inbound.payload.as_slice()) else {
                     return Actions::new();

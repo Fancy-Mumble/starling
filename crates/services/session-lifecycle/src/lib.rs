@@ -353,7 +353,10 @@ impl SessionLifecycleService {
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
         let Some(target) = self.connections.by_session(target_session) else {
-            tracing::debug!(session = target_session, "speak-state for an unknown session");
+            tracing::debug!(
+                session = target_session,
+                "speak-state for an unknown session"
+            );
             return Actions::new();
         };
 
@@ -387,7 +390,11 @@ impl SessionLifecycleService {
                 session = inbound.session,
                 "refusing a client-set suppress; it is server-owned"
             );
-            return vec![permission_denied(inbound, Perm::MUTE_DEAFEN, target.channel)];
+            return vec![permission_denied(
+                inbound,
+                Perm::MUTE_DEAFEN,
+                target.channel,
+            )];
         }
 
         if !self
@@ -401,7 +408,11 @@ impl SessionLifecycleService {
                 channel = target.channel,
                 "speak-state change refused"
             );
-            return vec![permission_denied(inbound, Perm::MUTE_DEAFEN, target.channel)];
+            return vec![permission_denied(
+                inbound,
+                Perm::MUTE_DEAFEN,
+                target.channel,
+            )];
         }
 
         let updated = self.connections.set_speak_state(
@@ -660,10 +671,7 @@ impl SessionLifecycleService {
             .permit
             .allows_session(inbound.scope, moved, target, Perm::ENTER.bits())
             .await
-            || self
-                .permit
-                .allows(inbound, target, Perm::MOVE.bits())
-                .await;
+            || self.permit.allows(inbound, target, Perm::MOVE.bits()).await;
         if !may_enter {
             tracing::info!(
                 actor = inbound.session,
@@ -677,7 +685,11 @@ impl SessionLifecycleService {
         let Some(result) = self.handshake.enter(inbound.scope, moved, target).await else {
             // metadata is unreachable. Not a refusal — saying "you lack Enter"
             // would blame the user for an outage.
-            tracing::error!(session = moved, channel = target, "metadata is unreachable; cannot move");
+            tracing::error!(
+                session = moved,
+                channel = target,
+                "metadata is unreachable; cannot move"
+            );
             return Actions::new();
         };
         if !result.applied {
@@ -714,7 +726,11 @@ impl SessionLifecycleService {
             channel_id: Some(target),
             ..tcp::UserState::default()
         };
-        vec![to_sessions(Vec::new(), USER_STATE, announce.encode_to_vec())]
+        vec![to_sessions(
+            Vec::new(),
+            USER_STATE,
+            announce.encode_to_vec(),
+        )]
     }
 
     /// Self-mute and self-deafen, which are the only `UserState` fields a
@@ -1116,7 +1132,11 @@ const fn echoed(requested: Option<bool>, before: bool, after: bool) -> Option<bo
 /// hands out the first has not handed out the second, so swapping these would
 /// quietly promote every self-registering user into an account administrator.
 const fn registration_permission(own: bool) -> Perm {
-    if own { Perm::SELF_REGISTER } else { Perm::REGISTER }
+    if own {
+        Perm::SELF_REGISTER
+    } else {
+        Perm::REGISTER
+    }
 }
 
 /// A refusal carrying prose, for a failure that is not about permissions.
@@ -1541,7 +1561,9 @@ mod tests {
             Some(tcp::permission_denied::DenyType::Text as i32)
         );
         assert!(
-            denied.reason.is_some_and(|reason| reason.contains("already")),
+            denied
+                .reason
+                .is_some_and(|reason| reason.contains("already")),
             "the client renders this string and it is all the user is told"
         );
     }

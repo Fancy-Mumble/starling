@@ -568,6 +568,17 @@ impl PermissionsService {
         let channel = query.channel_id.unwrap_or_default();
         let subject = self.asker(inbound).await;
         let granted = self.effective(inbound.scope, &subject, channel).await;
+        // What the client's menus are gated on. A wrong mask here is invisible
+        // in the UI — the action is simply absent — so the answer is worth
+        // being able to read back.
+        tracing::debug!(
+            session = inbound.session,
+            channel,
+            granted = format!("{granted:#x}"),
+            registered = subject.registered,
+            account = subject.account,
+            "permission query answered"
+        );
         let reply = starling_proto::proto::tcp::PermissionQuery {
             channel_id: Some(channel),
             permissions: Some(granted),
@@ -580,14 +591,82 @@ impl PermissionsService {
         )]
     }
 
+    /// A client rewriting a channel's ACL table — the editor's Save.
+    ///
+    /// This used to be refused outright on the grounds that rewriting ACLs is
+    /// an operator action. That was wrong twice over: murmur has always allowed
+    /// it (`Messages.cpp:2599`), and the client's ACL and role editors are
+    /// built on it — they read correctly and then saved nothing, silently, so a
+    /// role appeared to be created and was gone on the next read
+    /// (`docs/GAP-ANALYSIS.md` G1).
+    ///
+    /// **`Write` on the channel *or* on the root**, which is murmur's rule and
+    /// not a convenience: without the root clause, a user who may create a
+    /// channel can deny `Write` to everyone inside it and make it ungovernable
+    /// — an admin could no longer edit the very ACL that locked them out.
+    ///
+    /// The table is replaced wholesale. The editor sends what it is showing,
+    /// so merging would restore whatever the operator had just deleted.
+    async fn on_acl_write(
+        &self,
+        inbound: &Inbound,
+        acl: &starling_proto::proto::tcp::Acl,
+    ) -> Actions {
+        let subject = self.asker(inbound).await;
+        let channel = acl.channel_id;
+
+        let here = self.effective(inbound.scope, &subject, channel).await;
+        let root = self.effective(inbound.scope, &subject, 0).await;
+        if !Self::permits(here, Perm::WRITE.bits()) && !Self::permits(root, Perm::WRITE.bits()) {
+            tracing::info!(
+                session = inbound.session,
+                channel,
+                "acl write refused: no Write here or at the root"
+            );
+            return vec![permission_denied(inbound, Perm::WRITE, channel)];
+        }
+
+        let set = evaluate::from_wire(acl);
+        let (groups, entries) = (set.groups.len(), set.acls.len());
+        self.acls.set(inbound.scope, set.clone());
+        self.persist(inbound.scope, &set).await;
+
+        self.logger.log(
+            LogEvent::notice(Category::Permission, "acl changed")
+                .with("channel", channel)
+                .with("groups", groups)
+                .with("entries", entries)
+                .with("session", inbound.session)
+                .with("scope", inbound.scope),
+        );
+
+        // Published before anything else observes the change, for the reason
+        // this service exists: a stale deny is safe, a stale grant is not.
+        let _ = self.invalidations.send(Invalidation {
+            channels: vec![channel],
+            accounts: Vec::new(),
+            everything: true,
+        });
+        self.coalescer.clear();
+
+        // The editor re-reads after saving, and murmur answers that read from
+        // the stored table. Sending the stored set straight back saves the
+        // round trip and, more usefully, shows the client what was actually
+        // kept — inherited rows dropped, defaults filled in.
+        let stored = self.acls.get(inbound.scope, channel);
+        vec![to_conn(
+            inbound.conn,
+            ACL,
+            evaluate::to_wire(&stored).encode_to_vec(),
+        )]
+    }
+
     async fn on_acl_query(&self, inbound: &Inbound) -> Actions {
         let Ok(query) = starling_proto::proto::tcp::Acl::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
         if !query.query.unwrap_or(false) {
-            // A write arriving on the client plane is refused here: rewriting
-            // ACLs is an operator action and takes an operator identity.
-            return Actions::new();
+            return self.on_acl_write(inbound, &query).await;
         }
 
         // Reading a channel's ACL table takes `Write` on it, as murmur asks.

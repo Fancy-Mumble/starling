@@ -70,6 +70,9 @@ pub struct ServiceConfig {
     /// Where `operator-api` writes its own audit record.
     pub audit: Option<OperatorAudit>,
 
+    /// The live channel over WebTransport. Only `operator-api` reads it.
+    pub webtransport: Option<WebTransport>,
+
     /// Settings a service adds without a runtime release.
     pub options: BTreeMap<String, String>,
 }
@@ -91,6 +94,7 @@ impl Default for ServiceConfig {
             storage: None,
             auth: None,
             audit: None,
+            webtransport: None,
             options: BTreeMap::new(),
         }
     }
@@ -157,6 +161,47 @@ impl Default for OperatorAudit {
     }
 }
 
+/// The live channel's WebTransport half.
+///
+/// Off unless configured, and for a reason beyond caution: WebTransport is
+/// HTTP/3 over QUIC, and a reverse proxy generally cannot forward it. A
+/// deployment behind one reaches the same channel over the WebSocket at
+/// `/v1/events` and never binds this port at all.
+///
+/// `listen` is UDP, and it is a *different* socket from the API's TCP `listen`.
+/// One port per service rather than one shared: a WebTransport session is
+/// addressed by path, so several endpoints share this listener, but two
+/// independent services cannot share a UDP port without a QUIC-aware proxy
+/// steering on SNI.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebTransport {
+    /// Off unless the deployment can terminate QUIC.
+    pub enabled: bool,
+    /// The UDP address to bind, e.g. `0.0.0.0:8443`.
+    pub listen: String,
+    /// The certificate chain, PEM.
+    ///
+    /// Required in practice even when a proxy terminates TLS for every other
+    /// surface: this listener is the one the proxy is not terminating. A
+    /// self-signed pair is generated here on first boot if absent, which a
+    /// browser will refuse — so a real certificate is the deployed answer.
+    pub cert: Option<PathBuf>,
+    /// The private key, PEM.
+    pub key: Option<PathBuf>,
+}
+
+impl Default for WebTransport {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:8443".to_owned(),
+            cert: None,
+            key: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +212,38 @@ mod tests {
         // mode this rejects.
         let err = toml::from_str::<ServiceConfig>("tier = \"core\"\ntyps = [1005]\n");
         assert!(err.is_err(), "unknown key must be refused");
+    }
+
+    #[test]
+    fn webtransport_is_off_and_needs_no_keys_at_all() {
+        // A service block that never mentions it must not bind a UDP port.
+        // WebTransport cannot be proxied, so switching it on is a deployment
+        // decision and never a default.
+        let cfg: ServiceConfig =
+            toml::from_str("tier = \"optional\"\ntypes = []\n").expect("a block without it");
+        assert!(cfg.webtransport.is_none());
+
+        let cfg: ServiceConfig =
+            toml::from_str("tier = \"optional\"\ntypes = []\n\n[webtransport]\n")
+                .expect("an empty block");
+        assert!(!cfg.webtransport.expect("present").enabled);
+    }
+
+    #[test]
+    fn webtransport_takes_its_own_udp_address_and_certificate() {
+        let cfg: ServiceConfig = toml::from_str(
+            "tier = \"optional\"\ntypes = []\n\n[webtransport]\n\
+             enabled = true\nlisten = \"0.0.0.0:8443\"\n\
+             cert = \"/etc/starling/wt/cert.pem\"\nkey = \"/etc/starling/wt/key.pem\"\n",
+        )
+        .expect("a configured block");
+
+        let wt = cfg.webtransport.expect("present");
+        assert!(wt.enabled);
+        // UDP, and deliberately not the API's TCP `listen`: they are different
+        // sockets and sharing the number would only look like they were not.
+        assert_eq!(wt.listen, "0.0.0.0:8443");
+        assert!(wt.cert.is_some() && wt.key.is_some());
     }
 
     #[test]

@@ -74,6 +74,35 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> (Channel, Vec<String>) {
     if !state.links.is_empty() {
         channel.links = state.links.clone();
     }
+    // `hidden` was read by nothing, so a client asking for a private room got an
+    // ordinary one: the flag never reached `flags`, `is_hidden` was dead code,
+    // and every visibility check downstream had nothing to test. The room was
+    // then announced to everybody, which is the opposite of what was asked for.
+    //
+    // Folded into `flags` rather than kept as its own column because that is
+    // where the tree stores it and what `Channel.flags` publishes.
+    // Expiry, read for the same reason `hidden` is: the columns exist and the
+    // tree loads them, but nothing ever took them off the wire, so a client
+    // asking for a room that expires got one that never does.
+    //
+    // Mode and duration travel together — a mode with no duration has no
+    // deadline to compute, and a duration with no mode is never consulted — so
+    // a client that sends only one of them is asking for something incoherent
+    // and neither is applied.
+    if let (Some(mode), Some(duration)) = (state.expiry_mode, state.expiry_duration_secs) {
+        channel.expiry_mode = mode;
+        channel.expiry_duration_s = duration;
+        fields.push("expiry_mode".to_owned());
+        fields.push("expiry_duration_s".to_owned());
+    }
+    if let Some(hidden) = state.hidden {
+        channel.flags = if hidden {
+            channel.flags | FLAG_HIDDEN
+        } else {
+            channel.flags & !FLAG_HIDDEN
+        };
+        fields.push("flags".to_owned());
+    }
     (channel, fields)
 }
 

@@ -67,8 +67,8 @@ pub use keys::{
     VoiceSecrets,
 };
 pub use modern::XChaCha20Voice;
-pub use peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 pub use ocb2::Ocb2;
+pub use peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 pub use policy::{CompatibilityFirst, ModernOnly, SecurityPolicy};
 pub use profile::{
     CompatibilityFirstProfiles, ModernOnlyProfiles, ProfileError, ProfileFactory, VoiceProfile,

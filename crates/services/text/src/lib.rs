@@ -11,24 +11,39 @@
 use std::sync::Arc;
 
 use prost::Message as _;
-use starling_proto_fancy::common::Ack;
+use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::fancy::feature::{TextEnvelope, text_envelope};
+use starling_proto_fancy::metadata::TreeRequest;
+use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::perm::Perm;
+use starling_proto_fancy::sessionview::SubscribeRequest;
+use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::text::text_server::{Text, TextServer};
-use starling_proto_fancy::text::{HistoryPage, HistoryRequest, PurgeRequest, StoredMessage};
+use starling_proto_fancy::text::{
+    AnnounceRequest, AnnounceResult, HistoryPage, HistoryRequest, MessageEvent, PurgeRequest,
+    StoredMessage, WatchRequest,
+};
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
-use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::log::{Category, LogEvent, Logger, describe_actor};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
+    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn, to_sessions,
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 /// Upstream `TextMessage`.
 const TEXT_MESSAGE: u16 = 11;
+
+/// How many delivered messages a `Watch` subscriber may fall behind by.
+///
+/// Bounded because an unbounded queue turns one stalled watcher into an OOM.
+/// A subscriber that exceeds it is told it lagged rather than being
+/// disconnected, so a slow consumer loses events and knows it did.
+const EVENT_BACKLOG: usize = 1024;
 
 /// The schema.
 ///
@@ -55,6 +70,18 @@ pub struct TextService {
     logger: Logger,
     /// Asks `permissions` before a message reaches anyone.
     permit: Permit,
+    /// How `Announce` reaches `session-view` and `metadata` to turn a channel
+    /// into the sessions sitting in it. A client's own message never needs
+    /// this — the gateway holds the sessions and fan-out is an exclusion —
+    /// but a server-originated message has no session to broadcast from.
+    resolver: starling_runtime::channel::Resolver,
+    /// Delivered messages, for `Watch` subscribers.
+    ///
+    /// Bounded and lossy on purpose, like [`Fanout`]: a watcher that stops
+    /// reading must cost the oldest events it has not read, never memory
+    /// without limit and never the delivery of the message itself. A chat
+    /// observer falling behind is not a reason to stop serving chat.
+    events: broadcast::Sender<MessageEvent>,
 }
 
 impl TextService {
@@ -121,6 +148,94 @@ impl TextService {
             .collect();
         HistoryPage { messages, more }
     }
+
+    /// Every channel in `roots`, plus their descendants when `tree`.
+    ///
+    /// Walks the tree by parent rather than asking for a subtree, because
+    /// `metadata` publishes a flat list and the parent edge is the only shape
+    /// the descent needs.
+    async fn expand_channels(&self, scope: u32, roots: &[u32], tree: bool) -> Vec<u32> {
+        let mut wanted: Vec<u32> = roots.to_vec();
+        if !tree {
+            return wanted;
+        }
+        let Ok(channel) = self.resolver.channel("metadata") else {
+            // The roots themselves still resolve; a missing `metadata` costs
+            // the subchannels, not the message.
+            tracing::warn!("metadata is unreachable; announcing to the named channels only");
+            return wanted;
+        };
+        let Ok(reply) = MetadataClient::new(channel)
+            .get_tree(TreeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+            })
+            .await
+        else {
+            tracing::warn!(
+                "could not read the channel tree; announcing to the named channels only"
+            );
+            return wanted;
+        };
+
+        // Repeated passes rather than recursion: the tree is small, and a
+        // parent cycle in bad data would make a recursive descent hang.
+        let channels = reply.into_inner().channels;
+        loop {
+            let before = wanted.len();
+            for c in &channels {
+                if let Some(parent) = c.parent
+                    && wanted.contains(&parent)
+                    && !wanted.contains(&c.id)
+                {
+                    wanted.push(c.id);
+                }
+            }
+            if wanted.len() == before {
+                break;
+            }
+        }
+        wanted
+    }
+
+    /// The sessions an announcement should actually be written to.
+    ///
+    /// Named sessions are taken as given; channels are resolved through
+    /// `session-view`, which is the one place that knows who is where.
+    async fn recipients(&self, scope: u32, request: &AnnounceRequest) -> Vec<u32> {
+        let mut sessions = request.sessions.clone();
+        if request.channels.is_empty() {
+            return sessions;
+        }
+
+        let wanted = self
+            .expand_channels(scope, &request.channels, request.tree)
+            .await;
+        let Ok(channel) = self.resolver.channel("session-view") else {
+            tracing::warn!("session-view is unreachable; a channel announcement has no recipients");
+            return sessions;
+        };
+        let Ok(reply) = SessionViewClient::new(channel)
+            .list(SubscribeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+                subscriber: "text".to_owned(),
+            })
+            .await
+        else {
+            tracing::warn!("could not list sessions; a channel announcement has no recipients");
+            return sessions;
+        };
+
+        for session in reply.into_inner().sessions {
+            if wanted.contains(&session.channel) && !sessions.contains(&session.session) {
+                sessions.push(session.session);
+            }
+        }
+        sessions
+    }
 }
 
 /// The gRPC surface, as a type this crate owns.
@@ -154,6 +269,154 @@ impl Text for TextRpc {
         .execute(self.0.store.pool())
         .await;
         Ok(Response::new(Ack {}))
+    }
+
+    /// Every message as it is delivered.
+    ///
+    /// A late subscriber sees what happens from now on and nothing before it:
+    /// this is a notification channel, not a replay. What was said already is
+    /// `History`, which is the query built for it.
+    type WatchStream = tokio_stream::wrappers::ReceiverStream<Result<MessageEvent, Status>>;
+
+    async fn watch(
+        &self,
+        request: Request<WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let req = request.into_inner();
+        let subscriber = req.subscriber;
+        let mut events = self.0.events.subscribe();
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BACKLOG);
+
+        drop(tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        // The receiver has gone: the subscriber disconnected,
+                        // and this task is the only thing still holding on.
+                        if tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        // Reported rather than hidden. A watcher that silently
+                        // skips messages is worse than one that knows it did,
+                        // because only the second can go and read History.
+                        tracing::warn!(subscriber, missed, "a text watcher fell behind");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    /// A message from the server, with no client behind it.
+    ///
+    /// **No permission check, deliberately.** `Permit` exists to stop a client
+    /// asserting an identity it does not have; the caller here is the operator
+    /// plane, which has already authenticated and been scoped by
+    /// `operator-api` and whose action is already in the audit log. Asking
+    /// `permissions` would mean asking on behalf of a session that does not
+    /// exist, and the only honest answer to that is a denial.
+    async fn announce(
+        &self,
+        request: Request<AnnounceRequest>,
+    ) -> Result<Response<AnnounceResult>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+
+        if req.body.is_empty() {
+            return Err(Status::invalid_argument("an announcement needs a body"));
+        }
+        // Addressed at nobody is a mistake, not a broadcast. Treating it as one
+        // would turn a dropped session id into a message to the whole server.
+        if req.sessions.is_empty() && req.channels.is_empty() {
+            return Err(Status::invalid_argument(
+                "an announcement needs at least one session or channel",
+            ));
+        }
+
+        let sessions = self.0.recipients(scope, &req).await;
+        if sessions.is_empty() {
+            // Not an error: everyone addressed is simply offline. The caller
+            // gets `applied = false` and a reason rather than a fault, because
+            // "nobody was there" is a normal outcome for a notice.
+            return Ok(Response::new(AnnounceResult {
+                applied: false,
+                refused: "no addressed session is connected".to_owned(),
+            }));
+        }
+
+        let message = starling_proto::proto::tcp::TextMessage {
+            // No actor: the message is from the server itself. A client renders
+            // an actorless TextMessage as a server notice, which is what murmur
+            // sends for a server-originated message.
+            actor: None,
+            session: req.sessions.clone(),
+            channel_id: req.channels.clone(),
+            tree_id: if req.tree {
+                req.channels.clone()
+            } else {
+                Vec::new()
+            },
+            message: req.body.clone(),
+            ..starling_proto::proto::tcp::TextMessage::default()
+        };
+
+        self.0.logger.log(
+            LogEvent::info(Category::Message, "announcement")
+                .with("actor", describe_actor(req.actor.as_ref()))
+                .with("recipients", sessions.len())
+                .with("length", req.body.len()),
+        );
+
+        // Watchers see server-originated messages too, flagged as such, so a
+        // watcher can tell a message the server sent from one a user did —
+        // including one it caused itself.
+        let _ = self.0.events.send(MessageEvent {
+            sender_session: 0,
+            sender_account: 0,
+            sender_name: String::new(),
+            sender_registered: false,
+            channels: req.channels.clone(),
+            sessions: sessions.clone(),
+            tree: if req.tree {
+                req.channels.clone()
+            } else {
+                Vec::new()
+            },
+            body: req.body.clone(),
+            sent_at_ms: now_ms(),
+            from_client: false,
+        });
+
+        self.0
+            .fanout
+            .push(to_sessions(sessions, TEXT_MESSAGE, message.encode_to_vec()));
+
+        // History is per channel, so a message addressed only at sessions has
+        // nowhere to be stored even when `store` is set.
+        if req.store {
+            for channel in &req.channels {
+                let stored = StoredMessage {
+                    id: Vec::new(),
+                    channel: *channel,
+                    sender_account: 0,
+                    sender_name: String::new(),
+                    body: req.body.clone(),
+                    sent_at_ms: now_ms(),
+                };
+                let _ = self.0.record(scope, &stored).await;
+            }
+        }
+
+        Ok(Response::new(AnnounceResult {
+            applied: true,
+            refused: String::new(),
+        }))
     }
 }
 
@@ -230,6 +493,26 @@ impl TextService {
         };
         stored.id = self.record(inbound.scope, &stored).await.to_vec();
 
+        // Published after the message is stored and before it is returned for
+        // delivery. A watcher is an observer, so this is never allowed to
+        // decide whether the message goes out — `send` failing means only that
+        // nobody is watching.
+        let _ = self.events.send(MessageEvent {
+            sender_session: inbound.session,
+            sender_account: stored.sender_account,
+            sender_name: stored.sender_name.clone(),
+            // `on_text_message` does not resolve the sender's account, so this
+            // says what is actually known rather than implying account 0 is
+            // the SuperUser.
+            sender_registered: false,
+            channels: message.channel_id.clone(),
+            sessions: message.session.clone(),
+            tree: message.tree_id.clone(),
+            body: stored.body.clone(),
+            sent_at_ms: stored.sent_at_ms,
+            from_client: true,
+        });
+
         let echo = starling_proto::proto::tcp::TextMessage {
             actor: Some(inbound.session),
             ..message
@@ -298,6 +581,8 @@ impl Serve for TextService {
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
             permit: Permit::new(ctx.resolver.clone()),
+            resolver: ctx.resolver,
+            events: broadcast::channel(EVENT_BACKLOG).0,
         }))
     }
 
@@ -327,20 +612,23 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        // Points at a `permissions` nothing is serving, so every check denies.
+        // These tests exercise storage and history, not delivery; a test that
+        // wanted delivery would have to stand one up, which is the right amount
+        // of friction for skipping an authorisation.
+        let resolver = starling_runtime::channel::Resolver::new(
+            Arc::new(starling_runtime::config::Config::with_defaults(
+                std::path::Path::new("/run/starling"),
+            )),
+            starling_runtime::inproc::Broker::new(),
+        );
         Arc::new(TextService {
             store,
             fanout: Fanout::default(),
             logger: Logger::null(),
-            // Points at a `permissions` nothing is serving, so every check
-            // denies. These tests exercise storage and history, not delivery;
-            // a test that wanted delivery would have to stand one up, which is
-            // the right amount of friction for skipping an authorisation.
-            permit: Permit::new(starling_runtime::channel::Resolver::new(
-                Arc::new(starling_runtime::config::Config::with_defaults(
-                    std::path::Path::new("/run/starling"),
-                )),
-                starling_runtime::inproc::Broker::new(),
-            )),
+            permit: Permit::new(resolver.clone()),
+            resolver,
+            events: broadcast::channel(EVENT_BACKLOG).0,
         })
     }
 

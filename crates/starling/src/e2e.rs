@@ -54,6 +54,12 @@ use tokio_rustls::client::TlsStream;
 const MUMBLE_VERSION_V2: u64 = starling_proto::MUMBLE_VERSION.encode_v2();
 /// How long to wait for a frame before deciding the wiring is broken.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for the live channel to report itself started.
+///
+/// Generous on purpose: see [`started`]. It bounds a whole deployment coming
+/// up, not the delivery of a frame, and the two have no reason to share a
+/// number.
+const LIVE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upstream `UDPTunnel`: audio over the control connection.
 const UDP_TUNNEL: u16 = 1;
@@ -106,6 +112,15 @@ struct Deployment {
 impl Deployment {
     /// Start everything `--all-in-one` starts, bound to an ephemeral port.
     async fn start(data_dir: &Path) -> Self {
+        Self::start_with(data_dir, |_| {}).await
+    }
+
+    /// The same, with the configuration adjusted first.
+    ///
+    /// Exists for the surfaces that are **off by default** and so are absent
+    /// from a plain deployment: `operator-api` is one, and a test that wants it
+    /// has to say so the way an operator does, by configuring it.
+    async fn start_with(data_dir: &Path, adjust: impl FnOnce(&mut Config)) -> Self {
         let exclusive = ONE_AT_A_TIME.lock().await;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -129,6 +144,7 @@ impl Deployment {
         if let Some(voice) = config.services.get_mut("voice") {
             voice.udp_listen = Some(format!("127.0.0.1:{voice_port}"));
         }
+        adjust(&mut config);
         let config = Arc::new(config);
         let shutdown = Shutdown::new();
         let broker = Broker::new();
@@ -274,35 +290,73 @@ impl Deployment {
 
 /// Block until each of `services` has bound the endpoint it was configured with.
 ///
-/// Only a Unix endpoint is waited on, because that is the one whose readiness is
-/// a file appearing. A service configured any other way is skipped rather than
-/// guessed at — a wait that silently does nothing is worse than no wait, so the
-/// skip is deliberate and the deadline below is what catches a real hang.
+/// **Both local transports are waited on.** This used to look only for a
+/// `unix:` path, which meant that on Windows — where every local endpoint is a
+/// named pipe — it matched nothing, skipped every service, and returned
+/// immediately. The wait was a no-op on that platform, so a client connected to
+/// a deployment whose services had not finished binding and the handshake timed
+/// out. It presented as intermittent, and as a transport fault rather than as
+/// the missing wait it was.
+///
+/// A service reached over `http://` is left alone: it has no local artefact to
+/// watch, and the deadline below is what catches a genuine hang.
 async fn wait_until_serving(config: &Config, services: &[&str]) {
     let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
     for service in services {
         // Read off the configured string rather than through a parsed endpoint
-        // type. All this needs is the path a `unix:` endpoint would bind, and
-        // depending on the transport layer's own representation for that ties a
-        // test helper to a type that has already been moved once.
-        let Some(path) = config
+        // type. All this needs is what the endpoint binds, and depending on the
+        // transport layer's own representation for that ties a test helper to a
+        // type that has already been moved once.
+        let Some(endpoint) = config
             .services
             .get(*service)
             .and_then(|service| service.endpoint.as_deref())
-            .and_then(|endpoint| endpoint.strip_prefix("unix:"))
-            .map(PathBuf::from)
+            .map(str::to_owned)
         else {
             continue;
         };
-        while !path.exists() {
+        while !is_bound(&endpoint) {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{service} never bound {}",
-                path.display()
+                "{service} never bound {endpoint}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Whether whatever `endpoint` names is being served yet.
+fn is_bound(endpoint: &str) -> bool {
+    if let Some(path) = endpoint.strip_prefix("unix:") {
+        return PathBuf::from(path).exists();
+    }
+    if let Some(name) = endpoint.strip_prefix("pipe:") {
+        return pipe_bound(name);
+    }
+    // `http://` and anything else: nothing local to watch for.
+    true
+}
+
+/// Whether a named pipe has been created.
+///
+/// Opened and dropped rather than enumerated. The pipe namespace *can* be
+/// listed as a directory, but `local_endpoint` derives a pipe's name from a
+/// filesystem path and so produces one containing `/`, which does not survive
+/// being read back as a directory entry. Opening it is the question actually
+/// being asked, and the accept loop creates each instance's replacement before
+/// handing the connected one on (`transport/pipe.rs`), so this probe never
+/// takes the instance a real caller is about to need.
+#[cfg(windows)]
+fn pipe_bound(name: &str) -> bool {
+    tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(format!(r"\\.\pipe\{name}"))
+        .is_ok()
+}
+
+/// Never reached: a pipe endpoint is rejected at startup off Windows.
+#[cfg(not(windows))]
+const fn pipe_bound(_name: &str) -> bool {
+    true
 }
 
 /// Reserve a loopback port the gateway can bind next.
@@ -736,8 +790,16 @@ async fn two_clients_complete_the_handshake_and_exchange_text() {
         )
         .await;
 
-    let (bob_frame_type, bob_payload) = bob.recv().await;
-    assert_eq!(bob_frame_type, 11, "bob must receive alice's text message");
+    // Not `recv`: the handshake is followed by a pushed `PermissionQuery` for
+    // the channel the client landed in, as murmur sends one on every entry
+    // (`Server.cpp:2319`). It is a server-initiated frame with no request
+    // behind it, so it can be the first thing waiting here — asserting on the
+    // *next* frame made this test fail for a message it was not about.
+    let (before_text, bob_payload) = bob.recv_until(11).await;
+    assert!(
+        before_text.iter().all(|&kind| kind == 20),
+        "only the pushed PermissionQuery may precede alice's text, saw {before_text:?}"
+    );
     let received =
         tcp::TextMessage::decode(bob_payload.as_slice()).expect("a well-formed TextMessage");
     assert_eq!(received.message, "hello from alice");
@@ -1227,4 +1289,345 @@ mod example_config {
             "the file is the multi-container deployment; --all-in-one is a flag, not a second file"
         );
     }
+}
+
+// ── The live channel ────────────────────────────────────────────────────────
+//
+// Every test below runs on a **multi-threaded** runtime, and that is load
+// bearing rather than tidiness.
+//
+// `#[tokio::test]` gives a current-thread runtime, and these tests start a whole
+// deployment — twenty-one services plus the gateway — on it. A real Starling
+// process runs multi-threaded, so a single-threaded one is not a smaller
+// deployment, it is a different one.
+//
+// It bites here in particular because the event bridges are background tasks
+// nothing else awaits. On one thread they are scheduled only when everything
+// else yields, and during a cold start they lose that race often enough to be
+// flaky — the subscriber attaches, no bridge has run, and a task that never
+// executed writes no log. The symptom is silence, which is exactly why it first
+// read as a transport fault.
+
+/// The token the live-channel tests authenticate with.
+///
+/// Named rather than inlined because the configuration holds the *variable's
+/// name* and never the secret, so the test has to set the same variable the
+/// deployment reads.
+const LIVE_TOKEN_VAR: &str = "STARLING_E2E_LIVE_TOKEN";
+const LIVE_TOKEN: &str = "e2e-live-channel-token";
+
+/// A deployment with the admin plane switched on, and the port it listens on.
+///
+/// `operator-api` ships disabled, so a plain [`Deployment::start`] does not run
+/// it — which is correct, and means a test that wants it has to configure it
+/// the way an operator would.
+#[expect(
+    unsafe_code,
+    reason = "edition 2024 has no safe way to set an environment variable, and               token auth deliberately names a variable rather than holding a               secret — so a test of it has to set one"
+)]
+async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
+    use starling_runtime::config::{AuthMode, OperatorAuth, ServiceConfig, StaticToken, TokenAuth};
+
+    // SAFETY: setting an environment variable is only unsound alongside a
+    // concurrent read from another thread. These tests are serialised by
+    // `ONE_AT_A_TIME`, and this runs before the deployment that reads it exists.
+    unsafe { std::env::set_var(LIVE_TOKEN_VAR, LIVE_TOKEN) };
+
+    let port = free_port();
+    let data_dir_for_endpoint = data_dir.to_path_buf();
+    let deployment = Deployment::start_with(data_dir, move |config| {
+        // Inserted rather than adjusted: `operator-api` is not a `ServiceKind`
+        // — it owns no wire type and the gateway never routes to it — so
+        // `Config::with_defaults` creates no entry for it, and an absent entry
+        // is exactly what `compose::enabled` reads as "off" for this one
+        // service.
+        let service = config
+            .services
+            .entry("operator-api".to_owned())
+            .or_insert_with(|| {
+                ServiceConfig::new(
+                    // The deployment's own directory, never a fixed path: on
+                    // Windows the local endpoint is a named pipe whose name is
+                    // derived from it, so a hard-coded root would give every
+                    // deployment in this process the same pipe — and the second
+                    // one to start would find it busy.
+                    &starling_runtime::transport::local_endpoint(
+                        &data_dir_for_endpoint,
+                        "operator-api",
+                    ),
+                    starling_runtime::tier::Tier::Optional,
+                    &[],
+                )
+            });
+        service.enabled = true;
+        service.listen = Some(format!("127.0.0.1:{port}"));
+        service.auth = Some(OperatorAuth {
+            mode: AuthMode::Token,
+            token: Some(TokenAuth {
+                tokens: vec![StaticToken {
+                    value_env: LIVE_TOKEN_VAR.to_owned(),
+                    scopes: vec!["*".to_owned()],
+                }],
+            }),
+            ..OperatorAuth::default()
+        });
+    })
+    .await;
+
+    (deployment, port)
+}
+
+/// The live channel's socket type, spelled once.
+type LiveSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// Open the live channel, presenting the bearer token.
+async fn open_live_channel(port: u16) -> LiveSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    // Retried because the API's listener is spawned alongside the rest of the
+    // deployment: the port can be a moment behind everything else being up.
+    let deadline = std::time::Instant::now() + FRAME_TIMEOUT;
+    loop {
+        let mut request = format!("ws://127.0.0.1:{port}/v1/events")
+            .into_client_request()
+            .expect("a valid websocket URL");
+        let _ = request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {LIVE_TOKEN}")
+                .parse()
+                .expect("a valid header value"),
+        );
+
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _)) => return socket,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the live channel never accepted a subscriber: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Read events until one satisfies `wanted`.
+///
+/// Reads rather than inspecting only the next frame: the channel carries
+/// everything that happens on the server, so a test asserting on one event has
+/// to skip the others rather than demand its own arrive first.
+async fn next_event(
+    socket: &mut LiveSocket,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    next_event_within(socket, wanted, FRAME_TIMEOUT).await
+}
+
+/// Wait for the bridge's opening `started`.
+///
+/// Longer than [`FRAME_TIMEOUT`], because it is not waiting for a frame — it is
+/// waiting for twenty services to finish coming up. `started` is sent to a
+/// joining subscriber only once the state below the bridge is readable
+/// (`operator-api/src/live.rs:86`), so a subscriber that attaches during
+/// start-up waits for the deployment, not for the channel. On a loaded machine
+/// that is well past ten seconds: the gateway is still logging "All pipe
+/// instances are busy" retries at that point, and the test failed for a server
+/// that was merely slow.
+async fn started(socket: &mut LiveSocket) {
+    let _ = next_event_within(socket, |event| is(event, "started"), LIVE_START_TIMEOUT).await;
+}
+
+/// [`next_event`], with the caller choosing how long to wait.
+async fn next_event_within(
+    socket: &mut LiveSocket,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+    within: Duration,
+) -> serde_json::Value {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let deadline = tokio::time::Instant::now() + within;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = timeout(remaining, socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no matching event arrived; saw {seen:?}"))
+            .expect("the live channel closed")
+            .expect("a readable frame");
+
+        if let Message::Text(text) = message {
+            let event: serde_json::Value =
+                serde_json::from_str(&text).expect("every frame on this channel is JSON");
+            if wanted(&event) {
+                return event;
+            }
+            seen.push(event["event"].as_str().unwrap_or("?").to_owned());
+        }
+    }
+}
+
+/// Whether an event is of the named kind.
+fn is(event: &serde_json::Value, kind: &str) -> bool {
+    event["event"].as_str() == Some(kind)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_change_reaches_a_live_subscriber_as_the_right_kind_of_event() {
+    // The whole path in one test: `metadata` publishes a tree change, the
+    // bridge turns it into an event, and a real WebSocket client is handed it.
+    // Every unit test around this can pass while the wiring between them does
+    // not, which is the gap this closes.
+    let data_dir = TempDir::new("live-channel");
+    let (deployment, port) = deployment_with_operator_api(data_dir.path()).await;
+    let mut socket = open_live_channel(port).await;
+
+    // The bridge announces itself once the state below it is readable.
+    started(&mut socket).await;
+
+    // Created over the same gRPC surface the REST route calls, so this asserts
+    // the bridge observed a real change rather than one the test published into
+    // the hub itself.
+    use starling_proto_fancy::common::Scope;
+    use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+    use starling_proto_fancy::metadata::{Channel, CreateRequest, UpdateRequest};
+
+    let grpc = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    let created = MetadataClient::new(grpc)
+        .create(CreateRequest {
+            scope: Some(Scope { virtual_server: 1 }),
+            actor: None,
+            channel: Some(Channel {
+                parent: Some(0),
+                name: "Observed".to_owned(),
+                ..Channel::default()
+            }),
+            temporary: false,
+        })
+        .await
+        .expect("the channel is created")
+        .into_inner();
+    assert!(created.applied, "refused: {}", created.refused);
+    let id = created.channel.expect("a created channel").id;
+
+    let event = next_event(&mut socket, |event| is(event, "channelCreated")).await;
+    assert_eq!(event["channel"]["name"].as_str(), Some("Observed"));
+    assert_eq!(
+        event["channel"]["parent"].as_u64(),
+        Some(0),
+        "a channel under the root reports parent 0"
+    );
+
+    // And an edit arrives as a *change*, not a second creation. This is the
+    // distinction the bridge exists to reconstruct: `metadata` publishes one
+    // upsert for both, and a consumer cannot recover it from that alone.
+    let grpc = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    let renamed = MetadataClient::new(grpc)
+        .update(UpdateRequest {
+            scope: Some(Scope { virtual_server: 1 }),
+            actor: None,
+            channel: id,
+            fields: vec!["name".to_owned()],
+            values: Some(Channel {
+                name: "Renamed".to_owned(),
+                ..Channel::default()
+            }),
+        })
+        .await
+        .expect("the channel is renamed")
+        .into_inner();
+    assert!(renamed.applied, "refused: {}", renamed.refused);
+
+    let event = next_event(&mut socket, |event| is(event, "channelStateChanged")).await;
+    assert_eq!(event["channel"]["name"].as_str(), Some("Renamed"));
+    assert_eq!(event["channel"]["id"].as_u64(), Some(u64::from(id)));
+
+    deployment.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connecting_client_is_reported_to_a_live_subscriber() {
+    // `session-view` publishes an upsert for an arrival and for a change alike.
+    // This asserts the first one a session produces is reported as a connect.
+    let data_dir = TempDir::new("live-users");
+    let (deployment, port) = deployment_with_operator_api(data_dir.path()).await;
+    let mut socket = open_live_channel(port).await;
+    started(&mut socket).await;
+
+    let mut client = Client::connect(deployment.port).await;
+    let session = handshake(&mut client, "observed-user").await;
+
+    let event = next_event(&mut socket, |event| is(event, "userConnected")).await;
+    assert_eq!(event["user"]["name"].as_str(), Some("observed-user"));
+    assert_eq!(event["user"]["session"].as_u64(), Some(u64::from(session)));
+    // An unregistered guest carries no account. Account 0 is the SuperUser, so
+    // a guest reported as 0 would read as the administrator.
+    assert!(
+        event["user"]["user_id"].is_null(),
+        "an unregistered guest must not carry an account: {event}"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_live_channel_answers_a_command_and_refuses_an_unknown_one() {
+    // The channel is bidirectional, and a command that goes unanswered is
+    // indistinguishable from one the server chose not to honour.
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let data_dir = TempDir::new("live-commands");
+    let (deployment, port) = deployment_with_operator_api(data_dir.path()).await;
+    let mut socket = open_live_channel(port).await;
+
+    socket
+        .send(Message::Text(r#"{"command":"ping"}"#.into()))
+        .await
+        .expect("the command is sent");
+    let _ = next_event(&mut socket, |event| is(event, "pong")).await;
+
+    socket
+        .send(Message::Text(r#"{"command":"detonate"}"#.into()))
+        .await
+        .expect("the command is sent");
+    let event = next_event(&mut socket, |event| is(event, "error")).await;
+    assert!(
+        event["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "a refusal must say why: {event}"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
+    // The highest-privilege surface in the system. The refusal happens before
+    // the upgrade, because a socket that opens and then closes is — to most
+    // clients — indistinguishable from a network fault.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let data_dir = TempDir::new("live-unauthorised");
+    let (deployment, port) = deployment_with_operator_api(data_dir.path()).await;
+    // One authorised connection first, so a refusal below cannot be the
+    // listener simply not being up yet.
+    drop(open_live_channel(port).await);
+
+    let request = format!("ws://127.0.0.1:{port}/v1/events")
+        .into_client_request()
+        .expect("a valid websocket URL");
+    assert!(
+        tokio_tungstenite::connect_async(request).await.is_err(),
+        "the live channel accepted a subscriber with no credential"
+    );
+
+    deployment.stop();
 }

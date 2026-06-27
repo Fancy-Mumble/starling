@@ -14,12 +14,12 @@ use tokio as _;
 use std::sync::Arc;
 
 use prost::Message as _;
+use starling_proto_fancy::identity;
 use starling_proto_fancy::moderation::moderation_server::{Moderation, ModerationServer};
 use starling_proto_fancy::moderation::{
     Ban, BanCheck, BanList, BanRequest, BanResult, BanVerdict, KickRequest, UnbanRequest,
 };
 use starling_proto_fancy::perm::Perm;
-use starling_proto_fancy::identity;
 use starling_proto_fancy::sessionview::Session;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
@@ -363,7 +363,8 @@ impl ModerationService {
     /// removes them from the server rather than from a room. Banning needs
     /// `Ban`; kicking needs `Ban` *or* `Kick`.
     async fn on_user_remove(&self, inbound: &Inbound) -> Actions {
-        let Ok(request) = starling_proto::proto::tcp::UserRemove::decode(inbound.payload.as_slice())
+        let Ok(request) =
+            starling_proto::proto::tcp::UserRemove::decode(inbound.payload.as_slice())
         else {
             tracing::debug!(conn = inbound.conn, "undecodable UserRemove");
             return Actions::new();
@@ -402,7 +403,11 @@ impl ModerationService {
         self.logger.log(
             LogEvent::notice(
                 Category::Admin,
-                if banning { "user banned" } else { "user kicked" },
+                if banning {
+                    "user banned"
+                } else {
+                    "user kicked"
+                },
             )
             .with("actor", inbound.session)
             .with("session", request.session)
@@ -489,7 +494,10 @@ impl ModerationService {
         if !by_certificate && !by_address {
             // Nothing to key it on. murmur returns without writing rather than
             // storing a ban that matches everybody.
-            tracing::info!(session = target.session, "ban names no method; nothing stored");
+            tracing::info!(
+                session = target.session,
+                "ban names no method; nothing stored"
+            );
             return;
         }
 

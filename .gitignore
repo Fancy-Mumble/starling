@@ -12,3 +12,8 @@
 *.swp
 .DS_Store
 Thumbs.db
+
+# pnpm's content-addressable store. Same reasoning as the editor cruft above:
+# this repo has no JavaScript at all, but a stray `pnpm` invocation leaves one
+# in whatever directory it ran from, and it should never be staged.
+.pnpm-store/

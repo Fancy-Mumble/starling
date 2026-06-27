@@ -8,6 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# `PluginDataTransmission` is an upstream Mumble type, not a Fancy one: the
+# relay has to read its envelope to stamp the sender and honour the receiver
+# list, even though the payload inside stays opaque.
+starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
