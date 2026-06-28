@@ -36,6 +36,7 @@ use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::trail::{self, Record, Trail};
 use tonic::{Request, Response, Status};
 
 /// Upstream `QueryUsers`.
@@ -52,6 +53,8 @@ pub struct UserdataService {
     /// To reach `session-view`, which is the only place that knows which
     /// account a session belongs to — see [`UserdataService::sessions`].
     resolver: Resolver,
+    /// The operator-facing record of account changes.
+    trail: Trail,
 }
 
 impl UserdataService {
@@ -133,6 +136,13 @@ impl UserData for UserdataRpc {
                         .with("account", account.id)
                         .with("name", name)
                         .with("scope", scope),
+                );
+                self.0.trail.record(
+                    scope,
+                    Record::new(trail::category::REGISTER, "registered")
+                        .actor(req.actor.clone().unwrap_or_default(), String::new())
+                        .target_account(account.id)
+                        .detail(account.name.clone()),
                 );
                 Ok(Response::new(account))
             }
@@ -334,6 +344,7 @@ impl Serve for UserdataService {
             accounts,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            trail: Trail::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
         }))
     }
