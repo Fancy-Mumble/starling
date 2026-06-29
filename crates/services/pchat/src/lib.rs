@@ -16,8 +16,10 @@ use prost::Message as _;
 use starling_proto_fancy::fancy::pchat::{
     Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
 };
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
 };
@@ -48,6 +50,15 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
 pub struct PchatService {
     store: Store,
     fanout: Fanout,
+    /// Asks `permissions` before a channel's archive is written or read.
+    ///
+    /// The ciphertext is opaque to this service, which is not the same as it
+    /// being safe to hand to anyone who asks: the archive still discloses who
+    /// spoke in a channel and when, and the ciphertext itself is exactly what
+    /// an offline attack needs. `Permit` denies when `permissions` is
+    /// unreachable, so a broken dependency closes the archive rather than
+    /// opening it.
+    permit: Permit,
 }
 
 impl PchatService {
@@ -179,6 +190,22 @@ impl ClientService for PchatService {
 
         match envelope.body {
             Some(pchat_envelope::Body::Message(mut message)) => {
+                // Checked before the message is stored, not just before it is
+                // relayed: an unauthorised write that is refused delivery still
+                // leaves a row in somebody else's channel archive, and the
+                // sender is the one who chose the channel id.
+                if !self
+                    .permit
+                    .allows(&inbound, message.channel, Perm::TEXT_MESSAGE.bits())
+                    .await
+                {
+                    return vec![permission_denied(
+                        &inbound,
+                        Perm::TEXT_MESSAGE,
+                        message.channel,
+                    )];
+                }
+
                 message.sender = inbound.session;
                 let Some(id) = self.store_message(inbound.scope, &message).await else {
                     let refusal = PchatEnvelope {
@@ -202,12 +229,34 @@ impl ClientService for PchatService {
                 let relay = PchatEnvelope {
                     body: Some(pchat_envelope::Body::Message(message)),
                 };
+                // `broadcast_except` reaches every authenticated session on the
+                // server, not the channel: the gateway's `deliver` falls back
+                // to `registry.authenticated()` when a `Send` names no conns and
+                // no sessions. The ciphertext stays opaque, but who sent a
+                // message, when, and in which channel does not -- and the
+                // ciphertext is what an offline attack wants. Scoping this needs
+                // the channel roster from `session-view`, the way `voice`
+                // already addresses its `sessions`. Tracked as a finding rather
+                // than fixed here because `text` relays the same way, so the
+                // choice belongs at the plane, not in this one service.
                 vec![
                     to_conn(inbound.conn, outer, acknowledgement.encode_to_vec()),
                     broadcast_except(inbound.session, outer, relay.encode_to_vec()),
                 ]
             }
             Some(pchat_envelope::Body::Fetch(request)) => {
+                // The channel id comes off the wire, so without this a client
+                // could page through the stored archive of any channel on the
+                // server -- including ones it cannot see. murmur gates the same
+                // read on Enter (`handlePchatFetch`).
+                if !self
+                    .permit
+                    .allows(&inbound, request.channel, Perm::ENTER.bits())
+                    .await
+                {
+                    return vec![permission_denied(&inbound, Perm::ENTER, request.channel)];
+                }
+
                 let page = self.fetch(inbound.scope, &request).await;
                 let reply = PchatEnvelope {
                     body: Some(pchat_envelope::Body::FetchResponse(page)),
@@ -217,6 +266,14 @@ impl ClientService for PchatService {
             // Key distribution, pins, reactions and receipts are relayed
             // verbatim: reading any of them would mean understanding a payload
             // this service deliberately cannot decrypt.
+            //
+            // Unauthorised, and knowingly so. These bodies carry a channel id
+            // this arm never decodes, so there is nothing to check a permission
+            // against without teaching the service every body type -- which is
+            // the coupling the verbatim relay exists to avoid. It is also
+            // `broadcast_except`, which reaches every authenticated session on
+            // the server rather than the channel (see the note on the message
+            // relay below). Both are tracked in `SECURITY-AUDIT-pchat.md`.
             Some(_) => vec![broadcast_except(
                 inbound.session,
                 outer,
@@ -236,6 +293,7 @@ impl Serve for PchatService {
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
+            permit: Permit::new(ctx.resolver.clone()),
         }))
     }
 
@@ -273,10 +331,33 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        // Points at a `permissions` nothing is serving, so every check denies.
+        // The storage tests below call `store_message`/`fetch` directly and are
+        // unaffected; the two that go through `frame` rely on this to assert
+        // that an unauthorised client is refused.
+        let resolver = starling_runtime::channel::Resolver::new(
+            Arc::new(starling_runtime::config::Config::with_defaults(
+                std::path::Path::new("/run/starling"),
+            )),
+            starling_runtime::inproc::Broker::new(),
+        );
         Arc::new(PchatService {
             store,
             fanout: Fanout::default(),
+            permit: Permit::new(resolver),
         })
+    }
+
+    /// One decoded frame carrying `body`, from session 7 in channel 4.
+    fn frame(body: pchat_envelope::Body) -> Inbound {
+        Inbound {
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: ServiceKind::Pchat.outer_type(),
+            gateway: String::new(),
+            payload: PchatEnvelope { body: Some(body) }.encode_to_vec(),
+        }
     }
 
     fn message(channel: u32, ciphertext: &[u8]) -> Message {
@@ -324,5 +405,52 @@ mod tests {
         let page = service.fetch(1, &fetch(5, 2)).await;
         assert_eq!(page.total_stored, 3);
         assert!(page.more);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_the_client_may_not_make_returns_no_archive() {
+        // The channel id is chosen by the client, so an unchecked fetch paged
+        // through the stored archive of any channel on the server.
+        let service = service().await;
+        let _ = service.store_message(1, &message(4, b"secret")).await;
+
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Fetch(fetch(4, 10))))
+            .await;
+
+        // Refused, and specifically not a FetchResponse carrying the archive.
+        assert_eq!(actions.len(), 1);
+        let payload = sent_payload(&actions[0]);
+        assert!(
+            PchatEnvelope::decode(payload.as_slice())
+                .ok()
+                .and_then(|envelope| envelope.body)
+                .is_none(),
+            "a refused fetch must not answer with a pchat body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_the_client_may_not_send_is_never_stored() {
+        // Refusing only the relay would still leave the row in somebody else's
+        // channel archive.
+        let service = service().await;
+
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Message(message(4, b"x"))))
+            .await;
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(service.count(1, 4).await, 0);
+    }
+
+    /// The payload of a `Send` action, for asserting on what a refusal carries.
+    fn sent_payload(action: &starling_proto_fancy::control::ServerAction) -> Vec<u8> {
+        match &action.action {
+            Some(starling_proto_fancy::control::server_action::Action::Send(send)) => {
+                send.payload.clone()
+            }
+            _ => Vec::new(),
+        }
     }
 }
