@@ -36,6 +36,7 @@ pub mod metrics;
 pub mod permit;
 pub mod plane;
 pub mod ratelimit;
+pub mod roster;
 pub mod serve;
 pub mod shutdown;
 pub mod storage;
