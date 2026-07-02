@@ -79,6 +79,15 @@ message Snapshot {
   string registry_hostname = 33;
   // Free-text country or region. Optional in murmur, and omitted when empty.
   string registry_location = 34;
+  // Whether a listener's volume adjustment is announced to every client or only
+  // to the one that set it.
+  //
+  // murmur's `broadcastlistenervolumeadjustments`, and **off by default** as it
+  // is there: how loudly somebody is listening to a room is their own business,
+  // and the only client that has to know the number is the one applying it.
+  // Operators turn it on for overlays and talking-UI tooling that render other
+  // people's listeners.
+  bool broadcast_listener_volume_adjustments = 35;
   // Settings a later service adds, so an operator-facing knob does not need a
   // proto release to exist.
   map<string, string> extra = 40;

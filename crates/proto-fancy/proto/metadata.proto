@@ -21,7 +21,9 @@ service Metadata {
   // Membership. Metadata owns it because it owns the tree the answer is about.
   rpc Enter(EnterRequest) returns (EnterResult);
   rpc Leave(LeaveRequest) returns (starling.common.v1.Ack);
-  rpc Listen(ListenRequest) returns (starling.common.v1.Ack);
+  rpc Listen(ListenRequest) returns (ListenResult);
+  // Put a returning user's stored listeners back, at the start of a session.
+  rpc RestoreListeners(RestoreListenersRequest) returns (ListenResult);
 }
 
 message TreeRequest {
@@ -55,6 +57,12 @@ message Membership {
   uint32 session = 1;
   uint32 channel = 2;
   repeated uint32 listening = 3;
+  // Per-listener gain, keyed by the channel it applies to. Absent means unity.
+  //
+  // Kept for channels no longer in `listening`, which is murmur's behaviour and
+  // deliberate: a user who turns a room off and back on gets the volume they
+  // chose, not a silent reset to full.
+  map<uint32, float> listening_volume = 4;
 }
 
 message TreeEvent {
@@ -130,4 +138,46 @@ message ListenRequest {
   uint32 session = 2;
   repeated uint32 listen = 3;
   repeated uint32 unlisten = 4;
+  // Gains to set, keyed by channel. Applied after `listen` and `unlisten`, and
+  // accepted for a channel in neither — murmur stores an adjustment for a
+  // listener that does not exist yet, so a client may set the volume before it
+  // starts listening.
+  map<uint32, float> volume = 5;
+  // The account to persist this under. Absent for a guest, whose listeners live
+  // and die with the session — murmur stores nothing for an unregistered user
+  // (`Server.cpp:3224` guards on `iId >= 0`), because there is no identity for a
+  // later visit to be matched against.
+  optional uint64 account = 6;
+}
+
+message RestoreListenersRequest {
+  starling.common.v1.Scope scope = 1;
+  // The session to attach them to, freshly connected.
+  uint32 session = 2;
+  // Whose stored listeners to load. A guest has none, and asking is harmless.
+  uint64 account = 3;
+}
+
+message ListenResult {
+  // Channels this session now listens to that it did not before.
+  repeated uint32 added = 1;
+  // Channels it stopped listening to.
+  repeated uint32 removed = 2;
+  // Requests refused, and by which limit — so the caller can tell the client
+  // which ceiling it met rather than letting the request quietly do nothing.
+  repeated ListenRefusal refused = 3;
+  // Gains that changed, keyed by channel.
+  map<uint32, float> volume = 4;
+}
+
+message ListenRefusal {
+  uint32 channel = 1;
+  Limit limit = 2;
+
+  enum Limit {
+    // `listeners_per_channel` is reached for that channel.
+    CHANNEL_FULL = 0;
+    // `listeners_per_user` is reached for that session.
+    USER_FULL = 1;
+  }
 }

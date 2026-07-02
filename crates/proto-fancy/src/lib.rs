@@ -69,6 +69,11 @@ generated!(
     "starling.serverconfig.v1"
 );
 generated!(
+    /// Readiness, per service and aggregated.
+    health,
+    "starling.health.v1"
+);
+generated!(
     /// The channel tree and membership.
     metadata,
     "starling.metadata.v1"

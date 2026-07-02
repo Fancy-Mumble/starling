@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+// Readiness, as something other than a per-process HTTP endpoint.
+//
+// Every service already declares readiness gates (starling-runtime `Health`):
+// voice gates on its session-view subscription being warm, the gateway reports
+// a missing resume store as a warning, and so on. Until this existed those
+// gates were reachable only as `/readyz` on that one process — so in
+// `--all-in-one`, where twenty services share a process and each holds its own
+// `Health`, nineteen of them were invisible.
+//
+// Two surfaces, because they answer different questions:
+//
+//   Check    — one service describing itself. Served by *every* service, wired
+//              in by the runtime, so no service implements anything.
+//   Overview — the collector's aggregate, which is what a dashboard draws.
+package starling.health.v1;
+
+import "common.proto";
+
+// Served by every service. The runtime adds it; a service never writes one.
+service Health {
+  rpc Check(CheckRequest) returns (ServiceHealth);
+}
+
+// Served by the `health` service alone: the whole server, as last polled.
+service HealthOverview {
+  rpc Get(OverviewRequest) returns (Overview);
+  // The recent past, for a dashboard that plots rather than blinks.
+  rpc History(OverviewRequest) returns (HistoryReply);
+}
+
+message CheckRequest {}
+
+message OverviewRequest {
+  starling.common.v1.Scope scope = 1;
+}
+
+// How ready something is.
+//
+// The three states of `starling_runtime::health::Readiness`, plus the one the
+// runtime cannot report about itself: UNREACHABLE is the collector's answer for
+// a service that did not respond, which is precisely the case a per-process
+// endpoint can never describe.
+enum State {
+  STATE_UNSPECIFIED = 0;
+  // Warm, taking traffic.
+  READY = 1;
+  // Still warming a cache. Traffic must not be routed here yet.
+  WARMING = 2;
+  // Degraded, but not a reason to be taken out of rotation.
+  WARNING = 3;
+  // The collector could not reach it at all.
+  UNREACHABLE = 4;
+}
+
+// One readiness gate: what a service is waiting for, by name.
+message Gate {
+  string name = 1;
+  State state = 2;
+}
+
+// How full one bounded thing is.
+//
+// The question `Metrics` cannot answer. Counters describe what already
+// happened — refused, dropped, disconnected — and by the time a refusal is
+// counted the decision is made. This is the interval before that: the queue at
+// 80% of its budget, climbing.
+message Load {
+  // What it is called, in an operator's words.
+  string name = 1;
+  // In use when the sample was taken.
+  uint64 used = 2;
+  // The high-water mark since the previous sample.
+  //
+  // The number that matters. A queue that fills and drains between two polls
+  // is a queue that refused requests and reads as idle in both samples, which
+  // is exactly the event worth seeing.
+  uint64 peak = 3;
+  // What bounds it; **zero means nothing declares a limit**, and a dashboard
+  // must then show a count rather than a percentage. Inventing a denominator
+  // would turn an unknown into a reassuring number.
+  uint64 capacity = 4;
+  // Cumulative refusals. Cumulative and not per-interval because a reader that
+  // misses a poll must not lose one: a refusal is a request the server did not
+  // serve.
+  uint64 rejected = 5;
+}
+
+message ServiceHealth {
+  // The configuration key, which is also the log name.
+  string service = 1;
+  // The worst of `gates`, which is what a dashboard colours the row by.
+  State state = 2;
+  repeated Gate gates = 3;
+  // Why it is UNREACHABLE, verbatim from the transport.
+  string error = 5;
+  // **Microseconds** the check took, from the collector's side. Absent when
+  // the service answered for itself.
+  //
+  // Was milliseconds, which made every row read `0ms`: under `--all-in-one`
+  // twenty services share a process and a check is an in-process call taking
+  // tens of microseconds, so the only latency column an operator had was a
+  // column of zeroes. Truncation to zero is not a small error in a latency
+  // figure — it is the difference between "fast" and "not measured".
+  uint64 latency_us = 6;
+  // What this service has queued, and how close to full it is.
+  repeated Load load = 7;
+
+  reserved 4;
+  reserved "latency_ms";
+}
+
+// One past sweep, compressed to what a plot needs.
+//
+// Deliberately not a whole `Overview` per sample: retaining every gate of every
+// service for an hour would be a slow memory leak in the one service whose job
+// is to notice things going wrong. A plot needs the shape over time — the
+// server's state, how many services were in each state, and how long they took
+// to answer — and the detail is always available for *now* from `Get`.
+message Sample {
+  uint64 observed_at_ms = 1;
+  State state = 2;
+  uint32 ready = 3;
+  uint32 warming = 4;
+  uint32 warning = 5;
+  uint32 unreachable = 6;
+  // Which service was slowest, so a spike can be attributed without guessing.
+  string slowest = 8;
+  // Slowest service in that sweep, in **microseconds** — see
+  // `ServiceHealth.latency_us` for why not milliseconds.
+  //
+  // The slowest and not the average, because an average hides the one service
+  // that is timing out among nineteen that are fine.
+  uint64 worst_latency_us = 9;
+  // The fullest queue anywhere in the server that sweep, 0-100.
+  //
+  // One number for the whole server, so a plot can show pressure building
+  // without twenty overlapping lines. Only gauges that declare a capacity can
+  // contribute: a percentage of an unknown bound is not a percentage.
+  uint32 busiest_percent = 10;
+  // Which service and gauge that was.
+  string busiest = 11;
+  // Total refusals across every gauge, cumulative.
+  uint64 rejected = 12;
+
+  reserved 7;
+  reserved "worst_latency_ms";
+}
+
+message HistoryReply {
+  repeated Sample samples = 1;
+  // The gap between samples, so a dashboard can label its axis without
+  // inferring the interval from timestamps that a restart makes uneven.
+  uint32 interval_ms = 2;
+}
+
+message Overview {
+  // The worst state across `services`: one glance, not twenty.
+  State state = 1;
+  repeated ServiceHealth services = 2;
+  // When this snapshot was taken, so a dashboard can say how stale it is
+  // rather than presenting a frozen picture as current.
+  uint64 observed_at_ms = 3;
+  // Services configured but not enabled. Not a fault, and the answer to most
+  // "why is this feature missing" questions.
+  repeated string disabled = 4;
+}
