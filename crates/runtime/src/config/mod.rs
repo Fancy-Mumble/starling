@@ -232,6 +232,19 @@ impl Config {
                 ..ServiceConfig::default()
             },
         );
+        // Not a `ServiceKind` either — no client talks to it — but unlike the
+        // announcer it *is* dialled, by `operator-api` reading the aggregate,
+        // so it needs a real endpoint. Optional: a server with no health
+        // collector is a server nobody can see the state of, which is a poorer
+        // deployment and not a broken one.
+        let _ = config.services.insert(
+            "health".to_owned(),
+            ServiceConfig::new(
+                &crate::transport::local_endpoint(run_dir, "health"),
+                Tier::Optional,
+                &[],
+            ),
+        );
         config
     }
 
@@ -329,6 +342,13 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
         // handled and returned from at the top of `Server::message`
         // (`Server.cpp:1905`), before the message-rate check further down.
         ServiceKind::Voice => Some("audio"),
+        // The ACL editor emits one query per channel when it opens the tree,
+        // and chat is a person typing. Both are *interactive bursts* by a human
+        // rather than a flood, and both were being silently decimated by the
+        // shared 1/s bucket — the same failure that moved screen-share
+        // signalling and tunnelled audio off it.
+        ServiceKind::Permissions => Some("acl"),
+        ServiceKind::Text => Some("chat"),
         _ => None,
     }
 }
@@ -387,6 +407,41 @@ mod tests {
         Config::with_defaults(Path::new("/run/starling"))
             .validate()
             .expect("the shipped defaults must be a valid routing table");
+    }
+
+    #[test]
+    fn every_bucket_a_service_names_actually_exists() {
+        // A service naming a bucket the operator did not define is allowed
+        // through unlimited by `Limiter::check` — deliberately, because
+        // starving a route over a typo is the worse failure. That makes the
+        // typo *invisible*, so it is caught here instead: the defaults must
+        // name only buckets the defaults define.
+        let config = Config::with_defaults(Path::new("/run/starling"));
+        for (name, service) in &config.services {
+            let Some(bucket) = &service.limits else {
+                continue;
+            };
+            assert!(
+                config.gateway.limits.contains_key(bucket),
+                "{name} is charged to {bucket:?}, which no bucket defines"
+            );
+        }
+    }
+
+    #[test]
+    fn the_interactive_routes_do_not_share_murmurs_one_per_second_bucket() {
+        // Measured in an e2e run: 120 `ACL` frames and a `TextMessage` dropped,
+        // the latter failing a fan-out test by losing exactly the sixth message
+        // of eight. Both are human-driven bursts rather than floods.
+        let config = Config::with_defaults(Path::new("/run/starling"));
+        for service in ["permissions", "text"] {
+            let bucket = config
+                .services
+                .get(service)
+                .and_then(|s| s.limits.clone())
+                .unwrap_or_else(|| "control".to_owned());
+            assert_ne!(bucket, "control", "{service} is still on murmur's 1/s");
+        }
     }
 
     #[test]

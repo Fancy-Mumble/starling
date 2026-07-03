@@ -104,6 +104,28 @@ impl Health {
             .unwrap_or_default()
     }
 
+    /// Every gate and its state, for the health surface.
+    ///
+    /// [`Self::pending`] and [`Self::warnings`] each answer one question and
+    /// throw the rest away, which is right for `/readyz`'s prose and wrong for
+    /// a dashboard: it wants the whole picture, including the gates that are
+    /// *fine*, or it cannot tell "warm" from "never declared anything".
+    ///
+    /// Sorted, because it is a `BTreeMap`: a dashboard that reorders its rows
+    /// on every poll is a dashboard nobody can read.
+    #[must_use]
+    pub fn gates(&self) -> Vec<(String, Readiness)> {
+        self.gates
+            .lock()
+            .map(|gates| {
+                gates
+                    .iter()
+                    .map(|(name, state)| (name.clone(), *state))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The readiness body: the status, then the gates that explain it.
     #[must_use]
     pub fn report(&self) -> String {

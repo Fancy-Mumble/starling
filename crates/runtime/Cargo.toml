@@ -18,7 +18,10 @@ prost.workspace = true
 hyper-util.workspace = true
 
 serde.workspace = true
-
+# The admin API's configuration payloads, shared so both directions agree.
+serde_json.workspace = true
+# Only for the log's address pseudonyms; nothing here is a secret.
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -26,6 +29,10 @@ tokio-stream.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tower = "0.5"
+# The response-future wrapper in `inflight`: a guard has to live inside the
+# future, and hand-rolled pin projection there would be unsafe code in a
+# diagnostics path.
+pin-project-lite = "0.2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

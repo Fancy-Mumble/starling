@@ -71,6 +71,25 @@ impl Permit {
         channel: u32,
         permission: u32,
     ) -> bool {
+        self.allows_session_with_tokens(scope, session, channel, permission, Vec::new())
+            .await
+    }
+
+    /// The same check, carrying access tokens that apply to it and nothing else.
+    ///
+    /// A client sends a channel's password *with* the request to enter it
+    /// (`UserState.temporary_access_tokens`, `Messages.cpp:1133`) rather than
+    /// storing it on the session. Passing them here keeps that scope: the token
+    /// opens the door it was sent for and is not written anywhere that would let
+    /// it open the next one.
+    pub async fn allows_session_with_tokens(
+        &self,
+        scope: u32,
+        session: u32,
+        channel: u32,
+        permission: u32,
+        temporary_tokens: Vec<String>,
+    ) -> bool {
         // A session of zero is a client that has not finished its handshake.
         // `permissions` would resolve it to nobody and deny; refusing here
         // saves the round trip and says why.
@@ -96,6 +115,7 @@ impl Permit {
                 session,
                 channel,
                 permission,
+                temporary_tokens,
             })
             .await;
 
@@ -140,6 +160,38 @@ pub fn permission_denied(inbound: &Inbound, missing: Perm, channel: u32) -> Serv
         session: Some(inbound.session),
         reason: Some(missing.describe()),
         r#type: Some(starling_proto::proto::tcp::permission_denied::DenyType::Permission as i32),
+        name: None,
+    };
+    crate::plane::to_conn(inbound.conn, PERMISSION_DENIED, denied.encode_to_vec())
+}
+
+/// Tell the client its action was refused for a reason that is **not** a
+/// missing permission — a limit it met, a name it may not use.
+///
+/// murmur's `PERM_DENIED_TYPE`, and the distinction matters at the other end: a
+/// client told `Permission` renders "you lack the X permission", which is a
+/// lie when the truth is "this channel is full" or "the tree may not get
+/// deeper". Those are conditions an operator can change and a user can wait
+/// out, and a client that names them correctly is the difference between a
+/// retry and a bug report.
+///
+/// The `reason` string is carried as well as the type, because every one of
+/// these types post-dates some client version, and one that does not know the
+/// enum renders the text.
+#[must_use]
+pub fn refused(
+    inbound: &Inbound,
+    kind: starling_proto::proto::tcp::permission_denied::DenyType,
+    channel: u32,
+    reason: &str,
+) -> ServerAction {
+    use prost::Message as _;
+    let denied = starling_proto::proto::tcp::PermissionDenied {
+        permission: None,
+        channel_id: Some(channel),
+        session: Some(inbound.session),
+        reason: Some(reason.to_owned()),
+        r#type: Some(kind as i32),
         name: None,
     };
     crate::plane::to_conn(inbound.conn, PERMISSION_DENIED, denied.encode_to_vec())
