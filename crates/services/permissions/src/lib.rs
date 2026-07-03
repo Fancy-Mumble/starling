@@ -15,6 +15,7 @@ pub mod perm;
 
 pub mod coalesce;
 pub mod evaluate;
+pub mod group;
 
 pub use coalesce::Coalescer;
 pub use evaluate::{Acls, evaluate};
@@ -29,7 +30,7 @@ use starling_proto_fancy::permissions::permissions_server::{
 };
 use starling_proto_fancy::permissions::{
     AclRequest, AclResult, AclSet, CheckRequest, EffectiveRequest, EffectiveResponse, Invalidation,
-    SessionCheckRequest, SetAclRequest, Subject,
+    SessionCheckRequest, SetAclRequest, Subject, TemporaryGroupRequest, temporary_group_request,
 };
 use starling_proto_fancy::sessionview::GetRequest as SessionGetRequest;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
@@ -319,6 +320,157 @@ impl PermissionsService {
         tracing::info!(loaded, "acl tables loaded");
     }
 
+    /// Add or remove one temporary group membership.
+    ///
+    /// One function for both directions because everything except the final
+    /// call is shared, and the two drifting apart is how a grant ends up
+    /// validated differently from the revocation that undoes it.
+    ///
+    /// Not persisted, and the invalidation is published before the caller is
+    /// acknowledged — the same order every other write here uses, for the same
+    /// reason: a revocation that races an acknowledgement is a stale grant.
+    async fn temporary(
+        &self,
+        req: &TemporaryGroupRequest,
+        add: bool,
+    ) -> Result<Response<AclResult>, Status> {
+        let scope = scope_of(req.scope);
+        let refuse = |why: &str| {
+            Ok(Response::new(AclResult {
+                applied: false,
+                refused: why.to_owned(),
+            }))
+        };
+
+        // A group *name*, not a specification. Accepting `#token` or `!admin`
+        // here would store a membership of something the evaluator parses as a
+        // predicate, which no walk would ever consult.
+        if req.group.is_empty() {
+            return refuse("no group was named");
+        }
+        if req.group.starts_with(['!', '~', '#', '$']) {
+            return refuse("a temporary membership names a group, not a specification");
+        }
+        let Some(member) = req.member else {
+            return refuse("no member was named");
+        };
+        let member = match member {
+            temporary_group_request::Member::Account(account) => evaluate::Member::Account(account),
+            // Zero is "no session"; a grant naming it could never be matched,
+            // because no allocator issues it.
+            temporary_group_request::Member::Session(0) => {
+                return refuse("session 0 is not a session");
+            }
+            temporary_group_request::Member::Session(session) => evaluate::Member::Session(session),
+        };
+
+        if add {
+            // **A grant may only name a session that is currently connected**,
+            // which is murmur's rule (`NEED_PLAYER` ahead of
+            // `MumbleServerIce.cpp:2307`, raising `InvalidSessionException`) and
+            // is load-bearing rather than input validation. Departures are what
+            // clear these grants; a grant made for an id that has *already* gone
+            // has therefore missed its only cleanup, and would sit in the table
+            // until the pool reissues that id to somebody else.
+            //
+            // Only on the way in. Refusing a *revocation* because the holder has
+            // already left would be refusing a no-op, and of the two directions
+            // it is the one that must never be blocked.
+            if let evaluate::Member::Session(session) = member
+                && self.resolve(scope, session).await.is_none()
+            {
+                return refuse("that session is not connected");
+            }
+            self.acls
+                .add_temporary(scope, req.channel, &req.group, member);
+        } else {
+            self.acls
+                .remove_temporary(scope, req.channel, &req.group, member);
+        }
+
+        self.logger.log(
+            LogEvent::notice(Category::Permission, "temporary group membership changed")
+                .with("channel", req.channel)
+                .with("group", req.group.clone())
+                .with("added", add)
+                .with("member", format!("{member:?}"))
+                .with("scope", scope),
+        );
+
+        let _ = self.invalidations.send(Invalidation {
+            channels: vec![req.channel],
+            accounts: Vec::new(),
+            everything: true,
+        });
+        self.coalescer.clear();
+
+        Ok(Response::new(AclResult {
+            applied: true,
+            refused: String::new(),
+        }))
+    }
+
+    /// Drop a departed session's temporary memberships.
+    ///
+    /// A subscription rather than a call from `session-lifecycle`, because this
+    /// service already learns who a session is through `session-view` and that
+    /// is the edge `docs/ARCHITECTURE.md` §4 draws — a disconnect hook pointing
+    /// the other way would be a second one.
+    ///
+    /// **Fail-safe is not "carry on" here.** A lost `Gone` leaves a grant
+    /// attached to a session id that gets reissued, so a dropped stream clears
+    /// every session-scoped grant rather than trusting its own copy: the cost is
+    /// an external authority having to re-grant, and the alternative is somebody
+    /// silently inheriting a stranger's group.
+    async fn follow_sessions(&self, scope: u32) {
+        use starling_proto_fancy::sessionview::{SubscribeRequest, view_event};
+
+        /// How long to wait before re-subscribing.
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        loop {
+            let stream = match resolver.channel("session-view") {
+                Ok(transport) => {
+                    SessionViewClient::new(transport)
+                        .subscribe(SubscribeRequest {
+                            scope: Some(Scope {
+                                virtual_server: scope,
+                            }),
+                            subscriber: Self::NAME.to_owned(),
+                        })
+                        .await
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot reach session-view; retrying");
+                    tokio::time::sleep(RETRY).await;
+                    continue;
+                }
+            };
+            let Ok(stream) = stream else {
+                tokio::time::sleep(RETRY).await;
+                continue;
+            };
+
+            let mut events = stream.into_inner();
+            while let Ok(Some(event)) = events.message().await {
+                if let Some(view_event::Event::Gone(gone)) = event.event {
+                    self.acls.forget_session(gone.session);
+                    self.coalescer.clear();
+                }
+            }
+
+            // The stream ended, so a `Gone` may have been missed. Anything
+            // session-scoped is now suspect.
+            tracing::warn!("the session stream ended; clearing session-scoped group grants");
+            self.acls.forget_every_session();
+            self.coalescer.clear();
+            tokio::time::sleep(RETRY).await;
+        }
+    }
+
     /// Evaluate, coalescing identical concurrent questions into one walk.
     pub async fn effective(&self, scope: u32, subject: &Subject, channel: u32) -> u32 {
         let acls = self.acls.clone();
@@ -375,13 +527,18 @@ impl PermissionsRpc for PermissionsGrpc {
         // unresolvable session is refused outright rather than answered as a
         // guest — otherwise `session-view` being down would quietly grant every
         // caller the default set.
-        let Some(subject) = self.0.resolve(scope, req.session).await else {
+        let Some(mut subject) = self.0.resolve(scope, req.session).await else {
             return Ok(Response::new(Decision {
                 allowed: false,
                 missing: req.permission,
                 reason: "the session could not be identified".to_owned(),
             }));
         };
+        // Tokens the caller sent with *this* request — a channel password typed
+        // into the join dialog. Added to the session's own for the length of
+        // this call and no longer, which is upstream's scope for them
+        // (`Messages.cpp:110`, where a destructor takes them away again).
+        subject.tokens.extend(req.temporary_tokens);
         let decision = self.0.decide(scope, &subject, req.channel, req.permission);
         Ok(Response::new(decision))
     }
@@ -437,6 +594,20 @@ impl PermissionsRpc for PermissionsGrpc {
             applied: true,
             refused: String::new(),
         }))
+    }
+
+    async fn add_temporary_group(
+        &self,
+        request: Request<TemporaryGroupRequest>,
+    ) -> Result<Response<AclResult>, Status> {
+        self.0.temporary(&request.into_inner(), true).await
+    }
+
+    async fn remove_temporary_group(
+        &self,
+        request: Request<TemporaryGroupRequest>,
+    ) -> Result<Response<AclResult>, Status> {
+        self.0.temporary(&request.into_inner(), false).await
     }
 
     type WatchInvalidationsStream =
@@ -555,7 +726,16 @@ impl PermissionsService {
             registered: resolved.registered,
             name: resolved.name,
             cert_hash: resolved.cert_hash,
-            ..Subject::default()
+            // The channel the session is *standing in*, which is not the
+            // channel being evaluated: `in`, `out` and `sub` compare the two,
+            // and without this every one of them reads the user as being at the
+            // root (`crate::group`).
+            channel: resolved.channel,
+            // Access tokens, so `#password` groups can match at all. Written as
+            // `Vec::new()` at every call site until now, which is why channel
+            // passwords opened nothing (`docs/GAP-ANALYSIS.md` G2).
+            tokens: resolved.tokens,
+            strong_cert: resolved.strong_cert,
         })
     }
 
@@ -741,6 +921,12 @@ impl Serve for PermissionsService {
             followers.push(tokio::spawn(
                 async move { service.follow_tree(scope).await },
             ));
+            // The other subscription: who has *gone*, so a session-scoped group
+            // grant cannot outlive the session it names.
+            let service = Arc::clone(&self);
+            followers.push(tokio::spawn(async move {
+                service.follow_sessions(scope).await;
+            }));
         }
         ctx.shutdown.wait().await;
         for follower in followers {
@@ -890,6 +1076,7 @@ mod tests {
                 channel: 0,
                 // A permission every guest would otherwise hold by default.
                 permission: Perm::TEXT_MESSAGE.bits(),
+                temporary_tokens: Vec::new(),
             }))
             .await
             .expect("the call itself succeeds")
@@ -949,6 +1136,211 @@ mod tests {
         assert!(!decision.allowed);
         assert_eq!(decision.missing, Perm::SPEAK.bits());
         assert!(!decision.reason.is_empty());
+    }
+
+    /// An `ACL`(13) frame carrying `acl`, as a client's editor sends it.
+    fn acl_frame(acl: &starling_proto::proto::tcp::Acl) -> Inbound {
+        Inbound {
+            conn: 4,
+            session: 7,
+            type_id: ACL,
+            payload: acl.encode_to_vec(),
+            gateway: "test".to_owned(),
+            scope: 1,
+        }
+    }
+
+    /// What a `Send` action carries, for asserting on a reply.
+    fn sent(action: &starling_proto_fancy::control::ServerAction) -> (u16, Vec<u8>) {
+        let Some(starling_proto_fancy::control::server_action::Action::Send(send)) = &action.action
+        else {
+            panic!("the reply must be a Send");
+        };
+        (send.r#type as u16, send.payload.clone())
+    }
+
+    /// A `Write` grant to everybody at `channel`, so a test with no
+    /// `session-view` — where every asker resolves to a stranger — can still
+    /// reach the authorised path.
+    fn write_granted_at(channel: u32) -> AclSet {
+        AclSet {
+            channel,
+            inherit: true,
+            acls: vec![AclEntry {
+                apply_here: true,
+                apply_subs: true,
+                group: Some("all".to_owned()),
+                grant: Perm::WRITE.bits(),
+                ..AclEntry::default()
+            }],
+            groups: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_without_write_changes_nothing_and_is_told_so() {
+        // The refusal half of G1. It must *answer* — silence is what made the
+        // ACL editor look like it had saved.
+        let service = service();
+        let submitted = starling_proto::proto::tcp::Acl {
+            channel_id: 3,
+            inherit_acls: Some(true),
+            query: Some(false),
+            groups: vec![starling_proto::proto::tcp::acl::ChanGroup {
+                name: "admin".to_owned(),
+                ..starling_proto::proto::tcp::acl::ChanGroup::default()
+            }],
+            acls: Vec::new(),
+        };
+
+        let actions = service.on_acl_query(&acl_frame(&submitted)).await;
+
+        assert_eq!(actions.len(), 1, "a refusal is still an answer");
+        assert_eq!(sent(&actions[0]).0, 12, "PermissionDenied");
+        assert!(
+            service.acls.get(1, 3).groups.is_empty(),
+            "a refused write must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_holding_write_can_rewrite_a_channels_acl_table() {
+        // G1 itself: `on_acl_query` used to refuse every `ACL`(13) whose `query`
+        // flag was false, so the client's editor submitted and silently changed
+        // nothing — a role appeared to be created and was gone on the next read.
+        let service = service();
+        service.acls.set(1, write_granted_at(3));
+        let mut invalidations = service.invalidations.subscribe();
+
+        let submitted = starling_proto::proto::tcp::Acl {
+            channel_id: 3,
+            inherit_acls: Some(false),
+            query: Some(false),
+            groups: vec![starling_proto::proto::tcp::acl::ChanGroup {
+                name: "moderators".to_owned(),
+                add: vec![11],
+                ..starling_proto::proto::tcp::acl::ChanGroup::default()
+            }],
+            acls: vec![starling_proto::proto::tcp::acl::ChanAcl {
+                apply_here: Some(true),
+                apply_subs: Some(true),
+                group: Some("moderators".to_owned()),
+                grant: Some(Perm::MUTE_DEAFEN.bits()),
+                ..starling_proto::proto::tcp::acl::ChanAcl::default()
+            }],
+        };
+
+        let actions = service.on_acl_query(&acl_frame(&submitted)).await;
+
+        let stored = service.acls.get(1, 3);
+        assert!(!stored.inherit, "the inherit flag is part of the table");
+        assert_eq!(stored.groups.len(), 1);
+        assert_eq!(stored.groups[0].name, "moderators");
+        assert_eq!(stored.groups[0].add, vec![11]);
+        assert_eq!(stored.acls.len(), 1);
+        assert_eq!(stored.acls[0].grant, Perm::MUTE_DEAFEN.bits());
+
+        // Everything watching is told before the client is, for the reason this
+        // service exists: a stale grant is a security bug.
+        assert!(
+            invalidations
+                .try_recv()
+                .expect("an invalidation")
+                .everything,
+            "a rewrite invalidates"
+        );
+
+        // And the editor is answered with what was actually kept, so it renders
+        // the stored table rather than the one it hoped for.
+        let (type_id, payload) = sent(&actions[0]);
+        assert_eq!(type_id, ACL);
+        let echoed =
+            starling_proto::proto::tcp::Acl::decode(payload.as_slice()).expect("an ACL reply");
+        assert_eq!(echoed.channel_id, 3);
+        assert_eq!(echoed.acls.len(), 1);
+        assert_eq!(echoed.query, Some(false));
+    }
+
+    #[tokio::test]
+    async fn write_at_the_root_is_enough_to_repair_a_channel_that_locked_everyone_out() {
+        // murmur's rule, and not a convenience: without it, a user who may
+        // create a channel can deny `Write` inside it and make it ungovernable
+        // — the admin could no longer edit the ACL that locked them out.
+        let service = service();
+        service.acls.set(1, write_granted_at(0));
+        // The channel itself denies `Write` to everybody.
+        service.acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: false,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("all".to_owned()),
+                    deny: Perm::WRITE.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+
+        let repaired = starling_proto::proto::tcp::Acl {
+            channel_id: 5,
+            inherit_acls: Some(true),
+            query: Some(false),
+            groups: Vec::new(),
+            acls: Vec::new(),
+        };
+        let actions = service.on_acl_query(&acl_frame(&repaired)).await;
+
+        assert_eq!(sent(&actions[0]).0, ACL, "the repair is accepted");
+        assert!(
+            service.acls.get(1, 5).acls.is_empty(),
+            "the locking entry is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_access_token_sent_with_one_request_does_not_outlive_it() {
+        // The scope that makes a channel password a key to one door. murmur
+        // adds a temporary token for the length of one message and takes it
+        // away in a destructor (`Messages.cpp:110`); here it lives on the
+        // request and is never written to the session at all.
+        let service = service();
+        service.acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("#hunter2".to_owned()),
+                    grant: Perm::MUTE_DEAFEN.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+
+        let holder = Subject {
+            session: 7,
+            tokens: vec!["hunter2".to_owned()],
+            ..Subject::default()
+        };
+        let granted = service.effective(1, &holder, 0).await;
+        assert!(Perm::from_bits_truncate(granted).contains(Perm::MUTE_DEAFEN));
+
+        // The same subject without it holds nothing extra — and the coalescer
+        // keys on the session, so this also proves one client's answer is not
+        // being served to the next.
+        let stranger = Subject {
+            session: 7,
+            ..Subject::default()
+        };
+        let granted = service.effective(1, &stranger, 0).await;
+        assert!(!Perm::from_bits_truncate(granted).contains(Perm::MUTE_DEAFEN));
     }
 
     #[tokio::test]

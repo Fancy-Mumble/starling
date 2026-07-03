@@ -39,13 +39,59 @@ fn set_legacy_temporary(state: &mut tcp::ChannelState, temporary: bool) {
     state.temporary = Some(temporary);
 }
 
+/// A `ChannelState` announcing only a change of links.
+///
+/// A **delta**, not the whole record, and that is not an optimisation. A stock
+/// client reads a non-empty `links` as the complete set — it unlinks
+/// everything and re-links what is listed (`vendor/server/src/mumble/Messages.cpp:935`)
+/// — so an *unlink* announced as full state arrives as an empty repeated field,
+/// which the client skips entirely and the removed edge stays on its screen
+/// forever. `links_remove` is the only thing that takes a link away.
+#[must_use]
+pub fn link_state(channel: u32, added: &[u32], removed: &[u32]) -> tcp::ChannelState {
+    tcp::ChannelState {
+        channel_id: Some(channel),
+        links_add: added.to_vec(),
+        links_remove: removed.to_vec(),
+        ..tcp::ChannelState::default()
+    }
+}
+
+/// What an inbound `ChannelState` asked for.
+///
+/// The link deltas are kept apart from `fields` because they are not a field
+/// write: `links_add` names channels to link *to*, each of which is a
+/// separately permissioned edit of a channel other than the one being edited.
+/// Folding them into the field list would have made them look like a property
+/// of this channel, which is how a link ends up applied without asking the far
+/// end's ACL.
+#[derive(Debug, Default, Clone)]
+pub struct ChannelEdit {
+    /// The values the client sent.
+    pub channel: Channel,
+    /// Which of them it actually named.
+    pub fields: Vec<String>,
+    /// Channels to link to.
+    pub links_add: Vec<u32>,
+    /// Channels to unlink from.
+    pub links_remove: Vec<u32>,
+}
+
+impl ChannelEdit {
+    /// Whether the client asked to change any links.
+    #[must_use]
+    pub fn touches_links(&self) -> bool {
+        !self.links_add.is_empty() || !self.links_remove.is_empty()
+    }
+}
+
 /// Read an inbound `ChannelState` into a channel and the fields it names.
 ///
 /// Returning the field list rather than a whole channel is what lets an update
 /// touch only what the client sent — the same rule server-config follows, and
 /// for the same reason.
 #[must_use]
-pub fn to_proto(state: &tcp::ChannelState, id: u32) -> (Channel, Vec<String>) {
+pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
     let mut fields = Vec::new();
     let mut channel = Channel {
         id,
@@ -71,9 +117,11 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> (Channel, Vec<String>) {
         channel.max_users = max_users;
         fields.push("max_users".to_owned());
     }
-    if !state.links.is_empty() {
-        channel.links = state.links.clone();
-    }
+    // `links` is not applied here. A client sends it as a *complete* set and
+    // the server's answer to that is a pair of deltas, so it is turned into one
+    // below rather than written over `channel.links` — which the field-wise
+    // update would then have had to special-case anyway.
+
     // `hidden` was read by nothing, so a client asking for a private room got an
     // ordinary one: the flag never reached `flags`, `is_hidden` was dead code,
     // and every visibility check downstream had nothing to test. The room was
@@ -103,7 +151,12 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> (Channel, Vec<String>) {
         };
         fields.push("flags".to_owned());
     }
-    (channel, fields)
+    ChannelEdit {
+        channel,
+        fields,
+        links_add: state.links_add.clone(),
+        links_remove: state.links_remove.clone(),
+    }
 }
 
 /// Whether a channel is hidden from clients that may not see it.
@@ -139,8 +192,44 @@ mod tests {
             name: Some("Renamed".to_owned()),
             ..tcp::ChannelState::default()
         };
-        let (channel, fields) = to_proto(&state, 4);
-        assert_eq!(channel.name, "Renamed");
-        assert_eq!(fields, vec!["name".to_owned()]);
+        let edit = to_proto(&state, 4);
+        assert_eq!(edit.channel.name, "Renamed");
+        assert_eq!(edit.fields, vec!["name".to_owned()]);
+        assert!(!edit.touches_links());
+    }
+
+    #[test]
+    fn the_link_deltas_are_read_off_the_wire_rather_than_the_link_set() {
+        // C1's actual bug: `links_add` and `links_remove` were read by nothing,
+        // so a client's link button reached a server that had no field for it.
+        let state = tcp::ChannelState {
+            channel_id: Some(4),
+            links: vec![9],
+            links_add: vec![5, 6],
+            links_remove: vec![7],
+            ..tcp::ChannelState::default()
+        };
+        let edit = to_proto(&state, 4);
+        assert_eq!(edit.links_add, vec![5, 6]);
+        assert_eq!(edit.links_remove, vec![7]);
+        assert!(edit.touches_links());
+        assert!(
+            edit.channel.links.is_empty(),
+            "the complete-set field is not a field write"
+        );
+        assert!(
+            !edit.fields.iter().any(|field| field.contains("link")),
+            "links must not travel as a field, or the far end's ACL is never asked"
+        );
+    }
+
+    #[test]
+    fn an_unlink_is_announced_as_a_removal_and_not_as_an_empty_set() {
+        // A stock client skips `links` when it is empty, so an unlink sent as
+        // full state would leave the edge on its screen forever.
+        let state = link_state(4, &[], &[7]);
+        assert_eq!(state.links_remove, vec![7]);
+        assert!(state.links.is_empty());
+        assert_eq!(state.channel_id, Some(4));
     }
 }

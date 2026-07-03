@@ -54,8 +54,25 @@ impl Channel {
     /// `max_users == 0` means unlimited, matching murmur.
     #[must_use]
     pub fn is_full(&self, occupants: usize) -> bool {
-        self.max_users != 0 && occupants >= self.max_users as usize
+        is_full(self.max_users, occupants)
     }
+}
+
+/// Whether a channel with cap `max_users` is full at `occupants`.
+///
+/// A free function because the rule has **two** callers holding two different
+/// channel types — this entity and the proto record the live tree is made of —
+/// and it was previously written out in both. `GAP-ANALYSIS.md` C4 records what
+/// that cost: the rule was modelled here, covered by tests here, and the tree
+/// that clients actually enter had its own copy. A rule with two homes is a
+/// rule that is eventually enforced in one of them.
+///
+/// `max_users == 0` is **unlimited**, which is murmur's convention and the
+/// reading that is wrong in the direction nobody notices: taken literally it
+/// would lock every channel nobody has given an explicit limit.
+#[must_use]
+pub const fn is_full(max_users: u32, occupants: usize) -> bool {
+    max_users != 0 && occupants >= max_users as usize
 }
 
 #[cfg(test)]

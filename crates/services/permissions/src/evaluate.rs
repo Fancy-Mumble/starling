@@ -10,23 +10,59 @@
 //! memory: the database is a durable record of the control plane, never a read
 //! path for it (`docs/STORAGE.md` L7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use starling_proto::proto::tcp;
 use starling_proto_fancy::identity;
 use starling_proto_fancy::permissions::{AclEntry, AclSet, Group, Subject};
 
+use crate::group::Context;
 use crate::perm::Perm;
 
 /// The root channel's id, which is zero on every Mumble server.
 const ROOT_CHANNEL: u32 = 0;
+
+/// Who holds a temporary group membership.
+///
+/// Two named cases rather than upstream's one integer set, where an account is
+/// positive and a session is stored negated (`vendor/server/src/Group.cpp:242`).
+/// That encoding collides: an unregistered user's account id is `-1`, which is
+/// also session 1 negated, so on a murmur server the first session to connect
+/// is in every group any guest is in. Naming the cases costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Member {
+    /// A registered account, held until removed or until the server restarts.
+    Account(u64),
+    /// A live session — the only way to put an *unregistered* user in a group,
+    /// and dropped the moment that session goes.
+    Session(u32),
+}
+
+/// Temporary group memberships, keyed by `(scope, channel, group name)`.
+///
+/// The group name is in the key rather than the value because that is how it is
+/// looked up: the membership walk asks about one name on one channel, and a
+/// map from channel to a map of names would be two lookups to answer it.
+type Temporary = HashMap<(u32, u32, String), HashSet<Member>>;
 
 /// Every channel's ACL set, by virtual server.
 #[derive(Debug, Clone, Default)]
 pub struct Acls {
     inner: Arc<Mutex<HashMap<(u32, u32), AclSet>>>,
     parents: Arc<Mutex<HashMap<(u32, u32), u32>>>,
+    /// Temporary group memberships, by `(scope, channel, group name)`.
+    ///
+    /// **Held apart from the ACL sets, and never persisted.** Upstream keeps
+    /// them on the `Group` object and then has to stash and restore them by
+    /// hand around every ACL rewrite (`Messages.cpp:2842` and `:2900`,
+    /// duplicated again in `MumbleServerIce.cpp:1817`). Keeping them in their
+    /// own table makes that preservation the default rather than a step
+    /// somebody has to remember on each new write path.
+    ///
+    /// Not persisted because a session-scoped grant that outlived the process
+    /// would be a grant attached to a session id belonging to somebody else.
+    temporary: Arc<Mutex<Temporary>>,
 }
 
 impl Acls {
@@ -39,10 +75,150 @@ impl Acls {
     }
 
     /// Replace a channel's ACL set.
+    ///
+    /// **Temporary memberships for groups the new table still declares are
+    /// kept; the rest go.** That is upstream's rule, and it is not obvious from
+    /// either side: `Messages.cpp:2842` stashes every group's temporary set
+    /// before deleting the old `Group` objects, and `:2900` restores it while
+    /// looping over the *new* ones — so a group the operator deleted takes its
+    /// temporary members with it, and a group they merely edited does not.
+    ///
+    /// Getting this wrong is silent in both directions. Dropping everything
+    /// means an operator pressing Save in the ACL editor revokes every
+    /// temporary membership in the channel; keeping everything means a group
+    /// deleted from the table goes on admitting the people an external
+    /// authority put in it.
     pub fn set(&self, scope: u32, acls: AclSet) {
+        if let Ok(mut temporary) = self.temporary.lock() {
+            temporary.retain(|(held_scope, channel, name), _| {
+                *held_scope != scope
+                    || *channel != acls.channel
+                    || acls.groups.iter().any(|group| group.name == *name)
+            });
+        }
         if let Ok(mut inner) = self.inner.lock() {
             let _ = inner.insert((scope, acls.channel), acls);
         }
+    }
+
+    /// Put `member` in `group` on `channel`, until it is removed or lost.
+    ///
+    /// Declares the group on the channel if it is not there already, which is
+    /// what upstream does (`MumbleServerIce.cpp:2305` constructs a `Group` when
+    /// the lookup misses). It matters: the membership walk only visits channels
+    /// that declare the group, so a grant naming a group nobody has declared
+    /// would otherwise be accepted and then never match anybody.
+    ///
+    /// The declaration is added in memory and **not** persisted, again as
+    /// upstream: it exists to carry the temporary members, and writing it
+    /// through would leave an empty group in the table after a restart that
+    /// dropped the members.
+    pub fn add_temporary(&self, scope: u32, channel: u32, group: &str, member: Member) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let set = inner.entry((scope, channel)).or_insert_with(|| AclSet {
+                channel,
+                inherit: true,
+                acls: Vec::new(),
+                groups: Vec::new(),
+            });
+            if !set.groups.iter().any(|held| held.name == group) {
+                set.groups.push(Group {
+                    name: group.to_owned(),
+                    inherited: false,
+                    inherit: true,
+                    inheritable: true,
+                    add: Vec::new(),
+                    remove: Vec::new(),
+                    inherited_members: Vec::new(),
+                });
+            }
+        }
+        if let Ok(mut temporary) = self.temporary.lock() {
+            let _ = temporary
+                .entry((scope, channel, group.to_owned()))
+                .or_default()
+                .insert(member);
+        }
+    }
+
+    /// Take a temporary membership away.
+    pub fn remove_temporary(&self, scope: u32, channel: u32, group: &str, member: Member) {
+        if let Ok(mut temporary) = self.temporary.lock() {
+            let key = (scope, channel, group.to_owned());
+            if let Some(held) = temporary.get_mut(&key) {
+                let _ = held.remove(&member);
+                if held.is_empty() {
+                    let _ = temporary.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether `member` holds a temporary membership of `group` on `channel`.
+    #[must_use]
+    pub fn holds_temporary(&self, scope: u32, channel: u32, group: &str, member: Member) -> bool {
+        self.temporary
+            .lock()
+            .ok()
+            .and_then(|temporary| {
+                temporary
+                    .get(&(scope, channel, group.to_owned()))
+                    .map(|held| held.contains(&member))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether `channel` carries any temporary membership of `group`.
+    ///
+    /// Used by the membership walk to decide whether a channel takes part at
+    /// all: upstream always has a `Group` object where temporary members live,
+    /// so a channel holding them is a channel that declares the group.
+    #[must_use]
+    pub fn has_temporary(&self, scope: u32, channel: u32, group: &str) -> bool {
+        self.temporary
+            .lock()
+            .ok()
+            .is_some_and(|temporary| temporary.contains_key(&(scope, channel, group.to_owned())))
+    }
+
+    /// Drop **every** session-scoped membership, keeping account-scoped ones.
+    ///
+    /// For the case where this service can no longer be sure it has seen every
+    /// departure — a dropped `session-view` subscription. Account grants are
+    /// unaffected because they are not tied to a connection and nothing about
+    /// them has become uncertain.
+    pub fn forget_every_session(&self) {
+        let Ok(mut temporary) = self.temporary.lock() else {
+            return;
+        };
+        temporary.retain(|_, held| {
+            held.retain(|member| !matches!(member, Member::Session(_)));
+            !held.is_empty()
+        });
+    }
+
+    /// Drop every temporary membership one session holds, anywhere.
+    ///
+    /// Called when the session goes, and **required rather than tidy**: murmur
+    /// re-queues a departing session's id for reuse
+    /// (`vendor/server/src/murmur/Server.cpp:1904`) and Starling's allocator
+    /// does the same, so a grant that outlived its holder would be inherited by
+    /// whoever is issued that id next — silently, and carrying whatever the
+    /// group was granted.
+    ///
+    /// A scan of the whole table rather than a reverse index. Temporary grants
+    /// are made by an external authority a few at a time, not per frame, and
+    /// upstream walks the channel tree for the same reason (`RPC.cpp:262`). An
+    /// index here would be a second structure to keep consistent for a loop
+    /// that is never hot.
+    pub fn forget_session(&self, session: u32) {
+        let Ok(mut temporary) = self.temporary.lock() else {
+            return;
+        };
+        temporary.retain(|_, held| {
+            let _ = held.remove(&Member::Session(session));
+            !held.is_empty()
+        });
     }
 
     /// A channel's ACL set, or an empty inheriting one.
@@ -72,6 +248,14 @@ impl Acls {
         }
         if let Ok(mut parents) = self.parents.lock() {
             let _ = parents.remove(&(scope, channel));
+        }
+        // The third table, for the same reason as the first two: a later
+        // channel reusing this id would otherwise inherit the dead one's
+        // temporary members along with its ACL set.
+        if let Ok(mut temporary) = self.temporary.lock() {
+            temporary.retain(|(held_scope, held_channel, _), _| {
+                *held_scope != scope || *held_channel != channel
+            });
         }
     }
 
@@ -111,9 +295,28 @@ impl Acls {
         chain
     }
 
-    /// The groups a subject is in at `channel`.
+    /// The groups a subject is in at `channel`, for a client to display.
+    ///
+    /// The *identity* groups only — the ones that describe who somebody is.
+    /// `in`, `out` and `sub` are relations between two channels rather than
+    /// memberships, so there is no honest way to list them here, and an entry
+    /// naming one is still evaluated by [`crate::group::applies`] like any
+    /// other.
+    ///
+    /// Each candidate is put through the same predicate the evaluator uses,
+    /// rather than re-deriving membership. This used to scan the ancestry flat
+    /// and read `add` directly, which ignored `inherit` and `inheritable`
+    /// entirely: a group a parent declared as not inheritable was reported as
+    /// held in every child, so a client displayed a membership the evaluator
+    /// disagreed with.
     #[must_use]
     pub fn groups_of(&self, scope: u32, subject: &Subject, channel: u32) -> Vec<String> {
+        let context = Context {
+            acls: self,
+            scope,
+            target: channel,
+            acl_channel: channel,
+        };
         let mut groups = vec!["all".to_owned()];
         // `@auth` is `iId >= 0` upstream (`vendor/server/src/Group.cpp:154`) —
         // *registered*, not "connected". Reading it as the latter puts every
@@ -121,14 +324,12 @@ impl Acls {
         if identity::is_authenticated(subject.registered) {
             groups.push("auth".to_owned());
         }
-        for id in self.ancestry(scope, channel) {
-            for group in self.get(scope, id).groups {
-                let member = group.add.contains(&subject.account)
-                    || group.inherited_members.contains(&subject.account);
-                let removed = group.remove.contains(&subject.account);
-                if member && !removed && !groups.contains(&group.name) {
-                    groups.push(group.name);
-                }
+        if subject.strong_cert {
+            groups.push("strong".to_owned());
+        }
+        for name in crate::group::declared_names(self, scope, channel) {
+            if crate::group::applies(&name, subject, &context) && !groups.contains(&name) {
+                groups.push(name);
             }
         }
         groups
@@ -154,7 +355,6 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
         return Perm::SUPERUSER.bits();
     }
 
-    let groups = acls.groups_of(scope, subject, channel);
     let chain = acls.ancestry(scope, channel);
     // murmur seeds the walk with a default set rather than with nothing
     // (`vendor/server/src/ACL.cpp:130`). Starting from `NONE` made an
@@ -182,13 +382,22 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
         if *id == ROOT_CHANNEL && identity::account(subject.registered, subject.account).is_some() {
             granted |= Perm::READ_REGISTER;
         }
+        // Which channel the entry was written on, which is not the channel
+        // being evaluated once inheritance is in play. The group grammar reads
+        // both: `~` chooses between them (`crate::group`).
+        let context = Context {
+            acls,
+            scope,
+            target: channel,
+            acl_channel: *id,
+        };
         for entry in &set.acls {
             let applies = if is_target {
                 entry.apply_here
             } else {
                 entry.apply_subs
             };
-            if !applies || !matches(entry, subject, &groups) {
+            if !applies || !matches(entry, subject, &context) {
                 continue;
             }
             granted |= Perm::from_bits_truncate(entry.grant);
@@ -202,14 +411,29 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
 }
 
 /// Whether an entry addresses this subject.
-fn matches(entry: &AclEntry, subject: &Subject, groups: &[String]) -> bool {
-    if let Some(account) = entry.account {
-        return account == subject.account;
-    }
-    match &entry.group {
-        Some(group) => groups.iter().any(|held| held == group),
-        None => false,
-    }
+///
+/// An entry may name an account *and* a group, and upstream takes either
+/// (`vendor/server/src/ACL.cpp:154`, `matchUser || matchGroup`) rather than
+/// letting the account short-circuit the group. The client's editor writes one
+/// or the other, so the difference only shows on a table written by hand or by
+/// Ice — where preferring one would silently drop half of the rule.
+///
+/// The account is compared through [`identity::account`] and not by reading
+/// `subject.account`. That is the third place this mistake has been made in
+/// this file (`docs/GAP-ANALYSIS.md` G4): an unregistered guest goes on the
+/// wire as `account = 0, registered = false`, and `0` is also the SuperUser's
+/// id — so a comparison of the number alone means an entry granting something
+/// to the administrator's account grants it to **every anonymous visitor on the
+/// server**. The pair is only ever meaningful read together.
+fn matches(entry: &AclEntry, subject: &Subject, context: &Context<'_>) -> bool {
+    let by_account = entry.account.is_some_and(|account| {
+        identity::account(subject.registered, subject.account) == Some(account)
+    });
+    let by_group = entry
+        .group
+        .as_deref()
+        .is_some_and(|spec| crate::group::applies(spec, subject, context));
+    by_account || by_group
 }
 
 /// Read a client's `ACL` message into the set this service stores.
@@ -606,6 +830,419 @@ mod tests {
             0,
         );
         assert!(registered.contains(&"auth".to_owned()));
+    }
+
+    #[test]
+    fn an_entry_naming_the_superusers_account_does_not_match_every_guest() {
+        // `docs/GAP-ANALYSIS.md` G4, and the third appearance of one mistake in
+        // this file. An unregistered guest is written as
+        // `account = 0, registered = false`, which is the same *number* the
+        // SuperUser carries — so comparing `entry.account == subject.account`
+        // handed every anonymous visitor whatever an operator granted to the
+        // administrator's own account.
+        let acls = Acls::new();
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    account: Some(identity::SUPERUSER),
+                    grant: Perm::BAN.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+
+        let guest = Subject {
+            account: identity::SUPERUSER,
+            registered: false,
+            ..Subject::default()
+        };
+        assert!(
+            !Perm::from_bits_truncate(evaluate(&acls, 1, &guest, 0)).contains(Perm::BAN),
+            "an unregistered guest must not be read as account 0"
+        );
+
+        // An ordinary registered account still matches the entry that names it.
+        let named = Subject {
+            account: 4,
+            registered: true,
+            ..Subject::default()
+        };
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    account: Some(4),
+                    grant: Perm::BAN.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+        assert!(Perm::from_bits_truncate(evaluate(&acls, 1, &named, 0)).contains(Perm::BAN));
+    }
+
+    #[test]
+    fn a_channel_password_is_an_entry_granting_enter_to_a_token_group() {
+        // What G2 and G3 add up to, and the shape an operator actually writes:
+        // deny `Enter` to everybody on the channel, grant it back to whoever
+        // presents the token. Before this, `#hunter2` was read as the name of a
+        // group nobody was in, so the grant never fired and the channel was
+        // shut to everyone including the people with the password.
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: vec![
+                    AclEntry {
+                        apply_here: true,
+                        apply_subs: true,
+                        group: Some("all".to_owned()),
+                        deny: Perm::ENTER.bits(),
+                        ..AclEntry::default()
+                    },
+                    AclEntry {
+                        apply_here: true,
+                        apply_subs: true,
+                        group: Some("#hunter2".to_owned()),
+                        grant: Perm::ENTER.bits(),
+                        ..AclEntry::default()
+                    },
+                ],
+                groups: Vec::new(),
+            },
+        );
+
+        let stranger = Subject::default();
+        assert!(!Perm::from_bits_truncate(evaluate(&acls, 1, &stranger, 5)).contains(Perm::ENTER));
+
+        let holder = Subject {
+            tokens: vec!["hunter2".to_owned()],
+            ..Subject::default()
+        };
+        assert!(
+            Perm::from_bits_truncate(evaluate(&acls, 1, &holder, 5)).contains(Perm::ENTER),
+            "the token must open the channel"
+        );
+    }
+
+    #[test]
+    fn a_rule_written_on_a_parent_can_ask_about_the_parent_rather_than_the_child() {
+        // `~` through the whole evaluator, not just the parser: an entry on
+        // channel 1 granting to `~in` reaches a user standing in 1 while it is
+        // being evaluated for channel 2. That is how "people in this room may do
+        // this in every room below it" is written, and every part of it depends
+        // on the entry knowing which channel it was written on.
+        let acls = Acls::new();
+        acls.set_parent(1, 1, 0);
+        acls.set_parent(1, 2, 1);
+        acls.set(
+            1,
+            AclSet {
+                channel: 1,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("~in".to_owned()),
+                    grant: Perm::MUTE_DEAFEN.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+
+        let standing_in_the_parent = Subject {
+            channel: 1,
+            ..Subject::default()
+        };
+        assert!(
+            Perm::from_bits_truncate(evaluate(&acls, 1, &standing_in_the_parent, 2))
+                .contains(Perm::MUTE_DEAFEN)
+        );
+
+        let standing_in_the_child = Subject {
+            channel: 2,
+            ..Subject::default()
+        };
+        assert!(
+            !Perm::from_bits_truncate(evaluate(&acls, 1, &standing_in_the_child, 2))
+                .contains(Perm::MUTE_DEAFEN)
+        );
+    }
+
+    #[test]
+    fn a_reported_group_list_agrees_with_what_the_evaluator_will_do() {
+        // `groups_of` used to scan the ancestry flat and read `add` directly,
+        // ignoring `inheritable` — so a client was shown a membership the
+        // evaluator did not honour, which is a UI offering an action that is
+        // then refused.
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: Vec::new(),
+                groups: vec![Group {
+                    name: "staff".to_owned(),
+                    inherit: true,
+                    inheritable: false,
+                    add: vec![7],
+                    ..Group::default()
+                }],
+            },
+        );
+        let member = Subject {
+            account: 7,
+            registered: true,
+            ..Subject::default()
+        };
+        assert!(acls.groups_of(1, &member, 0).contains(&"staff".to_owned()));
+        assert!(
+            !acls.groups_of(1, &member, 5).contains(&"staff".to_owned()),
+            "a declaration that is not inheritable is not held below it"
+        );
+    }
+
+    /// A channel gated on a named group: `Enter` denied to everybody, granted
+    /// back to `vip`. What an operator writes when an external authority is
+    /// going to decide who gets in.
+    fn gated_on_vip() -> Acls {
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: vec![
+                    AclEntry {
+                        apply_here: true,
+                        apply_subs: true,
+                        group: Some("all".to_owned()),
+                        deny: Perm::ENTER.bits(),
+                        ..AclEntry::default()
+                    },
+                    AclEntry {
+                        apply_here: true,
+                        apply_subs: true,
+                        group: Some("vip".to_owned()),
+                        grant: Perm::ENTER.bits(),
+                        ..AclEntry::default()
+                    },
+                ],
+                groups: Vec::new(),
+            },
+        );
+        acls
+    }
+
+    fn guest(session: u32) -> Subject {
+        Subject {
+            session,
+            account: 0,
+            registered: false,
+            ..Subject::default()
+        }
+    }
+
+    fn may_enter(acls: &Acls, subject: &Subject) -> bool {
+        Perm::from_bits_truncate(evaluate(acls, 1, subject, 5)).contains(Perm::ENTER)
+    }
+
+    #[test]
+    fn a_temporary_membership_is_the_only_way_to_put_a_guest_in_a_named_group() {
+        // The reason this mechanism exists upstream. Permanent membership is
+        // recorded by account id and an unregistered visitor has none, so no
+        // amount of editing the ACL table can admit one to a named group.
+        let acls = gated_on_vip();
+        assert!(!may_enter(&acls, &guest(7)), "a guest starts outside");
+
+        // Adding them to the group's `add` list cannot work: `add` is account
+        // ids, and a guest's account is 0 — which is the SuperUser's.
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: acls.get(1, 5).acls,
+                groups: vec![Group {
+                    name: "vip".to_owned(),
+                    inherit: true,
+                    inheritable: true,
+                    add: vec![0],
+                    ..Group::default()
+                }],
+            },
+        );
+        assert!(
+            !may_enter(&acls, &guest(7)),
+            "a guest must not be admitted by an entry naming account 0"
+        );
+
+        acls.add_temporary(1, 5, "vip", Member::Session(7));
+        assert!(
+            may_enter(&acls, &guest(7)),
+            "a session-scoped grant must admit the guest holding that session"
+        );
+        // And nobody else's session.
+        assert!(!may_enter(&acls, &guest(8)));
+    }
+
+    #[test]
+    fn a_temporary_membership_does_not_outlive_the_session_it_names() {
+        // Not tidiness. Session ids are re-queued for reuse when a client
+        // leaves (`Server.cpp:1904`), so a grant that survived its holder would
+        // be handed to whoever is issued that id next.
+        let acls = gated_on_vip();
+        acls.add_temporary(1, 5, "vip", Member::Session(7));
+        assert!(may_enter(&acls, &guest(7)));
+
+        acls.forget_session(7);
+
+        assert!(
+            !may_enter(&acls, &guest(7)),
+            "the next holder of session 7 must not inherit the grant"
+        );
+    }
+
+    #[test]
+    fn an_acl_rewrite_keeps_the_memberships_of_groups_it_still_declares() {
+        // murmur stashes every group's temporary set before deleting the old
+        // group objects and restores it while looping over the new ones
+        // (`Messages.cpp:2842`, `:2900`). Both halves of that matter: an
+        // operator pressing Save must not revoke a temporary membership, and a
+        // group they *deleted* must not go on admitting people.
+        let acls = gated_on_vip();
+        acls.add_temporary(1, 5, "vip", Member::Session(7));
+        acls.add_temporary(1, 5, "doomed", Member::Session(7));
+        assert!(may_enter(&acls, &guest(7)));
+
+        // A save that keeps `vip` and drops `doomed`.
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: acls.get(1, 5).acls,
+                groups: vec![Group {
+                    name: "vip".to_owned(),
+                    inherit: true,
+                    inheritable: true,
+                    ..Group::default()
+                }],
+            },
+        );
+
+        assert!(
+            may_enter(&acls, &guest(7)),
+            "editing the table must not revoke a temporary membership"
+        );
+        assert!(
+            !acls.holds_temporary(1, 5, "doomed", Member::Session(7)),
+            "a group deleted from the table takes its temporary members with it"
+        );
+    }
+
+    #[test]
+    fn a_remove_on_a_closer_channel_still_overrides_a_temporary_membership() {
+        // Upstream reads `qsTemporary` inside the same per-level loop as `add`
+        // and `remove` (`Group.cpp:242`), so the ordinary "closest declaration
+        // wins" rule applies to it too. Reading temporary membership as an
+        // override applied after the whole walk would quietly make it
+        // unrevocable in a sub-channel.
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set_parent(1, 6, 5);
+        // The permission is granted to `vip` on channel 5 and inherited down.
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("vip".to_owned()),
+                    grant: Perm::MUTE_DEAFEN.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+        // The child takes the account back out of the group.
+        acls.set(
+            1,
+            AclSet {
+                channel: 6,
+                inherit: true,
+                acls: Vec::new(),
+                groups: vec![Group {
+                    name: "vip".to_owned(),
+                    inherit: true,
+                    inheritable: true,
+                    remove: vec![9],
+                    ..Group::default()
+                }],
+            },
+        );
+
+        let registered = Subject {
+            session: 3,
+            account: 9,
+            registered: true,
+            ..Subject::default()
+        };
+        acls.add_temporary(1, 5, "vip", Member::Account(9));
+
+        assert!(
+            Perm::from_bits_truncate(evaluate(&acls, 1, &registered, 5))
+                .contains(Perm::MUTE_DEAFEN),
+            "the temporary membership holds on the channel it was granted on"
+        );
+        assert!(
+            !Perm::from_bits_truncate(evaluate(&acls, 1, &registered, 6))
+                .contains(Perm::MUTE_DEAFEN),
+            "a remove on the closer channel must still win"
+        );
+    }
+
+    #[test]
+    fn a_channel_that_is_deleted_leaves_no_temporary_membership_behind() {
+        // The same id-reuse hazard as the ACL set itself.
+        let acls = gated_on_vip();
+        acls.add_temporary(1, 5, "vip", Member::Session(7));
+        acls.forget(1, 5);
+        assert!(!acls.holds_temporary(1, 5, "vip", Member::Session(7)));
+    }
+
+    #[test]
+    fn losing_the_session_stream_clears_session_grants_and_keeps_account_grants() {
+        // A missed departure is a grant attached to an id that gets reissued,
+        // so uncertainty is resolved by clearing. An account grant is not tied
+        // to a connection, so nothing about it has become uncertain.
+        let acls = gated_on_vip();
+        acls.add_temporary(1, 5, "vip", Member::Session(7));
+        acls.add_temporary(1, 5, "vip", Member::Account(9));
+
+        acls.forget_every_session();
+
+        assert!(!acls.holds_temporary(1, 5, "vip", Member::Session(7)));
+        assert!(acls.holds_temporary(1, 5, "vip", Member::Account(9)));
     }
 
     #[test]
