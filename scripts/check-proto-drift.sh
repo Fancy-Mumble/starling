@@ -21,7 +21,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Default layout: vendor/starling, vendor/server, vendor/client are siblings.
 root="${1:-$(cd "$here/../.." && pwd)}"
 
-ours="$here/crates/starling-proto/proto"
+ours="$here/crates/proto/proto"
 server="$root/vendor/server/src"
 client="$root/vendor/client/crates/mumble-protocol/proto"
 

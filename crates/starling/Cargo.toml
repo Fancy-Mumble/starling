@@ -35,6 +35,7 @@ starling-push.workspace = true
 starling-audit.workspace = true
 starling-onboarding.workspace = true
 starling-social.workspace = true
+starling-health.workspace = true
 starling-link-preview.workspace = true
 starling-context-actions.workspace = true
 starling-directory.workspace = true

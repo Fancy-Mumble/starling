@@ -291,12 +291,16 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
     // Encode once, clone the handle per recipient. This is murmur's
     // `QByteArray &cache` parameter, made structural.
     let frame = starling_proto::codec::frame(type_id, &send.payload);
+    // And the replay copy once, for the same reason. `stamp` used to take a
+    // slice and own a fresh `Vec` per recipient, so a broadcast to a thousand
+    // clients made a thousand copies of one payload; refcounted, they share it.
+    let payload = bytes::Bytes::copy_from_slice(&send.payload);
 
     for handle in targets {
         if send.except.contains(&handle.session()) {
             continue;
         }
-        let _ = ctx.resume.stamp(&handle.token, type_id, &send.payload);
+        let _ = ctx.resume.stamp(&handle.token, type_id, &payload);
         if handle.send(lane, frame.clone()).is_err() {
             // Control overflow: bounded and honest. Reconnect re-syncs from
             // scratch, and the client is told by the socket closing rather than

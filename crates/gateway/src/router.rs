@@ -151,10 +151,23 @@ mod tests {
             router().route(1008).map(|r| r.bucket.as_str()),
             Some("signalling")
         );
+        // `ChannelState`(7) still falls back to `control`, which is what makes
+        // the assertion above about *routing* rather than about everything
+        // having drifted onto its own bucket.
         assert_eq!(
-            router().route(11).map(|r| r.bucket.as_str()),
+            router().route(7).map(|r| r.bucket.as_str()),
             Some("control")
         );
+    }
+
+    #[test]
+    fn the_two_human_driven_routes_have_their_own_buckets() {
+        // `TextMessage`(11) used to assert `control` here, and that was the
+        // bug: a person typing eight messages lost the sixth to murmur's 1/s,
+        // and an ACL editor opening a thirty-channel tree lost most of its
+        // queries. Both were measured in an e2e run before being moved.
+        assert_eq!(router().route(11).map(|r| r.bucket.as_str()), Some("chat"));
+        assert_eq!(router().route(13).map(|r| r.bucket.as_str()), Some("acl"));
     }
 
     #[test]

@@ -21,16 +21,26 @@ pub struct GatewayService {
 impl Serve for GatewayService {
     const NAME: &'static str = "gateway";
 
-    /// Nothing calls the gateway over gRPC; it calls everything. Serving an
-    /// endpoint nobody dials would need a `config.services["gateway"]` entry
-    /// for no purpose, and one more thing to misconfigure.
-    const SERVES_GRPC: bool = false;
+    /// Something does call the gateway over gRPC now: the `health` collector.
+    ///
+    /// This was `false`, on the argument that an endpoint nobody dials is one
+    /// more thing to misconfigure. That argument held until there was a
+    /// collector, and its consequence was that the gateway — the process every
+    /// client connects to, holding every control queue and every audio buffer
+    /// in the server — was the one component absent from the health dashboard.
+    /// Its `listener` and `session store` gates existed and had no reader.
+    ///
+    /// The runtime's `with_health` adds the health surface to the empty route
+    /// set below, so this costs a `[services.gateway]` entry with an endpoint
+    /// and no gateway code at all.
+    const SERVES_GRPC: bool = true;
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         ctx.health.gate("listener");
         let gateway = Gateway::new(
             Arc::clone(&ctx.config),
             ctx.metrics.clone(),
+            &ctx.pressure,
             ctx.health.clone(),
             ctx.logger.clone(),
         )

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use starling_runtime::pressure::Gauge;
 use tokio::sync::{Notify, mpsc};
 
 /// Which queue a frame belongs in.
@@ -57,6 +58,31 @@ pub struct ClientHandle {
     audio_capacity: usize,
     dropped_audio: Arc<AtomicU32>,
     close: Arc<Notify>,
+    /// Bytes currently sitting in the control queue.
+    ///
+    /// Maintained by [`Self::send`] and [`Self::control_sent`], so the bound is
+    /// on memory rather than on a message count that says nothing about it.
+    queued_control: Arc<std::sync::atomic::AtomicUsize>,
+    /// The control lane's occupancy, shared by every client.
+    ///
+    /// Shared deliberately: a per-client gauge would be a registry entry per
+    /// connection, which on a server with a thousand clients is a thousand rows
+    /// nobody reads. One gauge watching all of them answers the question an
+    /// operator actually has — "is anybody close to being disconnected for
+    /// this" — see `Gauge::observe`.
+    pressure: Gauge,
+    /// The ceiling those bytes may reach before the client is disconnected.
+    control_budget: usize,
+    /// Raised when the connection is ending and the writer should flush what
+    /// is already queued before the socket goes.
+    ///
+    /// Separate from [`Self::close`], which wakes the *read* loop. The two are
+    /// the opposite halves of one shutdown: the reader must stop at once, and
+    /// the writer must not — a disconnect is nearly always preceded by the one
+    /// frame that explains it (`Reject` on a refused login, `UserRemove` on a
+    /// kick), and tearing the socket down first delivers the disconnect and
+    /// loses the reason.
+    drain: Arc<Notify>,
 }
 
 impl ClientHandle {
@@ -95,11 +121,44 @@ impl ClientHandle {
     /// drops the oldest frame and counts it.
     pub fn send(&self, lane: Lane, frame: Bytes) -> Result<(), QueueError> {
         match lane {
-            Lane::Control => match self.control.try_send(frame) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => Err(QueueError::ControlOverflow),
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
-            },
+            Lane::Control => {
+                // Counted in **bytes**, not just messages. The channel bounds
+                // the queue at 4096 frames, which says nothing about memory: a
+                // `UserState` is forty bytes and an avatar is up to
+                // `image_message_length`, 128 KiB by default. Four thousand of
+                // those is half a gigabyte queued for one client that has
+                // stopped reading its socket, and it only takes a few such
+                // clients to take the gateway down — with image sharing being
+                // exactly the workload that produces them.
+                //
+                // Overflowing on bytes disconnects that client, which is the
+                // same policy the frame bound already has and is documented in
+                // this module's header: dropping a control frame desyncs a
+                // client permanently and silently, so disconnecting is the only
+                // outcome that is both bounded and honest.
+                let len = frame.len();
+                let queued = self.queued_control.load(Ordering::Relaxed);
+                if queued.saturating_add(len) > self.control_budget {
+                    self.pressure.reject();
+                    return Err(QueueError::ControlOverflow);
+                }
+                match self.control.try_send(frame) {
+                    Ok(()) => {
+                        let total = self.queued_control.fetch_add(len, Ordering::Relaxed) + len;
+                        // Observed rather than accumulated: the budget is *per
+                        // client*, so the number worth watching is the client
+                        // closest to its own bound, not the sum across clients
+                        // — which has no ceiling to be a fraction of.
+                        self.pressure.observe(total as u64);
+                        Ok(())
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.pressure.reject();
+                        Err(QueueError::ControlOverflow)
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
+                }
+            }
             Lane::Audio => {
                 if let Ok(mut queue) = self.audio.lock() {
                     while queue.len() >= self.audio_capacity {
@@ -112,6 +171,25 @@ impl ClientHandle {
                 Ok(())
             }
         }
+    }
+
+    /// Account for a control frame the writer has taken off the queue.
+    ///
+    /// Called by the writer once the bytes are on their way out, which is what
+    /// keeps [`Self::send`]'s budget a measure of what is *queued* rather than
+    /// of everything ever sent.
+    pub fn control_sent(&self, len: usize) {
+        let _ = self
+            .queued_control
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                Some(queued.saturating_sub(len))
+            });
+    }
+
+    /// Bytes waiting in this client's control queue, for tests and metrics.
+    #[must_use]
+    pub fn queued_control_bytes(&self) -> usize {
+        self.queued_control.load(Ordering::Relaxed)
     }
 
     /// How many audio frames this client has lost to a full queue.
@@ -152,6 +230,22 @@ impl ClientHandle {
     pub async fn closed(&self) {
         self.close.notified().await;
     }
+
+    /// Tell the writer to flush what is queued and then stop.
+    ///
+    /// Called as the connection is torn down, *before* the writer task is
+    /// waited on. Without it the writer is simply aborted, and a client that
+    /// was refused, kicked or banned is disconnected without ever receiving
+    /// the message that says why — murmur flushes for the same reason
+    /// (`forceFlush()` before `disconnectSocket()`, `Messages.cpp:1424`).
+    pub fn drain(&self) {
+        self.drain.notify_one();
+    }
+
+    /// Resolves once [`Self::drain`] has been called.
+    pub async fn draining(&self) {
+        self.drain.notified().await;
+    }
 }
 
 /// Build a handle and the control receiver its writer task drains.
@@ -161,6 +255,7 @@ pub fn channel(
     token: String,
     control_queue: usize,
     audio_queue: usize,
+    pressure: Gauge,
 ) -> (Arc<ClientHandle>, mpsc::Receiver<Bytes>) {
     let (tx, rx) = mpsc::channel(control_queue.max(1));
     let handle = Arc::new(ClientHandle {
@@ -172,10 +267,41 @@ pub fn channel(
         audio: Arc::new(Mutex::new(VecDeque::new())),
         audio_wake: Arc::new(Notify::new()),
         audio_capacity: audio_queue.max(1),
+        queued_control: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        control_budget: CONTROL_BYTE_BUDGET,
+        pressure,
         dropped_audio: Arc::new(AtomicU32::new(0)),
         close: Arc::new(Notify::new()),
+        drain: Arc::new(Notify::new()),
     });
     (handle, rx)
+}
+
+/// Bytes one client may have waiting on the control lane.
+///
+/// The frame count alone does not bound memory: at the shipped 4096 frames and
+/// the default `image_message_length` of 128 KiB, one client that has stopped
+/// reading can hold **half a gigabyte**. A few of those take a gateway down,
+/// and heavy image sharing is precisely the workload that produces them.
+///
+/// 4 MiB is dozens of avatars plus far more ordinary control traffic than a
+/// healthy client is ever behind on, and a thousand clients simultaneously at
+/// the ceiling is 4 GiB — a number an operator can reason about, which the old
+/// bound never was.
+const CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// What the control lane's occupancy gauge is called, and its declared bound.
+///
+/// Named once because three places need to agree: the gateway that creates it,
+/// the dashboard that draws it, and the test that asserts it is reported. The
+/// capacity is [`CONTROL_BYTE_BUDGET`] and not the aggregate across clients,
+/// because the budget each client is disconnected for exceeding is its own.
+pub const CONTROL_QUEUE_GAUGE: &str = "control queue (worst client)";
+
+/// The capacity to declare for [`CONTROL_QUEUE_GAUGE`].
+#[must_use]
+pub const fn control_budget() -> u64 {
+    CONTROL_BYTE_BUDGET as u64
 }
 
 /// Every connected client, by connection and by session.
@@ -280,6 +406,27 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_runtime::pressure::Pressure;
+
+    /// A handle whose gauge nothing reads.
+    ///
+    /// Most of these tests are about the queue, not about how it is reported,
+    /// and threading a `Pressure` through each one would put the noun under
+    /// test in fifth place behind four arguments nobody is asserting on.
+    fn channel(
+        conn: u64,
+        token: String,
+        control_queue: usize,
+        audio_queue: usize,
+    ) -> (Arc<ClientHandle>, mpsc::Receiver<Bytes>) {
+        super::channel(
+            conn,
+            token,
+            control_queue,
+            audio_queue,
+            Pressure::new().gauge(CONTROL_QUEUE_GAUGE, control_budget()),
+        )
+    }
 
     #[test]
     fn a_full_control_queue_reports_overflow_rather_than_dropping() {
@@ -335,5 +482,129 @@ mod tests {
         registry.remove(42);
         assert!(registry.by_session(7).is_none());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn a_client_cannot_queue_unbounded_memory_under_a_bounded_frame_count() {
+        // The bound the frame count never provided. At the shipped 4096 frames
+        // and a 128 KiB `image_message_length`, one client that has stopped
+        // reading holds half a gigabyte — and heavy image sharing is exactly
+        // the workload that produces such clients.
+        //
+        // The frame count here is deliberately huge so that *only* the byte
+        // budget can stop it.
+        let (handle, _rx) = channel(1, "tok".to_owned(), 100_000, 4);
+        let blob = Bytes::from(vec![0_u8; 128 * 1024]);
+
+        let mut queued = 0_usize;
+        for _ in 0..100_000 {
+            if handle.send(Lane::Control, blob.clone()).is_err() {
+                break;
+            }
+            queued += blob.len();
+        }
+
+        assert!(
+            queued <= CONTROL_BYTE_BUDGET,
+            "queued {queued} bytes against a {CONTROL_BYTE_BUDGET}-byte budget"
+        );
+        assert!(
+            queued > 0,
+            "the budget refused everything; a client must be able to be sent an avatar"
+        );
+        assert_eq!(handle.queued_control_bytes(), queued);
+    }
+
+    #[test]
+    fn the_control_lane_reports_its_occupancy_and_its_refusals() {
+        // The counter beside this one ("clients disconnected for control
+        // overflow") only ever moves after somebody has been disconnected. The
+        // gauge is the interval before that — the client at 90% of its budget,
+        // still connected, about to not be.
+        let pressure = Pressure::new();
+        let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
+        let (handle, _rx) = super::channel(1, "tok".to_owned(), 100_000, 4, gauge);
+        let blob = Bytes::from(vec![0_u8; 128 * 1024]);
+
+        while handle.send(Lane::Control, blob.clone()).is_ok() {}
+
+        let load = pressure
+            .sample()
+            .into_iter()
+            .find(|load| load.name == CONTROL_QUEUE_GAUGE)
+            .expect("the gateway registered its gauge");
+
+        assert_eq!(load.capacity, control_budget());
+        assert!(
+            load.utilisation() >= Some(90),
+            "a client that filled its budget reported only {:?}",
+            load.utilisation()
+        );
+        assert!(
+            load.rejected >= 1,
+            "the frame that was refused was not counted"
+        );
+    }
+
+    #[test]
+    fn a_client_that_drains_stops_showing_as_pressure() {
+        // The peak is per interval, so a client that filled up and recovered
+        // must not keep the gauge pinned for the rest of the server's life —
+        // a dashboard that never comes back down is one nobody believes.
+        let pressure = Pressure::new();
+        let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
+        let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, gauge);
+
+        handle
+            .send(Lane::Control, Bytes::from(vec![0_u8; 2048]))
+            .expect("queued");
+        assert_eq!(pressure.sample()[0].peak, 2048);
+
+        let taken = rx.try_recv().expect("the writer takes it");
+        handle.control_sent(taken.len());
+        assert_eq!(pressure.sample()[0].peak, 0, "the gauge stayed pinned");
+    }
+
+    #[test]
+    fn draining_the_queue_returns_the_budget() {
+        // Without the credit the budget is a lifetime total rather than a
+        // measure of what is queued, so a long-lived, perfectly healthy client
+        // is eventually disconnected for bytes it received hours ago.
+        let (handle, mut rx) = channel(1, "tok".to_owned(), 16, 4);
+        let frame = Bytes::from(vec![0_u8; 1024]);
+        handle.send(Lane::Control, frame.clone()).expect("queued");
+        assert_eq!(handle.queued_control_bytes(), 1024);
+
+        let taken = rx.try_recv().expect("the writer takes it");
+        handle.control_sent(taken.len());
+        assert_eq!(handle.queued_control_bytes(), 0);
+
+        // And the room is genuinely reusable, not merely reported as free.
+        for _ in 0..8 {
+            handle.send(Lane::Control, frame.clone()).expect("reusable");
+            let taken = rx.try_recv().expect("drained");
+            handle.control_sent(taken.len());
+        }
+        assert_eq!(handle.queued_control_bytes(), 0);
+    }
+
+    #[test]
+    fn audio_is_still_bounded_by_frames_and_still_drops_rather_than_disconnects() {
+        // The asymmetry this module exists for must survive the change: a late
+        // voice frame is worthless, so audio drops the oldest and counts it,
+        // while control disconnects. Audio frames are all one size, so a frame
+        // count bounds their memory perfectly well.
+        let (handle, _rx) = channel(1, "tok".to_owned(), 16, 2);
+        for _ in 0..10 {
+            handle
+                .send(Lane::Audio, Bytes::from_static(b"frame"))
+                .expect("audio never reports overflow");
+        }
+        assert!(handle.dropped_audio() > 0, "the oldest should have gone");
+        assert_eq!(
+            handle.queued_control_bytes(),
+            0,
+            "audio is not charged here"
+        );
     }
 }
