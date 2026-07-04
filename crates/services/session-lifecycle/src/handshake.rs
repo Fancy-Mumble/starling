@@ -19,13 +19,17 @@
 //! authenticates, voice mints the cipher, metadata supplies the tree,
 //! server-config supplies the limits, and session-view is told the outcome.
 
+use std::collections::HashMap;
+
 use prost::Message as _;
 use starling_proto::proto::tcp;
 use starling_proto_fancy::control::{ServerAction, SessionUp, server_action};
 use starling_proto_fancy::fancy::session::{SessionEnvelope, session_envelope};
 use starling_proto_fancy::identity;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
-use starling_proto_fancy::metadata::{EnterRequest, TreeRequest};
+use starling_proto_fancy::metadata::{
+    EnterRequest, ListenRequest, RestoreListenersRequest, TreeRequest,
+};
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
 use starling_proto_fancy::serverconfig::{GetRequest, Snapshot};
@@ -38,7 +42,9 @@ use starling_proto_fancy::voice::MintRequest;
 use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent};
-use starling_runtime::plane::{Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn};
+use starling_runtime::plane::{
+    Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn, to_sessions,
+};
 use starling_runtime::serve::ServiceContext;
 
 use crate::state::{Connections, Identity, PendingConnection};
@@ -142,6 +148,13 @@ fn session_record(pending: &PendingConnection) -> Session {
         fancy_version: pending.fancy_version,
         address: pending.address.clone(),
         cert_hash: pending.cert_hash.clone(),
+        // An assurance rather than an identifier, and the `strong` ACL group.
+        strong_cert: pending.strong_cert,
+        // The access tokens, which `permissions` can reach in no other way — it
+        // resolves a session through the view and nowhere else. Secret: this is
+        // the one field here that must not be composed into anything a client
+        // or an operator can read back.
+        tokens: pending.tokens.clone(),
         // The account's profile, so that every client that builds its roster
         // from the view — which is every client that was already connected —
         // sees the avatar of someone who joined after it did.
@@ -151,11 +164,17 @@ fn session_record(pending: &PendingConnection) -> Session {
         // connected, and recomputing it on every change would reset the uptime
         // the client shows each time somebody muted them.
         connected_at_ms: pending.connected_at_ms,
+        // The channels this peer listens to without being in them, and the gain
+        // it set on each. Carried on the session because `voice` composes its
+        // routing snapshot from this view and nothing else
+        // (`voice/src/view.rs:123`): a listener that stops here is one nobody
+        // ever routes audio to.
+        listening: pending.listening.clone(),
+        listening_volume: pending.listening_volume.clone(),
         // Nothing populates these yet, and saying so here is the point of
-        // writing the fields out. `listening` waits on channel listeners
-        // (GAP-ANALYSIS V5), `recording` on a client that reports it, and
-        // `max_bandwidth` is a server-config value rather than a per-peer one.
-        listening: Vec::new(),
+        // writing the fields out: `recording` waits on a client that reports it,
+        // and `max_bandwidth` is a server-config value rather than a per-peer
+        // one.
         recording: false,
         max_bandwidth: 0,
     }
@@ -174,33 +193,30 @@ impl Handshake {
 
     /// The whole handshake, from `Authenticate` to `SuggestConfig`.
     pub async fn authenticate(&self, connections: &Connections, inbound: &Inbound) -> Actions {
-        let Ok(request) = tcp::Authenticate::decode(inbound.payload.as_slice()) else {
-            // Undecodable at the very first step: almost always a client
-            // speaking a different protocol at a Mumble port.
-            tracing::warn!(
-                conn = inbound.conn,
-                len = inbound.payload.len(),
-                "undecodable Authenticate"
-            );
-            self.ctx.logger.log(
-                LogEvent::notice(Category::Session, "malformed authentication")
-                    .with("conn", inbound.conn),
-            );
+        let Some((request, pending)) = self.opening(connections, inbound) else {
             return Actions::new();
         };
-        let Some(pending) = connections.get(inbound.conn) else {
-            tracing::warn!(
-                conn = inbound.conn,
-                "Authenticate for an unknown connection"
-            );
-            return Actions::new();
-        };
+
+        // A second `Authenticate` on a session that already has one is not a
+        // second login — murmur reads it as an access-token edit and nothing
+        // else (`vendor/server/src/murmur/Messages.cpp:367`). Letting it fall
+        // through would allocate another session for the same connection and
+        // announce the user twice.
+        if pending.session != 0 {
+            return self.retoken(connections, inbound, &request).await;
+        }
 
         let name = request.username.clone().unwrap_or_default();
         // `Authenticate` is where a client announces Opus
         // (`vendor/server/src/murmur/Messages.cpp:538`), so it is recorded
         // before anything can refuse the login and lose it.
         connections.record_opus(inbound.conn, request.opus.unwrap_or(false));
+        // Likewise the access tokens, and likewise before anything can refuse
+        // the login: they are the client's proof of knowing a channel password,
+        // and this is the only message that carries them.
+        //
+        // Not logged, and not counted. The value *is* the password.
+        let _ = connections.set_tokens(inbound.conn, request.tokens.clone());
         tracing::debug!(
             conn = inbound.conn,
             %name,
@@ -213,12 +229,12 @@ impl Handshake {
         if !config.password.is_empty()
             && request.password.as_deref().unwrap_or_default() != config.password
         {
-            return vec![self.refuse(
+            return self.refuse(
                 inbound.conn,
                 &name,
                 tcp::reject::RejectType::WrongServerPw,
                 "wrong server password",
-            )];
+            );
         }
 
         let outcome = self
@@ -226,12 +242,16 @@ impl Handshake {
             .await;
         let identity = match outcome {
             Ok(identity) => identity,
-            Err(action) => return vec![action],
+            Err(refusal) => return refusal,
         };
         // Borrowed, not re-bound: `identity` owns the name from here on, and
         // the stored profile hashes travel with it into `welcome`.
         let account = identity.account;
         let name = identity.name.as_str();
+
+        if let Some(refusal) = self.certificate_gate(&config, &pending, account, name) {
+            return refusal;
+        }
 
         // Somebody is already here under this name or this account
         // (`vendor/server/src/murmur/Messages.cpp:418`). murmur never lets two
@@ -242,21 +262,21 @@ impl Handshake {
         if let Some(ghost) = &ghost
             && !may_replace(&pending, ghost, account)
         {
-            return vec![self.refuse(
+            return self.refuse(
                 inbound.conn,
                 name,
                 tcp::reject::RejectType::UsernameInUse,
                 "that name is already in use",
-            )];
+            );
         }
 
         let Some(session) = connections.allocate(inbound.conn, &identity) else {
-            return vec![self.refuse(
+            return self.refuse(
                 inbound.conn,
                 name,
                 tcp::reject::RejectType::ServerFull,
                 "the server is full",
-            )];
+            );
         };
 
         // The line the operator asked for: somebody is now on the server.
@@ -283,6 +303,14 @@ impl Handshake {
         self.announce_up(connections, inbound.conn).await;
         self.enter_root(inbound.scope, session).await;
 
+        // After , which  has already queued: murmur is
+        // explicit that a client may need its own session id before it can make
+        // sense of a listener ().
+        actions.extend(
+            self.restore_and_announce(connections, inbound, session, account, &config)
+                .await,
+        );
+
         // Told, not asked. Sent after the announce so `permissions` can resolve
         // the session, and after entering root so the answer is about the
         // channel the client is actually in — the one its menus are drawn from.
@@ -297,6 +325,89 @@ impl Handshake {
             self.kick_ghost(&ghost);
         }
         actions
+    }
+
+    /// Decode the message, and find the connection it arrived on.
+    ///
+    /// Split out of [`Self::authenticate`] because neither failure is about
+    /// authentication: one is a peer speaking some other protocol at a Mumble
+    /// port, the other a frame that outran its own connection's teardown.
+    /// Neither can be answered — a `Reject` needs a connection to address — so
+    /// both are recorded and dropped, and keeping them here leaves the login
+    /// itself as a single readable sequence.
+    fn opening(
+        &self,
+        connections: &Connections,
+        inbound: &Inbound,
+    ) -> Option<(tcp::Authenticate, PendingConnection)> {
+        let Ok(request) = tcp::Authenticate::decode(inbound.payload.as_slice()) else {
+            tracing::warn!(
+                conn = inbound.conn,
+                len = inbound.payload.len(),
+                "undecodable Authenticate"
+            );
+            self.ctx.logger.log(
+                LogEvent::notice(Category::Session, "malformed authentication")
+                    .with("conn", inbound.conn),
+            );
+            return None;
+        };
+        let Some(pending) = connections.get(inbound.conn) else {
+            tracing::warn!(
+                conn = inbound.conn,
+                "Authenticate for an unknown connection"
+            );
+            return None;
+        };
+        Some((request, pending))
+    }
+
+    /// A second `Authenticate`: an access-token edit, and nothing else.
+    ///
+    /// This is how a Mumble client submits a channel password. The user is
+    /// refused entry, types the password into the dialog, and the client sends
+    /// its whole token list again on the same connection
+    /// (`vendor/server/src/murmur/Messages.cpp:367`) — no reconnection, and no
+    /// second login. Every other field of the message is ignored here, as it is
+    /// upstream: the name and password were settled at the handshake, and
+    /// honouring them again would be a way to change identity mid-session.
+    ///
+    /// The announcement is what makes the edit take effect at all. `permissions`
+    /// reads a session through `session-view` and nowhere else, so a token that
+    /// stops at this service's own record is a password the evaluator never
+    /// sees.
+    ///
+    /// **Not done here, deliberately:** murmur also re-sends every `ChannelState`
+    /// so a client can re-render which channels it may now enter
+    /// (`Messages.cpp:385`). That tree belongs to `metadata`, and the entry
+    /// itself works without it — the client simply learns the door is open by
+    /// walking through it rather than by seeing it un-greyed.
+    async fn retoken(
+        &self,
+        connections: &Connections,
+        inbound: &Inbound,
+        request: &tcp::Authenticate,
+    ) -> Actions {
+        if !connections.set_tokens(inbound.conn, request.tokens.clone()) {
+            // Unchanged — which is the common case, since a stock client sends
+            // its token list on every reconnect whether or not it has any.
+            return Actions::new();
+        }
+
+        self.announce_changed(connections, inbound.conn).await;
+        tracing::debug!(
+            conn = inbound.conn,
+            count = request.tokens.len(),
+            "access tokens replaced"
+        );
+
+        // The client's menus are drawn from this, and a token that just opened a
+        // channel has almost certainly changed it.
+        let Some(pending) = connections.get(inbound.conn) else {
+            return Actions::new();
+        };
+        let channel = pending.channel;
+        self.push_permissions(&pending, channel).await
     }
 
     /// Disconnect the older session a reconnecting user left behind.
@@ -351,7 +462,10 @@ impl Handshake {
         actions.push(self.crypt_setup(inbound, session, pending).await);
         actions.push(to_conn(inbound.conn, 21, codec_version().encode_to_vec()));
         actions.extend(self.channel_flood(inbound).await);
-        actions.extend(self.user_states(inbound, session, identity, pending).await);
+        actions.extend(
+            self.user_states(inbound, session, identity, pending, config)
+                .await,
+        );
         actions.push(to_conn(
             inbound.conn,
             5,
@@ -366,6 +480,11 @@ impl Handshake {
             inbound.conn,
             25,
             tcp::SuggestConfig::default().encode_to_vec(),
+        ));
+        actions.extend(listener_warning(
+            inbound.conn,
+            pending.mumble_version,
+            config,
         ));
 
         // The gateway learns the conn↔session mapping from this and nothing
@@ -413,6 +532,60 @@ impl Handshake {
         actions
     }
 
+    /// Refuse a certificate-less peer when the deployment requires one.
+    ///
+    /// `cert_required` was a setting an operator could set and nothing read
+    /// (`docs/GAP-ANALYSIS.md` A3), which is worse than a missing feature: the
+    /// server accepted the change, persisted it, reported it back through
+    /// `operator-api`, and went on admitting certificate-less clients.
+    ///
+    /// Asked *after* the identity is known, as upstream asks it
+    /// (`Messages.cpp:508`), because the answer depends on who this is. That
+    /// placement is the whole of the rule and not a detail: an earlier version
+    /// of this check sat before [`Self::identify`], where there is no identity
+    /// to consult, and so refused everybody.
+    ///
+    /// **The SuperUser is exempt**, and upstream exempts it the same way — that
+    /// line guards on `id != 0`. The administrator account deliberately carries
+    /// no certificate: [`Accounts::write_superuser`][w] leaves `cert_hash` empty
+    /// so that the one login which can repair a broken server is always
+    /// something you *know*. Enforcing this against it locks the owner out the
+    /// moment they switch the setting on and leaves no account anywhere that
+    /// can switch it back off — a server bricked by a checkbox.
+    ///
+    /// The *presence* of a certificate, not its strength: murmur admits a
+    /// self-signed one here and that is a Mumble client's default, so requiring
+    /// `strong_cert` would refuse nearly every real client and read to the
+    /// operator as the setting being broken.
+    ///
+    /// `NoCertificate` rather than a generic refusal, because it is the one
+    /// rejection a Mumble client answers by offering to generate a certificate
+    /// — which is exactly what this peer needs to do next.
+    ///
+    /// [w]: https://docs.rs/starling-userdata
+    fn certificate_gate(
+        &self,
+        config: &Snapshot,
+        pending: &PendingConnection,
+        account: Option<u64>,
+        name: &str,
+    ) -> Option<Actions> {
+        let (id, registered) = identity::wire(account);
+        if !refuse_for_certificate(
+            config.cert_required,
+            !pending.cert_hash.is_empty(),
+            identity::is_superuser(registered, id),
+        ) {
+            return None;
+        }
+        Some(self.refuse(
+            pending.conn,
+            name,
+            tcp::reject::RejectType::NoCertificate,
+            "a certificate is required to connect to this server",
+        ))
+    }
+
     /// Who the peer is, or the rejection to send.
     async fn identify(
         &self,
@@ -420,7 +593,7 @@ impl Handshake {
         name: &str,
         request: &tcp::Authenticate,
         pending: &PendingConnection,
-    ) -> Result<Identity, ServerAction> {
+    ) -> Result<Identity, Actions> {
         let Ok(channel) = self.resolver.channel("userdata") else {
             // Userdata is essential: without it a login cannot be decided, and
             // guessing would either lock everyone out or let everyone in.
@@ -597,7 +770,14 @@ impl Handshake {
                     registered,
                     name: pending.name.clone(),
                     cert_hash: pending.cert_hash.clone(),
-                    tokens: Vec::new(),
+                    // The tokens and the channel the client is standing in are
+                    // both *inputs* to the answer: a `#password` entry and every
+                    // `in`/`out`/`sub` rule read them, so omitting either shows
+                    // the user a menu built from permissions they do not have —
+                    // or, worse, hides the ones they do.
+                    tokens: pending.tokens.clone(),
+                    channel: pending.channel,
+                    strong_cert: pending.strong_cert,
                 }),
                 channel,
             })
@@ -650,6 +830,11 @@ impl Handshake {
                 session,
                 channel,
                 permission: Perm::SEE_CHANNEL.bits(),
+                // Whether a channel is *visible* is asked of the session's own
+                // standing tokens. There is no request here for a one-off token
+                // to ride on: this is composing a tree, not authorising an
+                // action the user just took.
+                temporary_tokens: Vec::new(),
             })
             .await
             .is_ok_and(|decision| decision.into_inner().allowed)
@@ -723,6 +908,7 @@ impl Handshake {
         session: u32,
         identity: &Identity,
         pending: &PendingConnection,
+        config: &Snapshot,
     ) -> Actions {
         let own = tcp::UserState {
             session: Some(session),
@@ -791,10 +977,95 @@ impl Handshake {
                 // be connected when its owner joined.
                 comment_hash: blob_hash(&other.comment_hash),
                 texture_hash: blob_hash(&other.texture_hash),
+                // What everyone else is listening to, so the arriving client
+                // renders their listeners from the first frame rather than only
+                // learning about the ones created while it was connected
+                // (`Messages.cpp:802`).
+                listening_channel_add: other.listening.clone(),
+                // Their *gains*, only when the operator has opted into sharing
+                // them. Off by default: how loudly somebody listens to a room is
+                // their own business, and the only client that needs the number
+                // is the one applying it.
+                listening_volume_adjustment: if config.broadcast_listener_volume_adjustments {
+                    volume_adjustments(&other.listening_volume)
+                } else {
+                    Vec::new()
+                },
                 ..tcp::UserState::default()
             };
             actions.push(to_conn(inbound.conn, 9, state.encode_to_vec()));
         }
+        actions
+    }
+
+    /// Put a returning user's listeners back, and tell everyone.
+    ///
+    /// **After `ServerSync`**, which is not incidental: murmur is explicit that
+    /// the client may need its own session id before it can process listeners
+    /// (`Messages.cpp:843`), and `ServerSync` is the message that carries it.
+    /// Called from [`Self::authenticate`] rather than [`Self::welcome`] for that
+    /// reason — everything `welcome` builds precedes the sync.
+    pub async fn restore_and_announce(
+        &self,
+        connections: &Connections,
+        inbound: &Inbound,
+        session: u32,
+        account: Option<u64>,
+        config: &Snapshot,
+    ) -> Actions {
+        let Some(restored) = self
+            .restore_listeners(inbound.scope, session, account)
+            .await
+        else {
+            return Actions::new();
+        };
+        if restored.added.is_empty() && restored.volume.is_empty() {
+            return Actions::new();
+        }
+
+        // This copy first: `voice` composes its routing from the session view,
+        // so a restored listener that stops here hears nothing.
+        connections.apply_listeners(inbound.conn, &restored.added, &[], &restored.volume);
+        self.announce_changed(connections, inbound.conn).await;
+
+        self.ctx.logger.log(
+            LogEvent::info(Category::Session, "channel listeners restored")
+                .with("session", session)
+                .with("count", restored.added.len() as u64)
+                .with("conn", inbound.conn),
+        );
+
+        let adjustments = volume_adjustments(&restored.volume);
+        if config.broadcast_listener_volume_adjustments {
+            let state = tcp::UserState {
+                session: Some(session),
+                listening_channel_add: restored.added,
+                listening_volume_adjustment: adjustments,
+                ..tcp::UserState::default()
+            };
+            return vec![to_sessions(Vec::new(), 9, state.encode_to_vec())];
+        }
+
+        // Two messages, because one message cannot have two audiences: everyone
+        // else gets the channels, and the owner gets the channels *and* the
+        // gains — murmur sends the same message twice, appending the
+        // adjustments before the second send (`Messages.cpp:851`).
+        let mut actions = Actions::new();
+        if !restored.added.is_empty() {
+            let public = tcp::UserState {
+                session: Some(session),
+                listening_channel_add: restored.added.clone(),
+                ..tcp::UserState::default()
+            };
+            actions.push(broadcast_except(session, 9, public.encode_to_vec()));
+        }
+        let mine = tcp::UserState {
+            session: Some(session),
+            listening_channel_add: restored.added,
+            listening_volume_adjustment: adjustments,
+            ..tcp::UserState::default()
+        };
+        actions.push(to_conn(inbound.conn, 9, mine.encode_to_vec()));
         actions
     }
 
@@ -882,6 +1153,66 @@ impl Handshake {
             .map(tonic::Response::into_inner)
     }
 
+    /// Add, remove and re-weight `session`'s channel listeners.
+    ///
+    /// `None` when metadata could not be reached — the same distinction
+    /// [`Self::enter`] draws, and for the same reason: an unreachable authority
+    /// must not be reported to a user as a permission they lack.
+    ///
+    /// The ceilings are applied *there*, not here: they are properties of the
+    /// tree, and a check on this side would be a second copy of a rule that has
+    /// to agree with the first one forever.
+    pub async fn listen(
+        &self,
+        scope: u32,
+        session: u32,
+        account: Option<u64>,
+        listen: Vec<u32>,
+        unlisten: Vec<u32>,
+        volume: HashMap<u32, f32>,
+    ) -> Option<starling_proto_fancy::metadata::ListenResult> {
+        let transport = self.resolver.channel("metadata").ok()?;
+        MetadataClient::new(transport)
+            .listen(ListenRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: scope,
+                }),
+                session,
+                listen,
+                unlisten,
+                volume,
+                account,
+            })
+            .await
+            .ok()
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Put a returning user's stored listeners back.
+    ///
+    /// Guests are skipped without a round trip: they have no account, so there
+    /// is nothing stored under one.
+    pub async fn restore_listeners(
+        &self,
+        scope: u32,
+        session: u32,
+        account: Option<u64>,
+    ) -> Option<starling_proto_fancy::metadata::ListenResult> {
+        let account = account?;
+        let transport = self.resolver.channel("metadata").ok()?;
+        MetadataClient::new(transport)
+            .restore_listeners(RestoreListenersRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: scope,
+                }),
+                session,
+                account,
+            })
+            .await
+            .ok()
+            .map(tonic::Response::into_inner)
+    }
+
     /// The Fancy extensions: hello, resume, lazy subscription.
     pub fn fancy(&self, connections: &Connections, inbound: &Inbound) -> Actions {
         let Ok(envelope) = SessionEnvelope::decode(inbound.payload.as_slice()) else {
@@ -955,20 +1286,41 @@ impl Handshake {
         &self.ctx
     }
 
-    /// Refuse a login, and record why.
+    /// Refuse a login: tell the client why, then hang up.
     ///
     /// Every refusal in the handshake goes through here, which is what makes
     /// "nobody can log in" answerable from the log alone — the client is told a
     /// `Reject` type it usually renders as one generic sentence, and without
     /// this the server's own reason existed only as the argument to a function
     /// that discarded it.
+    ///
+    /// # The disconnect is half the refusal
+    ///
+    /// It returns **two** actions, and that is why it returns a list rather
+    /// than one: murmur sends the `Reject` and immediately calls
+    /// `disconnectSocket()` (`vendor/server/src/murmur/Messages.cpp:568`), and
+    /// for a long time this sent only the first of those.
+    ///
+    /// The result was a connection that had been refused and was still open.
+    /// The client showed "Server connection rejected", drew the root channel it
+    /// had already been sent, and went on pinging — so the idle sweep never
+    /// reaped it either, because a connection that keeps talking is never
+    /// timed out. What the user saw was a session that was half there: no
+    /// audio, no roster, no way to act, and no disconnect.
+    ///
+    /// Returning both together is deliberate over pushing the disconnect
+    /// separately: they travel in one ordered list, so the `Reject` is always
+    /// queued before the socket is asked to close, and the gateway flushes what
+    /// is queued before tearing the connection down. Emitting the disconnect
+    /// from anywhere else would make that ordering a race, and the frame that
+    /// would lose it is the one that says why.
     fn refuse(
         &self,
         conn: u64,
         name: &str,
         kind: tcp::reject::RejectType,
         reason: &str,
-    ) -> ServerAction {
+    ) -> Actions {
         self.ctx.logger.log(
             LogEvent::warning(Category::Session, "login refused")
                 .with("conn", conn)
@@ -976,8 +1328,30 @@ impl Handshake {
                 .with("reason", reason.to_owned())
                 .with("reject", format!("{kind:?}")),
         );
-        reject(conn, kind, reason)
+        refusal(conn, kind, reason)
     }
+}
+
+/// The two actions a refusal is made of, in the order they must travel.
+///
+/// A free function so the pairing can be asserted without a deployment — see
+/// the tests at the foot of this file. The half that went missing was the
+/// second one, and it went missing silently: sending only the `Reject` still
+/// compiles, still logs, still tells the user they were refused, and leaves
+/// them connected.
+fn refusal(conn: u64, kind: tcp::reject::RejectType, reason: &str) -> Actions {
+    vec![reject(conn, kind, reason), disconnect(conn, reason)]
+}
+
+/// Whether `cert_required` refuses this peer.
+///
+/// A free function so the carve-out can be tested without a deployment, and it
+/// is worth testing rather than reasoning about: the failure it prevents has no
+/// recovery from inside the server. The administrator account is deliberately
+/// certificate-less, so refusing it would mean an operator ticking a checkbox
+/// and losing the only login that could untick it.
+const fn refuse_for_certificate(required: bool, has_certificate: bool, superuser: bool) -> bool {
+    required && !has_certificate && !superuser
 }
 
 /// Whether `arriving` may take over from the `ghost` already using the name.
@@ -1118,6 +1492,75 @@ fn codec_version() -> tcp::CodecVersion {
     }
 }
 
+/// Upstream `TextMessage`.
+const TEXT_MESSAGE: u16 = 11;
+
+/// The first Mumble release that understands channel listeners.
+///
+/// Wire encoding is `major << 48 | minor << 32 | patch << 16`.
+const LISTENERS_SINCE: u64 = 0x0001_0004_0000;
+
+/// Warn a client too old to know it can be listened to.
+///
+/// murmur's, and it is a privacy notice rather than a compatibility note
+/// (`Messages.cpp:907`): a pre-1.4 client cannot render a `ChannelListener`, so
+/// its user has no way to see that somebody outside the room is hearing them.
+/// The server is the only thing in a position to say so.
+///
+/// Sent only when the feature is actually reachable — both ceilings non-zero,
+/// exactly as upstream gates it. A deployment that has not configured listeners
+/// has nothing to warn about, and a warning nobody can act on is noise that
+/// teaches users to ignore server messages.
+fn listener_warning(conn: u64, mumble_version: u64, config: &Snapshot) -> Actions {
+    if mumble_version >= LISTENERS_SINCE
+        || config.listeners_per_channel == 0
+        || config.listeners_per_user == 0
+    {
+        return Actions::new();
+    }
+
+    // The markup only where the server has said markup is allowed. A client with
+    // `allow_html` off renders the tags literally, which turns a warning into
+    // something that looks like a broken server.
+    let message = if config.allow_html {
+        "<b>[WARNING]</b>: This server has the <b>ChannelListener</b> feature enabled but your \
+         client version does not support it. This means that users <b>might be listening to what \
+         you are saying in your channel without you noticing!</b> You can solve this issue by \
+         upgrading to Mumble 1.4.0 or newer."
+    } else {
+        "[WARNING]: This server has the ChannelListener feature enabled but your client version \
+         does not support it. This means that users might be listening to what you are saying in \
+         your channel without you noticing! You can solve this issue by upgrading to Mumble 1.4.0 \
+         or newer."
+    };
+
+    // No actor: a Mumble client renders an actorless `TextMessage` as a server
+    // notice rather than as a whisper from a user who does not exist.
+    let warning = tcp::TextMessage {
+        message: message.to_owned(),
+        ..tcp::TextMessage::default()
+    };
+    vec![to_conn(conn, TEXT_MESSAGE, warning.encode_to_vec())]
+}
+
+/// A gain map as the wire carries it.
+///
+/// Sorted by channel, because the map is a `HashMap` and an unstable order would
+/// make the same server state produce different bytes on every handshake — which
+/// is invisible in production and turns any test that reads the message into a
+/// coin flip.
+fn volume_adjustments(volume: &HashMap<u32, f32>) -> Vec<tcp::user_state::VolumeAdjustment> {
+    let mut adjustments: Vec<tcp::user_state::VolumeAdjustment> = volume
+        .iter()
+        .map(|(channel, gain)| tcp::user_state::VolumeAdjustment {
+            listening_channel: Some(*channel),
+            volume_adjustment: Some(*gain),
+        })
+        .collect();
+    adjustments.sort_by_key(|adjustment| adjustment.listening_channel);
+    adjustments
+}
+
 /// `ServerSync`: the message that ends the handshake.
 fn server_sync(session: u32, config: &Snapshot) -> tcp::ServerSync {
     tcp::ServerSync {
@@ -1147,6 +1590,102 @@ fn server_config(config: &Snapshot) -> tcp::ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `(type, payload)` of a send action, or `None` if it is not one.
+    fn sent(action: &ServerAction) -> Option<(u32, &[u8])> {
+        match &action.action {
+            Some(server_action::Action::Send(send)) => Some((send.r#type, &send.payload)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_refusal_tells_the_client_why_and_then_hangs_up() {
+        // The regression this file exists to prevent, at unit speed.
+        //
+        // Starling used to send the `Reject` alone. The client showed
+        // "Server connection rejected", then sat there — connected, rendering
+        // the root channel, pinging often enough that the idle sweep never
+        // reaped it. murmur sends the same `Reject` and calls
+        // `disconnectSocket()` in the next statement
+        // (`vendor/server/src/murmur/Messages.cpp:568`).
+        let actions = refusal(7, tcp::reject::RejectType::WrongUserPw, "wrong password");
+
+        assert_eq!(
+            actions.len(),
+            2,
+            "a refusal is a `Reject` *and* a disconnect; one without the other is the bug"
+        );
+
+        // Order is load-bearing: the gateway flushes what is queued before it
+        // closes, so the reason must already be in the queue when the
+        // disconnect is processed. Reversed, the client is hung up on and
+        // never learns why.
+        let (type_id, payload) = sent(&actions[0]).expect("the first action tells the client");
+        assert_eq!(type_id, 4, "type 4 is Reject");
+        let rejected = tcp::Reject::decode(payload).expect("a well-formed Reject");
+        assert_eq!(
+            rejected.r#type,
+            Some(tcp::reject::RejectType::WrongUserPw as i32)
+        );
+        assert_eq!(rejected.reason.as_deref(), Some("wrong password"));
+
+        match &actions[1].action {
+            Some(server_action::Action::Disconnect(hangup)) => {
+                assert_eq!(hangup.conn, 7, "the disconnect must name the refused peer");
+                assert_eq!(hangup.reason, "wrong password");
+            }
+            other => panic!("the second action must be a disconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_kind_of_refusal_hangs_up() {
+        // Not one path: all of them. The refusals are spread across the
+        // handshake — a bad server password, a name in use, a full server, a
+        // missing certificate, an unreachable account service — and a peer
+        // left connected is the same failure whichever one produced it.
+        for kind in [
+            tcp::reject::RejectType::WrongUserPw,
+            tcp::reject::RejectType::WrongServerPw,
+            tcp::reject::RejectType::UsernameInUse,
+            tcp::reject::RejectType::ServerFull,
+            tcp::reject::RejectType::NoCertificate,
+            tcp::reject::RejectType::None,
+        ] {
+            let actions = refusal(1, kind, "refused");
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a.action, Some(server_action::Action::Disconnect(_)))),
+                "{kind:?} left the connection open"
+            );
+        }
+    }
+
+    #[test]
+    fn cert_required_refuses_a_certificate_less_peer_and_nobody_else() {
+        // `docs/GAP-ANALYSIS.md` A3. Off, it must refuse nobody — a setting that
+        // is not switched on has to be invisible.
+        assert!(!refuse_for_certificate(false, false, false));
+        assert!(!refuse_for_certificate(false, false, true));
+        // On, it refuses exactly the peer that presented nothing.
+        assert!(refuse_for_certificate(true, false, false));
+        assert!(!refuse_for_certificate(true, true, false));
+    }
+
+    #[test]
+    fn cert_required_never_locks_the_administrator_out_of_their_own_server() {
+        // The SuperUser carries no certificate on purpose — `write_superuser`
+        // leaves `cert_hash` empty so the administrator login is always
+        // something you know. Refusing it here would mean an operator ticking
+        // this box and losing the only account that could untick it, with no
+        // way back in short of the command line.
+        //
+        // Upstream guards the same case the same way, on `id != 0`
+        // (`vendor/server/src/murmur/Messages.cpp:508`).
+        assert!(!refuse_for_certificate(true, false, true));
+    }
 
     #[test]
     fn a_peer_with_a_certificate_has_its_hash_announced() {

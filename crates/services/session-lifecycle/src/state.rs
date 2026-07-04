@@ -67,6 +67,22 @@ pub struct PendingConnection {
     pub os: String,
     /// That operating system's version.
     pub os_version: String,
+    /// The access tokens the peer presented, in `Authenticate`.
+    ///
+    /// murmur's `ServerUser::qslAccessTokens`. These are what a `#name` ACL
+    /// group matches, which is what makes a channel password a channel
+    /// password: the operator writes `#hunter2` into the channel's `Enter`
+    /// entry, and the token is the client's proof of knowing it.
+    ///
+    /// **Secret, and treated as one.** They are announced to `session-view`
+    /// because that is the only thing `permissions` reads a session through,
+    /// and they go nowhere else — no `UserState`, no log line, no operator
+    /// response. A password in a log is a password that has leaked.
+    ///
+    /// Replaceable after the handshake: a client that is told it may not enter
+    /// sends a fresh `Authenticate` carrying the token it has since been given
+    /// (`vendor/server/src/murmur/Messages.cpp:367`), rather than reconnecting.
+    pub tokens: Vec<String>,
     /// Whether the peer offered Opus.
     ///
     /// Read from `Authenticate`, which is where a client announces it
@@ -107,6 +123,20 @@ pub struct PendingConnection {
     pub name: String,
     /// Its channel.
     pub channel: u32,
+    /// Channels it listens to without being in them.
+    ///
+    /// Held here rather than read from `metadata` when a `Session` is composed,
+    /// because that composition happens on every self-mute and every avatar
+    /// change: a gRPC round trip there would put the tree actor's lock on the
+    /// path of every push-to-mute keypress. `metadata` remains the authority —
+    /// this is the copy it last agreed to.
+    pub listening: Vec<u32>,
+    /// The gain it set on each listened channel, keyed by channel.
+    ///
+    /// Sparse, and kept for channels no longer in [`Self::listening`]: murmur
+    /// keeps an adjustment across a listener being removed, so that toggling a
+    /// room off and on again does not reset a slider the user chose.
+    pub listening_volume: HashMap<u32, f32>,
     /// Self-mute.
     pub self_mute: bool,
     /// Self-deafen.
@@ -228,6 +258,30 @@ impl Connections {
         }
     }
 
+    /// Replace the access tokens a peer holds, from its `Authenticate`.
+    ///
+    /// **Replace, never merge**, as upstream does (`Messages.cpp:378`): the
+    /// client sends the whole set it is holding, so merging would make a token
+    /// impossible to withdraw — a channel password would keep working for
+    /// everyone who had ever typed it, for as long as they stayed connected.
+    ///
+    /// Answers whether anything actually changed, so the caller can skip
+    /// re-announcing and re-pushing permissions for the far commoner case of a
+    /// client that sent no tokens and has none.
+    pub fn set_tokens(&self, conn: u64, tokens: Vec<String>) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(pending) = inner.get_mut(&conn) else {
+            return false;
+        };
+        if pending.tokens == tokens {
+            return false;
+        }
+        pending.tokens = tokens;
+        true
+    }
+
     /// Record what a peer reported about its own link in a `Ping`.
     pub fn record_reported(&self, conn: u64, reported: ReportedStats) {
         if let Ok(mut inner) = self.inner.lock()
@@ -331,6 +385,46 @@ impl Connections {
         }
     }
 
+    /// Apply the listener change `metadata` has already agreed to.
+    ///
+    /// Takes the outcome rather than the request: the ceilings are the tree's to
+    /// enforce, and applying what was *asked for* here would leave this copy
+    /// claiming listeners the authority refused.
+    pub fn apply_listeners(
+        &self,
+        conn: u64,
+        added: &[u32],
+        removed: &[u32],
+        volume: &HashMap<u32, f32>,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(pending) = inner.get_mut(&conn) else {
+            return;
+        };
+        pending
+            .listening
+            .retain(|channel| !removed.contains(channel));
+        for channel in added {
+            if !pending.listening.contains(channel) {
+                pending.listening.push(*channel);
+            }
+        }
+        // An iterator chain rather than a `for`: nothing here observes the
+        // order, and saying so in the shape keeps `iter_over_hash_type` pointed
+        // at the loops where order would leak out.
+        volume.iter().for_each(|(channel, gain)| {
+            // Unity is the absence of an adjustment. Storing it would put an
+            // entry in every routing snapshot that changes nothing.
+            if (gain - 1.0).abs() < f32::EPSILON {
+                let _ = pending.listening_volume.remove(channel);
+            } else {
+                let _ = pending.listening_volume.insert(*channel, *gain);
+            }
+        });
+    }
+
     /// Apply a moderator's speak-state change, returning the session it hit.
     ///
     /// The couplings are murmur's (`Messages.cpp:1303`): deafening implies
@@ -377,6 +471,33 @@ impl Connections {
         let mut inner = self.inner.lock().ok()?;
         let pending = inner.get_mut(&conn)?;
         pending.account = Some(account);
+        (pending.session != 0).then_some(pending.session)
+    }
+
+    /// Record the comment and avatar hashes a connection now carries.
+    ///
+    /// `None` leaves that hash alone. `Some` replaces it, and an **empty**
+    /// vector is how a reset is stored: there is no blob to point at any more.
+    ///
+    /// This has to exist because `session-view` is fed from the connection
+    /// record (`handshake.rs:125`) and nothing else. Storing a blob and writing
+    /// its hash to the account row updates the two places a *reconnect* reads,
+    /// and leaves every already-connected client's view pointing at the previous
+    /// picture for the rest of the session.
+    pub fn set_content(
+        &self,
+        conn: u64,
+        comment: Option<Vec<u8>>,
+        texture: Option<Vec<u8>>,
+    ) -> Option<u32> {
+        let mut inner = self.inner.lock().ok()?;
+        let pending = inner.get_mut(&conn)?;
+        if let Some(comment) = comment {
+            pending.comment_hash = comment;
+        }
+        if let Some(texture) = texture {
+            pending.texture_hash = texture;
+        }
         (pending.session != 0).then_some(pending.session)
     }
 
