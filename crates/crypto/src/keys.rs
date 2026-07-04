@@ -14,12 +14,22 @@
 //!
 //! | `client_nonce` | Meaning | Response |
 //! |---|---|---|
-//! | absent | *tell me your counter* | reply with the server's send counter |
-//! | present | *here is mine, adopt it* | update the server's receive counter, no reply |
+//! | absent | *tell me your nonce* | reply with the nonce the server sends under |
+//! | present | *here is mine, adopt it* | update the server's receive nonce, no reply |
 //!
 //! Getting that branch backwards would look like a working handshake and then
 //! silence, which is why [`ResyncRequest`] names the two cases instead of leaving
 //! callers to test an `Option`.
+//!
+//! # Not every cipher can do this
+//!
+//! Swapping an IV mid-session is an OCB2 idea. `XChaCha20-Poly1305` folds its
+//! salt into a derived subkey and reconstructs the counter's high bits from the
+//! two bytes on the wire, so there is no value a peer could hand over that would
+//! mean anything — see [`VoiceCipher::send_nonce`](crate::VoiceCipher::send_nonce).
+//! A peer on that cipher resynchronises by being re-keyed instead, which is why
+//! the seam reports what it can do rather than assuming murmur's answer works
+//! everywhere.
 
 use rand::TryRng;
 use rand::rngs::SysRng;
@@ -152,39 +162,42 @@ pub struct MalformedKeys {
 /// effects and confusing them produces a session that handshakes and then goes
 /// quiet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResyncRequest {
+pub enum ResyncRequest<'a> {
     /// No `client_nonce`: the peer lost track and wants ours.
     ///
-    /// Reply with the server's current send counter. Nothing is updated.
+    /// Reply with the nonce this server sends under. Nothing is updated.
     SendMine,
 
-    /// A `client_nonce` was present: adopt it as the receive counter.
+    /// A `client_nonce` was present: adopt it as the receive nonce.
     ///
     /// No reply. murmur counts these to spot a peer resyncing in a loop, which is
     /// a symptom of a broken path rather than a broken peer.
     AdoptTheirs {
-        /// The counter the peer says it is sending from.
-        counter: u64,
+        /// The nonce the peer says it is sending under, exactly as it arrived.
+        ///
+        /// **Not a counter, and not validated here.** How wide it is and what it
+        /// means are the cipher's business: OCB2 wants the sixteen bytes of an
+        /// AES block, and a cipher whose nonce is folded into a derived subkey
+        /// has no use for it at all. Narrowing it to a number here is the bug
+        /// this field was reshaped to remove — an eight-byte counter matched
+        /// neither cipher Starling ships, so every real resync fell through to
+        /// [`Self::SendMine`].
+        nonce: &'a [u8],
     },
 }
 
-impl ResyncRequest {
+impl<'a> ResyncRequest<'a> {
     /// Classify an inbound `CryptSetup`.
     ///
-    /// A present-but-malformed `client_nonce` is treated as [`Self::SendMine`]:
-    /// the peer is evidently confused, and answering with our counter is the
-    /// response most likely to recover the session. Adopting an unparseable value
-    /// would be worse than useless.
+    /// Presence alone decides, exactly as murmur's `Server::msgCryptSetup`
+    /// decides on `has_client_nonce()`. A nonce of the wrong width is still
+    /// [`Self::AdoptTheirs`]: the peer meant to hand one over, and refusing it is
+    /// the cipher's call to make against a size it knows and this does not.
     #[must_use]
-    pub fn classify(client_nonce: Option<&[u8]>) -> Self {
+    pub const fn classify(client_nonce: Option<&'a [u8]>) -> Self {
         match client_nonce {
             None => Self::SendMine,
-            Some(bytes) => match bytes.try_into() {
-                Ok(eight) => Self::AdoptTheirs {
-                    counter: u64::from_be_bytes(eight),
-                },
-                Err(_) => Self::SendMine,
-            },
+            Some(nonce) => Self::AdoptTheirs { nonce },
         }
     }
 }
@@ -292,24 +305,44 @@ mod tests {
     }
 
     #[test]
-    fn a_present_client_nonce_is_adopted() {
-        let counter = 4_242_u64;
+    fn a_present_client_nonce_is_adopted_verbatim() {
+        // The width every stock Mumble client actually sends: an AES block, not
+        // a counter. This is the case that used to be misclassified.
+        let nonce = [0x5A_u8; OCB2_KEY_LEN];
         assert_eq!(
-            ResyncRequest::classify(Some(&counter.to_be_bytes())),
-            ResyncRequest::AdoptTheirs { counter }
+            ResyncRequest::classify(Some(&nonce)),
+            ResyncRequest::AdoptTheirs { nonce: &nonce }
         );
     }
 
     #[test]
-    fn a_malformed_client_nonce_falls_back_to_sending_ours() {
-        // Recovering the session beats adopting a value we cannot parse.
-        for len in [0, 1, 7, 9, 24] {
-            assert_eq!(
-                ResyncRequest::classify(Some(&vec![0; len])),
-                ResyncRequest::SendMine,
-                "a {len}-byte nonce should ask for ours"
+    fn a_nonce_of_any_width_is_still_an_offer_to_adopt() {
+        // Presence decides, as it does in murmur — refusing a width belongs to
+        // the cipher, which knows what it expects. Classifying an unexpected
+        // width as "send me yours" is what made every real resync take the
+        // wrong branch: nothing here sends an eight-byte nonce.
+        for len in [1, 7, 8, 9, 16, 24] {
+            let nonce = vec![0_u8; len];
+            assert!(
+                matches!(
+                    ResyncRequest::classify(Some(&nonce)),
+                    ResyncRequest::AdoptTheirs { .. }
+                ),
+                "a {len}-byte nonce is still the peer offering one"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_client_nonce_is_not_the_same_as_no_nonce() {
+        // `optional bytes` distinguishes them and so does murmur, which tests
+        // `has_client_nonce()`. Folding the two together would answer a peer
+        // that asked for nothing and ignore a peer that asked for our nonce.
+        assert_eq!(
+            ResyncRequest::classify(Some(&[])),
+            ResyncRequest::AdoptTheirs { nonce: &[] }
+        );
+        assert_eq!(ResyncRequest::classify(None), ResyncRequest::SendMine);
     }
 
     #[test]

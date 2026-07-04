@@ -183,27 +183,56 @@ impl Accounts {
         };
         let by_name = self.record_by_name(scope, &request.name);
 
-        match (by_cert, by_name) {
+        match by_cert {
             // A certificate that matches an account is the strongest signal
-            // murmur has, and it authenticates on its own — the certificate is
-            // the proof, so no password is demanded on top of it.
-            (Some(record), _) => self.finish(record, request, Proof::Certificate),
-            (None, Some(record)) => {
-                if record.account.cert_hash.is_empty() {
-                    // Only a name was offered, so only the password can prove
-                    // it belongs to this peer.
-                    self.finish(record, request, Proof::PasswordOnly)
-                } else {
-                    outcome(Outcome::NameTaken, None)
-                }
+            // murmur has — but it authenticates **that account and no other**.
+            //
+            // This arm used to be `(Some(record), _)`, matching on the
+            // certificate alone and ignoring the name the peer asked for. The
+            // failure that exposed it: a client whose certificate had been
+            // bound to some account by an earlier registration then connected
+            // as `SuperUser`, and the server resolved it to the *certificate's*
+            // account and checked the typed administrator password against
+            // **that** account's secret. It refused with "wrong password",
+            // which is a true statement about a question nobody asked.
+            //
+            // Refusing was the safe direction of a wrong answer, and the wrong
+            // answer is the point: selecting an identity the peer did not claim
+            // is silent substitution. Had the certificate's account carried no
+            // password, the same path would have *admitted* the peer as
+            // somebody else entirely.
+            Some(record) if record.account.name == request.name => {
+                self.finish(record, request, Proof::Certificate)
             }
-            // An unregistered name is a guest, which is what a Mumble server
-            // does by default. Whether guests are allowed at all is
-            // server-config's question, not this one's.
-            (None, None) => AuthResult {
-                outcome: Outcome::Ok as i32,
-                account: None,
-                guest: true,
+            // The certificate belongs to a different account than the one being
+            // claimed, so it proves nothing about this login and is set aside.
+            // Resolution falls to the name, which carries its own proof — and
+            // the impersonation guard below still applies, so a peer cannot use
+            // one account's certificate to take another's name.
+            _ => match by_name {
+                Some(record) => {
+                    if record.account.cert_hash.is_empty() {
+                        // Only a name was offered, so only the password can
+                        // prove it belongs to this peer.
+                        self.finish(record, request, Proof::PasswordOnly)
+                    } else {
+                        outcome(Outcome::NameTaken, None)
+                    }
+                }
+                // An unregistered name is a guest, which is what a Mumble
+                // server does by default. Whether guests are allowed at all is
+                // server-config's question, not this one's.
+                //
+                // Reached by a peer holding a valid certificate for another
+                // account too. That is a *downgrade* — they take no privileges
+                // with them — so it is allowed, and it is the only way for
+                // somebody to connect under a second, unregistered name from a
+                // machine they have already registered from.
+                None => AuthResult {
+                    outcome: Outcome::Ok as i32,
+                    account: None,
+                    guest: true,
+                },
             },
         }
     }
@@ -265,12 +294,56 @@ impl Accounts {
             .map(|record| record.account)
     }
 
+    /// One account by name, **case-insensitively**.
+    ///
+    /// # Why case-insensitively
+    ///
+    /// This compared with `==`, and the live-session check beside it does not:
+    /// `duplicate_of` uses `eq_ignore_ascii_case` (`session-lifecycle`'s
+    /// `state.rs`), as murmur does by lowercasing both sides
+    /// (`Messages.cpp:487`). That single asymmetry defeated the impersonation
+    /// guard this lookup exists to serve, and only while the owner was *away*:
+    /// a registered `Alice` who was offline could be worn by a guest calling
+    /// themselves `alice`, because `NameTaken` is reachable only through here.
+    /// A registration that protects a name only while its owner is connected
+    /// protects nothing — being connected is what already protects it.
+    ///
+    /// It also made `identity.rs`'s claim untrue, that the SuperUser name is
+    /// "matched case-insensitively … because every Mumble client offers it as
+    /// the administrator login". Now it is.
+    ///
+    /// # Why an exact match still wins
+    ///
+    /// A database written before this change may already hold `Alice` and
+    /// `alice` as two accounts. Collapsing them would take one person's login
+    /// away, so an exact match is preferred and returned immediately: both
+    /// legacy accounts keep working, and only a *third* spelling resolves by
+    /// fold. New collisions cannot be created — `register` and `rename` gate on
+    /// this same lookup, so `alice` is now refused while `Alice` exists.
+    ///
+    /// Ties are broken by the lowest account id rather than by iteration order.
+    /// The cache is a `HashMap`, so "whichever came first" is a different
+    /// answer in every process — and an authentication that depends on hash
+    /// seeding is not one anybody can reason about.
     fn record_by_name(&self, scope: u32, name: &str) -> Option<Record> {
         let cache = self.cache.lock().ok()?;
-        cache
-            .iter()
-            .find(|((s, _), record)| *s == scope && record.account.name == name)
-            .map(|(_, record)| record.clone())
+        let in_scope = || {
+            cache
+                .iter()
+                .filter(|((server, _), _)| *server == scope)
+                .map(|(_, record)| record)
+        };
+        // Two chains rather than one loop, and `min_by_key` rather than "the
+        // first one found": this walks a `HashMap`, so the *only* orders that
+        // may decide an authentication are ones written down here.
+        in_scope()
+            .find(|record| record.account.name == name)
+            .or_else(|| {
+                in_scope()
+                    .filter(|record| record.account.name.eq_ignore_ascii_case(name))
+                    .min_by_key(|record| record.account.id)
+            })
+            .cloned()
     }
 
     fn record_by_cert(&self, scope: u32, hash: &[u8]) -> Option<Record> {
@@ -344,6 +417,54 @@ impl Accounts {
             let _ = cache.insert((scope, id), record);
         }
         Ok(account)
+    }
+
+    /// Rename an account on somebody else's authority.
+    ///
+    /// Separate from [`Self::update`] because the two rest on different
+    /// evidence. `update` treats a name change as sensitive and demands the
+    /// account's current password, which is right when a user is editing their
+    /// own profile: a hijacked session must not be able to rename the account
+    /// out from under its owner. It is *impossible* for the other caller — an
+    /// administrator holding `Register` renaming somebody through the
+    /// registered-user dialog, who does not know that person's password and
+    /// must not need to. Folding the two together would mean either weakening
+    /// the self-service guard or having no working rename at all.
+    ///
+    /// # Errors
+    ///
+    /// The name, if it is empty or already registered. Uniqueness is checked
+    /// here rather than left to the `ux_account_name` index: a violated index
+    /// fails inside [`Self::write`], which only logs — so the cache would keep
+    /// the new name while the table kept the old one, and the two would disagree
+    /// until the next restart.
+    pub async fn rename(&self, scope: u32, id: u64, name: &str) -> Result<Account, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a name cannot be empty".to_owned());
+        }
+        let Some(mut record) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).cloned())
+        else {
+            return Err("no such account".to_owned());
+        };
+        if record.account.name == name {
+            return Ok(record.account);
+        }
+        if self.record_by_name(scope, name).is_some() {
+            return Err(format!("the name {name:?} is already registered"));
+        }
+
+        record.account.name = name.to_owned();
+        record.account.last_active_ms = now_ms();
+        self.write(scope, &record).await;
+        if let Ok(mut cache) = self.cache.lock() {
+            let _ = cache.insert((scope, id), record.clone());
+        }
+        Ok(record.account)
     }
 
     /// Create the SuperUser for this virtual server if it has none.
@@ -612,6 +733,295 @@ mod tests {
         assert!(identity::is_superuser(true, account.id));
     }
 
+    /// An authentication request carrying a certificate.
+    fn auth_with_cert(name: &str, password: &str, cert: &[u8]) -> AuthRequest {
+        AuthRequest {
+            cert_hash: cert.to_vec(),
+            ..auth(name, password)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_name_cannot_be_worn_by_changing_its_case() {
+        // The impersonation guard was reachable only through a case-sensitive
+        // lookup, so it protected a registered name **only while its owner was
+        // connected** — the live-session check beside it has always folded case.
+        // Being connected is what already protects a name; the registration is
+        // supposed to protect it when they are not.
+        let accounts = accounts().await;
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "Alice".to_owned(),
+                    cert_hash: b"alices-machine".to_vec(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        // Alice is offline: nothing but this lookup stands in the way.
+        for worn in ["alice", "ALICE", "aLiCe"] {
+            let result = accounts.authenticate(1, &auth(worn, ""));
+            assert_eq!(
+                result.outcome,
+                auth_result::Outcome::NameTaken as i32,
+                "{worn:?} must not be admitted as a guest wearing a registered name"
+            );
+            assert!(!result.guest, "{worn:?} was admitted as a guest");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_administrator_login_is_case_insensitive_as_documented() {
+        // `identity.rs` states the SuperUser name is matched case-insensitively
+        // "because every Mumble client offers it as the administrator login".
+        // It said so while the lookup compared with `==`.
+        let accounts = accounts().await;
+        let password = accounts.ensure_superuser(1).await.expect("created");
+
+        for spelling in ["SuperUser", "superuser", "SUPERUSER"] {
+            let result = accounts.authenticate(1, &auth(spelling, &password));
+            assert_eq!(
+                result.outcome,
+                auth_result::Outcome::Ok as i32,
+                "{spelling:?} must reach the administrator account"
+            );
+            assert_eq!(
+                result.account.expect("an account").id,
+                identity::SUPERUSER,
+                "{spelling:?} resolved to something other than the SuperUser"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_differs_only_in_case_cannot_be_registered() {
+        // Where the collision would otherwise be created in the first place.
+        let accounts = accounts().await;
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "Alice".to_owned(),
+                    ..Account::default()
+                },
+                "secret",
+            )
+            .await
+            .expect("registered");
+
+        for taken in ["alice", "ALICE"] {
+            assert!(
+                accounts
+                    .register(
+                        1,
+                        Account {
+                            name: taken.to_owned(),
+                            ..Account::default()
+                        },
+                        "secret",
+                    )
+                    .await
+                    .is_err(),
+                "{taken:?} collides with a registered name and must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_legacy_accounts_differing_only_in_case_both_keep_their_login() {
+        // A database written before the fold may already hold both. Collapsing
+        // them would take somebody's login away, so an exact match wins and is
+        // returned immediately; only a third spelling resolves by fold, and
+        // then to the lowest account id rather than to whatever the hash map
+        // happened to yield first.
+        let accounts = accounts().await;
+        let upper = accounts
+            .register(
+                1,
+                Account {
+                    name: "Alice".to_owned(),
+                    ..Account::default()
+                },
+                "upper-secret",
+            )
+            .await
+            .expect("registered");
+        // Written straight into the cache, as a legacy row would be: `register`
+        // now refuses this, which is the point of the fix.
+        let lower = Record {
+            account: Account {
+                id: upper.id + 1,
+                name: "alice".to_owned(),
+                ..Account::default()
+            },
+            password: Some(Secret::new("lower-secret")),
+            totp: None,
+        };
+        if let Ok(mut cache) = accounts.cache.lock() {
+            let _ = cache.insert((1, lower.account.id), lower.clone());
+        }
+
+        let as_upper = accounts.authenticate(1, &auth("Alice", "upper-secret"));
+        assert_eq!(as_upper.outcome, auth_result::Outcome::Ok as i32);
+        assert_eq!(as_upper.account.expect("account").id, upper.id);
+
+        let as_lower = accounts.authenticate(1, &auth("alice", "lower-secret"));
+        assert_eq!(as_lower.outcome, auth_result::Outcome::Ok as i32);
+        assert_eq!(as_lower.account.expect("account").id, lower.account.id);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_authenticates_its_own_account_and_no_other() {
+        // The bug this exists for, and it is a *security* bug rather than the
+        // login failure that exposed it: the account used to be selected by
+        // certificate alone, ignoring the name the peer asked for. A client
+        // whose certificate belonged to one account, connecting under another
+        // name, was resolved to the certificate's account.
+        //
+        // It surfaced as "wrong password" — the typed administrator password
+        // checked against somebody else's secret — which is the safe direction
+        // of a wrong answer. The unsafe direction is the same code path: had
+        // the certificate's account carried no password, the peer would have
+        // been *admitted* as an identity they never claimed.
+        let accounts = accounts().await;
+        let cert = b"a-registered-machine".to_vec();
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "mallory".to_owned(),
+                    cert_hash: cert.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered by certificate, as a client registration does");
+
+        let superuser = accounts.ensure_superuser(1).await.expect("created");
+
+        // The same machine, the same certificate, asking to be the SuperUser.
+        let result = accounts.authenticate(
+            1,
+            &auth_with_cert(identity::SUPERUSER_NAME, &superuser, &cert),
+        );
+
+        assert_eq!(
+            result.outcome,
+            auth_result::Outcome::Ok as i32,
+            "the administrator password must authenticate the administrator"
+        );
+        let account = result.account.expect("an account");
+        assert_eq!(
+            account.id,
+            identity::SUPERUSER,
+            "the certificate's account must not be substituted for the claimed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_accounts_certificate_cannot_take_another_accounts_name() {
+        // The impersonation guard has to survive the change above: setting the
+        // certificate aside must fall through to the *name*, where a registered
+        // name bound to a different certificate is still refused.
+        let accounts = accounts().await;
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "victim".to_owned(),
+                    cert_hash: b"the-victims-machine".to_vec(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        let attacker = b"the-attackers-machine".to_vec();
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "attacker".to_owned(),
+                    cert_hash: attacker.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        let result = accounts.authenticate(1, &auth_with_cert("victim", "", &attacker));
+
+        assert_eq!(
+            result.outcome,
+            auth_result::Outcome::NameTaken as i32,
+            "a certificate must not be a way to take somebody else's name"
+        );
+        assert!(result.account.is_none());
+        assert!(!result.guest);
+    }
+
+    #[tokio::test]
+    async fn a_registered_machine_may_still_connect_under_an_unregistered_name() {
+        // A downgrade, so it is allowed: the peer takes no privileges with
+        // them. It is also the only way to connect as a second, unregistered
+        // identity from a machine that has already registered one.
+        let accounts = accounts().await;
+        let cert = b"a-registered-machine".to_vec();
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "registered".to_owned(),
+                    cert_hash: cert.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        let result = accounts.authenticate(1, &auth_with_cert("a-guest-name", "", &cert));
+
+        assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
+        assert!(result.guest, "an unregistered name is a guest");
+        assert!(
+            result.account.is_none(),
+            "a guest must carry no account, or it inherits the certificate's privileges"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_certificate_still_authenticates_the_account_it_belongs_to() {
+        // The behaviour that must not regress: a client registration stores no
+        // password, so the certificate is the whole of the credential and has
+        // to keep working on its own.
+        let accounts = accounts().await;
+        let cert = b"my-own-machine".to_vec();
+        let registered = accounts
+            .register(
+                1,
+                Account {
+                    name: "owner".to_owned(),
+                    cert_hash: cert.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        let result = accounts.authenticate(1, &auth_with_cert("owner", "", &cert));
+
+        assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
+        assert_eq!(result.account.expect("an account").id, registered.id);
+    }
+
     #[tokio::test]
     async fn a_registered_account_with_no_password_cannot_be_claimed_by_name() {
         // Reachable through data, not code: an account row written before
@@ -841,6 +1251,152 @@ mod tests {
             .await
             .expect("first");
         assert!(accounts.register(1, account, "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_administrator_renames_an_account_without_its_password() {
+        // The whole reason `rename` exists next to `update`. Renaming somebody
+        // through the registered-user dialog is authorised by `Register` on the
+        // caller, and the caller does not know — and must not need — the
+        // password of the account they are renaming.
+        let accounts = accounts().await;
+        let account = accounts
+            .register(
+                1,
+                Account {
+                    name: "dave".to_owned(),
+                    ..Account::default()
+                },
+                "a password the admin has never seen",
+            )
+            .await
+            .expect("registered");
+
+        let renamed = accounts
+            .rename(1, account.id, "  david  ")
+            .await
+            .expect("an administrator may rename");
+        assert_eq!(renamed.name, "david", "the name is trimmed");
+
+        // And the account is still the same account, still reachable by its new
+        // name and no longer by its old one.
+        assert_eq!(accounts.by_name(1, "david").map(|a| a.id), Some(account.id));
+        assert!(accounts.by_name(1, "dave").is_none());
+    }
+
+    #[tokio::test]
+    async fn renaming_onto_a_taken_name_is_refused_before_it_is_written() {
+        // `ux_account_name` would refuse this in the table, and `write` only
+        // logs a failure — so without the check here the cache would hold two
+        // accounts with one name while the table held the old one, and the two
+        // would disagree until a restart resolved it in favour of the row
+        // nobody asked for.
+        let accounts = accounts().await;
+        let first = accounts
+            .register(
+                1,
+                Account {
+                    name: "erin".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        let second = accounts
+            .register(
+                1,
+                Account {
+                    name: "frank".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        assert!(accounts.rename(1, second.id, "erin").await.is_err());
+        assert_eq!(
+            accounts.by_id(1, second.id).map(|a| a.name),
+            Some("frank".to_owned())
+        );
+        assert_eq!(accounts.by_name(1, "erin").map(|a| a.id), Some(first.id));
+    }
+
+    #[tokio::test]
+    async fn renaming_an_account_to_the_name_it_already_has_is_not_a_collision() {
+        // It would otherwise find *itself* in the name index and refuse, which
+        // makes a dialog that submits every row it is showing fail on the rows
+        // nobody edited.
+        let accounts = accounts().await;
+        let account = accounts
+            .register(
+                1,
+                Account {
+                    name: "grace".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        assert_eq!(
+            accounts
+                .rename(1, account.id, "grace")
+                .await
+                .map(|a| a.name),
+            Ok("grace".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_needs_a_name_and_a_real_account() {
+        let accounts = accounts().await;
+        let account = accounts
+            .register(
+                1,
+                Account {
+                    name: "heidi".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        assert!(accounts.rename(1, account.id, "   ").await.is_err());
+        assert!(accounts.rename(1, 9_999, "someone").await.is_err());
+        // The name it had is untouched by either refusal.
+        assert_eq!(accounts.by_name(1, "heidi").map(|a| a.id), Some(account.id));
+    }
+
+    #[tokio::test]
+    async fn one_virtual_servers_names_do_not_block_anothers() {
+        // The name index is per server, and a rename that consulted it globally
+        // would make every account name on a shared deployment first-come.
+        let accounts = accounts().await;
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "ivan".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        let elsewhere = accounts
+            .register(
+                2,
+                Account {
+                    name: "judy".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+        assert!(accounts.rename(2, elsewhere.id, "ivan").await.is_ok());
     }
 
     #[tokio::test]

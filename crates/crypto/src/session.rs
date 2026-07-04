@@ -230,6 +230,20 @@ impl crate::stream::VoiceCipher for VoiceSession {
     fn open(&mut self, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, VoiceError> {
         Self::open(self, packet, aad)
     }
+
+    /// Nothing: this is one direction of the cipher
+    /// [`XChaCha20Voice`](crate::XChaCha20Voice) pairs, and it resynchronises the
+    /// same way that type does — by being re-keyed. The salt is already inside
+    /// the derived subkey and the counter's high bits are reconstructed from the
+    /// wire, so there is no nonce to exchange.
+    fn send_nonce(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Refused, for the same reason.
+    fn adopt_recv_nonce(&mut self, _nonce: &[u8]) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

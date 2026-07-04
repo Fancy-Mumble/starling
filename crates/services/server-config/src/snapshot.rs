@@ -1,55 +1,18 @@
-//! The defaults, the field-level merge, and what is never read back.
+//! The field-level merge, and what is never read back.
 //!
-//! Every default here is murmur's, named after the `.ini` key it replaces, so a
-//! server that has never been configured behaves the way an operator migrating
-//! from murmur expects rather than the way a fresh design would have chosen.
+//! The **defaults** are not here. They moved to
+//! [`starling_runtime::settings::defaults`] when the settings in `§5` of
+//! `docs/GAP-ANALYSIS.md` were made to take effect: every service that enforces
+//! a setting needs the same answer when this service cannot be reached, and a
+//! second copy of a default table is one copy that eventually disagrees — the
+//! symptom being a limit that depends on which service restarted last. This
+//! module re-exports it so the name still reads as this service's own.
 
 use std::collections::HashMap;
 
 use starling_proto_fancy::serverconfig::Snapshot;
 
-/// murmur's defaults, for a virtual server nobody has configured.
-#[must_use]
-pub fn defaults(virtual_server: u32) -> Snapshot {
-    Snapshot {
-        virtual_server,
-        version: 0,
-        welcome_text: String::new(),
-        password: String::new(),
-        max_users: 100,
-        max_bandwidth: 72_000,
-        text_message_length: 5_000,
-        image_message_length: 131_072,
-        allow_html: true,
-        allow_recording: true,
-        channel_nesting_limit: 10,
-        channel_count_limit: 1_000,
-        listeners_per_channel: 0,
-        listeners_per_user: 0,
-        cert_required: false,
-        log_days: 31,
-        // The leaky bucket that silently drops when it is wrong
-        // (`PORTING-PLAN.md` R5). These two numbers are murmur's.
-        message_limit: 1,
-        message_burst: 5,
-        plugin_message_limit: 4,
-        plugin_message_burst: 15,
-        registry_name: String::new(),
-        obfuscate_ips: false,
-        // murmur's default, and the reason a fresh server is visible in a
-        // server browser at all.
-        allow_ping: true,
-        // Every one of these empty is what stops an unconfigured server from
-        // announcing itself: registration refuses without a name, a password
-        // and a URL, so the safe default is silence rather than a listing the
-        // operator never asked for.
-        registry_password: String::new(),
-        registry_url: String::new(),
-        registry_hostname: String::new(),
-        registry_location: String::new(),
-        extra: HashMap::new(),
-    }
-}
+pub use starling_runtime::settings::defaults;
 
 /// Copy only `fields` from `values` into `current`.
 ///
@@ -67,6 +30,10 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
             "image_message_length" => current.image_message_length = values.image_message_length,
             "allow_html" => current.allow_html = values.allow_html,
             "allow_recording" => current.allow_recording = values.allow_recording,
+            "broadcast_listener_volume_adjustments" => {
+                current.broadcast_listener_volume_adjustments =
+                    values.broadcast_listener_volume_adjustments;
+            }
             "channel_nesting_limit" => current.channel_nesting_limit = values.channel_nesting_limit,
             "channel_count_limit" => current.channel_count_limit = values.channel_count_limit,
             "listeners_per_channel" => current.listeners_per_channel = values.listeners_per_channel,
@@ -124,6 +91,10 @@ pub fn redact(snapshot: &Snapshot) -> (HashMap<String, String>, Vec<String>) {
         (
             "allow_recording".to_owned(),
             snapshot.allow_recording.to_string(),
+        ),
+        (
+            "broadcast_listener_volume_adjustments".to_owned(),
+            snapshot.broadcast_listener_volume_adjustments.to_string(),
         ),
         (
             "channel_nesting_limit".to_owned(),

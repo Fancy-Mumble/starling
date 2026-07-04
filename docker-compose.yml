@@ -260,6 +260,20 @@ services:
       # is exactly the truth available.
       disable: true
 
+  # The other collector, and the opposite shape: this one *is* dialled. It asks
+  # every service how it is on a timer and holds the answer, so `operator-api`
+  # serves `/v1/health` from one snapshot instead of fanning out across twenty
+  # endpoints per page load.
+  #
+  # In the default set rather than `--profile admin`, even though `operator-api`
+  # is its only reader. The sweep is what makes silence into evidence — a
+  # service that stops answering reads UNREACHABLE, a state no service can
+  # report about itself — and a collector that starts with the dashboard would
+  # have no history of the outage the operator opened it to look at.
+  health:
+    <<: *starling
+    command: ["health", "--config", "/etc/starling/starling.toml"]
+
   # -------------------------------------------------------------------------
   # The front door, started last.
   #
@@ -347,6 +361,11 @@ services:
       userdata: {condition: service_healthy}
       moderation: {condition: service_healthy}
       server-config: {condition: service_healthy}
+      # `/v1/health` is the one route that reads another service rather than an
+      # authority, and it is the route a dashboard opens on. Waiting on it here
+      # is what makes `--profile admin up --wait` mean the Health page works,
+      # rather than meaning :8081 accepts connections.
+      health: {condition: service_healthy}
 
   # -------------------------------------------------------------------------
   # The single-box deployment.

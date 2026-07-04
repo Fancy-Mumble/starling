@@ -5,8 +5,13 @@
 //! index rather than a sort, and an insert appends instead of scattering the
 //! way `UUIDv4` does (`docs/STORAGE.md` L3).
 //!
-//! Fan-out names the speaker as an *exclusion* rather than filtering here:
-//! only the gateway knows which sessions it holds.
+//! Fan-out **addresses** its recipients. It used to name the speaker as an
+//! exclusion and leave the rest to the gateway, on the reasoning that only the
+//! gateway knows which sessions it holds — but a `Send` naming no sessions goes
+//! to every authenticated client on the server, so excluding the speaker left
+//! everyone else *on the server* rather than everyone else in the channel.
+//! Membership comes from `session-view` through a [`Roster`], and a cold roster
+//! addresses nobody rather than falling back to a broadcast.
 
 use std::sync::Arc;
 
@@ -26,17 +31,28 @@ use starling_proto_fancy::text::{
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::log::{Category, LogEvent, Logger, describe_actor};
-use starling_runtime::permit::{Permit, permission_denied};
+use starling_runtime::permit::{Permit, permission_denied, refused};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
+use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::settings::Settings;
 use starling_runtime::storage::{Migration, Store};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
+pub mod filter;
+
 /// Upstream `TextMessage`.
 const TEXT_MESSAGE: u16 = 11;
+
+/// The readiness gate that stays closed until the roster has a snapshot.
+///
+/// A text service that is up with a cold roster delivers nothing, which looks
+/// exactly like a server where nobody is talking. Gating readiness keeps
+/// traffic away until it can actually address a channel.
+const VIEW_GATE: &str = "session-view";
 
 /// How many delivered messages a `Watch` subscriber may fall behind by.
 ///
@@ -71,10 +87,22 @@ pub struct TextService {
     /// Asks `permissions` before a message reaches anyone.
     permit: Permit,
     /// How `Announce` reaches `session-view` and `metadata` to turn a channel
-    /// into the sessions sitting in it. A client's own message never needs
-    /// this — the gateway holds the sessions and fan-out is an exclusion —
-    /// but a server-originated message has no session to broadcast from.
+    /// into the sessions sitting in it, and how a client's message expands a
+    /// `tree_id` into the channels under it.
+    ///
+    /// This used to say a client's own message never needed any of it, because
+    /// "the gateway holds the sessions and fan-out is an exclusion". That was
+    /// the mistake: excluding the sender from a `Send` that names nobody leaves
+    /// *everyone else on the server*, not everyone else in the channel.
     resolver: starling_runtime::channel::Resolver,
+    /// Who is in which channel, so a message can be addressed at one.
+    roster: Arc<Roster>,
+    /// The two settings that bound a message: how long it may be and whether
+    /// it may carry markup.
+    ///
+    /// Live rather than read at boot, because murmur's are: `setLiveConf`
+    /// applies a changed `textmessagelength` to the next message anybody sends.
+    settings: Settings,
     /// Delivered messages, for `Watch` subscribers.
     ///
     /// Bounded and lossy on purpose, like [`Fanout`]: a watcher that stops
@@ -431,13 +459,76 @@ impl ClientService for TextService {
 }
 
 impl TextService {
+    /// Apply `text_message_length` and `allow_html` to a body in place.
+    ///
+    /// `Err` carries the refusal to send. Split out of
+    /// [`Self::on_text_message`] because it is the whole of what the two
+    /// settings do, and reads there as one decision rather than three.
+    fn bound_body(
+        &self,
+        inbound: &Inbound,
+        message: &mut starling_proto::proto::tcp::TextMessage,
+    ) -> Result<(), Actions> {
+        let config = self.settings.get(inbound.scope);
+        match filter::check(
+            &message.message,
+            config.allow_html,
+            config.text_message_length,
+            config.image_message_length,
+        ) {
+            filter::Verdict::Deliver => Ok(()),
+            filter::Verdict::Rewritten(text) => {
+                tracing::debug!(
+                    session = inbound.session,
+                    before = message.message.len(),
+                    after = text.len(),
+                    "html stripped from a text message"
+                );
+                message.message = text;
+                Ok(())
+            }
+            // murmur's `TextTooLong`, and it is sent rather than dropped: a
+            // message that vanishes with no reply is indistinguishable from a
+            // server that stopped delivering chat.
+            filter::Verdict::TooLong => {
+                self.logger.log(
+                    LogEvent::notice(Category::Message, "text message refused")
+                        .with("session", inbound.session)
+                        .with("length", message.message.len())
+                        .with("limit", config.text_message_length)
+                        .with("reason", "over the text message length"),
+                );
+                Err(vec![refused(
+                    inbound,
+                    starling_proto::proto::tcp::permission_denied::DenyType::TextTooLong,
+                    message.channel_id.first().copied().unwrap_or_default(),
+                    "that message is too long",
+                )])
+            }
+        }
+    }
+
     async fn on_text_message(&self, inbound: &Inbound) -> Actions {
-        let Ok(message) =
+        let Ok(mut message) =
             starling_proto::proto::tcp::TextMessage::decode(inbound.payload.as_slice())
         else {
             tracing::debug!(conn = inbound.conn, "undecodable TextMessage");
             return Actions::new();
         };
+        if message.message.is_empty() {
+            return Actions::new();
+        }
+
+        // Before the permission check, as murmur has it (`Messages.cpp:2322`):
+        // a body that is too long is refused whatever the sender may do, and
+        // checking permission first would put a round trip in front of a
+        // refusal that needs none.
+        if let Err(denial) = self.bound_body(inbound, &mut message) {
+            return denial;
+        }
+        // A body that was only markup is now empty, and an empty message is
+        // not delivered — murmur returns here too rather than broadcasting a
+        // blank line to a channel.
         if message.message.is_empty() {
             return Actions::new();
         }
@@ -513,15 +604,63 @@ impl TextService {
             from_client: true,
         });
 
+        let recipients = self.recipients_of(inbound, &message).await;
+
         let echo = starling_proto::proto::tcp::TextMessage {
             actor: Some(inbound.session),
             ..message
         };
-        vec![broadcast_except(
-            inbound.session,
-            TEXT_MESSAGE,
-            echo.encode_to_vec(),
-        )]
+
+        if recipients.is_empty() {
+            // Nobody to tell. Deliberately not a broadcast: an empty answer
+            // means either the channel is empty or membership is unknown, and
+            // neither of those is "send it to the whole server".
+            if !self.roster.is_warm() {
+                tracing::warn!("the session-view roster is cold; a text message reached nobody");
+            }
+            return Actions::new();
+        }
+        vec![to_sessions(recipients, TEXT_MESSAGE, echo.encode_to_vec())]
+    }
+
+    /// Who a client's message is actually for.
+    ///
+    /// The union of the sessions it names outright, the members of every
+    /// channel it names, and the members of every channel under a `tree_id` —
+    /// minus the sender, who already has it.
+    async fn recipients_of(
+        &self,
+        inbound: &Inbound,
+        message: &starling_proto::proto::tcp::TextMessage,
+    ) -> Vec<u32> {
+        let mut targets: Vec<u32> = Vec::new();
+        let mut add = |session: u32| {
+            if session != inbound.session && !targets.contains(&session) {
+                targets.push(session);
+            }
+        };
+
+        // A direct message names its recipients, so they need no lookup.
+        for session in message.session.iter().copied() {
+            add(session);
+        }
+        for channel in message.channel_id.iter().copied() {
+            for session in self.roster.in_channel(channel, inbound.session) {
+                add(session);
+            }
+        }
+        // Only pay for the tree walk when a tree was actually addressed.
+        if !message.tree_id.is_empty() {
+            for channel in self
+                .expand_channels(inbound.scope, &message.tree_id, true)
+                .await
+            {
+                for session in self.roster.in_channel(channel, inbound.session) {
+                    add(session);
+                }
+            }
+        }
+        targets
     }
 
     async fn on_envelope(&self, inbound: &Inbound) -> Actions {
@@ -576,14 +715,29 @@ impl Serve for TextService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        let settings = Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
+        // Dropped on purpose: these live as long as the process, and a service
+        // whose settings stopped updating would be enforcing yesterday's limit
+        // with nothing to say so.
+        drop(settings.watch(&ctx.virtual_servers()));
+        ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
             permit: Permit::new(ctx.resolver.clone()),
+            settings,
             resolver: ctx.resolver,
+            roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
         }))
+    }
+
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        ctx.shutdown.wait().await;
+        follower.abort();
+        Ok(())
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
@@ -599,6 +753,16 @@ mod tests {
     use super::*;
 
     async fn service() -> Arc<TextService> {
+        service_with(starling_runtime::settings::defaults(1)).await
+    }
+
+    /// The same service, with the operator's settings pinned to `config`.
+    ///
+    /// Pinned rather than fetched: the point of a §5 test is that the *value*
+    /// decides the outcome, so the value has to be the only thing that varies.
+    async fn service_with(
+        config: starling_proto_fancy::serverconfig::Snapshot,
+    ) -> Arc<TextService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
@@ -627,7 +791,9 @@ mod tests {
             fanout: Fanout::default(),
             logger: Logger::null(),
             permit: Permit::new(resolver.clone()),
+            settings: Settings::fixed(resolver.clone(), config),
             resolver,
+            roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
         })
     }
@@ -684,5 +850,176 @@ mod tests {
         }
         assert!(service.history(1, 7, 2, &[]).await.more);
         assert!(!service.history(1, 7, 10, &[]).await.more);
+    }
+
+    /// One `TextMessage` frame, as the gateway would deliver it.
+    fn frame(body: &str) -> Inbound {
+        use prost::Message as _;
+        Inbound {
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: TEXT_MESSAGE,
+            gateway: String::new(),
+            payload: starling_proto::proto::tcp::TextMessage {
+                channel_id: vec![0],
+                message: body.to_owned(),
+                ..starling_proto::proto::tcp::TextMessage::default()
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    /// A message addressed at `channels` and `sessions`, from session 7.
+    fn addressed_to(
+        channels: Vec<u32>,
+        sessions: Vec<u32>,
+    ) -> starling_proto::proto::tcp::TextMessage {
+        starling_proto::proto::tcp::TextMessage {
+            channel_id: channels,
+            session: sessions,
+            message: "hello".to_owned(),
+            ..starling_proto::proto::tcp::TextMessage::default()
+        }
+    }
+
+    /// Sessions 7 and 8 in channel 4, session 9 in channel 9.
+    fn warm(service: &TextService) {
+        use starling_proto_fancy::sessionview::{Session, Sessions, ViewEvent, view_event};
+        let member = |session, channel| Session {
+            session,
+            channel,
+            ..Session::default()
+        };
+        let _ = service.roster.apply(ViewEvent {
+            event: Some(view_event::Event::Snapshot(Sessions {
+                sessions: vec![member(7, 4), member(8, 4), member(9, 9)],
+                ..Sessions::default()
+            })),
+        });
+    }
+
+    #[tokio::test]
+    async fn a_message_reaches_its_channel_and_not_the_whole_server() {
+        // The finding: fan-out named the speaker as an exclusion on a Send that
+        // named nobody, so a message to channel 4 reached session 9 in channel
+        // 9 as well -- and everybody else on the server.
+        let service = service().await;
+        warm(&service);
+
+        let recipients = service
+            .recipients_of(&frame("hello"), &addressed_to(vec![4], Vec::new()))
+            .await;
+
+        assert_eq!(recipients, vec![8], "only the other member of channel 4");
+    }
+
+    #[tokio::test]
+    async fn a_cold_roster_sends_a_message_to_nobody_rather_than_everybody() {
+        // Failing open here would be the leak wearing a fallback.
+        let service = service().await;
+
+        let recipients = service
+            .recipients_of(&frame("hello"), &addressed_to(vec![4], Vec::new()))
+            .await;
+
+        assert!(recipients.is_empty());
+        assert!(!service.roster.is_warm());
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_reaches_the_sessions_it_names() {
+        // A session named outright needs no membership lookup, and must still
+        // arrive when it is sitting in a different channel.
+        let service = service().await;
+        warm(&service);
+
+        let recipients = service
+            .recipients_of(&frame("hello"), &addressed_to(Vec::new(), vec![9]))
+            .await;
+
+        assert_eq!(recipients, vec![9]);
+    }
+
+    #[tokio::test]
+    async fn the_sender_is_never_told_its_own_message_twice() {
+        // Session 7 is both the sender and a member of channel 4, and names
+        // itself directly as well.
+        let service = service().await;
+        warm(&service);
+
+        let recipients = service
+            .recipients_of(&frame("hello"), &addressed_to(vec![4], vec![7, 8]))
+            .await;
+
+        assert_eq!(recipients, vec![8]);
+    }
+
+    /// The `DenyType` of a `PermissionDenied` action, if that is what it is.
+    fn deny_type(actions: &Actions) -> Option<i32> {
+        use prost::Message as _;
+        use starling_proto_fancy::control::server_action::Action;
+        let Some(Action::Send(send)) = actions.first().and_then(|action| action.action.as_ref())
+        else {
+            return None;
+        };
+        starling_proto::proto::tcp::PermissionDenied::decode(send.payload.as_slice())
+            .ok()
+            .and_then(|denied| denied.r#type)
+    }
+
+    #[tokio::test]
+    async fn the_text_message_length_decides_whether_a_message_is_delivered() {
+        // §5's first entry. The limit was applied to comments and to nothing
+        // else, so an operator who set it watched clients keep posting past it.
+        //
+        // The same body, twice, with only the setting different — asserting it
+        // round-trips through the API would reproduce the bug being fixed.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let body = "x".repeat(64);
+
+        let strict = service_with(starling_proto_fancy::serverconfig::Snapshot {
+            text_message_length: 10,
+            ..starling_runtime::settings::defaults(1)
+        })
+        .await;
+        let refusal = strict.on_text_message(&frame(&body)).await;
+        assert_eq!(
+            deny_type(&refusal),
+            Some(DenyType::TextTooLong as i32),
+            "the client must be told which limit it met, not left in silence"
+        );
+
+        // With a limit that admits it, the message reaches the permission
+        // check instead — which denies here, because these tests point at a
+        // `permissions` nothing is serving. A different refusal is the proof
+        // the length check is no longer the one refusing.
+        let lenient = service_with(starling_proto_fancy::serverconfig::Snapshot {
+            text_message_length: 1_000,
+            ..starling_runtime::settings::defaults(1)
+        })
+        .await;
+        assert_eq!(
+            deny_type(&lenient.on_text_message(&frame(&body)).await),
+            Some(DenyType::Permission as i32),
+            "a message under the limit must get past the length check"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_length_check_happens_before_the_permission_round_trip() {
+        // murmur's order (`Messages.cpp:2322`), and it is what makes the test
+        // above possible: a body that is too long is refused whatever the
+        // sender may do, with no round trip in front of the refusal.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service_with(starling_proto_fancy::serverconfig::Snapshot {
+            text_message_length: 1,
+            ..starling_runtime::settings::defaults(1)
+        })
+        .await;
+        assert_eq!(
+            deny_type(&service.on_text_message(&frame("far too long")).await),
+            Some(DenyType::TextTooLong as i32)
+        );
     }
 }

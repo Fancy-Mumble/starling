@@ -172,6 +172,30 @@ impl VoiceCipher for Ocb2 {
         self.recv.accept(&candidate);
         Ok(opened.plain)
     }
+
+    /// The IV this server sends under — murmur's `getEncryptIV`.
+    ///
+    /// What a client sets its *decrypt* IV from, which is why the send half is
+    /// the right one: answering with the receive half would tell the client to
+    /// expect packets under the nonce it is itself sending, and every frame from
+    /// the server would then fail its tag.
+    fn send_nonce(&self) -> Option<Vec<u8>> {
+        Some(self.send.get().0.to_vec())
+    }
+
+    /// Adopt the IV a client says it is sending under — murmur's `setDecryptIV`.
+    ///
+    /// A wrong width is refused rather than padded. murmur checks the same size
+    /// and logs "Messed up nonce"; padding would leave the receiver expecting a
+    /// nonce the client never sends, which is silence with a resync that
+    /// reported success.
+    fn adopt_recv_nonce(&mut self, nonce: &[u8]) -> bool {
+        let Ok(block) = <[u8; BLOCK_LEN]>::try_from(nonce) else {
+            return false;
+        };
+        self.resync_to(Block(block));
+        true
+    }
 }
 
 impl std::fmt::Debug for Ocb2 {
@@ -382,6 +406,51 @@ mod tests {
         // Resyncing to the *last sent* nonce means the next packet is in order.
         let next = sender.seal(b"resynced", b"").expect("sealed");
         assert_eq!(receiver.open(&next, b"").expect("opened"), b"resynced");
+    }
+
+    #[test]
+    fn the_seam_answers_a_resync_the_way_murmur_does() {
+        // The whole `CryptSetup`(15) round trip, through the trait the voice
+        // service reaches this cipher by rather than through `Ocb2`'s own
+        // methods — which is what the service can actually call.
+        //
+        // `sender` is the server here: it hands over the nonce it seals under,
+        // the client installs that as what it expects, and the stream that had
+        // walked away carries again.
+        let (mut server, mut client) = pair();
+        for _ in 0..500 {
+            let _ = server.seal(b"lost in transit", b"").expect("sealed");
+        }
+        let stranded = server.seal(b"unheard", b"").expect("sealed");
+        assert!(
+            client.open(&stranded, b"").is_err(),
+            "the client should be out of step, or this proves nothing"
+        );
+
+        let offered = VoiceCipher::send_nonce(&server).expect("OCB2 can be resynchronised");
+        assert_eq!(offered.len(), BLOCK_LEN, "an AES block, not a counter");
+        assert!(VoiceCipher::adopt_recv_nonce(&mut client, &offered));
+
+        let next = server.seal(b"audible again", b"").expect("sealed");
+        assert_eq!(
+            client.open(&next, b"").expect("opened"),
+            b"audible again",
+            "the resync answered but the peer is still deaf"
+        );
+    }
+
+    #[test]
+    fn a_nonce_of_the_wrong_width_is_refused_rather_than_padded() {
+        // murmur checks the same size and logs "Messed up nonce". Padding or
+        // truncating would leave the receiver expecting a nonce the peer never
+        // sends — silence, reported as a successful resync.
+        let (_, mut receiver) = pair();
+        for len in [0, 1, 8, 15, 17, 24] {
+            assert!(
+                !VoiceCipher::adopt_recv_nonce(&mut receiver, &vec![0; len]),
+                "a {len}-byte nonce was accepted as an AES block"
+            );
+        }
     }
 
     #[test]

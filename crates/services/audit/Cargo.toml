@@ -14,6 +14,9 @@ sha2.workspace = true
 sqlx.workspace = true
 
 prost.workspace = true
+# The retention sweeper is a timer task, so this is a runtime dependency now
+# rather than only a test one.
+tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 

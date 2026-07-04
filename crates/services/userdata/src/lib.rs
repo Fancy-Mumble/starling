@@ -14,6 +14,7 @@
 pub mod ids;
 
 pub mod accounts;
+mod directory;
 pub mod secret;
 
 pub use accounts::Accounts;
@@ -34,6 +35,7 @@ use starling_proto_fancy::userdata::{
 };
 use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::permit::Permit;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::trail::{self, Record, Trail};
@@ -41,8 +43,13 @@ use tonic::{Request, Response, Status};
 
 /// Upstream `QueryUsers`.
 const QUERY_USERS: u16 = 14;
+/// Upstream `UserList`, which is the client's registered-users dialog.
+const USER_LIST: u16 = 18;
 /// Upstream `RequestBlob`.
 const REQUEST_BLOB: u16 = 23;
+
+/// The root channel, where the server-wide permissions live.
+const ROOT_CHANNEL: u32 = 0;
 
 /// The service.
 #[derive(Debug)]
@@ -50,11 +57,22 @@ pub struct UserdataService {
     accounts: Accounts,
     fanout: Fanout,
     logger: Logger,
+    /// Asks `permissions` before the registered-user directory is read or
+    /// edited. It is the account list of everyone who has ever been on the
+    /// server, so it is not public.
+    permit: Permit,
     /// To reach `session-view`, which is the only place that knows which
     /// account a session belongs to — see [`UserdataService::sessions`].
     resolver: Resolver,
     /// The operator-facing record of account changes.
     trail: Trail,
+}
+
+/// The client on `session`, as an audit actor.
+fn actor_of(session: u32) -> starling_proto_fancy::common::Actor {
+    starling_proto_fancy::common::Actor {
+        who: Some(starling_proto_fancy::common::actor::Who::Session(session)),
+    }
 }
 
 impl UserdataService {
@@ -71,20 +89,55 @@ pub struct UserdataRpc(Arc<UserdataService>);
 
 #[tonic::async_trait]
 impl UserData for UserdataRpc {
+    /// Decide a login.
+    ///
+    /// # Why this hops to the blocking pool
+    ///
+    /// Verifying a password is 210 000 rounds of PBKDF2-HMAC-SHA256 — the
+    /// OWASP figure, and deliberately expensive, because the whole point is to
+    /// cost an attacker something. Measured here: **30 ms in release, 1.45 s in
+    /// a debug build**.
+    ///
+    /// Run inline, that is 30 ms during which this runtime worker serves
+    /// nobody: other clients' pings, text and channel joins queue behind a
+    /// stranger's failed login. It is also a lever anyone can pull *without
+    /// credentials*, since the cost is paid before the password is known to be
+    /// wrong — so a handful of connections can hold every worker busy.
+    ///
+    /// `spawn_blocking` puts it on the pool that exists for exactly this, where
+    /// blocking is expected and the async workers stay free. The cost itself is
+    /// not reduced and must not be: lowering the iteration count to make logins
+    /// feel snappier would trade every stored password's security for latency
+    /// nobody notices at 30 ms.
     async fn authenticate(
         &self,
         request: Request<AuthRequest>,
     ) -> Result<Response<AuthResult>, Status> {
         let req = request.into_inner();
-        let result = self.0.accounts.authenticate(scope_of(req.scope), &req);
+        // Kept for the log line below, which outlives the request moved into
+        // the closure.
+        let name = req.name.clone();
+        let strong_cert = req.strong_cert;
+        let scope = scope_of(req.scope);
+
+        let service = Arc::clone(&self.0);
+        let result =
+            tokio::task::spawn_blocking(move || service.accounts.authenticate(scope, &req))
+                .await
+                .map_err(|error| {
+                    // The pool panicked or was shut down. Refusing is the only safe
+                    // answer: a login that cannot be decided must not be allowed.
+                    tracing::error!(%error, "the password check could not be run");
+                    Status::internal("the account service could not decide this login")
+                })?;
 
         // The refusal reason is decided here and only the enum reaches
         // session-lifecycle, so this is the one place that can say which
         // credential was wrong without the password going anywhere near a log.
         tracing::debug!(
-            name = %req.name,
+            %name,
             outcome = result.outcome,
-            strong_cert = req.strong_cert,
+            strong_cert,
             "authentication decided"
         );
         Ok(Response::new(result))
@@ -201,6 +254,7 @@ impl ClientService for UserdataService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
             QUERY_USERS => self.on_query_users(&inbound),
+            USER_LIST => self.on_user_list(&inbound).await,
             REQUEST_BLOB => self.on_request_blob(&inbound).await,
             _ => Actions::new(),
         }
@@ -293,10 +347,40 @@ impl UserdataService {
                 });
             }
         }
-        states
+
+        // Named by **account**, not by session: this is how a client redeems the
+        // `comment_hash` in a `UserList` entry, whose subject may well not be
+        // connected — that is the whole point of a directory. Answered as a
+        // `UserList` of one for the same reason: there is no session to hang a
+        // `UserState` on.
+        let mut listed = Vec::new();
+        for id in &request.user_id_comment {
+            let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*id)) else {
+                continue;
+            };
+            let comment = self
+                .accounts
+                .blob(inbound.scope, &account.comment_hash)
+                .await
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            if comment.is_some() {
+                listed.push(starling_proto::proto::tcp::user_list::User {
+                    user_id: *id,
+                    comment,
+                    ..starling_proto::proto::tcp::user_list::User::default()
+                });
+            }
+        }
+
+        let mut actions: Actions = states
             .into_iter()
             .map(|state| to_conn(inbound.conn, 9, state.encode_to_vec()))
-            .collect()
+            .collect();
+        if !listed.is_empty() {
+            let reply = starling_proto::proto::tcp::UserList { users: listed };
+            actions.push(to_conn(inbound.conn, USER_LIST, reply.encode_to_vec()));
+        }
+        actions
     }
 
     /// Every live session on a virtual server, from `session-view`.
@@ -344,6 +428,7 @@ impl Serve for UserdataService {
             accounts,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            permit: Permit::new(ctx.resolver.clone()),
             trail: Trail::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
         }))
@@ -404,4 +489,56 @@ pub const fn outer_type() -> u16 {
 #[must_use]
 pub fn admits(outcome: auth_result::Outcome) -> bool {
     matches!(outcome, auth_result::Outcome::Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime must keep serving other clients while a password is checked.
+    ///
+    /// Verifying a password is 210 000 rounds of PBKDF2 — 30 ms in release,
+    /// 1.45 s in a debug build like the one this test runs in. Done inline on
+    /// an async worker, that is time no other client is served, and it is
+    /// reachable *without credentials*: the cost is paid before the password
+    /// is known to be wrong.
+    ///
+    /// A single-worker runtime is what makes the difference visible. With the
+    /// check on the blocking pool the ticker below keeps running; with it
+    /// inline the worker is held and the ticker cannot advance at all.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn a_password_check_does_not_stall_the_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let counting = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let _ = counting.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Not the service's RPC surface, which would need a whole deployment —
+        // the same `spawn_blocking` hop it makes, around the same work.
+        let secret = Secret::new("correct horse");
+        let checked = tokio::task::spawn_blocking(move || secret.verify("wrong"))
+            .await
+            .expect("the blocking pool ran the check");
+        assert!(!checked, "a wrong password must not verify");
+
+        ticker.abort();
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime made no progress while a password was being checked; the check is running on an async worker and every other client is queued behind it"
+        );
+    }
+
+    #[test]
+    fn admits_only_a_successful_outcome() {
+        assert!(admits(auth_result::Outcome::Ok));
+        assert!(!admits(auth_result::Outcome::WrongPassword));
+        assert!(!admits(auth_result::Outcome::NameTaken));
+    }
 }

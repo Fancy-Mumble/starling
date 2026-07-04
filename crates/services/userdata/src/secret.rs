@@ -22,6 +22,19 @@ use subtle::ConstantTimeEq as _;
 /// migration and without locking anyone out.
 pub const DEFAULT_ITERATIONS: u32 = 210_000;
 
+/// The count may not drop below OWASP's figure for PBKDF2-HMAC-SHA256.
+///
+/// A compile-time assertion rather than a test, because it guards a decision
+/// rather than a behaviour: this is precisely the knob somebody reaches for
+/// when logins feel slow, and it should not be possible to turn it down and
+/// still get a build. If logins are slow the answer is a **release build** and
+/// the blocking pool — the derivation costs 1.45 s compiled without
+/// optimisation and 30 ms with, and only one of those is what ships.
+const _: () = assert!(
+    DEFAULT_ITERATIONS >= 210_000,
+    "PBKDF2-HMAC-SHA256 below 210 000 rounds is under the OWASP recommendation"
+);
+
 /// A stored password: salt, iterations and the derived key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Secret {

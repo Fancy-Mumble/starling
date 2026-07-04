@@ -51,7 +51,24 @@ pub struct AuditService {
     store: Store,
     fanout: Fanout,
     logger: Logger,
+    /// `log_days`, the retention an operator sets.
+    ///
+    /// It existed in `server-config` and was read by nothing, so the operator
+    /// log had no retention at all (`docs/GAP-ANALYSIS.md` §5): a record of
+    /// every login and every moderation action, kept for ever, on a server
+    /// whose operator had written down how long they wanted to keep it.
+    settings: starling_runtime::Settings,
 }
+
+/// How often expired entries are swept.
+///
+/// Hourly, because the unit of the setting is a *day*: sweeping more often
+/// would be a query per minute to delete nothing, and a record surviving an
+/// extra few minutes past a 31-day retention is not a retention failure.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// Milliseconds in a day.
+const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// The hash of one entry, given the hash before it.
 ///
@@ -85,6 +102,75 @@ impl AuditService {
         .flatten()
         .and_then(|row| row.try_get::<Vec<u8>, _>("entry_hash").ok())
         .unwrap_or_default()
+    }
+
+    /// Delete entries older than `log_days`, for one virtual server.
+    ///
+    /// Returns how many went, so the operator log can say so — a retention
+    /// sweep that silently removes a month of records is exactly the kind of
+    /// deletion this service exists to make visible.
+    ///
+    /// **The chain is not re-linked.** Every surviving entry keeps the
+    /// `prev_hash` it was written with, so a verify across the seam reports a
+    /// break — which is correct and is the point: retention *is* a deletion,
+    /// and an audit log that could delete its own history and still verify
+    /// clean would be an audit log that can be edited without evidence. The
+    /// sweep is announced in the log so the break has a documented cause.
+    ///
+    /// Zero days is "keep for ever", the same convention every other limit
+    /// here uses, and it is also what an unreachable `server-config` yields —
+    /// so the failure mode of this path is keeping too much, never deleting
+    /// something an operator meant to keep.
+    pub async fn sweep(&self, scope: u32, now_ms: u64) -> u64 {
+        let days = u64::from(self.settings.get(scope).log_days);
+        if days == 0 {
+            return 0;
+        }
+        let cutoff = now_ms.saturating_sub(days.saturating_mul(DAY_MS));
+        // `at_ms` rather than `expires_at_ms`: that column is a per-entry
+        // deadline some records carry, and this is the server-wide policy.
+        // A record with its own earlier deadline is swept by whichever comes
+        // first, which is what both settings mean read together.
+        let result = sqlx::query(
+            "DELETE FROM server_audit WHERE server_id = ? AND (at_ms < ? \
+             OR (expires_at_ms > 0 AND expires_at_ms < ?))",
+        )
+        .bind(i64::from(scope))
+        .bind(cutoff as i64)
+        .bind(now_ms as i64)
+        .execute(self.store.pool())
+        .await;
+
+        match result {
+            Ok(done) if done.rows_affected() > 0 => {
+                let removed = done.rows_affected();
+                self.logger.log(
+                    LogEvent::notice(Category::Server, "audit retention swept")
+                        .with("removed", removed)
+                        .with("days", days)
+                        .with("scope", scope),
+                );
+                removed
+            }
+            Ok(_) => 0,
+            Err(error) => {
+                // Reported rather than swallowed: a retention policy that has
+                // silently stopped running looks exactly like one that is
+                // working, until the disk fills.
+                tracing::error!(%error, scope, "the audit retention sweep failed");
+                0
+            }
+        }
+    }
+
+    /// One sweep per interval, across every virtual server, until aborted.
+    async fn sweep_forever(self: Arc<Self>, scopes: Vec<u32>) {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            for scope in &scopes {
+                let _ = self.sweep(*scope, now_ms()).await;
+            }
+        }
     }
 
     /// Append one entry.
@@ -332,11 +418,28 @@ impl Serve for AuditService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        let settings =
+            starling_runtime::Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
+        drop(settings.watch(&ctx.virtual_servers()));
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            settings,
         }))
+    }
+
+    /// Sweep expired entries until shutdown.
+    ///
+    /// A timer rather than a check per write: retention is a coarse deadline,
+    /// and doing it on the write path would make every audited action wait for
+    /// a `DELETE` that concerns none of it.
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let scopes = ctx.virtual_servers();
+        let sweeper = tokio::spawn(Arc::clone(&self).sweep_forever(scopes));
+        ctx.shutdown.wait().await;
+        sweeper.abort();
+        Ok(())
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
@@ -352,6 +455,11 @@ mod tests {
     use super::*;
 
     async fn service() -> Arc<AuditService> {
+        service_keeping(starling_runtime::settings::defaults(1).log_days).await
+    }
+
+    /// The same service, with `log_days` pinned to `days`.
+    async fn service_keeping(days: u32) -> Arc<AuditService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
@@ -365,10 +473,23 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        let resolver = starling_runtime::channel::Resolver::new(
+            Arc::new(starling_runtime::config::Config::with_defaults(
+                std::path::Path::new("/run/starling"),
+            )),
+            starling_runtime::inproc::Broker::new(),
+        );
         Arc::new(AuditService {
             store,
             fanout: Fanout::default(),
             logger: Logger::null(),
+            settings: starling_runtime::Settings::fixed(
+                resolver,
+                starling_proto_fancy::serverconfig::Snapshot {
+                    log_days: days,
+                    ..starling_runtime::settings::defaults(1)
+                },
+            ),
         })
     }
 
@@ -415,5 +536,99 @@ mod tests {
         let result = service.verify(1).await;
         assert!(!result.intact);
         assert!(!result.broken_at.is_empty());
+    }
+
+    /// One entry, recorded as though it happened `days` ago.
+    async fn record_aged(service: &AuditService, days: u64, now: u64) {
+        let _ = service
+            .record(
+                1,
+                Entry {
+                    at_ms: now.saturating_sub(days * DAY_MS),
+                    ..entry("ban")
+                },
+            )
+            .await;
+    }
+
+    /// How many entries the log holds for scope 1.
+    ///
+    /// The limit is explicit because `QueryRequest::default()` asks for zero,
+    /// which the query clamps to one — a count taken through the default would
+    /// read "1" however many entries survived.
+    async fn held(service: &AuditService) -> usize {
+        service
+            .query(
+                1,
+                &QueryRequest {
+                    limit: 100,
+                    ..QueryRequest::default()
+                },
+            )
+            .await
+            .entries
+            .len()
+    }
+
+    #[tokio::test]
+    async fn log_days_decides_how_much_of_the_operator_log_survives() {
+        // §5's `log_days`: in `server-config`, read by nothing, so the operator
+        // log had no retention at all. An operator who wrote down 7 days kept
+        // every login and every ban for ever.
+        //
+        // The same three entries, swept twice, with only the setting different.
+        let now = now_ms();
+
+        let strict = service_keeping(7).await;
+        for age in [1, 10, 40] {
+            record_aged(&strict, age, now).await;
+        }
+        assert_eq!(strict.sweep(1, now).await, 2, "two entries are past 7 days");
+        assert_eq!(held(&strict).await, 1);
+
+        let lenient = service_keeping(90).await;
+        for age in [1, 10, 40] {
+            record_aged(&lenient, age, now).await;
+        }
+        assert_eq!(
+            lenient.sweep(1, now).await,
+            0,
+            "all three are inside 90 days"
+        );
+        assert_eq!(held(&lenient).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_retention_of_zero_keeps_everything() {
+        // The convention every other limit here uses, and the direction this
+        // one has to fail in: an unreachable `server-config` must not be a way
+        // to delete an operator's records.
+        let now = now_ms();
+        let service = service_keeping(0).await;
+        record_aged(&service, 4_000, now).await;
+        assert_eq!(service.sweep(1, now).await, 0);
+        assert_eq!(held(&service).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_entry_with_its_own_deadline_goes_at_whichever_comes_first() {
+        // `log_days` is the server-wide policy and `expires_at_ms` is a
+        // per-entry one. Read together they mean "delete at the earlier", and
+        // a sweep that honoured only the policy would keep a record somebody
+        // deliberately marked short-lived.
+        let now = now_ms();
+        let service = service_keeping(365).await;
+        let _ = service
+            .record(
+                1,
+                Entry {
+                    at_ms: now,
+                    expires_at_ms: now.saturating_sub(1_000),
+                    ..entry("ban")
+                },
+            )
+            .await;
+        assert_eq!(service.sweep(1, now).await, 1);
+        assert_eq!(held(&service).await, 0);
     }
 }
