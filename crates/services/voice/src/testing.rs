@@ -172,8 +172,13 @@ impl ClientCodec {
 /// Unencrypted, which is what the `UDPTunnel` path carries. For the UDP path,
 /// seal it with that peer's own cipher.
 pub(crate) fn as_client_sends(format: UdpFormat, opus: &[u8]) -> Bytes {
+    as_client_sends_to(format, REGULAR_SPEECH, opus)
+}
+
+/// The same, aimed at one of the client's registered target slots.
+pub(crate) fn as_client_sends_to(format: UdpFormat, target: u8, opus: &[u8]) -> Bytes {
     ClientCodec(format).encode_audio(&AudioPacket {
-        target: REGULAR_SPEECH,
+        target,
         sender: SessionId(0),
         opus: Bytes::copy_from_slice(opus),
         ..AudioPacket::silent()
@@ -358,8 +363,13 @@ impl TestPeer {
     /// decrypts tunnelled audio drops every frame from a client that fell back
     /// to tunnelling, and a test double that also encrypts agrees with it.
     pub(crate) fn speak_tunnelled(&mut self, opus: &[u8]) -> Bytes {
+        self.speak_tunnelled_to(REGULAR_SPEECH, opus)
+    }
+
+    /// The same, aimed at one of this client's registered target slots.
+    pub(crate) fn speak_tunnelled_to(&mut self, target: u8, opus: &[u8]) -> Bytes {
         self.codec().encode_audio(&AudioPacket {
-            target: REGULAR_SPEECH,
+            target,
             sender: SessionId(0),
             opus: Bytes::copy_from_slice(opus),
             ..AudioPacket::silent()

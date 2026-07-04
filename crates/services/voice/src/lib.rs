@@ -20,6 +20,7 @@
 //! is **N seals, not one**, because every listener needs the frame under their
 //! own key.
 
+pub mod bandwidth;
 pub mod packet;
 pub mod peer;
 pub mod ports;
@@ -30,12 +31,14 @@ pub mod varint;
 
 pub mod service;
 pub mod socket;
+pub mod tree;
 pub mod tunnel;
 pub mod view;
 
 #[cfg(test)]
 mod testing;
 
+pub use bandwidth::Bandwidth;
 pub use packet::{AudioCodec, AudioPacket, Datagram, PacketError, Ping, ServerDetails, codec_for};
 pub use peer::VoicePeer;
 pub use ports::{AudioSource, ChannelId, ConnId, Datagrams, FrameSink, SessionId, Stuck};
@@ -44,5 +47,6 @@ pub use routing::{REGULAR_SPEECH, RoutingSnapshot, SERVER_LOOPBACK, Target};
 pub use service::VoiceService;
 pub use socket::VoiceSocket;
 pub use targets::{MAX_TARGET, ShoutTarget, TargetError, TargetRegistry, VoiceTarget};
+pub use tree::ChannelTree;
 pub use tunnel::GatewayTunnel;
 pub use view::SessionCache;

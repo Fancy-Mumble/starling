@@ -73,6 +73,21 @@ impl SessionCache {
         }
     }
 
+    /// The channel a session is in, if it is here at all.
+    ///
+    /// Asked when a client registers a whisper target, because the permission
+    /// for whispering to somebody is held in *their* channel rather than the
+    /// speaker's. Off the packet path entirely — this runs once per
+    /// `VoiceTarget`, not once per frame.
+    #[must_use]
+    pub fn channel_of(&self, session: u32) -> Option<u32> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(&session)
+            .map(|session| session.channel)
+    }
+
     /// How many sessions are known.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -111,12 +126,22 @@ pub fn compose<'a>(sessions: impl Iterator<Item = &'a Session>) -> RoutingSnapsh
         let id = SessionId(session.session);
         snapshot = snapshot.with_member(id, ChannelId(session.channel));
 
-        // Listening to a channel without being in it. Nothing writes these yet
-        // — `UserState.listening_channel_add` is unhandled — but reading them
-        // here is what makes that a one-sided change when it lands.
+        // Listening to a channel without being in it, and the gain the user set
+        // on each. The volume map is read separately from the channel list
+        // because it outlives it: murmur keeps an adjustment for a listener that
+        // has been removed, so that toggling a channel off and on again does not
+        // reset a slider the user set deliberately.
         for channel in &session.listening {
             snapshot = snapshot.with_listener(id, ChannelId(*channel));
         }
+        // Folded rather than looped: the map is unordered and the fold is
+        // commutative, so the shape says the order cannot matter.
+        snapshot = session
+            .listening_volume
+            .iter()
+            .fold(snapshot, |snapshot, (channel, gain)| {
+                snapshot.with_listener_gain(id, ChannelId(*channel), *gain)
+            });
 
         if cannot_hear(session) {
             snapshot = snapshot.with_deaf(id);
