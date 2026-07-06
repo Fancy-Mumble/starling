@@ -146,13 +146,23 @@ The client keeps the mirror of this in `mumble-protocol/src/fancy_codec.rs`
 (`FANCY_PROTOCOL_EPOCH`, `speaks_epoch`), and announces its own epoch in the
 `Version` it sends, so the judgement is symmetric.
 
-### What is still epoch 0 on the client
+### What the client encodes at epoch 1 — a correction
 
-The client can only *encode* epoch 0 today, so against Starling it degrades to
-the `PluginData` path. Moving it to epoch 1 means giving each Fancy message a
-home in a service envelope — the mapping in §3 — and is the remaining work.
-Until then the split is honest rather than silent: features whose fallback is
-`PluginData` work, and `ServerOnly` ones are visibly off.
+An earlier version of this section claimed the client "can only encode epoch 0
+today, so against Starling it degrades to the `PluginData` path". **That is
+false, and dangerously so.** The client announces `fancy_protocol = 1`
+(`fancy_codec.rs`, `FANCY_PROTOCOL_EPOCH`), selects its `NativeCodec` the
+moment Starling's `Version` arrives, and frames every Fancy message under its
+service's outer type — `message.rs`, the `fancy_services!` mapping. There is
+no degradation and no honest split.
+
+What it frames is the problem: the *payloads* are the proto2 envelope shapes
+from this file's `Mumble.proto`, while Starling decodes the proto3 sets in
+`crates/proto-fancy/proto/fancy/`. Same epoch, same outer types, different
+inner schemas — the silent break documented as D1 in `PROTOCOL-REDESIGN.md`
+§0, fixed by its migration step M2c (the client codec moves to the canon).
+Until M2c lands, Fancy traffic between the client and Starling corrupts or
+vanishes per message, with nothing above debug level in any log.
 
 ## 3. The scheme: one outer type per service
 
