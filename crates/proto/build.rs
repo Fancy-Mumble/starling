@@ -5,9 +5,13 @@
 //! `include!`d rather than checked in — there is no reason to review generated
 //! code in review, and it keeps the tree honest about what is hand-written.
 //!
-//! The `.proto` files are copied from `vendor/server/src/` (upstream's source of
-//! truth). `scripts/check-proto-drift.sh` asserts they stay wire-identical to
-//! the server's and the client's copies.
+//! The `.proto` files here, in `vendor/server/src/` and in the client are three
+//! copies of one contract. **None of them is upstream** — `vendor/server` is the
+//! Fancy fork, and taking it for upstream's source of truth is how the field
+//! numbering in `docs/PROTOCOL-COMPATIBILITY.md` §1 drifted unnoticed. A change
+//! is adjudicated and then applied to all three; `scripts/check-proto-drift.sh`
+//! asserts they stay wire-identical, and `check-proto-hygiene.py` asserts the
+//! rules that hold identically in all three and so are invisible to a diff.
 use std::io::Result;
 
 fn main() -> Result<()> {
