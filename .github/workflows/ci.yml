@@ -20,7 +20,8 @@ env:
 
 jobs:
   # ----------------------------------------------------------------
-  # The protobuf contract must not drift from the C++ server / client.
+  # The protobuf contract must not drift from the C++ server / client,
+  # and must not break the rules no compiler enforces.
   # ----------------------------------------------------------------
   proto:
     name: Protobuf contract
@@ -30,8 +31,29 @@ jobs:
         with:
           submodules: recursive
 
+      # Consistency: our three trees agree on L0's wire meaning.
       - name: Check for protobuf drift
         run: scripts/check-proto-drift.sh
+
+      # Hygiene: the rules the drift check is blind to *by construction*,
+      # because all three trees can break them identically — a Fancy field in
+      # the burned 100-999 range, and code bound to the dead proto2 envelopes.
+      # Both of these shipped undetected; see docs/PROTOCOL-REDESIGN.md §9 M6.
+      # Through the interpreter rather than the shebang: the runner has it, and
+      # a contributor on Windows has `python` but no `python3`, where relying on
+      # the shebang fails with a Microsoft Store message instead of a result.
+      - name: Check protobuf hygiene
+        run: python3 scripts/check-proto-hygiene.py
+
+      # Compatibility: our upstream surface against *actual* upstream Mumble.
+      # The only one of the three that can fail with a released client on the
+      # other end — the other two prove our trees agree, not that they are
+      # right. Needs the upstream remote, and skips loudly without it.
+      - name: Fetch upstream Mumble for the compatibility check
+        run: git -C vendor/server fetch --no-tags --depth=1 upstream 1.6.x || true
+
+      - name: Check upstream compatibility
+        run: python3 scripts/check-proto-compat.py
 
   # ----------------------------------------------------------------
   # The microkernel rule: the kernel must never depend on a feature.
