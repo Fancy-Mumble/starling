@@ -28,7 +28,9 @@
 //! UDP straight to voice) and any service's schema.
 
 pub mod attach;
-pub mod connection;
+/// Compressing the control stream for peers that asked for it.
+pub mod compress;
+mod connection;
 pub mod limiter;
 pub mod listener;
 pub mod resume;
@@ -36,7 +38,7 @@ pub mod router;
 pub mod service;
 
 pub use attach::{Attachments, ServiceLink};
-pub use connection::{ClientHandle, Lane, Registry};
+pub use connection::{ClientHandle, Lane, Outbound, Registry};
 pub use limiter::{Limiter, Verdict};
 pub use listener::{Gateway, GatewayError};
 pub use resume::{ResumeStore, Sequenced};

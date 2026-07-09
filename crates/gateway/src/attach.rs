@@ -25,6 +25,7 @@ use starling_runtime::tier::Tier;
 use tokio::sync::mpsc;
 
 use crate::connection::{Lane, Registry};
+use crate::connection::Outbound;
 use crate::resume::ResumeStore;
 
 /// One service's attachment.
@@ -261,7 +262,70 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
         Some(server_action::Action::SessionDown(down)) => {
             ctx.registry.remove(down.conn);
         }
+        Some(server_action::Action::Sequence(sequence)) => {
+            if let Some(handle) = ctx.registry.by_conn(sequence.conn) {
+                handle.set_sequenced(sequence.enabled);
+                handle.set_compresses(sequence.compress);
+            }
+        }
+        Some(server_action::Action::Replay(replay)) => replay_to(replay, ctx),
         Some(server_action::Action::Throttle(_)) | None => {}
+    }
+}
+
+/// Re-send what one connection missed.
+///
+/// The frames go out through the same queue as anything else, so the ordinary
+/// backpressure applies: a client that asks to resume and then stops reading is
+/// disconnected for control overflow exactly as it would be otherwise. They are
+/// **not** re-stamped — a replayed frame keeps the sequence it was written
+/// under, which is what lets a client that disconnects again mid-replay resume
+/// from the right place rather than from a number that has since moved.
+fn replay_to(replay: &starling_proto_fancy::control::Replay, ctx: &AttachContext) {
+    let Some(handle) = ctx.registry.by_conn(replay.conn) else {
+        return;
+    };
+    let frames = match ctx.resume.resume(&handle.token, replay.from_seq) {
+        crate::resume::ResumeOutcome::Replay(frames) => frames,
+        // Nothing is sent, and nothing needs to be said. The client learns of
+        // the gap from the sequence numbers themselves: the next frame it
+        // receives carries a number well past the one it asked from, and a jump
+        // means re-sync. That covers every cause of a gap rather than just this
+        // one, and it keeps the gateway from having to encode a service's
+        // message to explain itself — which is the coupling §1 exists to avoid.
+        outcome => {
+            tracing::debug!(
+                conn = replay.conn,
+                from = replay.from_seq,
+                ?outcome,
+                "cannot replay; the client will see the gap and re-sync"
+            );
+            return;
+        }
+    };
+    tracing::debug!(
+        conn = replay.conn,
+        from = replay.from_seq,
+        frames = frames.len(),
+        "replaying"
+    );
+    for frame in frames {
+        let prefix =
+            starling_proto::codec::header(frame.type_id, frame.payload.len(), Some(frame.seq));
+        let queued = handle.send(
+            Lane::Control,
+            Outbound {
+                prefix,
+                payload: frame.payload,
+            },
+        );
+        if queued.is_err() {
+            ctx.metrics
+                .counter("starling_gateway_control_overflow_disconnects")
+                .inc();
+            ctx.registry.remove(handle.conn);
+            return;
+        }
     }
 }
 
@@ -288,20 +352,33 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
         ctx.registry.authenticated()
     };
 
-    // Encode once, clone the handle per recipient. This is murmur's
-    // `QByteArray &cache` parameter, made structural.
-    let frame = starling_proto::codec::frame(type_id, &send.payload);
-    // And the replay copy once, for the same reason. `stamp` used to take a
-    // slice and own a fresh `Vec` per recipient, so a broadcast to a thousand
-    // clients made a thousand copies of one payload; refcounted, they share it.
+    // Encoded once and shared by every recipient. This is murmur's
+    // `QByteArray &cache` parameter, made structural — and it is why the
+    // header is built separately below rather than concatenated here: the
+    // sequence number in it differs per connection, and joining them would
+    // copy the payload once per client to carry eight bytes of difference.
     let payload = bytes::Bytes::copy_from_slice(&send.payload);
+    // The one header every peer that is *not* sequenced shares.
+    let plain = starling_proto::codec::header(type_id, payload.len(), None);
 
     for handle in targets {
         if send.except.contains(&handle.session()) {
             continue;
         }
-        let _ = ctx.resume.stamp(&handle.token, type_id, &payload);
-        if handle.send(lane, frame.clone()).is_err() {
+        // Stamped for everybody, because the ring is what a resume replays
+        // from and a peer may negotiate resume after frames have already gone
+        // out. Only a peer that asked is *told* its number.
+        let seq = ctx.resume.stamp(&handle.token, type_id, &payload);
+        let prefix = if handle.sequenced() {
+            starling_proto::codec::header(type_id, payload.len(), Some(seq))
+        } else {
+            plain.clone()
+        };
+        let frame = Outbound {
+            prefix,
+            payload: payload.clone(),
+        };
+        if handle.send(lane, frame).is_err() {
             // Control overflow: bounded and honest. Reconnect re-syncs from
             // scratch, and the client is told by the socket closing rather than
             // by a silent hole in its world.

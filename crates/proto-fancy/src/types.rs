@@ -26,6 +26,21 @@ pub const BURNED_MAX: u16 = 999;
 /// First outer type available to a service.
 pub const SERVICE_BASE: u16 = 1000;
 
+/// A compressed batch of frames, unwrapped before anything is routed.
+///
+/// **Not a service, and deliberately far from where they are allocated.** This
+/// is a property of the connection rather than a destination on it: the gateway
+/// writes it and a client unwraps it, and what comes out is ordinary frames
+/// that route as they always did. Numbering it 1018 — the next service slot —
+/// would have made it look like the eighteenth service to every reader of this
+/// table and to every capture.
+///
+/// The payload is one or more whole frames, `type ‖ len ‖ payload` each, zstd
+/// compressed. Only ever sent to a peer that announced `zstd` in its `Hello`,
+/// so a stock Mumble client and an older Fancy one never see it — and a peer
+/// that did announce it is by definition able to unwrap it.
+pub const COMPRESSED_BATCH: u16 = 1900;
+
 /// A service that owns an outer message type.
 ///
 /// This enum exists for logs, metrics and the operator API. The gateway does

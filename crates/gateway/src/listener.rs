@@ -31,6 +31,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::attach::{AttachContext, Attachments};
 use crate::connection::{self, ClientHandle, Lane, Registry};
 use crate::limiter::{Limiter, MessageLimit, Verdict};
+use crate::compress;
+use crate::connection::Outbound;
 use crate::resume::ResumeStore;
 use crate::router::Router;
 
@@ -635,7 +637,7 @@ impl Gateway {
         };
         let payload = envelope.encode_to_vec();
         let outer = ServiceKind::SessionLifecycle.outer_type();
-        let _ = handle.send(Lane::Control, codec::frame(outer, &payload));
+        let _ = handle.send(Lane::Control, Outbound::whole(codec::frame(outer, &payload)));
     }
 
     /// Tear one connection down, giving the writer a moment to say why.
@@ -703,9 +705,16 @@ impl Gateway {
 /// all arrive; audio is popped in a burst and a write failure there returns
 /// immediately, because a late voice frame is worthless and a peer whose socket
 /// is failing has nothing to gain from the rest of the queue.
+/// How many queued frames one batch may hold.
+///
+/// Bounded so a client that has stopped reading cannot make the writer hold an
+/// unbounded slice while it compresses: the queue is already byte-bounded, and
+/// this bounds the working set on top of it.
+const MAX_BATCH: usize = 64;
+
 async fn pump_writer(
     mut writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
-    mut outbound: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    mut outbound: tokio::sync::mpsc::Receiver<Outbound>,
     handle: Arc<ClientHandle>,
 ) {
     loop {
@@ -717,13 +726,46 @@ async fn pump_writer(
                 // write must not make the queue look fuller than it is and
                 // disconnect a client for the writer's own backlog.
                 handle.control_sent(frame.len());
-                if writer.write_all(&frame).await.is_err() {
+                // Drain whatever else is already queued before writing. A burst
+                // is where compression pays — a reconnect flood or a page of
+                // history — and a batch of one is exactly the case `batch`
+                // declines, so a quiet connection is unaffected.
+                let mut queued = vec![frame];
+                while let Ok(more) = outbound.try_recv() {
+                    handle.control_sent(more.len());
+                    queued.push(more);
+                    if queued.len() >= MAX_BATCH {
+                        break;
+                    }
+                }
+
+                let batched = handle.compresses().then(|| compress::batch(&queued)).flatten();
+                let to_write: &[Outbound] = match &batched {
+                    Some(one) => std::slice::from_ref(one),
+                    None => &queued,
+                };
+
+                let mut failed = false;
+                for frame in to_write {
+                    // Header then payload, never joined. Joining them would copy
+                    // the payload once per recipient to carry a per-connection
+                    // sequence number (`PROTOCOL-REDESIGN.md` §4, Z4).
+                    if writer.write_all(&frame.prefix).await.is_err()
+                        || writer.write_all(&frame.payload).await.is_err()
+                    {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
                     break;
                 }
             }
             () = handle.audio_ready() => {
                 while let Some(frame) = handle.pop_audio() {
-                    if writer.write_all(&frame).await.is_err() {
+                    if writer.write_all(&frame.prefix).await.is_err()
+                        || writer.write_all(&frame.payload).await.is_err()
+                    {
                         return;
                     }
                 }
@@ -741,7 +783,9 @@ async fn pump_writer(
             () = handle.draining() => {
                 while let Ok(frame) = outbound.try_recv() {
                     handle.control_sent(frame.len());
-                    if writer.write_all(&frame).await.is_err() {
+                    if writer.write_all(&frame.prefix).await.is_err()
+                        || writer.write_all(&frame.payload).await.is_err()
+                    {
                         break;
                     }
                 }

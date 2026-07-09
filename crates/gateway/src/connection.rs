@@ -41,6 +41,53 @@ pub enum QueueError {
     Closed,
 }
 
+/// One frame on its way to a client, split where it stops being shared.
+///
+/// A broadcast encodes its payload **once** and hands the same refcounted
+/// buffer to every recipient (`PROTOCOL-REDESIGN.md` §4, Z4). The header cannot
+/// be shared the same way once resume exists, because the sequence number in it
+/// is per connection — so the two are carried separately and joined at the
+/// socket rather than concatenated per recipient.
+///
+/// That is the whole reason this type exists. Building a combined buffer per
+/// client would copy the payload once per recipient, which for a thousand
+/// clients receiving one avatar is a thousand copies of 128 KiB to carry eight
+/// bytes of difference.
+#[derive(Debug, Clone)]
+pub struct Outbound {
+    /// `type ‖ len`, and `‖ seq` for a peer that negotiated resume. Six or
+    /// fourteen bytes, and never shared.
+    pub prefix: Bytes,
+    /// The encoded message. Shared across every recipient of one broadcast.
+    pub payload: Bytes,
+}
+
+impl Outbound {
+    /// One frame whose bytes are already joined.
+    ///
+    /// The prefix is empty rather than absent: audio is never sequenced, and a
+    /// caller that has already built a complete frame has nothing to split.
+    #[must_use]
+    pub fn whole(frame: Bytes) -> Self {
+        Self {
+            prefix: Bytes::new(),
+            payload: frame,
+        }
+    }
+
+    /// What this costs the queue: both halves, since both are written.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.prefix.len() + self.payload.len()
+    }
+
+    /// Whether there is nothing to write.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// The gateway's handle on one connected client.
 #[derive(Debug)]
 pub struct ClientHandle {
@@ -52,8 +99,21 @@ pub struct ClientHandle {
     fancy_version: AtomicU32,
     /// The resume token, which is what the replay ring is keyed by.
     pub token: String,
-    control: mpsc::Sender<Bytes>,
-    audio: Arc<Mutex<VecDeque<Bytes>>>,
+    /// Whether this peer's frames carry a sequence number.
+    ///
+    /// Off until the peer announces `resume` in its `Hello` and
+    /// session-lifecycle turns it on, because a client that is not expecting
+    /// eight extra bytes reads them as the start of its payload — and a stock
+    /// Mumble client never announces anything, so it never gets them.
+    sequenced: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this peer's control stream may be compressed.
+    ///
+    /// Off unless it announced `zstd`, for the same reason the sequence is:
+    /// a peer that receives a type it cannot parse is a peer that cannot read
+    /// its own connection, and a stock Mumble client announces nothing.
+    compresses: Arc<std::sync::atomic::AtomicBool>,
+    control: mpsc::Sender<Outbound>,
+    audio: Arc<Mutex<VecDeque<Outbound>>>,
     audio_wake: Arc<Notify>,
     audio_capacity: usize,
     dropped_audio: Arc<AtomicU32>,
@@ -112,6 +172,32 @@ impl ClientHandle {
             .store((version & u64::from(u32::MAX)) as u32, Ordering::Release);
     }
 
+    /// Whether this peer's frames carry a sequence number.
+    #[must_use]
+    pub fn sequenced(&self) -> bool {
+        self.sequenced.load(Ordering::Acquire)
+    }
+
+    /// Whether this peer's control stream may be compressed.
+    #[must_use]
+    pub fn compresses(&self) -> bool {
+        self.compresses.load(Ordering::Acquire)
+    }
+
+    /// Allow (or stop) compressing this peer's control stream.
+    pub fn set_compresses(&self, on: bool) {
+        self.compresses.store(on, Ordering::Release);
+    }
+
+    /// Begin (or stop) sequencing this peer's frames.
+    ///
+    /// Turned on only once the peer has announced `resume`, and never for a
+    /// stock client: the eight bytes are unannounced to anything that did not
+    /// ask, and a client that is not expecting them reads them as payload.
+    pub fn set_sequenced(&self, on: bool) {
+        self.sequenced.store(on, Ordering::Release);
+    }
+
     /// Queue a frame.
     ///
     /// # Errors
@@ -119,7 +205,7 @@ impl ClientHandle {
     /// [`QueueError::ControlOverflow`] when the control queue is full, which
     /// the caller turns into a disconnect. Audio never returns an error: it
     /// drops the oldest frame and counts it.
-    pub fn send(&self, lane: Lane, frame: Bytes) -> Result<(), QueueError> {
+    pub fn send(&self, lane: Lane, frame: Outbound) -> Result<(), QueueError> {
         match lane {
             Lane::Control => {
                 // Counted in **bytes**, not just messages. The channel bounds
@@ -200,7 +286,7 @@ impl ClientHandle {
 
     /// Take the next audio frame, if there is one.
     #[must_use]
-    pub fn pop_audio(&self) -> Option<Bytes> {
+    pub fn pop_audio(&self) -> Option<Outbound> {
         self.audio
             .lock()
             .ok()
@@ -250,13 +336,13 @@ impl ClientHandle {
 
 /// Build a handle and the control receiver its writer task drains.
 #[must_use]
-pub fn channel(
+pub(crate) fn channel(
     conn: u64,
     token: String,
     control_queue: usize,
     audio_queue: usize,
     pressure: Gauge,
-) -> (Arc<ClientHandle>, mpsc::Receiver<Bytes>) {
+) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
     let (tx, rx) = mpsc::channel(control_queue.max(1));
     let handle = Arc::new(ClientHandle {
         conn,
@@ -264,6 +350,8 @@ pub fn channel(
         fancy_version: AtomicU32::new(0),
         token,
         control: tx,
+        sequenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        compresses: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         audio: Arc::new(Mutex::new(VecDeque::new())),
         audio_wake: Arc::new(Notify::new()),
         audio_capacity: audio_queue.max(1),
@@ -296,11 +384,11 @@ const CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 /// the dashboard that draws it, and the test that asserts it is reported. The
 /// capacity is [`CONTROL_BYTE_BUDGET`] and not the aggregate across clients,
 /// because the budget each client is disconnected for exceeding is its own.
-pub const CONTROL_QUEUE_GAUGE: &str = "control queue (worst client)";
+pub(crate) const CONTROL_QUEUE_GAUGE: &str = "control queue (worst client)";
 
 /// The capacity to declare for [`CONTROL_QUEUE_GAUGE`].
 #[must_use]
-pub const fn control_budget() -> u64 {
+pub(crate) const fn control_budget() -> u64 {
     CONTROL_BYTE_BUDGET as u64
 }
 
@@ -418,7 +506,7 @@ mod tests {
         token: String,
         control_queue: usize,
         audio_queue: usize,
-    ) -> (Arc<ClientHandle>, mpsc::Receiver<Bytes>) {
+    ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
         super::channel(
             conn,
             token,
@@ -432,10 +520,10 @@ mod tests {
     fn a_full_control_queue_reports_overflow_rather_than_dropping() {
         // Dropping would desync that client permanently and silently.
         let (handle, _rx) = channel(1, "tok".to_owned(), 2, 4);
-        assert!(handle.send(Lane::Control, Bytes::from_static(b"a")).is_ok());
-        assert!(handle.send(Lane::Control, Bytes::from_static(b"b")).is_ok());
+        assert!(handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"a"))).is_ok());
+        assert!(handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"b"))).is_ok());
         assert_eq!(
-            handle.send(Lane::Control, Bytes::from_static(b"c")),
+            handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"c"))),
             Err(QueueError::ControlOverflow)
         );
     }
@@ -447,13 +535,13 @@ mod tests {
         for byte in [1_u8, 2, 3] {
             assert!(
                 handle
-                    .send(Lane::Audio, Bytes::copy_from_slice(&[byte]))
+                    .send(Lane::Audio, Outbound::whole(Bytes::copy_from_slice(&[byte])))
                     .is_ok()
             );
         }
         assert_eq!(handle.dropped_audio(), 1);
-        assert_eq!(handle.pop_audio(), Some(Bytes::copy_from_slice(&[2])));
-        assert_eq!(handle.pop_audio(), Some(Bytes::copy_from_slice(&[3])));
+        assert_eq!(handle.pop_audio().map(|f| f.payload), Some(Bytes::copy_from_slice(&[2])));
+        assert_eq!(handle.pop_audio().map(|f| f.payload), Some(Bytes::copy_from_slice(&[3])));
     }
 
     #[test]
@@ -498,7 +586,7 @@ mod tests {
 
         let mut queued = 0_usize;
         for _ in 0..100_000 {
-            if handle.send(Lane::Control, blob.clone()).is_err() {
+            if handle.send(Lane::Control, Outbound::whole(blob.clone())).is_err() {
                 break;
             }
             queued += blob.len();
@@ -526,7 +614,7 @@ mod tests {
         let (handle, _rx) = super::channel(1, "tok".to_owned(), 100_000, 4, gauge);
         let blob = Bytes::from(vec![0_u8; 128 * 1024]);
 
-        while handle.send(Lane::Control, blob.clone()).is_ok() {}
+        while handle.send(Lane::Control, Outbound::whole(blob.clone())).is_ok() {}
 
         let load = pressure
             .sample()
@@ -556,7 +644,7 @@ mod tests {
         let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, gauge);
 
         handle
-            .send(Lane::Control, Bytes::from(vec![0_u8; 2048]))
+            .send(Lane::Control, Outbound::whole(Bytes::from(vec![0_u8; 2048])))
             .expect("queued");
         assert_eq!(pressure.sample()[0].peak, 2048);
 
@@ -572,7 +660,7 @@ mod tests {
         // is eventually disconnected for bytes it received hours ago.
         let (handle, mut rx) = channel(1, "tok".to_owned(), 16, 4);
         let frame = Bytes::from(vec![0_u8; 1024]);
-        handle.send(Lane::Control, frame.clone()).expect("queued");
+        handle.send(Lane::Control, Outbound::whole(frame.clone())).expect("queued");
         assert_eq!(handle.queued_control_bytes(), 1024);
 
         let taken = rx.try_recv().expect("the writer takes it");
@@ -581,7 +669,7 @@ mod tests {
 
         // And the room is genuinely reusable, not merely reported as free.
         for _ in 0..8 {
-            handle.send(Lane::Control, frame.clone()).expect("reusable");
+            handle.send(Lane::Control, Outbound::whole(frame.clone())).expect("reusable");
             let taken = rx.try_recv().expect("drained");
             handle.control_sent(taken.len());
         }
@@ -597,7 +685,7 @@ mod tests {
         let (handle, _rx) = channel(1, "tok".to_owned(), 16, 2);
         for _ in 0..10 {
             handle
-                .send(Lane::Audio, Bytes::from_static(b"frame"))
+                .send(Lane::Audio, Outbound::whole(Bytes::from_static(b"frame")))
                 .expect("audio never reports overflow");
         }
         assert!(handle.dropped_audio() > 0, "the oldest should have gone");

@@ -137,6 +137,26 @@ pub fn frame(type_id: u16, payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
+/// Just the header, for a payload written separately.
+///
+/// The gateway keeps the two apart so one encoded payload can be shared by
+/// every recipient of a broadcast while the header varies per connection
+/// (`PROTOCOL-REDESIGN.md` §4, Z4 and §5, S2). `seq` is `Some` only for a peer
+/// that negotiated resume, and `len` then covers the sequence as well as the
+/// payload — a reader takes `len` bytes after the header either way, and the
+/// eight it must skip first are the ones it asked for.
+#[must_use]
+pub fn header(type_id: u16, payload_len: usize, seq: Option<u64>) -> Bytes {
+    let extra = if seq.is_some() { 8 } else { 0 };
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + extra);
+    buf.put_u16(type_id);
+    buf.put_u32((payload_len + extra) as u32);
+    if let Some(seq) = seq {
+        buf.put_u64(seq);
+    }
+    buf.freeze()
+}
+
 /// Split one complete frame from `buf` without decoding its payload.
 ///
 /// Returns `Ok(None)` when more bytes are needed. The length bound is checked
@@ -234,6 +254,35 @@ fn decode_proto(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sequenced_header_puts_the_sequence_inside_the_length() {
+        // The layout the client's decoder strips. `len` covers the sequence as
+        // well as the payload, so a reader takes `len` bytes after the header
+        // either way and the eight it skips first are the ones it asked for —
+        // which is what keeps an unsequenced peer's parsing untouched.
+        let header = header(9, 100, Some(0x0102_0304_0506_0708));
+        assert_eq!(header.len(), HEADER_SIZE + 8);
+        assert_eq!(u16::from_be_bytes([header[0], header[1]]), 9);
+        assert_eq!(
+            u32::from_be_bytes([header[2], header[3], header[4], header[5]]),
+            108,
+            "the length must cover the sequence, or the reader stops short"
+        );
+        assert_eq!(&header[6..], &0x0102_0304_0506_0708_u64.to_be_bytes());
+    }
+
+    #[test]
+    fn an_unsequenced_header_is_byte_identical_to_the_joined_frame() {
+        // The split exists so one payload can be shared by every recipient
+        // (Z4); it must not change what a peer that never asked for a sequence
+        // sees on the wire.
+        let payload = b"opaque";
+        let joined = frame(11, payload);
+        let split = header(11, payload.len(), None);
+        assert_eq!(&joined[..HEADER_SIZE], &split[..]);
+        assert_eq!(&joined[HEADER_SIZE..], payload);
+    }
+
     use super::*;
 
     fn roundtrip(msg: &ControlMessage) -> ControlMessage {
