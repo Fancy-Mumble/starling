@@ -4,6 +4,8 @@ syntax = "proto3";
 // get a short-lived signed one, then move the bytes over HTTP.
 package starling.fancy.files.v1;
 
+import "fancy/wire.proto";
+
 message FilesEnvelope {
   oneof body {
     UploadRequest upload = 1;
@@ -61,5 +63,5 @@ message Listing {
 
 message Refused {
   string request_id = 1;
-  string reason = 2;
+  starling.fancy.wire.v1.Refusal refusal = 2;
 }

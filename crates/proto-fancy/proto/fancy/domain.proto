@@ -52,6 +52,7 @@ message MetadataEnvelope {
     ChannelExtras extras = 1;
     StructuralHint structural = 2;
     Subscribe subscribe = 3;
+    SyncDelta delta = 4;
   }
 }
 
@@ -80,6 +81,34 @@ message StructuralHint {
 message Subscribe {
   repeated uint32 channels = 1;
   bool everything = 2;
+}
+
+// A coalesced batch of state changes for a lazy subscriber — the delivery
+// half of Subscribe, and the mechanism that takes presence fan-out from
+// Θ(events × clients) to Θ(events × subscribers of the changed entity).
+//
+// Legacy clients keep the murmur flood: one UserState broadcast to every
+// session per change. A subscribed Fancy client instead receives these, and
+// only for entities inside its subscription. The server MAY coalesce a burst
+// (a mass-move, a reconnect wave) into one delta; a client applies entries in
+// order and treats the batch as atomic.
+//
+// The frames inside are *encoded upstream messages*, embedded as bytes. A
+// protobuf submessage and a bytes field share one wire shape (tag ‖ len ‖
+// payload), so the buffer encoded once for the legacy flood is placed here
+// verbatim — never re-encoded per recipient, and decoded by the parsers a
+// client already has (docs/PROTOCOL-REDESIGN.md §4, rule Z3).
+message SyncDelta {
+  // Encoded MumbleProto.UserState frames, verbatim.
+  repeated bytes user_states = 1;
+  // Encoded MumbleProto.ChannelState frames, verbatim.
+  repeated bytes channel_states = 2;
+  // Sessions gone from the subscribed view. Deliberately one list: left the
+  // server, or moved somewhere unsubscribed — the render outcome is the same,
+  // and distinguishing them would leak movement the subscriber cannot see.
+  repeated uint32 users_gone = 3;
+  // Channels removed from the subscribed view.
+  repeated uint32 channels_gone = 4;
 }
 
 // -- 1003 userdata ----------------------------------------------------------
@@ -140,11 +169,46 @@ message ServerConfigEnvelope {
 
 message ConfigQuery {}
 
-// Secrets are redacted on the way out. The server password is a value an
-// operator sets and nobody reads back.
+// One editable setting: its current value, and everything a client needs to
+// render a field for it without knowing the key.
+//
+// The schema travels with the value because the server is the only thing that
+// knows it. A client that hard-codes "max_users is an integer labelled Maximum
+// users" has to ship a release whenever an operator-facing knob is added, and
+// `Snapshot.extra` exists precisely so a service can add one without a proto
+// change — those would arrive as untyped, unlabelled keys and render as raw
+// strings, which is how a settings screen rots.
+message Setting {
+  string key = 1;
+  Kind kind = 2;
+  // The section it belongs under, so a form groups without a lookup table.
+  string group = 3;
+  string label = 4;
+  // **Empty when `secret`.** Those are write-only.
+  string value = 5;
+  // The permitted values. Meaningful for CHOICE, empty otherwise.
+  repeated string options = 6;
+  // Never carries a value outward, and only ever received. Named rather than
+  // omitted, so a client can tell "no password set" from "password withheld" —
+  // they mean very different things to whoever is looking at the screen.
+  bool secret = 7;
+  string help = 8;
+
+  enum Kind {
+    STRING = 0;
+    // Multi-line: the welcome text is a paragraph, not a field.
+    TEXT = 1;
+    BOOL = 2;
+    INT = 3;
+    CHOICE = 4;
+  }
+}
+
 message ConfigValues {
-  map<string, string> values = 1;
-  repeated string redacted = 2;
+  repeated Setting settings = 1;
+  // Monotonic. A client drops a snapshot older than the one it holds, which is
+  // what stops a slow reply from overwriting a fresh edit.
+  uint64 version = 2;
 }
 
 message ConfigUpdate {

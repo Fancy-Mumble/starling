@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+// Moderating a *connected* session: move it, mute it, deafen it, suppress it.
+//
+// murmur's `setState` (`MumbleServer.ice`), and the one thing an external
+// moderation bot cannot do by holding a client connection of its own — a bot
+// that joins as a user can only act where that user's ACLs let it, and cannot
+// act at all while it is disconnected.
+//
+// Why this is `session-lifecycle` and not `moderation`: the fields below are
+// connection state, and `session-lifecycle` is the service that owns a
+// connection's existence. `moderation` owns what outlives a session — bans —
+// which is why `Kick` lives there and `SetState` does not.
+package starling.sessioncontrol.v1;
+
+import "common.proto";
+
+service SessionControl {
+  // Apply a partial change to a live session.
+  rpc SetState(SetStateRequest) returns (SetStateResult);
+}
+
+// Every field is optional, and absent means "leave it alone".
+//
+// A request that restated the whole state would make two operators racing each
+// other silently undo one another: the second write would carry a stale copy of
+// everything it did not mean to touch.
+message SetStateRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 session = 3;
+
+  // Move the session to this channel. Enforced as murmur enforces a move rather
+  // than applied blindly — see `SetStateResult.refused`.
+  optional uint32 channel = 4;
+
+  // Administrative mute and deafen, which are the server's statement about the
+  // user rather than the user's own. `self_mute`/`self_deaf` are deliberately
+  // absent: those belong to the client, and an operator setting them would put
+  // the client's own UI out of step with no way for it to notice.
+  optional bool mute = 5;
+  optional bool deaf = 6;
+  // The server's statement that the user lacks `Speak` here. murmur refuses a
+  // *client* that sets this (`Messages.cpp:1135`); an operator may.
+  optional bool suppress = 7;
+  optional bool priority_speaker = 8;
+}
+
+message SetStateResult {
+  bool applied = 1;
+  // Why not, when `applied` is false. Empty on success.
+  string refused = 2;
+  // The state as it now stands, which is not always what was asked for:
+  // murmur's couplings mean deafening also mutes, so an operator told only
+  // what they requested would render a user who is deaf but not muted.
+  bool mute = 3;
+  bool deaf = 4;
+  bool suppress = 5;
+  bool priority_speaker = 6;
+  uint32 channel = 7;
+}

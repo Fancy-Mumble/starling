@@ -76,7 +76,40 @@ message ServerAction {
     SessionUp session_up = 3;
     SessionDown session_down = 4;
     Throttle throttle = 5;
+    Sequence sequence = 6;
+    Replay replay = 7;
   }
+}
+
+// Start numbering this connection's frames, once its `Hello` asked for resume.
+//
+// The gateway cannot decide this for itself: the request arrives inside a
+// payload, and the gateway never parses one (docs/ARCHITECTURE.md §1). So the
+// service that reads the `Hello` instructs it, which keeps that rule intact —
+// the gateway acts on a control-plane instruction rather than on client bytes.
+message Sequence {
+  uint64 conn = 1;
+  bool enabled = 2;
+  // Whether this connection's control stream may be compressed.
+  //
+  // Carried alongside the sequence because both answer the same question — what
+  // this peer agreed to receive — and both are read from the one `Hello`.
+  // Splitting them into two actions would let a connection end up with one
+  // applied and not the other.
+  bool compress = 3;
+}
+
+// Re-send what this connection missed, from the gateway's replay ring.
+//
+// Also the gateway's to perform rather than the service's, and for a stronger
+// reason than routing: only the pod holding the socket knows what it already
+// wrote to it. A service replaying from its own idea of history would re-send
+// frames the client has and skip ones it does not.
+message Replay {
+  uint64 conn = 1;
+  // The last sequence the client says it processed. Everything after it is
+  // re-sent, in the order it was originally written.
+  uint64 from_seq = 2;
 }
 
 // Frames to write to clients.

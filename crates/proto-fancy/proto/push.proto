@@ -18,7 +18,9 @@ message Registration {
   uint64 account = 2;
   string token = 3;
   string platform = 4;
-  repeated uint32 channels = 5;
+  // Channels this device wants no notification from. An exclusion list: see
+  // `fancy.feature.v1.Subscribe` for why muting is the thing a user does.
+  repeated uint32 muted = 5;
 }
 
 message UnregisterRequest {
@@ -36,6 +38,13 @@ message Notification {
   // Recipients that are connected right now; they are skipped, because they
   // already got the real message.
   repeated uint64 skip_accounts = 6;
+  // Which channel this is about, so a device that muted it can be left alone.
+  //
+  // Without this the mute preference was unusable and the whole feature a
+  // no-op: registrations stored a channel list, the read path returned it, and
+  // delivery had nothing to compare it against — so a user who muted a room
+  // was notified from it anyway.
+  uint32 channel = 7;
 }
 
 message NotifyResult {

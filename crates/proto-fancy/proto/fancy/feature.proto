@@ -6,6 +6,8 @@ syntax = "proto3";
 //   1012 audit   1014 onboarding   1016 link-preview   1017 context-actions
 package starling.fancy.feature.v1;
 
+import "fancy/wire.proto";
+
 // -- 1004 voice -------------------------------------------------------------
 
 message VoiceEnvelope {
@@ -56,9 +58,9 @@ message TextEnvelope {
 }
 
 message HistoryRequest {
+  // Flat for the same reason pchat's is: routing and authorisation read it.
   uint32 channel = 1;
-  uint32 limit = 2;
-  string before_id = 3;
+  starling.fancy.wire.v1.Cursor page = 2;
 }
 
 message StoredMessage {
@@ -74,16 +76,20 @@ message StoredMessage {
 message HistoryPage {
   uint32 channel = 1;
   repeated StoredMessage messages = 2;
-  bool more = 3;
+  starling.fancy.wire.v1.PageInfo page = 3;
 }
 
+// Both of these named a message and no channel, which left the service unable
+// to route or authorise one without first looking the id up. `MessageRef`
+// carries the pair, and unlike the fan-out paths above nothing here reads the
+// channel before the body is understood.
 message Edit {
-  string message_id = 1;
+  starling.fancy.wire.v1.MessageRef target = 1;
   string body = 2;
 }
 
 message Delete {
-  string message_id = 1;
+  starling.fancy.wire.v1.MessageRef target = 1;
 }
 
 // -- 1007 moderation --------------------------------------------------------
@@ -118,7 +124,7 @@ message Unban {
 
 message Refused {
   string action = 1;
-  string reason = 2;
+  starling.fancy.wire.v1.Refusal refusal = 2;
 }
 
 // -- 1010 plugins -----------------------------------------------------------
@@ -186,15 +192,29 @@ message PushEnvelope {
 message Register {
   string token = 1;
   string platform = 2;
+  // The channels to stay quiet about, as `Subscribe.muted` — carried here so a
+  // device that has just registered is not loud until its first subscribe.
+  repeated uint32 muted = 3;
 }
 
 message Unregister {
   string token = 1;
 }
 
+// Which channels a device wants *no* notification from.
+//
+// An exclusion list, and the direction matters. This was an inclusion list —
+// `channels` plus an `all` flag — which is the wrong shape twice over: a user
+// mutes two rooms out of forty and cannot be asked to enumerate the other
+// thirty-eight, and any channel created after the list was sent would silently
+// stop notifying. Muting is the thing a person does; being notified is the
+// default they are changing.
+//
+// The whole set is replaced on every send, so a client can always say "I have
+// forgotten that one" — the same reason `permissions.TokenSet` replaces rather
+// than adds.
 message Subscribe {
-  repeated uint32 channels = 1;
-  bool all = 2;
+  repeated uint32 muted = 1;
 }
 
 message PushAck {
@@ -218,8 +238,12 @@ message Query {
   uint64 since_ms = 1;
   uint64 until_ms = 2;
   string category = 3;
-  uint32 limit = 4;
-  string before_id = 5;
+  starling.fancy.wire.v1.Cursor page = 4;
+  // Narrow to what was done to one account. Indexed
+  // (`ix_audit_target`), which is why this is offered as a filter and
+  // `target_channel` below is not: a filter that table-scans the log is a
+  // way to make the server slow from a chat window.
+  uint64 target_account = 5;
 }
 
 message AuditRecord {
@@ -230,11 +254,16 @@ message AuditRecord {
   string actor = 5;
   string detail = 6;
   string entry_hash = 7;
+  // Who and where it was done to. The store has held both since it existed and
+  // the record dropped them, so "banned" arrived without saying whom, and a
+  // reader had to parse `detail` — prose written for a human — to find out.
+  uint64 target_account = 8;
+  uint32 target_channel = 9;
 }
 
 message Page {
   repeated AuditRecord records = 1;
-  bool more = 2;
+  starling.fancy.wire.v1.PageInfo page = 2;
 }
 
 message Config {
@@ -274,22 +303,71 @@ message Step {
     TEXT = 3;
   }
   Kind kind = 4;
-  repeated string options = 5;
-  bool required = 6;
+  bool required = 5;
+  repeated Choice choices = 6;
+  // Asked before the user may enter a channel at all, rather than at leisure
+  // afterwards. murmur has no such gate, so a stock client never sees one.
+  bool before_join = 7;
+  bool multi_select = 8;
+
+  // One selectable answer, and what choosing it grants.
+  //
+  // The grants are the feature. An onboarding answer is not a survey datum: it
+  // is a request for channel visibility and group membership that the server
+  // applies on submission, which is why a shape carrying only a label would
+  // make the whole questionnaire decorative.
+  message Choice {
+    string id = 1;
+    string label = 2;
+    string description = 3;
+    // Rendered beside the label. A Unicode grapheme cluster — deliberately not
+    // `wire.Emoji`, because a server shortcode would have to resolve against a
+    // custom-emoji set the onboarding flow is shown before the client has.
+    string emoji = 4;
+    // Channels this answer reveals to the user...
+    repeated uint32 channels = 5;
+    // ...and the ACL groups it joins them to.
+    repeated string groups = 6;
+  }
 }
 
 message Flow {
   string flow_id = 1;
   repeated Step steps = 2;
   uint64 version = 3;
+  // Off means no client shows the flow. Kept rather than deleting the flow, so
+  // an operator can turn it off without losing what they wrote.
+  bool enabled = 4;
+  // Granted to everyone who arrives, whatever they answer.
+  repeated uint32 default_channels = 5;
+  // Who last changed it, and when. Server-filled; ignored as input.
+  string updated_by = 6;
+  uint64 updated_at_ms = 7;
 }
 
-message FlowQuery {}
+message FlowQuery {
+  // Also send back this user's own stored answers.
+  bool include_answers = 1;
+}
 
 message Response {
   string flow_id = 1;
-  string step_id = 2;
-  string value = 3;
+  repeated Answer answers = 2;
+  // The flow version these answers were given against. What decides whether to
+  // ask again: an admin who adds a question has a flow nobody has answered,
+  // and without this the server cannot tell that from everybody having.
+  uint64 flow_version = 3;
+  // Server-filled. **Zero means nothing is stored** — the reply to a query from
+  // a user who has never answered, which is a different thing from a user who
+  // answered and chose nothing.
+  uint64 submitted_at_ms = 4;
+
+  message Answer {
+    string step_id = 1;
+    // The `Choice.id`s picked. A TEXT step carries `text` instead.
+    repeated string choice_ids = 2;
+    string text = 3;
+  }
 }
 
 message FlowUpdate {

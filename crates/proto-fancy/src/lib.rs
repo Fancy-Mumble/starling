@@ -16,6 +16,7 @@
 //! someone has to remember.
 
 pub mod identity;
+pub mod page;
 pub mod perm;
 pub mod types;
 
@@ -62,6 +63,11 @@ generated!(
     /// The composed live view of connected sessions.
     sessionview,
     "starling.sessionview.v1"
+);
+generated!(
+    /// Moderating a connected session: move, mute, deafen, suppress.
+    sessioncontrol,
+    "starling.sessioncontrol.v1"
 );
 generated!(
     /// Runtime-mutable operational settings.
@@ -131,6 +137,11 @@ generated!(
 
 /// Client-facing envelopes, one module per owning service.
 pub mod fancy {
+    generated!(
+        /// Primitives shared by more than one envelope; owns no outer type.
+        wire,
+        "starling.fancy.wire.v1"
+    );
     generated!(
         /// Outer type 1000.
         session,

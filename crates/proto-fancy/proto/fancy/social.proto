@@ -6,6 +6,8 @@ syntax = "proto3";
 // and a fan-out, and nineteen services with one message each is worse.
 package starling.fancy.social.v1;
 
+import "fancy/wire.proto";
+
 message SocialEnvelope {
   oneof body {
     Reaction reaction = 1;
@@ -21,10 +23,17 @@ message SocialEnvelope {
   }
 }
 
+// The one reaction message. pchat carried a second, weaker one until the
+// epoch-1 canon settled (docs/PROTOCOL-REDESIGN.md §2).
+//
+// `channel` and `message_id` stay flat rather than folding into a
+// `wire.MessageRef`: this is the fan-out address the service reads on every
+// reaction, and nesting it would put an "absent" case in front of a field
+// routing cannot do without.
 message Reaction {
   uint32 channel = 1;
   string message_id = 2;
-  string emoji = 3;
+  starling.fancy.wire.v1.Emoji emoji = 3;
   uint32 actor = 4;
   bool remove = 5;
 }
