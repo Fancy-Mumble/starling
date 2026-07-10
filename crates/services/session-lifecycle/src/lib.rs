@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use starling_proto::proto::tcp;
+use starling_proto_fancy::common::actor;
 use starling_proto_fancy::control::{Opened, ServerAction, server_action};
 use starling_proto_fancy::identity;
 use starling_proto_fancy::perm::Perm;
@@ -60,6 +61,62 @@ const CODEC_VERSION: u16 = 21;
 
 /// Upstream `PermissionDenied`.
 const PERMISSION_DENIED: u16 = 12;
+
+/// Announce a `UserState` change that happened in `channel`.
+///
+/// The murmur behaviour is one broadcast to everybody, which is why control
+/// fan-out grows with the square of the population (`PROTOCOL-REDESIGN.md` §5,
+/// S1). This splits the audience instead: peers that did not ask for deltas get
+/// exactly what murmur sends, and peers that did get a `SyncDelta` — but only
+/// if they are looking at the channel it happened in. **A subscriber looking
+/// elsewhere is sent nothing at all**, and that omission is the whole saving.
+///
+/// The `UserState` is encoded **once** and the same bytes are placed in both,
+/// because a length-delimited protobuf field is identical whether it is
+/// declared `bytes` or a message (§4, Z3). Nothing is re-encoded per recipient.
+/// `subject` is the session the change is *about* — not the one that caused it.
+/// A moderator muting somebody in another channel is a change in the *target's*
+/// channel, and choosing the audience by the actor would send it to the wrong
+/// set of people. Looked up here rather than at each call site, because that
+/// distinction is exactly the kind a caller gets subtly wrong.
+fn announce_user_state(connections: &Connections, subject: u32, state: &tcp::UserState) -> Actions {
+    let payload = state.encode_to_vec();
+    let channel = connections
+        .by_session(subject)
+        .map_or(0, |pending| pending.channel);
+    let (flood, subscribed) = connections.audience(channel);
+
+    // Nobody is subscribed and nobody is addressable — the roster is empty or a
+    // lock was lost. Fall back to the unaddressed broadcast, which is what this
+    // did before subscriptions existed: a state change that reaches nobody is a
+    // client rendering a world that has moved on.
+    if flood.is_empty() && subscribed.is_empty() {
+        return vec![to_sessions(Vec::new(), USER_STATE, payload)];
+    }
+
+    let mut actions = Actions::new();
+    if !flood.is_empty() {
+        actions.push(to_sessions(flood, USER_STATE, payload.clone()));
+    }
+    if !subscribed.is_empty() {
+        let delta = starling_proto_fancy::fancy::domain::MetadataEnvelope {
+            body: Some(
+                starling_proto_fancy::fancy::domain::metadata_envelope::Body::Delta(
+                    starling_proto_fancy::fancy::domain::SyncDelta {
+                        user_states: vec![payload],
+                        ..Default::default()
+                    },
+                ),
+            ),
+        };
+        actions.push(to_sessions(
+            subscribed,
+            ServiceKind::Metadata.outer_type(),
+            delta.encode_to_vec(),
+        ));
+    }
+    actions
+}
 
 /// The root channel, which is always id 0.
 const ROOT_CHANNEL: u32 = 0;
@@ -168,6 +225,143 @@ impl ClientService for SessionLifecycleService {
                 )),
             },
         ]
+    }
+}
+
+/// The gRPC surface: moderating a session somebody else is holding.
+///
+/// The out-of-band half of what `on_speak_state` and `on_move` do in band. It
+/// deliberately reuses both of their mechanisms rather than reaching into the
+/// connection table directly — an operator's mute has to couple deafen to mute
+/// the same way a moderator's does, and an operator's move has to be refused by
+/// the same `Enter` check, or the two planes disagree about the same server.
+#[derive(Debug, Clone)]
+pub struct SessionControlGrpc(Arc<SessionLifecycleService>);
+
+#[tonic::async_trait]
+impl starling_proto_fancy::sessioncontrol::session_control_server::SessionControl
+    for SessionControlGrpc
+{
+    async fn set_state(
+        &self,
+        request: tonic::Request<starling_proto_fancy::sessioncontrol::SetStateRequest>,
+    ) -> Result<tonic::Response<starling_proto_fancy::sessioncontrol::SetStateResult>, tonic::Status>
+    {
+        use starling_proto_fancy::sessioncontrol::SetStateResult;
+
+        let req = request.into_inner();
+        let scope = req.scope.map_or(1, |scope| scope.virtual_server);
+        let refused = |why: &str| {
+            Ok(tonic::Response::new(SetStateResult {
+                applied: false,
+                refused: why.to_owned(),
+                ..SetStateResult::default()
+            }))
+        };
+
+        let Some(target) = self.0.connections.by_session(req.session) else {
+            return refused(&format!("no session {} is connected", req.session));
+        };
+
+        // The move first, and refused through `metadata` exactly as a client's
+        // own move is: an operator may move somebody into a channel, but into a
+        // channel that refuses them the server would be lying to every client
+        // about where that user is.
+        let mut channel = target.channel;
+        if let Some(wanted) = req.channel
+            && wanted != target.channel
+        {
+            match self.0.handshake.enter(scope, req.session, wanted).await {
+                None => return refused("metadata is unreachable; cannot move"),
+                Some(result) if !result.applied => {
+                    return refused(&format!("channel {wanted} refused the move: {}", result.refused));
+                }
+                Some(_) => {
+                    self.0.connections.set_channel(target.conn, wanted);
+                    channel = wanted;
+                }
+            }
+        }
+
+        let speak = [req.mute, req.deaf, req.suppress, req.priority_speaker]
+            .iter()
+            .any(Option::is_some);
+        if speak {
+            let _ = self.0.connections.set_speak_state(
+                target.conn,
+                req.mute,
+                req.deaf,
+                req.priority_speaker,
+                req.suppress,
+            );
+        }
+
+        let Some(applied) = self.0.connections.by_session(req.session) else {
+            return refused("the session went away while it was being changed");
+        };
+
+        // Who did it, not just that somebody did. operator-api holds the
+        // authoritative record, but this line is what an operator reads when
+        // they are looking at the *server* — and "by operator" without a name
+        // is unattributable in exactly the situation it gets read in.
+        let by = req.actor.as_ref().and_then(|actor| actor.who.as_ref()).map_or_else(
+            String::new,
+            |who| match who {
+                actor::Who::Operator(operator) => operator.subject.clone(),
+                actor::Who::Session(session) => format!("session {session}"),
+                actor::Who::Internal(internal) => internal.service.clone(),
+            },
+        );
+        self.0.handshake.context().logger.log(
+            LogEvent::notice(Category::Admin, "session state set by operator")
+                .with("by", by)
+                .with("session", req.session)
+                .with("name", applied.name.clone())
+                .with("channel", applied.channel)
+                .with("mute", applied.mute)
+                .with("deaf", applied.deaf)
+                .with("suppress", applied.suppress)
+                .with("priority_speaker", applied.priority_speaker),
+        );
+
+        // Before the broadcast, for the reason every other writer here does it
+        // in this order: `session-view` is what other services read an identity
+        // through, and a client told a user is muted while `voice` still has
+        // them unmuted is a user whose mute does not take effect.
+        self.0
+            .handshake
+            .announce_changed(&self.0.connections, target.conn)
+            .await;
+
+        // No `actor`: murmur sets it to the session that caused the change, and
+        // an operator has no session. Absent is what a client renders as "by
+        // the server", which is exactly what this was.
+        let state = tcp::UserState {
+            session: Some(req.session),
+            channel_id: Some(applied.channel),
+            mute: Some(applied.mute),
+            deaf: Some(applied.deaf),
+            suppress: Some(applied.suppress),
+            priority_speaker: Some(applied.priority_speaker),
+            ..tcp::UserState::default()
+        };
+        self.0
+            .fanout
+            .push_all(vec![to_sessions(
+                Vec::new(),
+                USER_STATE,
+                state.encode_to_vec(),
+            )]);
+
+        Ok(tonic::Response::new(SetStateResult {
+            applied: true,
+            refused: String::new(),
+            mute: applied.mute,
+            deaf: applied.deaf,
+            suppress: applied.suppress,
+            priority_speaker: applied.priority_speaker,
+            channel,
+        }))
     }
 }
 
@@ -504,6 +698,10 @@ impl SessionLifecycleService {
             state.mute,
             state.deaf,
             state.priority_speaker,
+            // Never from a client: the guard above already refused any message
+            // carrying `suppress`, and passing it through would walk it past
+            // that refusal.
+            None,
         );
         let Some(session) = updated else {
             return Actions::new();
@@ -556,7 +754,7 @@ impl SessionLifecycleService {
             ),
             ..tcp::UserState::default()
         };
-        vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+        announce_user_state(&self.connections, session, &echo)
     }
 
     /// Register a user, or oneself (`UserState.user_id`).
@@ -643,9 +841,7 @@ impl SessionLifecycleService {
                 // other-registration are the same call, and only this
                 // distinguishes them once it has left here.
                 actor: Some(starling_proto_fancy::common::Actor {
-                    who: Some(starling_proto_fancy::common::actor::Who::Session(
-                        inbound.session,
-                    )),
+                    who: Some(actor::Who::Session(inbound.session)),
                 }),
                 account: Some(Account {
                     name: target.name.clone(),
@@ -704,7 +900,7 @@ impl SessionLifecycleService {
             user_id: Some(account.id as u32),
             ..tcp::UserState::default()
         };
-        vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+        announce_user_state(&self.connections, session, &echo)
     }
 
     /// Move `moved` into `target`, whether or not that is the caller.
@@ -1012,7 +1208,10 @@ impl SessionLifecycleService {
             texture_hash,
             ..tcp::UserState::default()
         };
-        vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+        // A self-mute is the highest-rate presence change there is — a
+        // push-to-talk binding emits two per utterance — so it is the one most
+        // worth not sending to ten thousand people who are looking elsewhere.
+        announce_user_state(&self.connections, session, &echo)
     }
 
     /// Start or stop listening to channels, and re-weight the ones already on.
@@ -1250,7 +1449,7 @@ impl SessionLifecycleService {
             texture: cleared_texture.then(Vec::new),
             ..tcp::UserState::default()
         };
-        vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+        announce_user_state(&self.connections, target_session, &echo)
     }
 
     /// Clear the stored comment or avatar on a registered account.
@@ -1440,8 +1639,14 @@ impl Serve for SessionLifecycleService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
+        use starling_proto_fancy::sessioncontrol::session_control_server::SessionControlServer;
+
         let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
-        tonic::service::Routes::default().add_service(plane)
+        tonic::service::Routes::default()
+            .add_service(plane)
+            .add_service(SessionControlServer::new(SessionControlGrpc(Arc::clone(
+                &self,
+            ))))
     }
 
     /// Reap connections nothing has been heard from.
@@ -1613,6 +1818,15 @@ fn announce_listeners(
         ..tcp::UserState::default()
     };
 
+    // Deliberately still the flood, unlike the presence changes above.
+    //
+    // A listener is about a channel the user is *not* in, so there are two
+    // defensible audiences — everyone rendering the listener, and everyone
+    // rendering the channel being listened to — and they are not the same set.
+    // Choosing wrong hides state from people who should see it, which is a
+    // worse failure than sending it to people who do not need it. The saving
+    // here is small besides: listeners change when somebody clicks, not twice
+    // per utterance the way a self-mute does.
     if broadcast_volume {
         echo.listening_volume_adjustment = adjustments;
         return vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())];

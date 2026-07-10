@@ -99,6 +99,25 @@ pub struct PendingConnection {
     pub reported: ReportedStats,
     /// The Fancy version the peer announced, 0 for a stock client.
     pub fancy_version: u64,
+    /// What the peer said it can actually do, from its `Hello`.
+    ///
+    /// Separate from `fancy_version` for the reason the epoch is separate from
+    /// it: a version says which features *exist* in a build, and these say
+    /// which of them this connection will accept. Every one is a thing the
+    /// server may do *to* a client — compress its stream, replay a gap, send
+    /// deltas instead of the full flood — and doing any of them to a peer that
+    /// did not ask is a peer that cannot read its own connection.
+    ///
+    /// So the default is all-false, and silence means the murmur behaviour:
+    /// uncompressed, no replay, the whole flood. A stock client never sends a
+    /// `Hello` at all and lands here correctly by doing nothing.
+    pub capabilities: Capabilities,
+    /// What this connection is looking at, when it asked for deltas.
+    ///
+    /// `None` means the murmur flood: every state change, whether or not the
+    /// peer can see the channel it happened in. That stays the default and the
+    /// only behaviour a stock client ever gets.
+    pub subscription: Option<Subscription>,
     /// The session id, once one has been allocated.
     pub session: u32,
     /// The registered account, once authenticated. `None` for a guest.
@@ -165,6 +184,53 @@ pub struct PendingConnection {
 
 /// What a client last told the server about its own side of the link.
 ///
+/// What a connection accepts, as it announced in its `Hello`.
+///
+/// Recorded rather than acted on: the three features these gate are not built
+/// (`PROTOCOL-REDESIGN.md` M5). The gate exists first so that each lands behind
+/// a flag that is already true or false per connection, instead of arriving
+/// with its own ad-hoc way of asking — which is how one of them ends up sent to
+/// a peer that never agreed to it.
+///
+/// Before this, a `Hello` was received and thrown away, so a client announcing
+/// `zstd` had no way to tell whether anything heard it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The control stream may be zstd-compressed.
+    pub zstd: bool,
+    /// A reconnect may replay from a sequence number instead of re-syncing.
+    pub resume: bool,
+    /// Channel and user state may be sent as deltas for a declared subscription
+    /// rather than as the full murmur flood.
+    pub lazy_subscribe: bool,
+}
+
+/// The channels a connection asked to be told about.
+///
+/// murmur sends every user's every state change to everybody, so control
+/// fan-out grows with the square of the population: at ten thousand clients and
+/// one change each per thirty seconds that is millions of frames a second
+/// before anyone speaks. A client that declares what it is actually rendering
+/// can be sent only that, which turns the second factor from "everyone" into
+/// "everyone looking at this channel".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subscription {
+    /// The channels this peer is rendering.
+    pub channels: Vec<u32>,
+    /// Everything, which is the flood by choice rather than by default. A
+    /// client that wants it says so, and then it is not a client that quietly
+    /// failed to subscribe.
+    pub everything: bool,
+}
+
+impl Subscription {
+    /// Whether a change in `channel` is one this peer asked for.
+    #[must_use]
+    pub fn covers(&self, channel: u32) -> bool {
+        self.everything || self.channels.contains(&channel)
+    }
+}
+
 /// Every field here is the *client's* measurement. The server cannot compute
 /// them: only the client knows when it sent a ping and when the reply came
 /// back, and only the client can count what it did not receive. Reporting them
@@ -376,6 +442,90 @@ impl Connections {
         }
     }
 
+    /// Record what a connection said it accepts.
+    ///
+    /// Only ever narrowed by the client's own `Hello`; nothing else may widen
+    /// it, because every capability is something done *to* that connection.
+    pub fn set_capabilities(&self, conn: u64, capabilities: Capabilities) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.capabilities = capabilities;
+        }
+    }
+
+    /// What a connection accepts, or nothing at all if it is unknown.
+    ///
+    /// An unknown connection reads as all-false rather than as an error: the
+    /// only safe answer to "may I compress this peer's stream" for a peer that
+    /// is not there is no.
+    #[must_use]
+    pub fn capabilities(&self, conn: u64) -> Capabilities {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.get(&conn).map(|pending| pending.capabilities))
+            .unwrap_or_default()
+    }
+
+    /// Record what a connection is looking at.
+    pub fn set_subscription(&self, conn: u64, subscription: Option<Subscription>) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.subscription = subscription;
+        }
+    }
+
+    /// Split the audience for a state change in `channel`.
+    ///
+    /// Returns `(flood, subscribed)`: the sessions that get the message the way
+    /// murmur sends it, and the sessions that asked for deltas and are looking
+    /// at the channel it happened in. **A subscriber not looking at `channel`
+    /// appears in neither** — that omission is the entire point, and the reason
+    /// the fan-out stops growing with the population.
+    ///
+    /// Sessions with no id yet (mid-handshake) are in neither list: they cannot
+    /// be addressed by session, and they get the full state at sync anyway.
+    #[must_use]
+    #[allow(
+        clippy::iter_over_hash_type,
+        reason = "membership decides both lists and visit order cannot change \
+                  it; the results are sorted before returning, so the output is \
+                  deterministic for tests and for a log line either way"
+    )]
+    pub fn audience(&self, channel: u32) -> (Vec<u32>, Vec<u32>) {
+        let Ok(inner) = self.inner.lock() else {
+            // A poisoned lock must not silently become "send to nobody": that
+            // reads as a quiet server. Empty flood and empty subscribers means
+            // the caller falls back to its unaddressed broadcast.
+            return (Vec::new(), Vec::new());
+        };
+        let mut flood = Vec::new();
+        let mut subscribed = Vec::new();
+        for pending in inner.values() {
+            if pending.session == 0 {
+                continue;
+            }
+            match &pending.subscription {
+                Some(subscription) if pending.capabilities.lazy_subscribe => {
+                    if subscription.covers(channel) {
+                        subscribed.push(pending.session);
+                    }
+                }
+                // No subscription, or one from a peer that never announced it
+                // could read deltas. Either way it gets what murmur sends.
+                _ => flood.push(pending.session),
+            }
+        }
+        // Sorted so the same membership always produces the same lists: a test
+        // asserting an audience should not depend on hash order, and neither
+        // should a log line somebody is comparing across two runs.
+        flood.sort_unstable();
+        subscribed.sort_unstable();
+        (flood, subscribed)
+    }
+
     /// Record which channel a session is in.
     pub fn set_channel(&self, conn: u64, channel: u32) {
         if let Ok(mut inner) = self.inner.lock()
@@ -437,6 +587,7 @@ impl Connections {
         mute: Option<bool>,
         deaf: Option<bool>,
         priority_speaker: Option<bool>,
+        suppress: Option<bool>,
     ) -> Option<u32> {
         let mut inner = self.inner.lock().ok()?;
         let pending = inner.get_mut(&conn)?;
@@ -454,6 +605,14 @@ impl Connections {
         }
         if let Some(priority) = priority_speaker {
             pending.priority_speaker = priority;
+        }
+        // Always `None` from a client: murmur refuses one that sets `suppress`
+        // however privileged (`Messages.cpp:1135`), because it is the server's
+        // own statement that the user lacks `Speak` here rather than anybody's
+        // opinion. An operator acting out of band may set it, which is the one
+        // caller that passes `Some`.
+        if let Some(suppress) = suppress {
+            pending.suppress = suppress;
         }
         (pending.session != 0).then_some(pending.session)
     }
@@ -560,6 +719,156 @@ pub fn fancy_version(version: &tcp::Version) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_that_announced_nothing_accepts_nothing() {
+        // Every capability is something the server does *to* a connection —
+        // compress its stream, replay a gap, send deltas instead of the flood.
+        // Doing one to a peer that never asked leaves it unable to read its own
+        // connection, so silence must mean the murmur behaviour and not a
+        // convenient default. A stock client never sends a `Hello` at all.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        assert_eq!(connections.capabilities(1), Capabilities::default());
+
+        // And an unknown connection answers the same way rather than erroring:
+        // "may I compress this peer" for a peer that is not there is no.
+        assert_eq!(connections.capabilities(999), Capabilities::default());
+    }
+
+    #[test]
+    fn what_a_client_announces_is_kept() {
+        // It used to be dropped on the floor, so a client announcing `zstd` had
+        // no way to learn whether anything heard it.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.set_capabilities(
+            1,
+            Capabilities {
+                zstd: true,
+                resume: false,
+                lazy_subscribe: true,
+            },
+        );
+        let held = connections.capabilities(1);
+        assert!(held.zstd);
+        assert!(held.lazy_subscribe);
+        assert!(!held.resume, "an unannounced capability stays off");
+    }
+
+    /// A connection that announced deltas and is looking at `channels`.
+    fn subscriber(connections: &Connections, conn: u64, session: u32, channels: &[u32]) {
+        connections.opened(&opened(conn), "gw");
+        connections.set_capabilities(
+            conn,
+            Capabilities {
+                lazy_subscribe: true,
+                ..Capabilities::default()
+            },
+        );
+        connections.set_subscription(
+            conn,
+            Some(Subscription {
+                channels: channels.to_vec(),
+                everything: false,
+            }),
+        );
+        if let Ok(mut inner) = connections.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.session = session;
+        }
+    }
+
+    #[test]
+    fn a_subscriber_looking_elsewhere_is_sent_nothing() {
+        // The entire saving. murmur sends every state change to everybody, so
+        // fan-out grows with the square of the population; the win is not that
+        // subscribers get a smaller message, it is that most of them get *no*
+        // message. If this ever quietly starts including them, the feature is
+        // costing bandwidth to achieve nothing.
+        let connections = Connections::new(8);
+        subscriber(&connections, 1, 11, &[4]);
+        subscriber(&connections, 2, 22, &[9]);
+
+        let (flood, subscribed) = connections.audience(4);
+        assert!(flood.is_empty(), "nobody here wants the flood");
+        assert_eq!(subscribed, vec![11], "only the peer looking at channel 4");
+    }
+
+    #[test]
+    fn a_peer_that_did_not_subscribe_still_gets_what_murmur_sends() {
+        // The compatibility half: a stock client never subscribes, and must not
+        // be quietly cut out of state it is still rendering.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        if let Ok(mut inner) = connections.inner.lock()
+            && let Some(pending) = inner.get_mut(&1)
+        {
+            pending.session = 11;
+        }
+        subscriber(&connections, 2, 22, &[9]);
+
+        let (flood, subscribed) = connections.audience(4);
+        assert_eq!(flood, vec![11], "the unsubscribed peer gets everything");
+        assert!(subscribed.is_empty());
+    }
+
+    #[test]
+    fn a_subscription_without_the_capability_is_not_honoured() {
+        // Announcing a subscription without announcing that deltas are readable
+        // would stop the flood for a client that cannot read what replaces it —
+        // a roster that silently stops updating. It falls back to the flood.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.set_subscription(
+            1,
+            Some(Subscription {
+                channels: vec![9],
+                everything: false,
+            }),
+        );
+        if let Ok(mut inner) = connections.inner.lock()
+            && let Some(pending) = inner.get_mut(&1)
+        {
+            pending.session = 11;
+        }
+
+        let (flood, subscribed) = connections.audience(4);
+        assert_eq!(flood, vec![11]);
+        assert!(subscribed.is_empty());
+    }
+
+    #[test]
+    fn subscribing_to_everything_is_the_flood_by_choice() {
+        // Distinct from not subscribing: the peer reads deltas and asked for all
+        // of them, so it is not a client that quietly failed to subscribe.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.set_capabilities(
+            1,
+            Capabilities {
+                lazy_subscribe: true,
+                ..Capabilities::default()
+            },
+        );
+        connections.set_subscription(
+            1,
+            Some(Subscription {
+                channels: Vec::new(),
+                everything: true,
+            }),
+        );
+        if let Ok(mut inner) = connections.inner.lock()
+            && let Some(pending) = inner.get_mut(&1)
+        {
+            pending.session = 11;
+        }
+
+        let (flood, subscribed) = connections.audience(4321);
+        assert!(flood.is_empty());
+        assert_eq!(subscribed, vec![11], "everything covers any channel");
+    }
 
     fn opened(conn: u64) -> Opened {
         Opened {
@@ -748,7 +1057,7 @@ mod tests {
         connections.opened(&opened(1), "gw");
         let _ = connections.allocate(1, &guest("victim"));
 
-        let _ = connections.set_speak_state(1, None, Some(true), None);
+        let _ = connections.set_speak_state(1, None, Some(true), None, None);
         let pending = connections.get(1).expect("the connection");
         assert!(pending.deaf);
         assert!(pending.mute, "deafening implies muting");
@@ -762,9 +1071,9 @@ mod tests {
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         let _ = connections.allocate(1, &guest("victim"));
-        let _ = connections.set_speak_state(1, None, Some(true), None);
+        let _ = connections.set_speak_state(1, None, Some(true), None, None);
 
-        let _ = connections.set_speak_state(1, Some(false), None, None);
+        let _ = connections.set_speak_state(1, Some(false), None, None, None);
         let pending = connections.get(1).expect("the connection");
         assert!(!pending.mute);
         assert!(!pending.deaf, "un-muting clears deafen");
@@ -778,9 +1087,9 @@ mod tests {
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         let _ = connections.allocate(1, &guest("speaker"));
-        let _ = connections.set_speak_state(1, Some(true), None, None);
+        let _ = connections.set_speak_state(1, Some(true), None, None, None);
 
-        let _ = connections.set_speak_state(1, None, None, Some(true));
+        let _ = connections.set_speak_state(1, None, None, Some(true), None);
         let pending = connections.get(1).expect("the connection");
         assert!(pending.priority_speaker);
         assert!(pending.mute, "a priority speaker who was muted stays muted");
@@ -827,7 +1136,7 @@ mod tests {
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         let _ = connections.allocate(1, &guest("victim"));
-        let _ = connections.set_speak_state(1, Some(true), None, None);
+        let _ = connections.set_speak_state(1, Some(true), None, None, None);
 
         let _ = connections.set_self_flags(1, Some(false), Some(false));
         let pending = connections.get(1).expect("the connection");

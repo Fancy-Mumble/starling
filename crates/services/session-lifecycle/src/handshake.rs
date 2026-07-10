@@ -1213,34 +1213,156 @@ impl Handshake {
             .map(tonic::Response::into_inner)
     }
 
+    /// One arm of [`Self::fancy`], split out when it grew a fourth.
+    fn on_hello(&self, connections: &Connections, inbound: &Inbound, hello: &starling_proto_fancy::fancy::session::Hello) -> Actions {
+            // Recorded, not discarded. This used to drop the message on the
+            // floor, so a client announcing `zstd` had no way to learn
+            // whether anything heard it — and the three features these gate
+            // would each have had to invent their own way of asking.
+            connections.touch(inbound.conn);
+            connections.set_capabilities(
+                inbound.conn,
+                crate::state::Capabilities {
+                    zstd: hello.zstd,
+                    resume: hello.resume,
+                    lazy_subscribe: hello.lazy_subscribe,
+                },
+            );
+            tracing::debug!(
+                conn = inbound.conn,
+                zstd = hello.zstd,
+                resume = hello.resume,
+                lazy_subscribe = hello.lazy_subscribe,
+                "client announced its capabilities"
+            );
+            if !hello.resume && !hello.zstd {
+                return Actions::new();
+            }
+            // Sequencing starts here and not before. The gateway cannot
+            // decide it — the request is inside a payload it never parses —
+            // so this instructs it, and the `ResumeAck` afterwards is what
+            // tells the client to start expecting eight more bytes per
+            // frame. Both are queued in that order, and the gateway is the
+            // single writer to the socket, so the client cannot see a
+            // sequenced frame before the acknowledgement that explains it.
+            vec![
+                ServerAction {
+                    action: Some(server_action::Action::Sequence(
+                        starling_proto_fancy::control::Sequence {
+                            conn: inbound.conn,
+                            enabled: hello.resume,
+                            compress: hello.zstd,
+                        },
+                    )),
+                },
+                to_conn(
+                    inbound.conn,
+                    ServiceKind::SessionLifecycle.outer_type(),
+                    SessionEnvelope {
+                        body: Some(session_envelope::Body::ResumeAck(
+                            starling_proto_fancy::fancy::session::ResumeAck {
+                                accepted: true,
+                                from_seq: 0,
+                                full_resync_required: false,
+                                session_token: String::new(),
+                            },
+                        )),
+                    }
+                    .encode_to_vec(),
+                ),
+            ]
+        }
+
+    /// One arm of [`Self::fancy`], split out when it grew a fourth.
+    fn on_subscribe(&self, connections: &Connections, inbound: &Inbound, subscribe: &starling_proto_fancy::fancy::session::LazySubscribe) -> Actions {
+            // Only honoured from a peer that announced it can read deltas.
+            // Otherwise this would quietly stop sending a client state it
+            // still expects as the full flood — the failure mode being a
+            // roster that silently stops updating.
+            if !connections.capabilities(inbound.conn).lazy_subscribe {
+                tracing::debug!(
+                    conn = inbound.conn,
+                    "subscription from a peer that did not announce \
+                     lazy_subscribe; ignored"
+                );
+                return Actions::new();
+            }
+            connections.set_subscription(
+                inbound.conn,
+                Some(crate::state::Subscription {
+                    channels: subscribe.channels.clone(),
+                    everything: subscribe.everything,
+                }),
+            );
+            Actions::new()
+        }
+
+    /// One arm of [`Self::fancy`], split out when it grew a fourth.
+    fn on_resume(&self, connections: &Connections, inbound: &Inbound, resume: starling_proto_fancy::fancy::session::ResumeRequest) -> Actions {
+            // The replay itself is the gateway's, and for a stronger reason
+            // than routing: only the pod holding the socket knows what it
+            // already wrote to it. This used to answer
+            // `full_resync_required` unconditionally, which made the whole
+            // feature a stub — the ring was filled on every frame and never
+            // read from.
+            //
+            // Whether the gap can actually be covered is the gateway's to
+            // discover, and the client does not need to be told: a replay
+            // that cannot reach back far enough simply leaves a jump in the
+            // sequence numbers, which the client sees for itself.
+            let ack = SessionEnvelope {
+                body: Some(session_envelope::Body::ResumeAck(
+                    starling_proto_fancy::fancy::session::ResumeAck {
+                        accepted: true,
+                        from_seq: resume.last_seq,
+                        full_resync_required: false,
+                        session_token: resume.session_token,
+                    },
+                )),
+            };
+            vec![
+                ServerAction {
+                    action: Some(server_action::Action::Sequence(
+                        starling_proto_fancy::control::Sequence {
+                            conn: inbound.conn,
+                            enabled: true,
+                            // Whatever the `Hello` settled. Re-deciding it here
+                            // would let a resume quietly switch compression on
+                            // for a peer that never asked for it.
+                            compress: connections.capabilities(inbound.conn).zstd,
+                        },
+                    )),
+                },
+                to_conn(
+                    inbound.conn,
+                    ServiceKind::SessionLifecycle.outer_type(),
+                    ack.encode_to_vec(),
+                ),
+                ServerAction {
+                    action: Some(server_action::Action::Replay(
+                        starling_proto_fancy::control::Replay {
+                            conn: inbound.conn,
+                            from_seq: resume.last_seq,
+                        },
+                    )),
+                },
+            ]
+        }
+
     /// The Fancy extensions: hello, resume, lazy subscription.
     pub fn fancy(&self, connections: &Connections, inbound: &Inbound) -> Actions {
         let Ok(envelope) = SessionEnvelope::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
         match envelope.body {
-            Some(session_envelope::Body::Hello(_)) => {
-                connections.touch(inbound.conn);
-                Actions::new()
+            Some(session_envelope::Body::Hello(hello)) => {
+                self.on_hello(connections, inbound, &hello)
+            }
+            Some(session_envelope::Body::Subscribe(subscribe)) => {
+                self.on_subscribe(connections, inbound, &subscribe)
             }
             Some(session_envelope::Body::Resume(resume)) => {
-                // The replay itself is the gateway's: it owns the ring, and a
-                // service cannot know what a pod already wrote to a socket.
-                let reply = SessionEnvelope {
-                    body: Some(session_envelope::Body::ResumeAck(
-                        starling_proto_fancy::fancy::session::ResumeAck {
-                            accepted: false,
-                            from_seq: resume.last_seq,
-                            full_resync_required: true,
-                            session_token: resume.session_token,
-                        },
-                    )),
-                };
-                vec![to_conn(
-                    inbound.conn,
-                    ServiceKind::SessionLifecycle.outer_type(),
-                    reply.encode_to_vec(),
-                )]
+                self.on_resume(connections, inbound, resume)
             }
             _ => Actions::new(),
         }
