@@ -17,6 +17,7 @@ use starling_proto_fancy::push::{
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
+use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use tonic::{Request, Response, Status};
@@ -34,17 +35,32 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
     ],
 )];
 
+/// The readiness gate that stays closed until the roster has a snapshot.
+///
+/// A cold roster cannot name the account behind a session, so every
+/// registration would be filed under nobody and every device silently never
+/// notified.
+const VIEW_GATE: &str = "session-view";
+
 /// The service.
 #[derive(Debug)]
 pub struct PushService {
     store: Store,
     fanout: Fanout,
+    /// Who is behind a session, so a registration is filed under the person
+    /// rather than under nobody.
+    ///
+    /// Every registration used to be stored with `account: 0`, and every lookup
+    /// asked for a real account — so nothing was ever found and no device was
+    /// ever notified. A push token belongs to a person across reconnects, which
+    /// is exactly what a session id is not.
+    roster: Arc<Roster>,
 }
 
 impl PushService {
     async fn register(&self, scope: u32, registration: &Registration) {
         let channels = registration
-            .channels
+            .muted
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
@@ -70,7 +86,7 @@ impl PushService {
             Ok(_) => tracing::debug!(
                 account = registration.account,
                 platform = %registration.platform,
-                channels = registration.channels.len(),
+                muted = registration.muted.len(),
                 "push registration stored"
             ),
             Err(error) => tracing::error!(
@@ -98,7 +114,7 @@ impl PushService {
             account: row.try_get::<i64, _>("account_id").unwrap_or_default() as u64,
             token: row.try_get("token").unwrap_or_default(),
             platform: row.try_get("platform").unwrap_or_default(),
-            channels: row
+            muted: row
                 .try_get::<String, _>("channels")
                 .unwrap_or_default()
                 .split(',')
@@ -151,7 +167,18 @@ impl Push for PushRpc {
                 skipped += 1;
                 continue;
             }
-            delivered += self.0.subscriptions(scope, *account).await.len() as u32;
+            // Muted channels are honoured here, and this is the point the whole
+            // preference exists for. Every layer below stored it and no layer
+            // read it: registrations kept a channel list, the read path
+            // returned it, and delivery counted every device regardless — so a
+            // user who muted a room was notified from it anyway.
+            for registration in self.0.subscriptions(scope, *account).await {
+                if registration.muted.contains(&req.channel) {
+                    skipped += 1;
+                } else {
+                    delivered += 1;
+                }
+            }
         }
         Ok(Response::new(NotifyResult {
             delivered,
@@ -190,19 +217,56 @@ impl ClientService for PushService {
             );
             return Actions::new();
         };
+        // A push token belongs to a person, so an unregistered guest has
+        // nothing durable to file one under and is refused rather than stored
+        // under a session id that will belong to somebody else tomorrow.
+        let Some(account) = self.roster.account_of(inbound.session) else {
+            tracing::debug!(
+                session = inbound.session,
+                "push registration from a session with no account; ignored"
+            );
+            let refusal = PushEnvelope {
+                body: Some(push_envelope::Body::Ack(PushAck {
+                    ok: false,
+                    detail: "push notifications need a registered account".to_owned(),
+                })),
+            };
+            return vec![to_conn(inbound.conn, outer, refusal.encode_to_vec())];
+        };
         let ok = match envelope.body {
             Some(push_envelope::Body::Register(register)) => {
                 self.register(
                     inbound.scope,
                     &Registration {
                         scope: None,
-                        account: 0,
+                        account,
                         token: register.token,
                         platform: register.platform,
-                        channels: Vec::new(),
+                        // Was `Vec::new()`, which threw away what the device
+                        // asked for and left it loud until a later subscribe
+                        // that nothing handled either.
+                        muted: register.muted,
                     },
                 )
                 .await;
+                true
+            }
+            Some(push_envelope::Body::Subscribe(subscribe)) => {
+                // Previously unhandled: it fell through to `ok: false`, so a
+                // device muting a channel was told the request failed *and*
+                // nothing was stored. The mute is per device, so it is written
+                // against every token this account has registered.
+                let existing = self.subscriptions(inbound.scope, account).await;
+                for registration in existing {
+                    self.register(
+                        inbound.scope,
+                        &Registration {
+                            muted: subscribe.muted.clone(),
+                            ..registration
+                        },
+                    )
+                    .await;
+                }
                 true
             }
             Some(push_envelope::Body::Unregister(unregister)) => {
@@ -233,10 +297,22 @@ impl Serve for PushService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
+            roster: Arc::new(Roster::new()),
         }))
+    }
+
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        // Follow `session-view`, so a session can be resolved to the account a
+        // registration is filed under. Without this the roster stays cold and
+        // every device registers as nobody.
+        let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        ctx.shutdown.wait().await;
+        follower.abort();
+        Ok(())
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
@@ -266,6 +342,7 @@ mod tests {
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(PushService {
+            roster: Arc::new(Roster::new()),
             store,
             fanout: Fanout::default(),
         })
@@ -285,7 +362,7 @@ mod tests {
                         account: 5,
                         token: "device-token".to_owned(),
                         platform: platform.to_owned(),
-                        channels: vec![1, 2],
+                        muted: vec![1, 2],
                     },
                 )
                 .await;
@@ -299,6 +376,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_muted_channel_does_not_buzz_the_phone() {
+        // The preference was a complete no-op: stored on the registration,
+        // returned by the read path, and never compared against anything —
+        // because the notification did not say which channel it was about. A
+        // user who muted a room was notified from it anyway.
+        let service = service().await;
+        service
+            .register(
+                1,
+                &Registration {
+                    scope: None,
+                    account: 5,
+                    token: "t".to_owned(),
+                    platform: "android".to_owned(),
+                    muted: vec![7],
+                },
+            )
+            .await;
+
+        let notify = |channel| {
+            let service = Arc::clone(&service);
+            async move {
+                PushRpc(service)
+                    .notify(Request::new(Notification {
+                        channel,
+                        scope: None,
+                        accounts: vec![5],
+                        title: "t".to_owned(),
+                        body: "b".to_owned(),
+                        data: Default::default(),
+                        skip_accounts: Vec::new(),
+                    }))
+                    .await
+                    .expect("notify")
+                    .into_inner()
+            }
+        };
+
+        let muted = notify(7).await;
+        assert_eq!(muted.delivered, 0, "a muted channel must not be delivered");
+        assert_eq!(muted.skipped, 1, "and the skip is counted, not lost");
+
+        let other = notify(9).await;
+        assert_eq!(other.delivered, 1, "an unmuted channel still notifies");
+    }
+
+    #[tokio::test]
     async fn a_connected_recipient_is_skipped_rather_than_notified_twice() {
         let service = service().await;
         service
@@ -309,13 +433,14 @@ mod tests {
                     account: 5,
                     token: "t".to_owned(),
                     platform: "android".to_owned(),
-                    channels: Vec::new(),
+                    muted: Vec::new(),
                 },
             )
             .await;
 
         let result = PushRpc(Arc::clone(&service))
             .notify(Request::new(Notification {
+                channel: 0,
                 scope: None,
                 accounts: vec![5],
                 title: "t".to_owned(),
