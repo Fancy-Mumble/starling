@@ -62,6 +62,15 @@ pub struct Roster {
     /// session, or a reconnect looks like a stranger and a recycled id looks
     /// like the wrong one.
     accounts: Mutex<HashMap<u32, Option<u64>>>,
+    /// Session id to the SHA-1 of the peer's leaf certificate, empty when it
+    /// presented none.
+    ///
+    /// The other durable identity, and the one end-to-end crypto needs: an
+    /// account says *who* a person is to this server, a certificate says which
+    /// keypair they hold. A guest has no account but may still hold a
+    /// certificate, and pchat's key ladder is keyed on exactly this — peer
+    /// keys, channel originators and key holders are all `cert_hash`.
+    certs: Mutex<HashMap<u32, Vec<u8>>>,
     warm: AtomicBool,
 }
 
@@ -116,6 +125,12 @@ impl Roster {
                 })
                 .collect();
         }
+        if let Ok(mut held) = self.certs.lock() {
+            *held = sessions
+                .iter()
+                .map(|session| (session.session, session.cert_hash.clone()))
+                .collect();
+        }
         if let Ok(mut held) = self.channels.lock() {
             *held = sessions
                 .into_iter()
@@ -136,6 +151,9 @@ impl Roster {
         if let Ok(mut held) = self.channels.lock() {
             let _ = held.insert(session.session, session.channel);
         }
+        if let Ok(mut held) = self.certs.lock() {
+            let _ = held.insert(session.session, session.cert_hash.clone());
+        }
     }
 
     /// Forget one session.
@@ -149,6 +167,26 @@ impl Roster {
         if let Ok(mut held) = self.channels.lock() {
             let _ = held.remove(&session);
         }
+        if let Ok(mut held) = self.certs.lock() {
+            let _ = held.remove(&session);
+        }
+    }
+
+    /// The certificate hash behind `session`, or `None` for a session that
+    /// presented none, an unknown session, or a cold roster.
+    ///
+    /// Read by anything that has to record *who wrote this* durably. A session
+    /// id cannot serve: it is handed out per connection and reused, so an
+    /// archive keyed on one attributes old messages to whoever holds the
+    /// number now.
+    #[must_use]
+    pub fn cert_of(&self, session: u32) -> Option<Vec<u8>> {
+        self.certs
+            .lock()
+            .ok()?
+            .get(&session)
+            .filter(|cert| !cert.is_empty())
+            .cloned()
     }
 
     /// The account behind `session`, or `None` for an unregistered guest, an
