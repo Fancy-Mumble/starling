@@ -19,6 +19,7 @@ use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::pchat::{
     Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
 };
+use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
@@ -51,12 +52,44 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
              ciphertext BLOB NOT NULL, supersedes BLOB NULL, expires_at_ms BIGINT NULL, \
              PRIMARY KEY (server_id, channel_id, id))",
         "CREATE INDEX IF NOT EXISTS ix_pchat_expiry ON pchat_message(server_id, expires_at_ms)",
+        // `holder` is the certificate hash, not a session: holding a key is
+        // what lets someone read the archive after reconnecting, so the one
+        // thing it cannot be keyed on is the connection. Nothing writes this
+        // table yet, which is why it is defined right rather than migrated.
         "CREATE TABLE IF NOT EXISTS pchat_holder (\
              server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, epoch INTEGER NOT NULL, \
-             holder BIGINT NOT NULL, \
+             holder BLOB NOT NULL, \
              PRIMARY KEY (server_id, channel_id, epoch, holder))",
     ],
-)];
+),
+    // The archive recorded its author as a session id, which is handed out per
+    // connection and reused — so a message written last week is attributed to
+    // whoever holds that number now. Sessions are the wrong key for anything
+    // that outlives a connection (`Roster::accounts` says so in as many words);
+    // an archive is the longest-lived thing this server keeps.
+    //
+    // Nullable and not backfilled: rows written before this column existed have
+    // no recoverable author. Left NULL and honestly empty on the wire rather
+    // than guessed at, because a wrong attribution in an audit-relevant archive
+    // is worse than an absent one.
+    Migration::new(
+        "0002_pchat_sender_cert",
+        &["ALTER TABLE pchat_message ADD COLUMN sender_cert BLOB NULL"],
+    ),
+    // What a reader needs to decrypt what it fetches back. The archive stored
+    // the ciphertext and the epoch *number* but not which key that was, so a
+    // channel that forked during a membership change had two epoch 4s and the
+    // page came back undecryptable — with nothing to distinguish "wrong key"
+    // from "corrupt". Opaque to this service, like the ciphertext beside them.
+    Migration::new(
+        "0003_pchat_decryption_context",
+        &[
+            "ALTER TABLE pchat_message ADD COLUMN epoch_fingerprint BLOB NULL",
+            "ALTER TABLE pchat_message ADD COLUMN chain_index INTEGER NULL",
+            "ALTER TABLE pchat_message ADD COLUMN protocol INTEGER NULL",
+        ],
+    ),
+];
 
 /// The service.
 #[derive(Debug)]
@@ -84,8 +117,9 @@ impl PchatService {
         let id = Uuid7::now();
         let result = sqlx::query(
             "INSERT INTO pchat_message \
-                 (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, supersedes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, \
+                  supersedes, sender_cert, epoch_fingerprint, chain_index, protocol) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(message.channel))
@@ -95,6 +129,10 @@ impl PchatService {
         .bind(i64::from(message.epoch))
         .bind(message.ciphertext.as_slice())
         .bind(Uuid7::parse(&message.supersedes).map(Uuid7::to_vec))
+        .bind((!message.sender_cert.is_empty()).then(|| message.sender_cert.clone()))
+        .bind((!message.epoch_fingerprint.is_empty()).then(|| message.epoch_fingerprint.clone()))
+        .bind(i64::from(message.chain_index))
+        .bind(i64::from(message.protocol))
         .execute(self.store.pool())
         .await;
         match result {
@@ -109,13 +147,14 @@ impl PchatService {
     /// A page of ciphertexts, newest first.
     async fn fetch(&self, scope: u32, request: &Fetch) -> FetchResponse {
         use sqlx::Row as _;
-        let limit = request.limit.clamp(1, 200);
-        let before = Uuid7::parse(&request.before_id).map(Uuid7::to_vec);
+        let page = request.page.clone().unwrap_or_default();
+        let limit = page.page_size(50, 200);
+        let before = Uuid7::parse(&page.before_id).map(Uuid7::to_vec);
         let sql = if before.is_some() {
-            "SELECT id, sent_at_ms, sender, epoch, ciphertext FROM pchat_message \
+            "SELECT id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
              WHERE server_id = ? AND channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
         } else {
-            "SELECT id, sent_at_ms, sender, epoch, ciphertext FROM pchat_message \
+            "SELECT id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
              WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
         };
         let mut query = sqlx::query(sql)
@@ -130,7 +169,13 @@ impl PchatService {
             .await
             .unwrap_or_default();
 
-        let more = rows.len() > limit as usize;
+        let page_info = PageInfo::after(rows.len(), limit, || {
+            rows.get(limit as usize - 1)
+                .and_then(|row| row.try_get::<Vec<u8>, _>("id").ok())
+                .and_then(|id| Uuid7::from_slice(&id))
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        });
         let messages = rows
             .into_iter()
             .take(limit as usize)
@@ -144,13 +189,19 @@ impl PchatService {
                 sent_at_ms: row.try_get::<i64, _>("sent_at_ms").unwrap_or_default() as u64,
                 supersedes: String::new(),
                 epoch: row.try_get::<i64, _>("epoch").unwrap_or_default() as u32,
+                // NULL for a row written before the column existed, which is
+                // read back as "unattributable" rather than guessed at.
+                sender_cert: row.try_get("sender_cert").unwrap_or_default(),
+                epoch_fingerprint: row.try_get("epoch_fingerprint").unwrap_or_default(),
+                chain_index: row.try_get::<i64, _>("chain_index").unwrap_or_default() as u32,
+                protocol: row.try_get::<i64, _>("protocol").unwrap_or_default() as i32,
             })
             .collect();
 
         FetchResponse {
             channel: request.channel,
             messages,
-            more,
+            page: Some(page_info),
             total_stored: self.count(scope, request.channel).await,
         }
     }
@@ -199,6 +250,13 @@ struct Relay {
     /// Deliver to this one session instead of the channel, when the body names
     /// its recipient.
     unicast: Option<u32>,
+    /// The certificate this body claims for its own sender, when it names one.
+    ///
+    /// Read so the relay can refuse a body claiming somebody else's identity.
+    /// The bodies are re-sent verbatim — they carry signatures over their own
+    /// encoding — so this cannot be stamped the way `Message.sender_cert` is;
+    /// it is checked instead. Absent for bodies that claim no identity.
+    claims: Option<Vec<u8>>,
 }
 
 impl Relay {
@@ -211,24 +269,40 @@ impl Relay {
                 channel,
                 needs,
                 unicast: None,
+                claims: None,
+            })
+        };
+        let claiming = |channel, needs, cert: &[u8]| {
+            Some(Self {
+                channel,
+                needs,
+                unicast: None,
+                claims: Some(cert.to_vec()),
             })
         };
         match body {
             // Sealed key material naming exactly one recipient. Relaying it to
             // the channel handed every member a copy of a message addressed to
             // one of them.
+            //
+            // No `claims`: this body names its *recipient*, not its sender, and
+            // checking a recipient against the sender's certificate would
+            // refuse every delivery there is.
             Body::KeyDeliver(deliver) => Some(Self {
                 channel: deliver.channel,
                 needs: Perm::ENTER,
                 unicast: Some(deliver.recipient),
+                claims: None,
             }),
-            Body::KeyAnnounce(announce) => in_channel(announce.channel, Perm::ENTER),
-            Body::KeyRequest(request) => in_channel(request.channel, Perm::ENTER),
+            Body::KeyAnnounce(announce) => {
+                claiming(announce.channel, Perm::ENTER, &announce.holder_cert)
+            }
+            Body::KeyRequest(request) => {
+                claiming(request.channel, Perm::ENTER, &request.requester_cert)
+            }
             Body::HolderReport(report) => in_channel(report.channel, Perm::ENTER),
             Body::HolderQuery(query) => in_channel(query.channel, Perm::ENTER),
-            Body::Reaction(reaction) => in_channel(reaction.channel, Perm::TEXT_MESSAGE),
             Body::Pin(pin) => in_channel(pin.channel, Perm::TEXT_MESSAGE),
-            Body::Receipt(receipt) => in_channel(receipt.channel, Perm::ENTER),
             Body::Delete(delete) => in_channel(delete.channel, Perm::DELETE_MESSAGE),
             // Server-to-client answers. A client that sends one is trying to
             // forge somebody else's history or pin list, and the verbatim relay
@@ -353,7 +427,13 @@ impl PchatService {
             )];
         }
 
+        // Both stamped, and both server-side: whatever the client claimed about
+        // its own identity is discarded here, so a message cannot be attributed
+        // to somebody else. `sender` addresses the live connection; the
+        // certificate is what survives it and what the recipients' key ladder
+        // is keyed on.
         message.sender = inbound.session;
+        message.sender_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
         let Some(id) = self.store_message(inbound.scope, &message).await else {
             return vec![self.ack(
                 inbound,
@@ -423,6 +503,27 @@ impl PchatService {
             return Actions::new();
         }
 
+        // A body that names its own sender must name the connection's own
+        // certificate. Without this, anyone in the channel could announce a
+        // public key under somebody else's identity and be relayed as them —
+        // and key distribution is exactly the place where being believed about
+        // who you are is the whole game.
+        //
+        // Refused rather than corrected: the body is re-sent verbatim because
+        // it is signed over its own bytes, so there is nothing to correct
+        // without invalidating the signature.
+        if let Some(claimed) = &relay.claims {
+            let actual = self.roster.cert_of(inbound.session);
+            if actual.as_deref() != Some(claimed.as_slice()) {
+                tracing::warn!(
+                    session = inbound.session,
+                    "refused a pchat body claiming an identity that is not the \
+                     connection's own"
+                );
+                return Actions::new();
+            }
+        }
+
         if !self
             .permit
             .allows(inbound, relay.channel, relay.needs.bits())
@@ -481,7 +582,8 @@ impl Serve for PchatService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starling_proto_fancy::fancy::pchat::{Delete, KeyAnnounce, KeyDeliver, PinList, Reaction};
+    use starling_proto_fancy::fancy::pchat::{Delete, KeyAnnounce, KeyDeliver, Pin, PinList};
+    use starling_proto_fancy::fancy::wire::Cursor;
 
     async fn service() -> Arc<PchatService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
@@ -520,6 +622,9 @@ mod tests {
     ///
     /// Sessions 7, 8 are in channel 4 and session 9 is in channel 9 — enough to
     /// tell "the channel" from "everyone".
+    /// The certificate behind session 7, as the TLS connection presented it.
+    const SPEAKER_CERT: &[u8] = b"\x01\x02speaker-cert";
+
     async fn service_with_members() -> Arc<PchatService> {
         use starling_proto_fancy::sessionview::{Session, Sessions, ViewEvent, view_event};
         let service = service().await;
@@ -529,6 +634,7 @@ mod tests {
                     Session {
                         session: 7,
                         channel: 4,
+                        cert_hash: SPEAKER_CERT.to_vec(),
                         ..Session::default()
                     },
                     Session {
@@ -569,16 +675,150 @@ mod tests {
             sent_at_ms: 0,
             supersedes: String::new(),
             epoch: 1,
+            sender_cert: Vec::new(),
+            epoch_fingerprint: Vec::new(),
+            chain_index: 0,
+            protocol: 0,
         }
     }
 
     fn fetch(channel: u32, limit: u32) -> Fetch {
         Fetch {
             channel,
-            limit,
-            before_id: String::new(),
-            after_id: String::new(),
+            page: Some(Cursor {
+                limit,
+                ..Cursor::default()
+            }),
         }
+    }
+
+    #[tokio::test]
+    async fn the_archive_keeps_an_identity_that_outlives_the_session() {
+        // The archive recorded its author as a session id, which is handed out
+        // per connection and reused — so a message written last week is
+        // attributed to whoever holds that number today. An archive is the
+        // longest-lived thing this server keeps, and a session is the shortest
+        // lived name in it.
+        //
+        // Asserted through storage rather than through `frame`, for the reason
+        // `sealed_key_material_is_addressed_to_its_recipient_alone` gives: the
+        // test resolver denies every permission, so a frame test would pass on
+        // the refusal and prove nothing about what was written.
+        let service = service().await;
+        let _ = service
+            .store_message(
+                1,
+                &Message {
+                    sender_cert: SPEAKER_CERT.to_vec(),
+                    ..message(4, b"x")
+                },
+            )
+            .await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let stored = page.messages.first().expect("the message is on record");
+        assert_eq!(
+            stored.sender_cert,
+            SPEAKER_CERT.to_vec(),
+            "the certificate must survive the round trip through the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_written_before_the_column_existed_reads_back_unattributed() {
+        // The migration adds the column nullable and does not backfill: those
+        // rows have no recoverable author. Empty is the honest answer, and the
+        // one thing that must not happen is a decode failure that takes the
+        // whole page with it.
+        let service = service().await;
+        let _ = service.store_message(1, &message(4, b"x")).await;
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let stored = page.messages.first().expect("the message is on record");
+        assert!(stored.sender_cert.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_announcement_under_somebody_elses_identity_is_refused() {
+        // Key distribution is the one place where being believed about who you
+        // are *is* the whole game: announce a public key as somebody else and
+        // every member who trusts it seals their next epoch key to you.
+        //
+        // The body is relayed verbatim because it is signed over its own bytes,
+        // so there is nothing to correct — it is refused instead. Session 7's
+        // certificate is `SPEAKER_CERT`; this claims a different one.
+        let service = service_with_members().await;
+        let forged = pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+            channel: 4,
+            epoch: 1,
+            public_key: vec![1],
+            holder_cert: b"somebody-elses-cert".to_vec(),
+        });
+        assert!(
+            service.frame(frame(forged)).await.is_empty(),
+            "a body claiming another identity must reach nobody"
+        );
+
+        // The same body under its own identity gets as far as the permission
+        // check, which the test resolver denies — so this asserts it was *not*
+        // stopped by the identity check, which is the distinction that matters.
+        let honest = pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+            channel: 4,
+            epoch: 1,
+            public_key: vec![1],
+            holder_cert: SPEAKER_CERT.to_vec(),
+        });
+        let actions = service.frame(frame(honest)).await;
+        assert_eq!(
+            actions.len(),
+            1,
+            "an honest announcement should reach the permission check"
+        );
+    }
+
+    #[test]
+    fn the_identity_comes_off_the_connection_and_not_off_the_wire() {
+        // Why the stamp in `on_message` can be trusted: the roster carries what
+        // the TLS connection presented, so a client cannot write into somebody
+        // else's name however it fills the field. A peer that presented no
+        // certificate has no identity here, which is distinct from an empty
+        // one and is why `cert_of` filters rather than returning the empty vec.
+        use starling_proto_fancy::sessionview::Session;
+        let roster = Roster::new();
+        roster.upsert(&Session {
+            session: 7,
+            cert_hash: SPEAKER_CERT.to_vec(),
+            ..Session::default()
+        });
+        roster.upsert(&Session {
+            session: 8,
+            ..Session::default()
+        });
+
+        assert_eq!(roster.cert_of(7).as_deref(), Some(SPEAKER_CERT));
+        assert_eq!(roster.cert_of(8), None, "no certificate is not an identity");
+        assert_eq!(roster.cert_of(99), None, "an unknown session has none either");
+
+        // The snapshot path, which is how a subscription actually opens — and
+        // which this test caught missing the certificates entirely. Getting it
+        // only in `upsert` fails closed rather than open (an unknown identity
+        // matches nothing, so every announcement is refused), but the feature
+        // is dead either way until a session happens to be updated.
+        let fresh = Roster::new();
+        fresh.replace(vec![Session {
+            session: 7,
+            cert_hash: SPEAKER_CERT.to_vec(),
+            ..Session::default()
+        }]);
+        assert_eq!(
+            fresh.cert_of(7).as_deref(),
+            Some(SPEAKER_CERT),
+            "a snapshot must carry identities, not just membership"
+        );
+
+        // And it goes when the session does: a stale entry would hand the next
+        // holder of that number somebody else's identity.
+        roster.remove(7);
+        assert_eq!(roster.cert_of(7), None);
     }
 
     #[tokio::test]
@@ -604,7 +844,12 @@ mod tests {
         }
         let page = service.fetch(1, &fetch(5, 2)).await;
         assert_eq!(page.total_stored, 3);
-        assert!(page.more);
+        let more = page.page.expect("a page always reports its tail");
+        assert!(more.more);
+        assert!(
+            !more.next_before_id.is_empty(),
+            "a page with more behind it must say where the next one starts"
+        );
     }
 
     #[tokio::test]
@@ -639,17 +884,16 @@ mod tests {
 
         for body in [
             pchat_envelope::Body::Message(message(4, b"x")),
-            pchat_envelope::Body::Reaction(Reaction {
+            pchat_envelope::Body::Pin(Pin {
                 message_id: "m".to_owned(),
                 channel: 4,
-                emoji: "x".to_owned(),
-                remove: false,
+                unpin: false,
             }),
             pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
                 channel: 4,
                 epoch: 1,
                 public_key: vec![1],
-                holder: 7,
+                holder_cert: SPEAKER_CERT.to_vec(),
             }),
             pchat_envelope::Body::Ack(Ack::default()),
         ] {
@@ -666,11 +910,10 @@ mod tests {
         // original leak wearing a fallback.
         let service = service().await;
         let actions = service
-            .frame(frame(pchat_envelope::Body::Reaction(Reaction {
+            .frame(frame(pchat_envelope::Body::Pin(Pin {
                 message_id: "m".to_owned(),
                 channel: 4,
-                emoji: "x".to_owned(),
-                remove: false,
+                unpin: false,
             })))
             .await;
 
@@ -692,7 +935,7 @@ mod tests {
             .frame(frame(pchat_envelope::Body::FetchResponse(FetchResponse {
                 channel: 4,
                 messages: vec![message(4, b"forged")],
-                more: false,
+                page: None,
                 total_stored: 1,
             })))
             .await;
@@ -714,6 +957,7 @@ mod tests {
             recipient: 8,
             sealed_key: vec![9],
             countersignature: Vec::new(),
+            recipient_cert: Vec::new(),
         }))
         .expect("KeyDeliver is relayable");
 
@@ -728,11 +972,10 @@ mod tests {
         // wrong people.
         let cases: Vec<(pchat_envelope::Body, Option<(u32, Perm)>)> = vec![
             (
-                pchat_envelope::Body::Reaction(Reaction {
+                pchat_envelope::Body::Pin(Pin {
                     message_id: "m".to_owned(),
                     channel: 4,
-                    emoji: "x".to_owned(),
-                    remove: false,
+                    unpin: false,
                 }),
                 Some((4, Perm::TEXT_MESSAGE)),
             ),
@@ -748,7 +991,7 @@ mod tests {
                     channel: 6,
                     epoch: 1,
                     public_key: vec![1],
-                    holder: 7,
+                    holder_cert: SPEAKER_CERT.to_vec(),
                 }),
                 Some((6, Perm::ENTER)),
             ),
