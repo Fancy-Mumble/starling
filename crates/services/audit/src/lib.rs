@@ -19,6 +19,7 @@ use starling_proto_fancy::audit::{
     Entry, EntryPage, QueryRequest, RecordResult, VerifyRequest, VerifyResult,
 };
 use starling_proto_fancy::fancy::feature::{AuditEnvelope, AuditRecord, Page, audit_envelope};
+use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::log::{Category, LogEvent, Logger};
@@ -222,18 +223,55 @@ impl AuditService {
     /// A page, newest first.
     async fn query(&self, scope: u32, request: &QueryRequest) -> EntryPage {
         use sqlx::Row as _;
-        let limit = request.limit.clamp(1, 500);
-        let rows = sqlx::query(
+        // Not `clamp(1, 500)`: an operator calling `GET /v1/log` without a
+        // limit sends 0, and clamping that up returned a one-row audit log.
+        let limit = starling_proto_fancy::page::page_size(request.limit, 50, 500);
+
+        // Every filter below was already in the contract and **none of them was
+        // applied**: the statement bound `scope` and `since_ms` and nothing
+        // else, so an operator narrowing by category, by target or by time
+        // window got the unfiltered log back and no indication of it. A filter
+        // that is accepted and ignored is worse than one that is refused —
+        // whoever is reading the result believes it.
+        //
+        // A `QueryBuilder` rather than an assembled string: every clause sits
+        // beside the value it binds, so the two cannot fall out of order, and
+        // no operator-supplied text reaches the statement as text.
+        let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
             "SELECT id, at_ms, category, action, actor, target_account, target_channel, \
-                    detail, entry_hash FROM server_audit \
-             WHERE server_id = ? AND at_ms >= ? ORDER BY id DESC LIMIT ?",
-        )
-        .bind(i64::from(scope))
-        .bind(request.since_ms as i64)
-        .bind(i64::from(limit + 1))
-        .fetch_all(self.store.pool())
-        .await
-        .unwrap_or_default();
+                    detail, entry_hash FROM server_audit WHERE server_id = ",
+        );
+        let _ = query.push_bind(i64::from(scope));
+        let _ = query.push(" AND at_ms >= ").push_bind(request.since_ms as i64);
+        if request.until_ms > 0 {
+            let _ = query
+                .push(" AND at_ms <= ")
+                .push_bind(request.until_ms as i64);
+        }
+        if !request.category.is_empty() {
+            let _ = query
+                .push(" AND category = ")
+                .push_bind(request.category.clone());
+        }
+        if request.target_account > 0 {
+            let _ = query
+                .push(" AND target_account = ")
+                .push_bind(request.target_account as i64);
+        }
+        // Keyset pagination: entries are UUIDv7, so "older than this id" stays
+        // a stable position as the log grows underneath the reader.
+        if !request.before.is_empty() {
+            let _ = query.push(" AND id < ").push_bind(request.before.clone());
+        }
+        let _ = query
+            .push(" ORDER BY id DESC LIMIT ")
+            .push_bind(i64::from(limit + 1));
+
+        let rows = query
+            .build()
+            .fetch_all(self.store.pool())
+            .await
+            .unwrap_or_default();
 
         let more = rows.len() > limit as usize;
         let mut entries = Vec::new();
@@ -370,6 +408,7 @@ impl ClientService for AuditService {
         let Some(audit_envelope::Body::Query(query)) = envelope.body else {
             return Actions::new();
         };
+        let cursor = query.page.unwrap_or_default();
         let page = self
             .query(
                 inbound.scope,
@@ -377,7 +416,13 @@ impl ClientService for AuditService {
                     since_ms: query.since_ms,
                     until_ms: query.until_ms,
                     category: query.category,
-                    limit: query.limit,
+                    target_account: query.target_account,
+                    limit: cursor.page_size(50, 200),
+                    // Keyset pagination, so a client pages by handing back the
+                    // id of the oldest entry it holds.
+                    before: Uuid7::parse(&cursor.before_id)
+                        .map(Uuid7::to_vec)
+                        .unwrap_or_default(),
                     ..QueryRequest::default()
                 },
             )
@@ -385,7 +430,17 @@ impl ClientService for AuditService {
 
         let reply = AuditEnvelope {
             body: Some(audit_envelope::Body::Page(Page {
-                more: page.more,
+                page: Some(if page.more {
+                    PageInfo::more_before(
+                        page.entries
+                            .last()
+                            .and_then(|entry| Uuid7::from_slice(&entry.id))
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    PageInfo::complete()
+                }),
                 records: page
                     .entries
                     .into_iter()
@@ -400,6 +455,8 @@ impl ClientService for AuditService {
                         actor: entry.actor_name,
                         detail: entry.detail,
                         entry_hash: hex(&hash),
+                        target_account: entry.target_account,
+                        target_channel: entry.target_channel,
                     })
                     .collect(),
             })),
@@ -501,6 +558,75 @@ mod tests {
             detail: "detail".to_owned(),
             ..Entry::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_filtered_query_actually_filters() {
+        // Every one of these filters was in the contract and none was applied:
+        // the statement bound `scope` and `since_ms` and nothing else. An
+        // operator narrowing the log got the whole log back, looking narrowed.
+        let service = service().await;
+        let _ = service
+            .record(
+                1,
+                Entry {
+                    category: "moderation".to_owned(),
+                    target_account: 7,
+                    ..entry("ban")
+                },
+            )
+            .await;
+        let _ = service
+            .record(
+                1,
+                Entry {
+                    category: "channel".to_owned(),
+                    target_account: 9,
+                    ..entry("create")
+                },
+            )
+            .await;
+
+        let by_category = service
+            .query(
+                1,
+                &QueryRequest {
+                    category: "moderation".to_owned(),
+                    limit: 100,
+                    ..QueryRequest::default()
+                },
+            )
+            .await;
+        assert_eq!(by_category.entries.len(), 1, "the category was ignored");
+        assert_eq!(by_category.entries[0].action, "ban");
+
+        let by_target = service
+            .query(
+                1,
+                &QueryRequest {
+                    target_account: 9,
+                    limit: 100,
+                    ..QueryRequest::default()
+                },
+            )
+            .await;
+        assert_eq!(by_target.entries.len(), 1, "the target was ignored");
+        assert_eq!(by_target.entries[0].target_account, 9);
+
+        // An upper bound in the past matches nothing, which is the case that
+        // proves `until_ms` is bound rather than silently dropped: without it
+        // this returns both entries.
+        let ancient = service
+            .query(
+                1,
+                &QueryRequest {
+                    until_ms: 1,
+                    limit: 100,
+                    ..QueryRequest::default()
+                },
+            )
+            .await;
+        assert!(ancient.entries.is_empty(), "until_ms was ignored");
     }
 
     #[tokio::test]
