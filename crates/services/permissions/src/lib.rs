@@ -861,7 +861,29 @@ impl PermissionsService {
         let granted = self
             .effective(inbound.scope, &subject, query.channel_id)
             .await;
-        if !Self::permits(granted, Perm::WRITE.bits()) {
+        // `here` *or* the root, exactly as `on_acl_write` next door decides it.
+        // Write at the root administers the whole tree in murmur, so an operator
+        // who can save a table must be able to read it back — and checking only
+        // `here` made saving self-locking: the editor wrote a set it was then
+        // refused sight of. It also papers over a real race while it lasts —
+        // `follow_tree` learns a new channel's parent asynchronously, and until
+        // that arrives the ancestor walk finds nothing and returns the seed set,
+        // which is why the refusal was intermittent rather than constant.
+        let at_root = self.effective(inbound.scope, &subject, 0).await;
+        if !Self::permits(granted, Perm::WRITE.bits())
+            && !Self::permits(at_root, Perm::WRITE.bits())
+        {
+            // Said out loud, as the write path next door already does. A client
+            // reading an ACL waits for an `ACL` and skips anything else, so a
+            // silent refusal here is indistinguishable from the server never
+            // answering — the editor simply hangs, and nothing anywhere names
+            // the permission that was missing.
+            tracing::info!(
+                session = inbound.session,
+                channel = query.channel_id,
+                granted,
+                "acl read refused: no Write on the channel"
+            );
             return vec![permission_denied(inbound, Perm::WRITE, query.channel_id)];
         }
 
