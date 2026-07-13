@@ -8,8 +8,7 @@
 //! symptom being a limit that depends on which service restarted last. This
 //! module re-exports it so the name still reads as this service's own.
 
-use std::collections::HashMap;
-
+use starling_proto_fancy::fancy::domain::{Setting, setting::Kind};
 use starling_proto_fancy::serverconfig::Snapshot;
 
 pub use starling_runtime::settings::defaults;
@@ -65,79 +64,242 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
     }
 }
 
-/// The readable settings, and the names of the ones withheld.
+/// The readable settings, with the schema a client renders them from.
 ///
-/// Secrets are named but not shown. Saying nothing at all would leave a client
-/// unable to tell "no password set" from "password withheld", and the two mean
-/// very different things to whoever is looking at the screen.
+/// Schema and value live in one table on purpose. They used to be two — a map
+/// of values and a separate list of withheld names — and two lists keyed by the
+/// same strings drift: a secret added to one and not the other is a password
+/// printed on a settings screen.
+///
+/// Secrets are named but never valued. Saying nothing at all would leave a
+/// client unable to tell "no password set" from "password withheld", and the
+/// two mean very different things to whoever is looking at the screen.
 #[must_use]
-pub fn redact(snapshot: &Snapshot) -> (HashMap<String, String>, Vec<String>) {
-    let mut values = HashMap::from([
-        ("welcome_text".to_owned(), snapshot.welcome_text.clone()),
-        ("max_users".to_owned(), snapshot.max_users.to_string()),
-        (
-            "max_bandwidth".to_owned(),
-            snapshot.max_bandwidth.to_string(),
-        ),
-        (
-            "text_message_length".to_owned(),
-            snapshot.text_message_length.to_string(),
-        ),
-        (
-            "image_message_length".to_owned(),
-            snapshot.image_message_length.to_string(),
-        ),
-        ("allow_html".to_owned(), snapshot.allow_html.to_string()),
-        (
-            "allow_recording".to_owned(),
-            snapshot.allow_recording.to_string(),
-        ),
-        (
-            "broadcast_listener_volume_adjustments".to_owned(),
-            snapshot.broadcast_listener_volume_adjustments.to_string(),
-        ),
-        (
-            "channel_nesting_limit".to_owned(),
-            snapshot.channel_nesting_limit.to_string(),
-        ),
-        (
-            "message_limit".to_owned(),
-            snapshot.message_limit.to_string(),
-        ),
-        (
-            "message_burst".to_owned(),
-            snapshot.message_burst.to_string(),
-        ),
-        (
-            "cert_required".to_owned(),
-            snapshot.cert_required.to_string(),
-        ),
-        ("allow_ping".to_owned(), snapshot.allow_ping.to_string()),
-        ("registry_name".to_owned(), snapshot.registry_name.clone()),
-        ("registry_url".to_owned(), snapshot.registry_url.clone()),
-        (
-            "registry_hostname".to_owned(),
-            snapshot.registry_hostname.clone(),
-        ),
-        (
-            "registry_location".to_owned(),
-            snapshot.registry_location.clone(),
-        ),
-    ]);
-    values.extend(
-        snapshot
-            .extra
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-    // Named but not shown. The registry password proves to the public list that
-    // a later update is the same server as the first, so it is exactly as much
-    // a secret as the server password is.
-    (
-        values,
-        vec!["password".to_owned(), "registry_password".to_owned()],
-    )
+pub fn redact(snapshot: &Snapshot) -> Vec<Setting> {
+    let mut settings: Vec<Setting> = SCHEMA
+        .iter()
+        .map(|row| Setting {
+            key: row.key.to_owned(),
+            kind: row.kind as i32,
+            group: row.group.to_owned(),
+            label: row.label.to_owned(),
+            // The one place secrecy is enforced, rather than at each call site.
+            value: if row.secret {
+                String::new()
+            } else {
+                (row.read)(snapshot)
+            },
+            options: Vec::new(),
+            secret: row.secret,
+            help: row.help.to_owned(),
+        })
+        .collect();
+
+    // Keys a service added without a proto change (`Snapshot.extra`). They have
+    // no schema, so they are offered as plain strings under their own heading
+    // rather than dropped — an operator can still read and set them, and the
+    // absence of a label is visible instead of silent.
+    settings.extend(snapshot.extra.iter().map(|(key, value)| Setting {
+        key: key.clone(),
+        kind: Kind::String as i32,
+        group: "Other".to_owned(),
+        label: key.clone(),
+        value: value.clone(),
+        options: Vec::new(),
+        secret: false,
+        help: String::new(),
+    }));
+    settings
 }
+
+/// One row of the settings schema: what a field is, and how to read it.
+struct Row {
+    key: &'static str,
+    kind: Kind,
+    group: &'static str,
+    label: &'static str,
+    help: &'static str,
+    /// Never sent outward with a value, and only ever received.
+    secret: bool,
+    /// How to project it out of a snapshot. A function rather than a second
+    /// table, so a row cannot describe one setting and read another.
+    read: fn(&Snapshot) -> String,
+}
+
+/// Every operator-editable setting, in the order a form should show them.
+const SCHEMA: &[Row] = &[
+    Row {
+        key: "welcome_text",
+        kind: Kind::Text,
+        group: "General",
+        label: "Welcome text",
+        help: "Shown to each user once, on connect.",
+        secret: false,
+        read: |s| s.welcome_text.clone(),
+    },
+    Row {
+        key: "password",
+        kind: Kind::String,
+        group: "General",
+        label: "Server password",
+        help: "Required to connect. Empty means the server is open.",
+        secret: true,
+        read: |_| String::new(),
+    },
+    Row {
+        key: "max_users",
+        kind: Kind::Int,
+        group: "General",
+        label: "Maximum users",
+        help: "Connections beyond this are rejected as full.",
+        secret: false,
+        read: |s| s.max_users.to_string(),
+    },
+    Row {
+        key: "max_bandwidth",
+        kind: Kind::Int,
+        group: "Audio",
+        label: "Maximum bandwidth",
+        help: "Bits per second per speaking user.",
+        secret: false,
+        read: |s| s.max_bandwidth.to_string(),
+    },
+    Row {
+        key: "allow_recording",
+        kind: Kind::Bool,
+        group: "Audio",
+        label: "Allow recording",
+        help: "Whether clients may record, and announce that they are.",
+        secret: false,
+        read: |s| s.allow_recording.to_string(),
+    },
+    Row {
+        key: "broadcast_listener_volume_adjustments",
+        kind: Kind::Bool,
+        group: "Audio",
+        label: "Broadcast listener volumes",
+        help: "Tell everyone when a user changes a per-channel volume.",
+        secret: false,
+        read: |s| s.broadcast_listener_volume_adjustments.to_string(),
+    },
+    Row {
+        key: "text_message_length",
+        kind: Kind::Int,
+        group: "Messages",
+        label: "Maximum message length",
+        help: "Characters, measured after markup is stripped.",
+        secret: false,
+        read: |s| s.text_message_length.to_string(),
+    },
+    Row {
+        key: "image_message_length",
+        kind: Kind::Int,
+        group: "Messages",
+        label: "Maximum image length",
+        help: "Bytes, for a message that is an image rather than text.",
+        secret: false,
+        read: |s| s.image_message_length.to_string(),
+    },
+    Row {
+        key: "allow_html",
+        kind: Kind::Bool,
+        group: "Messages",
+        label: "Allow HTML",
+        help: "Whether messages may carry markup.",
+        secret: false,
+        read: |s| s.allow_html.to_string(),
+    },
+    Row {
+        key: "channel_nesting_limit",
+        kind: Kind::Int,
+        group: "Channels",
+        label: "Channel nesting limit",
+        help: "How deep the channel tree may go.",
+        secret: false,
+        read: |s| s.channel_nesting_limit.to_string(),
+    },
+    Row {
+        key: "message_limit",
+        kind: Kind::Int,
+        group: "Rate limits",
+        label: "Messages per second",
+        help: "Sustained rate before a client is throttled.",
+        secret: false,
+        read: |s| s.message_limit.to_string(),
+    },
+    Row {
+        key: "message_burst",
+        kind: Kind::Int,
+        group: "Rate limits",
+        label: "Message burst",
+        help: "How many may arrive at once before the rate applies.",
+        secret: false,
+        read: |s| s.message_burst.to_string(),
+    },
+    Row {
+        key: "cert_required",
+        kind: Kind::Bool,
+        group: "Access",
+        label: "Require a certificate",
+        help: "Refuse connections from users without one.",
+        secret: false,
+        read: |s| s.cert_required.to_string(),
+    },
+    Row {
+        key: "allow_ping",
+        kind: Kind::Bool,
+        group: "Public listing",
+        label: "Answer server-browser pings",
+        help: "Also gates public-list registration: a listing nobody can measure is a dead entry.",
+        secret: false,
+        read: |s| s.allow_ping.to_string(),
+    },
+    Row {
+        key: "registry_name",
+        kind: Kind::String,
+        group: "Public listing",
+        label: "Listed name",
+        help: "How the server appears in the public list.",
+        secret: false,
+        read: |s| s.registry_name.clone(),
+    },
+    Row {
+        key: "registry_url",
+        kind: Kind::String,
+        group: "Public listing",
+        label: "Website",
+        help: "The page a listing links to. Registration refuses to run without one.",
+        secret: false,
+        read: |s| s.registry_url.clone(),
+    },
+    Row {
+        key: "registry_hostname",
+        kind: Kind::String,
+        group: "Public listing",
+        label: "Hostname",
+        help: "The address the public list should reach this server at.",
+        secret: false,
+        read: |s| s.registry_hostname.clone(),
+    },
+    Row {
+        key: "registry_location",
+        kind: Kind::String,
+        group: "Public listing",
+        label: "Location",
+        help: "ISO country code, shown beside the listing.",
+        secret: false,
+        read: |s| s.registry_location.clone(),
+    },
+    Row {
+        key: "registry_password",
+        kind: Kind::String,
+        group: "Public listing",
+        label: "Listing secret",
+        help: "Proves to the public list that a later update is this same server.",
+        secret: true,
+        read: |_| String::new(),
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -185,12 +347,48 @@ mod tests {
         // very different things to whoever is looking at the screen.
         let mut snapshot = defaults(1);
         snapshot.registry_password = "hunter2".to_owned();
-        let (values, withheld) = redact(&snapshot);
-        assert!(withheld.contains(&"registry_password".to_owned()));
+        let settings = redact(&snapshot);
+        let listed = settings
+            .iter()
+            .find(|s| s.key == "registry_password")
+            .expect("named even though it is withheld");
+        assert!(listed.secret);
         assert!(
-            !values.values().any(|value| value.contains("hunter2")),
+            !settings.iter().any(|s| s.value.contains("hunter2")),
             "the registry password must not appear in a readable field"
         );
+    }
+
+    #[test]
+    fn every_setting_carries_enough_schema_to_render_itself() {
+        // The point of the change: a client builds the form from this and
+        // nothing else, so a row without a label or a group is a field that
+        // shows up blank or in the wrong section — and one whose kind defaults
+        // to STRING renders a checkbox as a text box.
+        for setting in redact(&defaults(1)) {
+            assert!(!setting.key.is_empty());
+            assert!(!setting.label.is_empty(), "{} has no label", setting.key);
+            assert!(!setting.group.is_empty(), "{} has no group", setting.key);
+            assert!(!setting.help.is_empty(), "{} has no help", setting.key);
+        }
+    }
+
+    #[test]
+    fn a_setting_with_no_schema_is_offered_rather_than_dropped() {
+        // `Snapshot.extra` exists so a service can add an operator-facing knob
+        // without a proto release. Dropping those from the form would make the
+        // mechanism useless the moment anyone used it.
+        let mut snapshot = defaults(1);
+        let _ = snapshot
+            .extra
+            .insert("some_new_knob".to_owned(), "7".to_owned());
+        let settings = redact(&snapshot);
+        let extra = settings
+            .iter()
+            .find(|s| s.key == "some_new_knob")
+            .expect("an unschema'd key is still offered");
+        assert_eq!(extra.value, "7");
+        assert!(!extra.secret, "an unknown key must not be treated as secret");
     }
 
     #[test]

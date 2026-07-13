@@ -194,11 +194,10 @@ impl ClientService for ServerConfigService {
         match envelope.body {
             Some(server_config_envelope::Body::Query(_)) => {
                 let snapshot = self.snapshot(inbound.scope).await;
-                let (values, redacted) = redact(&snapshot);
                 let reply = ServerConfigEnvelope {
                     body: Some(server_config_envelope::Body::Values(ConfigValues {
-                        values,
-                        redacted,
+                        settings: redact(&snapshot),
+                        version: snapshot.version,
                     })),
                 };
                 vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
@@ -319,8 +318,16 @@ mod tests {
         // make a chat window a credential store.
         let mut snapshot = defaults(1);
         snapshot.password = "hunter2".to_owned();
-        let (values, redacted) = redact(&snapshot);
-        assert!(!values.values().any(|value| value.contains("hunter2")));
-        assert!(redacted.contains(&"password".to_owned()));
+        let settings = redact(&snapshot);
+        assert!(
+            !settings.iter().any(|s| s.value.contains("hunter2")),
+            "no readable field may carry the password"
+        );
+        let password = settings
+            .iter()
+            .find(|s| s.key == "password")
+            .expect("the password is named even though it is withheld");
+        assert!(password.secret, "it must say it is withheld");
+        assert!(password.value.is_empty());
     }
 }
