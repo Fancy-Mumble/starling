@@ -20,6 +20,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::files::{FilesEnvelope, Grant, Refused, files_envelope};
+use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::files::files_server::{Files, FilesServer};
 use starling_proto_fancy::files::{ObjectInfo, SignRequest, SignedUrl, StatRequest, sign_request};
 use starling_proto_fancy::types::ServiceKind;
@@ -182,7 +183,11 @@ impl ClientService for FilesService {
                     FilesEnvelope {
                         body: Some(files_envelope::Body::Refused(Refused {
                             request_id: upload.request_id,
-                            reason: format!("the limit is {} bytes", self.max_upload),
+                            refusal: Some(Refusal {
+                                kind: refusal::Kind::Limit as i32,
+                                detail: format!("the limit is {} bytes", self.max_upload),
+                                retry_after_ms: 0,
+                            }),
                         })),
                     }
                 } else {

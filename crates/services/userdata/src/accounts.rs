@@ -359,7 +359,7 @@ impl Accounts {
 
     /// A page of accounts, ordered by id.
     pub fn list(&self, scope: u32, prefix: &str, limit: u32, after: u64) -> AccountPage {
-        let limit = limit.clamp(1, 500) as usize;
+        let limit = starling_proto_fancy::page::page_size(limit, 50, 500) as usize;
         let mut accounts: Vec<Account> = self
             .cache
             .lock()

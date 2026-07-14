@@ -10,8 +10,16 @@
 //! **whether this user already answered it**. A client that cannot tell "never
 //! answered" from "not told yet" has to guess, and the only safe guess is to
 //! ask again — which is how an onboarded user gets the questionnaire on every
-//! single connect. `FancyOnboardingResponseDeliver` exists to answer that, and
-//! is sent even when there is nothing stored, because silence is the ambiguity.
+//! single connect. A `Response` is sent back even when there is nothing stored
+//! (carrying `submitted_at_ms == 0`), because silence is the ambiguity.
+//!
+//! # What an answer does
+//!
+//! Each `Step.Choice` names the channels it reveals and the ACL groups it joins
+//! the user to. That is the feature: the questionnaire is a way of asking which
+//! grants somebody wants, not a survey. Applying those grants is
+//! `PROTOCOL-REDESIGN.md` M2b's remaining half — the wire carries them now, and
+//! nothing here acts on them yet.
 //!
 //! # What answers are keyed on
 //!
@@ -25,9 +33,8 @@
 use std::sync::Arc;
 
 use prost::Message as _;
-use starling_proto::proto::tcp::{
-    FancyOnboardingConfig, FancyOnboardingResponse, FancyOnboardingResponseDeliver,
-    OnboardingEnvelope, onboarding_envelope,
+use starling_proto_fancy::fancy::feature::{
+    Flow, OnboardingEnvelope, Response, onboarding_envelope,
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
@@ -59,23 +66,39 @@ const VIEW_GATE: &str = "onboarding_roster_warm";
 /// submits a questionnaire in one message stamped with the config revision it
 /// was answering, and that revision is what decides whether to ask again —
 /// splitting it into rows would lose the thing the decision is made on.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
-    "0002_onboarding_epoch1",
-    &[
-        "CREATE TABLE IF NOT EXISTS onboarding_config (\
-             server_id BIGINT PRIMARY KEY, config BLOB NOT NULL, at_ms BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS onboarding_answers (\
-             server_id BIGINT NOT NULL, account_id BIGINT NOT NULL, \
-             response BLOB NOT NULL, at_ms BIGINT NOT NULL, \
-             PRIMARY KEY (server_id, account_id))",
-    ],
-)];
+const SCHEMA: &[Migration<'static>] = &[
+    Migration::new(
+        "0002_onboarding_epoch1",
+        &[
+            "CREATE TABLE IF NOT EXISTS onboarding_config (\
+                 server_id BIGINT PRIMARY KEY, config BLOB NOT NULL, at_ms BIGINT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS onboarding_answers (\
+                 server_id BIGINT NOT NULL, account_id BIGINT NOT NULL, \
+                 response BLOB NOT NULL, at_ms BIGINT NOT NULL, \
+                 PRIMARY KEY (server_id, account_id))",
+        ],
+    ),
+    // Both blob columns held the epoch-0 `FancyOnboardingConfig` /
+    // `FancyOnboardingResponse` from the dead proto2 envelope block; they now
+    // hold the canon `Flow` and `Response`, whose field numbers mean different
+    // things. Emptied rather than converted: the two shapes disagree on nearly
+    // every field, so a "migration" would be guesswork, and a row that decodes
+    // into the wrong questionnaire is worse than an operator re-entering one.
+    // Answers are re-asked because the flow they answered no longer exists.
+    Migration::new(
+        "0003_onboarding_canon_encoding",
+        &[
+            "DELETE FROM onboarding_config",
+            "DELETE FROM onboarding_answers",
+        ],
+    ),
+];
 
 /// The service.
 #[derive(Debug)]
 pub struct OnboardingService {
     store: Store,
-    config: RwLock<Option<FancyOnboardingConfig>>,
+    config: RwLock<Option<Flow>>,
     roster: Arc<Roster>,
     permit: Permit,
     fanout: Fanout,
@@ -93,7 +116,7 @@ impl OnboardingService {
     }
 
     /// The configured flow, reading through to the database on first use.
-    async fn config(&self, scope: u32) -> Option<FancyOnboardingConfig> {
+    async fn config(&self, scope: u32) -> Option<Flow> {
         if let Some(cached) = self.config.read().await.clone() {
             return Some(cached);
         }
@@ -104,7 +127,7 @@ impl OnboardingService {
             .await
             .ok()??;
         let bytes: Vec<u8> = row.try_get("config").ok()?;
-        let config = FancyOnboardingConfig::decode(bytes.as_slice()).ok()?;
+        let config = Flow::decode(bytes.as_slice()).ok()?;
         *self.config.write().await = Some(config.clone());
         Some(config)
     }
@@ -115,18 +138,11 @@ impl OnboardingService {
     /// that a restart cannot reset it: answers are compared against it, and a
     /// revision that went backwards would make already-answered look newer
     /// than the flow it answered.
-    async fn store_config(
-        &self,
-        scope: u32,
-        mut config: FancyOnboardingConfig,
-    ) -> FancyOnboardingConfig {
-        let previous = self
-            .config(scope)
-            .await
-            .and_then(|c| c.revision)
-            .unwrap_or(0);
-        config.revision = Some(previous + 1);
-        config.updated_at = Some(now_ms());
+    async fn store_config(&self, scope: u32, mut config: Flow, by: &str) -> Flow {
+        let previous = self.config(scope).await.map_or(0, |c| c.version);
+        config.version = previous + 1;
+        config.updated_at_ms = now_ms();
+        config.updated_by = by.to_owned();
 
         let _ = sqlx::query(
             "INSERT INTO onboarding_config (server_id, config, at_ms) VALUES (?, ?, ?) \
@@ -143,7 +159,7 @@ impl OnboardingService {
     }
 
     /// This account's stored answers, if there are any.
-    async fn answers(&self, scope: u32, account: u64) -> Option<FancyOnboardingResponse> {
+    async fn answers(&self, scope: u32, account: u64) -> Option<Response> {
         use sqlx::Row as _;
         let row = sqlx::query(
             "SELECT response FROM onboarding_answers WHERE server_id = ? AND account_id = ?",
@@ -154,11 +170,11 @@ impl OnboardingService {
         .await
         .ok()??;
         let bytes: Vec<u8> = row.try_get("response").ok()?;
-        FancyOnboardingResponse::decode(bytes.as_slice()).ok()
+        Response::decode(bytes.as_slice()).ok()
     }
 
     /// Record this account's answers, replacing whatever they said before.
-    async fn record(&self, scope: u32, account: u64, response: &FancyOnboardingResponse) {
+    async fn record(&self, scope: u32, account: u64, response: &Response) {
         let _ = sqlx::query(
             "INSERT INTO onboarding_answers (server_id, account_id, response, at_ms) \
                  VALUES (?, ?, ?, ?) \
@@ -184,11 +200,15 @@ impl OnboardingService {
             // is nothing on record, which is the honest answer.
             None => None,
         };
+        // A default `Response` carries `submitted_at_ms == 0`, which is how the
+        // canon says "nothing stored" — distinct from a stored response whose
+        // answers happen to be empty, and the distinction a client needs to
+        // decide whether to ask.
         vec![to_conn(
             inbound.conn,
             Self::outer(),
-            Self::envelope(onboarding_envelope::Body::ResponseDeliver(
-                FancyOnboardingResponseDeliver { response: stored },
+            Self::envelope(onboarding_envelope::Body::Response(
+                stored.unwrap_or_default(),
             )),
         )]
     }
@@ -213,7 +233,7 @@ impl ClientService for OnboardingService {
         };
 
         match envelope.body {
-            Some(onboarding_envelope::Body::ConfigUpdate(update)) => {
+            Some(onboarding_envelope::Body::Update(update)) => {
                 // Editing the flow is server-wide, so it takes Write on the
                 // root channel. Denied on any failure, including the
                 // permissions service being unreachable.
@@ -228,14 +248,22 @@ impl ClientService for OnboardingService {
                     );
                     return Actions::new();
                 }
-                let Some(config) = update.config else {
+                let Some(config) = update.flow else {
                     return Actions::new();
                 };
-                let stored = self.store_config(inbound.scope, config).await;
+                // The editor's account, not their session: a session id is
+                // reused by somebody else after they disconnect, so recording
+                // one would eventually attribute the edit to a stranger.
+                let by = self
+                    .roster
+                    .account_of(inbound.session)
+                    .map(|account| account.to_string())
+                    .unwrap_or_default();
+                let stored = self.store_config(inbound.scope, config, &by).await;
                 tracing::info!(
                     session = inbound.session,
-                    revision = stored.revision,
-                    questions = stored.questions.len(),
+                    version = stored.version,
+                    steps = stored.steps.len(),
                     "onboarding flow updated"
                 );
                 // Everyone gets the new flow, the editor included: they are as
@@ -244,7 +272,7 @@ impl ClientService for OnboardingService {
                 vec![broadcast_except(
                     0,
                     Self::outer(),
-                    Self::envelope(onboarding_envelope::Body::Config(stored)),
+                    Self::envelope(onboarding_envelope::Body::Flow(stored)),
                 )]
             }
             Some(onboarding_envelope::Body::Response(mut response)) => {
@@ -258,29 +286,37 @@ impl ClientService for OnboardingService {
                     );
                     return Actions::new();
                 };
-                response.user_hash = None;
-                response.submitted_at = Some(now_ms());
+                // Stamped by the server, both of them. The client chooses its
+                // answers and nothing else: a submission claiming to have been
+                // made against a flow version it was not is how an edited
+                // questionnaire looks already-answered.
+                response.submitted_at_ms = now_ms();
+                response.flow_version = self.config(inbound.scope).await.map_or(0, |c| c.version);
                 self.record(inbound.scope, account, &response).await;
-                // Echo it back as the delivery: the client now knows its own
-                // answers are on record, from the same message it would have
-                // had to ask for.
+                // Echo it back: the client now knows its own answers are on
+                // record, from the same message it would have had to ask for.
                 vec![to_conn(
                     inbound.conn,
                     Self::outer(),
-                    Self::envelope(onboarding_envelope::Body::ResponseDeliver(
-                        FancyOnboardingResponseDeliver {
-                            response: Some(response),
-                        },
-                    )),
+                    Self::envelope(onboarding_envelope::Body::Response(response)),
                 )]
             }
-            Some(onboarding_envelope::Body::ResponseQuery(_)) => {
-                self.deliver_answers(&inbound).await
+            Some(onboarding_envelope::Body::Query(query)) => {
+                let mut actions = Actions::new();
+                if let Some(flow) = self.config(inbound.scope).await {
+                    actions.push(to_conn(
+                        inbound.conn,
+                        Self::outer(),
+                        Self::envelope(onboarding_envelope::Body::Flow(flow)),
+                    ));
+                }
+                if query.include_answers {
+                    actions.extend(self.deliver_answers(&inbound).await);
+                }
+                actions
             }
             // Server -> client only; a client sending one is ignored.
-            Some(onboarding_envelope::Body::Config(_))
-            | Some(onboarding_envelope::Body::ResponseDeliver(_))
-            | None => Actions::new(),
+            Some(onboarding_envelope::Body::Flow(_)) | None => Actions::new(),
         }
     }
 }
@@ -316,6 +352,7 @@ impl Serve for OnboardingService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_proto_fancy::fancy::feature::{Step, step};
 
     async fn service() -> Arc<OnboardingService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
@@ -351,14 +388,14 @@ mod tests {
         // The bug this replaced keyed answers on the session id, so a reconnect
         // looked like somebody who had never answered.
         let service = service().await;
-        let response = FancyOnboardingResponse {
-            config_revision: Some(3),
-            ..FancyOnboardingResponse::default()
+        let response = Response {
+            flow_version: 3,
+            ..Response::default()
         };
         service.record(1, 7, &response).await;
 
         let read_back = service.answers(1, 7).await.expect("answers on record");
-        assert_eq!(read_back.config_revision, Some(3));
+        assert_eq!(read_back.flow_version, 3);
     }
 
     #[tokio::test]
@@ -370,17 +407,14 @@ mod tests {
                 .record(
                     1,
                     7,
-                    &FancyOnboardingResponse {
-                        config_revision: Some(revision),
-                        ..FancyOnboardingResponse::default()
+                    &Response {
+                        flow_version: revision,
+                        ..Response::default()
                     },
                 )
                 .await;
         }
-        assert_eq!(
-            service.answers(1, 7).await.and_then(|r| r.config_revision),
-            Some(2)
-        );
+        assert_eq!(service.answers(1, 7).await.map(|r| r.flow_version), Some(2));
     }
 
     #[tokio::test]
@@ -390,9 +424,9 @@ mod tests {
             .record(
                 1,
                 7,
-                &FancyOnboardingResponse {
-                    config_revision: Some(9),
-                    ..FancyOnboardingResponse::default()
+                &Response {
+                    flow_version: 9,
+                    ..Response::default()
                 },
             )
             .await;
@@ -404,26 +438,65 @@ mod tests {
         // Answers are compared against this number, so a revision that went
         // backwards would make an old answer look like it answered the future.
         let service = service().await;
-        let first = service
-            .store_config(1, FancyOnboardingConfig::default())
-            .await;
-        let second = service
-            .store_config(1, FancyOnboardingConfig::default())
-            .await;
-        assert_eq!(first.revision, Some(1));
-        assert_eq!(second.revision, Some(2));
+        let first = service.store_config(1, Flow::default(), "7").await;
+        let second = service.store_config(1, Flow::default(), "7").await;
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
 
         // A restart drops the cache but not the stored revision.
         *service.config.write().await = None;
-        let third = service
-            .store_config(1, FancyOnboardingConfig::default())
-            .await;
-        assert_eq!(third.revision, Some(3));
+        let third = service.store_config(1, Flow::default(), "7").await;
+        assert_eq!(third.version, 3);
     }
 
     #[tokio::test]
     async fn a_server_with_no_flow_has_nothing_to_serve() {
         let service = service().await;
         assert!(service.config(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn what_an_answer_grants_survives_being_stored() {
+        // The reason this service moved off the epoch-0 envelope. An answer is
+        // a request for channel visibility and group membership; the shape it
+        // used to be stored in could carry a label and nothing else, so a
+        // questionnaire that round-tripped intact still granted nothing.
+        let service = service().await;
+        let flow = Flow {
+            flow_id: "welcome".to_owned(),
+            steps: vec![Step {
+                id: "interests".to_owned(),
+                title: "What are you here for?".to_owned(),
+                kind: step::Kind::Choice as i32,
+                multi_select: true,
+                choices: vec![step::Choice {
+                    id: "dev".to_owned(),
+                    label: "Development".to_owned(),
+                    channels: vec![7, 9],
+                    groups: vec!["developers".to_owned()],
+                    ..step::Choice::default()
+                }],
+                ..Step::default()
+            }],
+            ..Flow::default()
+        };
+        let _ = service.store_config(1, flow, "7").await;
+
+        // Read back through the database, not the cache, or this asserts only
+        // that a clone is a clone.
+        *service.config.write().await = None;
+        let stored = service.config(1).await.expect("the flow is on record");
+        let choice = stored
+            .steps
+            .first()
+            .and_then(|step| step.choices.first())
+            .expect("the choice survived");
+        assert_eq!(choice.channels, vec![7, 9]);
+        assert_eq!(choice.groups, vec!["developers".to_owned()]);
+        assert!(
+            stored.steps[0].multi_select,
+            "a multi-select question that round-trips as single-select silently \
+             discards every answer but one"
+        );
     }
 }

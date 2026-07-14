@@ -18,6 +18,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::fancy::feature::{TextEnvelope, text_envelope};
+use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::perm::Perm;
@@ -141,7 +142,7 @@ impl TextService {
     /// A page, newest first, optionally before a cursor.
     async fn history(&self, scope: u32, channel: u32, limit: u32, before: &[u8]) -> HistoryPage {
         use sqlx::Row as _;
-        let limit = limit.clamp(1, 200);
+        let limit = starling_proto_fancy::page::page_size(limit, 50, 200);
         let sql = if before.is_empty() {
             "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
              WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
@@ -670,34 +671,47 @@ impl TextService {
         let Some(text_envelope::Body::History(request)) = envelope.body else {
             return Actions::new();
         };
-        let before = Uuid7::parse(&request.before_id)
+        let cursor = request.page.unwrap_or_default();
+        let before = Uuid7::parse(&cursor.before_id)
             .map(Uuid7::to_vec)
             .unwrap_or_default();
+        let limit = cursor.page_size(50, 200);
         let page = self
-            .history(inbound.scope, request.channel, request.limit, &before)
+            .history(inbound.scope, request.channel, limit, &before)
             .await;
+        let messages: Vec<_> = page
+            .messages
+            .into_iter()
+            .map(|message| starling_proto_fancy::fancy::feature::StoredMessage {
+                message_id: Uuid7::from_slice(&message.id)
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                channel: message.channel,
+                sender: 0,
+                sender_name: message.sender_name,
+                body: message.body,
+                sent_at_ms: message.sent_at_ms,
+                edited: false,
+            })
+            .collect();
+        // `history` already trimmed to `limit`, so the cursor comes from the
+        // page it returned rather than from an unconsumed extra row.
+        let page_info = if page.more {
+            PageInfo::more_before(
+                messages
+                    .last()
+                    .map(|message| message.message_id.clone())
+                    .unwrap_or_default(),
+            )
+        } else {
+            PageInfo::complete()
+        };
         let reply = TextEnvelope {
             body: Some(text_envelope::Body::Page(
                 starling_proto_fancy::fancy::feature::HistoryPage {
                     channel: request.channel,
-                    more: page.more,
-                    messages: page
-                        .messages
-                        .into_iter()
-                        .map(
-                            |message| starling_proto_fancy::fancy::feature::StoredMessage {
-                                message_id: Uuid7::from_slice(&message.id)
-                                    .map(|id| id.to_string())
-                                    .unwrap_or_default(),
-                                channel: message.channel,
-                                sender: 0,
-                                sender_name: message.sender_name,
-                                body: message.body,
-                                sent_at_ms: message.sent_at_ms,
-                                edited: false,
-                            },
-                        )
-                        .collect(),
+                    page: Some(page_info),
+                    messages,
                 },
             )),
         };
