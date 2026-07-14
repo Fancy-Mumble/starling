@@ -67,6 +67,13 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
     ),
     ("/v1/bans", "get", "List bans", "moderation:read"),
     (
+        "/v1/bans",
+        "post",
+        "Ban by address, certificate hash or name, optionally dropping a session",
+        "moderation:write",
+    ),
+    ("/v1/bans/{id}", "delete", "Lift a ban", "moderation:write"),
+    (
         "/v1/channels",
         "get",
         "The channel tree, unfiltered by any viewer's permissions",
@@ -133,6 +140,30 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "get",
         "Who is connected, and where",
         "session-view:read",
+    ),
+    (
+        "/v1/sessions/{session}",
+        "patch",
+        "Move, mute, deafen, suppress or promote a live session; omitted fields are left alone",
+        "session:write",
+    ),
+    (
+        "/v1/sessions/{session}/kick",
+        "post",
+        "Disconnect a session, with an optional reason",
+        "moderation:write",
+    ),
+    (
+        "/v1/sessions/{session}/permissions",
+        "get",
+        "Effective permissions for a session in a channel; add `permission` to test one bit",
+        "permissions:read",
+    ),
+    (
+        "/v1/log",
+        "get",
+        "The audit log, filtered by window, category or target account",
+        "audit:read",
     ),
     (
         "/v1/events",

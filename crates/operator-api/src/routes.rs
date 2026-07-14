@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use starling_proto_fancy::common::{Actor, Operator, Scope, actor};
@@ -48,7 +48,12 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
             "/v1/accounts/{id}/comment",
             get(get_comment).put(set_comment),
         )
-        .route("/v1/bans", get(list_bans))
+        // `Ban`, `Unban` and `Kick` have existed in `moderation.proto` since the
+        // service did, and nothing outside the service ever called them: an
+        // operator could *list* bans and not make one, so the admin plane could
+        // watch a user misbehave and do nothing about them.
+        .route("/v1/bans", get(list_bans).post(create_ban))
+        .route("/v1/bans/{id}", delete(remove_ban))
         .route("/v1/config", get(get_config).post(set_config))
         // How the server is, collected by the `health` service. The route a
         // dashboard polls; `/healthz` above stays a bare liveness probe.
@@ -74,6 +79,23 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         // external system cannot do by holding a client connection of its own.
         .route("/v1/messages", post(send_message))
         .route("/v1/sessions", get(list_sessions))
+        // Moderating a *connected* user. `PATCH` because these are a partial
+        // update to a live session and every field is optional — omitted means
+        // "leave it alone", which a `PUT` could not express without the caller
+        // having to restate the user's whole state and race whoever else is
+        // changing it.
+        .route("/v1/sessions/{session}", patch(set_session_state))
+        .route("/v1/sessions/{session}/kick", post(kick_session))
+        // murmur's `hasPermission` and `effectivePermissions` in one route: the
+        // first is the second plus a mask test, and serving them separately
+        // would be two ways to ask one question that could disagree.
+        .route(
+            "/v1/sessions/{session}/permissions",
+            get(session_permissions),
+        )
+        // murmur's `getLog`/`getLogLen`. The audit service has answered
+        // `Query` all along; nothing exposed it.
+        .route("/v1/log", get(get_log))
         // What changed, as it changes: one stream a consumer follows instead
         // of polling every route above. Bidirectional, because registering a
         // context-menu entry has to end when the connection servicing it does.
@@ -752,6 +774,430 @@ async fn set_comment(
         &format!("PUT /v1/accounts/{id}/comment"),
     )?;
     write_blob(&api, subject, id, Blob::Comment, body.into_bytes()).await
+}
+
+/// A ban to place, as JSON.
+///
+/// Everything except the reason is optional because murmur's ban table matches
+/// on any of three things — address, certificate hash, or name — and a ban that
+/// named all three would only catch somebody presenting all three.
+#[derive(Debug, Deserialize)]
+struct NewBan {
+    /// Dotted-quad or IPv6 literal. Stored as the bytes murmur stores.
+    #[serde(default)]
+    address: Option<String>,
+    /// How much of `address` to match. Defaults to the whole of it.
+    #[serde(default)]
+    prefix_len: Option<u32>,
+    #[serde(default)]
+    name: String,
+    /// Hex-encoded certificate digest.
+    #[serde(default)]
+    cert_hash: String,
+    #[serde(default)]
+    reason: String,
+    /// Seconds. Absent or 0 is permanent, as it is in murmur's `BanTable`.
+    #[serde(default)]
+    duration_s: u32,
+    /// A connected session to drop as part of the ban.
+    #[serde(default)]
+    session: u32,
+}
+
+impl NewBan {
+    /// The wire form, or why it could not be built.
+    ///
+    /// A ban matching nothing is refused rather than stored: it would sit in the
+    /// list looking like protection and catch nobody.
+    fn resolve(self) -> Result<(starling_proto_fancy::moderation::Ban, u32), String> {
+        let address = match self.address.as_deref().filter(|a| !a.is_empty()) {
+            None => Vec::new(),
+            Some(text) => match text.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => v4.octets().to_vec(),
+                Ok(std::net::IpAddr::V6(v6)) => v6.octets().to_vec(),
+                Err(_) => return Err(format!("{text:?} is not an IP address")),
+            },
+        };
+        let cert_hash = if self.cert_hash.is_empty() {
+            Vec::new()
+        } else {
+            decode_hex(&self.cert_hash).ok_or("cert_hash must be hex")?
+        };
+        if address.is_empty() && cert_hash.is_empty() && self.name.is_empty() {
+            return Err(
+                "a ban needs an address, a cert_hash or a name; one matching nothing catches nobody"
+                    .to_owned(),
+            );
+        }
+        let prefix_len = self
+            .prefix_len
+            .unwrap_or_else(|| u32::try_from(address.len() * 8).unwrap_or(0));
+        Ok((
+            starling_proto_fancy::moderation::Ban {
+                id: 0,
+                address,
+                prefix_len,
+                name: self.name,
+                cert_hash,
+                reason: self.reason,
+                start_ms: 0,
+                duration_s: self.duration_s,
+            },
+            self.session,
+        ))
+    }
+}
+
+/// Hex to bytes, rejecting anything that is not an even run of hex digits.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+async fn create_ban(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Json(ban): Json<NewBan>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::moderation::BanRequest;
+
+    let subject = admit(&api, &headers, "moderation:write", "POST /v1/bans")?;
+    let (ban, session) = ban
+        .resolve()
+        .map_err(|why| refuse(StatusCode::BAD_REQUEST, &why))?;
+    let channel = dial(&api, "moderation")?;
+
+    let result = ModerationClient::new(channel)
+        .ban(BanRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "moderation:write"),
+            ban: Some(ban),
+            session,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    if !result.applied {
+        return Err(refuse(StatusCode::CONFLICT, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_ban(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::moderation::UnbanRequest;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "moderation:write",
+        &format!("DELETE /v1/bans/{id}"),
+    )?;
+    let channel = dial(&api, "moderation")?;
+
+    let result = ModerationClient::new(channel)
+        .unban(UnbanRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "moderation:write"),
+            id,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    if !result.applied {
+        // A ban that is not there is the state the caller asked for, but saying
+        // so is what tells an operator their id was wrong.
+        return Err(refuse(StatusCode::NOT_FOUND, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Why somebody is being removed. Optional: murmur allows a bare kick.
+#[derive(Debug, Default, Deserialize)]
+struct KickReason {
+    #[serde(default)]
+    reason: String,
+}
+
+async fn kick_session(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(session): Path<u32>,
+    body: Option<Json<KickReason>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::moderation::KickRequest;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "moderation:write",
+        &format!("POST /v1/sessions/{session}/kick"),
+    )?;
+    let channel = dial(&api, "moderation")?;
+
+    let result = ModerationClient::new(channel)
+        .kick(KickRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "moderation:write"),
+            session,
+            reason: body.map(|Json(body)| body.reason).unwrap_or_default(),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    if !result.applied {
+        return Err(refuse(StatusCode::NOT_FOUND, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A partial change to a live session. Absent means "leave it alone".
+#[derive(Debug, Deserialize)]
+struct SessionPatch {
+    #[serde(default)]
+    channel: Option<u32>,
+    #[serde(default)]
+    mute: Option<bool>,
+    #[serde(default)]
+    deaf: Option<bool>,
+    #[serde(default)]
+    suppress: Option<bool>,
+    #[serde(default)]
+    priority_speaker: Option<bool>,
+}
+
+/// murmur's `setState`: move, mute, deafen or suppress a connected user.
+///
+/// The gap an operator meets first — an admin plane that can watch somebody
+/// misbehave and do nothing about them. Everything else here reads the server
+/// or changes what is stored; this is the only route that reaches a live
+/// connection.
+async fn set_session_state(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(session): Path<u32>,
+    Json(patch): Json<SessionPatch>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::sessioncontrol::SetStateRequest;
+    use starling_proto_fancy::sessioncontrol::session_control_client::SessionControlClient;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "session:write",
+        &format!("PATCH /v1/sessions/{session}"),
+    )?;
+    let channel = dial(&api, "session-lifecycle")?;
+
+    let result = SessionControlClient::new(channel)
+        .set_state(SetStateRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "session:write"),
+            session,
+            channel: patch.channel,
+            mute: patch.mute,
+            deaf: patch.deaf,
+            suppress: patch.suppress,
+            priority_speaker: patch.priority_speaker,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    if !result.applied {
+        // `NOT_FOUND` when the session is gone, `CONFLICT` when it is there and
+        // the change was refused — the caller's recourse differs: one is retry
+        // with a different session, the other is fix the ACL.
+        let status = if result.refused.starts_with("no session") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::CONFLICT
+        };
+        return Err(refuse(status, &result.refused));
+    }
+    // The *applied* state, which is not always what was asked: deafening also
+    // mutes.
+    Ok(Json(serde_json::json!({
+        "session": session,
+        "channel": result.channel,
+        "mute": result.mute,
+        "deaf": result.deaf,
+        "suppress": result.suppress,
+        "priority_speaker": result.priority_speaker,
+    })))
+}
+
+/// Which channel to evaluate in, and optionally which permission to test.
+#[derive(Debug, Deserialize)]
+struct PermissionQuery {
+    #[serde(default)]
+    channel: u32,
+    /// A single `ChanACL::Perm` bit. Present turns this into `hasPermission`.
+    #[serde(default)]
+    permission: Option<u32>,
+}
+
+/// One live session as `session-view` holds it.
+///
+/// Resolved there and nowhere else: it is the authority on who a session is, and
+/// an admin plane that let a caller assert an identity would be a way to ask
+/// "what could this other user do" and get an answer shaped by the lie.
+async fn live_session(
+    api: &OperatorApi,
+    session: u32,
+) -> Result<starling_proto_fancy::sessionview::Session, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::sessionview::SubscribeRequest;
+    use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
+
+    let channel = api
+        .resolver()
+        .channel("session-view")
+        .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
+    let sessions = SessionViewClient::new(channel)
+        .list(SubscribeRequest {
+            scope: Some(Scope { virtual_server: 1 }),
+            subscriber: "operator-api".to_owned(),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    sessions
+        .sessions
+        .into_iter()
+        .find(|held| held.session == session)
+        .ok_or_else(|| {
+            refuse(
+                StatusCode::NOT_FOUND,
+                &format!("no session {session} is connected"),
+            )
+        })
+}
+
+/// murmur's `effectivePermissions`, and `hasPermission` when `permission` is
+/// given.
+async fn session_permissions(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(session): Path<u32>,
+    Query(query): Query<PermissionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+    use starling_proto_fancy::permissions::{EffectiveRequest, Subject};
+
+    let _ = admit(
+        &api,
+        &headers,
+        "permissions:read",
+        &format!("GET /v1/sessions/{session}/permissions"),
+    )?;
+    let held = live_session(&api, session).await?;
+    let channel = dial(&api, "permissions")?;
+
+    let granted = PermissionsClient::new(channel)
+        .effective(EffectiveRequest {
+            scope: scope(),
+            subject: Some(Subject {
+                session,
+                account: held.account,
+                name: held.name,
+                registered: held.registered,
+                ..Subject::default()
+            }),
+            channel: query.channel,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    let mut answer = serde_json::json!({
+        "session": session,
+        "channel": query.channel,
+        "granted": granted.granted,
+        "groups": granted.groups,
+    });
+    if let Some(permission) = query.permission {
+        // The mask test done here rather than by a second RPC: one evaluation,
+        // so the boolean cannot disagree with the bitset beside it.
+        let allowed = permission != 0 && granted.granted & permission == permission;
+        answer["permission"] = serde_json::json!(permission);
+        answer["allowed"] = serde_json::json!(allowed);
+    }
+    Ok(Json(answer))
+}
+
+/// The window, and how much of it to return.
+#[derive(Debug, Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    since_ms: u64,
+    #[serde(default)]
+    until_ms: u64,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    account: u64,
+    #[serde(default)]
+    limit: u32,
+}
+
+/// murmur's `getLog`, over the audit service's own store.
+///
+/// `getLogLen` has no counterpart on purpose: it exists upstream so a client can
+/// page by offset, and paging by offset over an append-only log re-reads rows
+/// that shifted underneath it. `before` is a cursor, so a caller pages by
+/// passing back the id of the oldest entry it has.
+async fn get_log(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::audit::QueryRequest;
+    use starling_proto_fancy::audit::audit_client::AuditClient;
+
+    let subject = admit(&api, &headers, "audit:read", "GET /v1/log")?;
+    let channel = dial(&api, "audit")?;
+
+    let page = AuditClient::new(channel)
+        .query(QueryRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "audit:read"),
+            since_ms: query.since_ms,
+            until_ms: query.until_ms,
+            category: query.category,
+            target_account: query.account,
+            limit: query.limit,
+            before: Vec::new(),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+
+    let entries: Vec<serde_json::Value> = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "id": hex(&entry.id),
+                "at_ms": entry.at_ms,
+                "category": entry.category,
+                "action": entry.action,
+                "actor_name": entry.actor_name,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::Value::Array(entries)))
 }
 
 async fn list_bans(
