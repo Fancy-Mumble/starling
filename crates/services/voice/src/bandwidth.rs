@@ -79,6 +79,13 @@ impl Bandwidth {
     }
 
     /// Re-size every live bucket, for an operator who changed the cap.
+    #[allow(
+        clippy::iter_over_hash_type,
+        reason = "every bucket is retuned to the same rate independently, so the \
+                  visit order changes nothing observable — and the map is keyed by \
+                  live connection on the audio path, where a BTreeMap's ordering \
+                  would be paid for on every packet and used by nothing"
+    )]
     fn retune(&mut self, budget: u32) {
         let rate = Rate::per_second(f64::from(budget));
         let burst = burst_for(budget);
