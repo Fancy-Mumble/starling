@@ -836,6 +836,32 @@ impl Client {
     /// Both are legitimate answers and a test asserting one has to be able to
     /// see the other — a locked channel that quietly moves nobody and a locked
     /// channel that says so are the same timeout otherwise.
+    /// Ask to enter `channel`, and wait for the server's answer.
+    ///
+    /// The pair is always used together — a bare `UserState` with no answer
+    /// read proves nothing, and reading an answer nobody asked for hangs — so
+    /// they are one call. `why` names the step, because a timeout here is
+    /// otherwise an unattributed ten seconds in a test with several of them.
+    async fn enter(
+        &mut self,
+        session: u32,
+        channel: u32,
+        why: &str,
+    ) -> Result<u32, tcp::PermissionDenied> {
+        self.send(
+            9,
+            &tcp::UserState {
+                session: Some(session),
+                channel_id: Some(channel),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+        timeout(FRAME_TIMEOUT, self.next_entry_answer(session))
+            .await
+            .unwrap_or_else(|_| panic!("{why}"))
+    }
+
     async fn next_entry_answer(&mut self, session: u32) -> Result<u32, tcp::PermissionDenied> {
         loop {
             let (type_id, payload) = self.recv().await;
@@ -1503,6 +1529,68 @@ async fn a_client_can_switch_channels_and_everyone_is_told() {
 }
 
 #[tokio::test]
+async fn an_operator_can_moderate_a_live_session_from_outside() {
+    // murmur's `setState`, which Starling had no equivalent of at all: every
+    // moderation path went through a Mumble client holding a connection, so an
+    // external bot could watch somebody misbehave and do nothing about them.
+    //
+    // Driven over gRPC and asserted on the *socket*, because the two halves fail
+    // separately — a change that lands in the connection table and is never
+    // broadcast leaves every other client rendering the old state, which is the
+    // same class of bug as the missing `actor` above.
+    use starling_proto_fancy::sessioncontrol::SetStateRequest;
+    use starling_proto_fancy::sessioncontrol::session_control_client::SessionControlClient;
+
+    let data_dir = TempDir::new("operator-moderation");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("Naughty Step").await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    let transport = deployment
+        .resolver
+        .channel("session-lifecycle")
+        .expect("session-lifecycle resolves");
+    let applied = SessionControlClient::new(transport)
+        .set_state(SetStateRequest {
+            scope: None,
+            actor: None,
+            session: alice_session,
+            channel: Some(target),
+            // Deafen without muting, to prove the coupling is applied on this
+            // path too: murmur's deafen implies mute, and an operator told only
+            // what they asked for would render a user deaf but not muted.
+            deaf: Some(true),
+            ..SetStateRequest::default()
+        })
+        .await
+        .expect("the operator plane answers")
+        .into_inner();
+
+    assert!(applied.applied, "refused: {}", applied.refused);
+    assert_eq!(applied.channel, target, "the move was not applied");
+    assert!(applied.deaf, "the deafen was not applied");
+    assert!(applied.mute, "deafening must imply muting, as it does in murmur");
+
+    // And everyone is told — the mover included. Asserted from bob as well
+    // because a client builds its user list from these: a moderation action only
+    // the subject hears about leaves everybody else rendering them unmuted and
+    // in the wrong channel.
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let moved = timeout(FRAME_TIMEOUT, client.next_move_of(alice_session))
+            .await
+            .unwrap_or_else(|_| panic!("{who} was never told alice was moved"));
+        assert_eq!(moved.channel_id, Some(target), "{who} saw the wrong channel");
+        assert_eq!(moved.deaf, Some(true), "{who} was not told alice is deaf");
+    }
+
+    deployment.stop();
+}
+
+#[tokio::test]
 async fn a_move_names_who_made_it_and_not_the_server() {
     // Reported as the client logging "You were moved to X by the server." for an
     // ordinary channel click, where murmur produces "You joined X."
@@ -1878,19 +1966,9 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
     let alice_session = handshake(&mut alice, "alice").await;
 
     // Shut, as it is to everybody, before the grant.
-    alice
-        .send(
-            9,
-            &tcp::UserState {
-                session: Some(alice_session),
-                channel_id: Some(target),
-                ..tcp::UserState::default()
-            },
-        )
-        .await;
-    let refusal = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+    let refusal = alice
+        .enter(alice_session, target, "alice was never answered")
         .await
-        .expect("alice was never answered")
         .expect_err("a channel gated on a group must not admit a guest");
     assert_eq!(refusal.permission, Some(Perm::ENTER.bits()));
 
@@ -1898,19 +1976,13 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
         .add_temporary_group(target, "vip", alice_session)
         .await;
 
-    alice
-        .send(
-            9,
-            &tcp::UserState {
-                session: Some(alice_session),
-                channel_id: Some(target),
-                ..tcp::UserState::default()
-            },
+    let admitted = alice
+        .enter(
+            alice_session,
+            target,
+            "alice was never answered after the grant",
         )
         .await;
-    let admitted = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
-        .await
-        .expect("alice was never answered after the grant");
     assert_eq!(
         admitted,
         Ok(target),
@@ -1926,32 +1998,16 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
             .await
             .applied
     );
-    alice
-        .send(
-            9,
-            &tcp::UserState {
-                session: Some(alice_session),
-                channel_id: Some(0),
-                ..tcp::UserState::default()
-            },
+    let _ = alice
+        .enter(alice_session, 0, "alice was never moved back to the root")
+        .await;
+    let after_revoke = alice
+        .enter(
+            alice_session,
+            target,
+            "alice was never answered after the revocation",
         )
         .await;
-    let _ = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
-        .await
-        .expect("alice was never moved back to the root");
-    alice
-        .send(
-            9,
-            &tcp::UserState {
-                session: Some(alice_session),
-                channel_id: Some(target),
-                ..tcp::UserState::default()
-            },
-        )
-        .await;
-    let after_revoke = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
-        .await
-        .expect("alice was never answered after the revocation");
     assert!(
         after_revoke.is_err(),
         "a revoked membership must stop admitting"
@@ -1961,18 +2017,9 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
     // was granted nothing.
     let mut bob = Client::connect(deployment.port).await;
     let bob_session = handshake(&mut bob, "bob").await;
-    bob.send(
-        9,
-        &tcp::UserState {
-            session: Some(bob_session),
-            channel_id: Some(target),
-            ..tcp::UserState::default()
-        },
-    )
-    .await;
-    let refusal = timeout(FRAME_TIMEOUT, bob.next_entry_answer(bob_session))
+    let refusal = bob
+        .enter(bob_session, target, "bob was never answered")
         .await
-        .expect("bob was never answered")
         .expect_err("the grant must not admit anybody else");
     assert_eq!(refusal.channel_id, Some(target));
 
