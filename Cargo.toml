@@ -117,8 +117,9 @@ rustls-pemfile = "2"
 # this dials nothing and verifies no peer, so a trust store is dead weight.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"
-# : WebTransport requires the client and server to agree on datagram
-# support, and h3-quinn does not implement the extension without it.
+# The `datagram` feature is not optional for us: WebTransport requires the
+# client and server to agree on datagram support, and h3-quinn does not
+# implement the extension without it.
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 rcgen = "0.14.8"
@@ -140,7 +141,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 uuid = { version = "1", features = ["v7"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1.1.3+spec-1.1.0"
+toml = "1.1"
 # Control-stream compression (PROTOCOL-REDESIGN.md §5, S3), declared here
 # before it had a user and now wired into the gateway.
 zstd = "0.13"
@@ -156,17 +157,13 @@ sha2 = "0.11"
 rand = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
-jsonwebtoken = "11"
-base64 = "0.23"
 
 # -- diagnostics ------------------------------------------------------------
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-arc-swap = "1"
 bitflags = "2.13"
 async-trait = "0.1"
-socket2 = "0.6"
 
 # -- Workspace-wide lints ---------------------------------------------------
 # Mirrors the FancyMumble client and mumble-plugin-host workspaces so crates
