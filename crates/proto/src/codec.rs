@@ -34,8 +34,8 @@ pub const MAX_PAYLOAD_SIZE: u32 = 8 * 1024 * 1024;
 /// Encode a message into a framed buffer ready for the wire.
 ///
 /// Returns `Bytes` rather than `Vec<u8>` so the server can encode a broadcast
-/// once and hand a cheap clone to every recipient — see the fan-out rules in
-/// `PORTING-PLAN.md` §2.3.
+/// once and hand a cheap clone to every recipient. See the fan-out rules in
+/// `docs/ARCHITECTURE.md` §5.
 #[must_use]
 pub fn encode(msg: &ControlMessage) -> Bytes {
     let payload = serialize(msg);

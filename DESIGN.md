@@ -68,22 +68,25 @@ Named so reviewers recognise them, and so new code reaches for the same shapes.
 
 | Pattern | Where | Why |
 |---|---|---|
-| **Command** | `Command` enum into `ServerCore` | Serialises all state mutation onto one owner; makes the actor's inbox explicit |
-| **Strategy** | `Permissions`, `CertificateSource`, `ConfigSource` | Swap policy without touching callers |
-| **Registry / Chain of Responsibility** | `Dispatcher` → `Handler` | Adding a message type is registration, not an edit |
-| **Repository** | `ChannelStore`, `UserRegistry` | An SQL implementation replaces the in-memory one, handlers unchanged |
-| **Facade** | `ServerState` | One assembly point for the stores, so handlers take what they need |
-| **Builder** | `Effects` | Ordered, append-only effect lists that read declaratively |
+| **Command** | `ServerAction` back over `Attach` | A service says what it wants done without holding the socket it happens on |
+| **Strategy** | `Permissions`, `CertificateSource`, `SecurityPolicy` | Swap policy without touching callers |
+| **Adapter** | `Plane<S>` around `ClientService` | A service writes `async fn frame(..)`; the gRPC surface is generated around it |
+| **Repository** | `ChannelStore` | A persistent implementation replaces the in-memory one, handlers unchanged |
+| **Facade** | `Roster` | One place to ask who is connected, so no service keeps its own copy |
+| **Builder** | `Actions` | Ordered, append-only action lists that read declaratively |
 | **Null Object** | `AllowAll` | A working permission policy before the real evaluator exists |
-| **Observer** | `Recipients` fan-out | Broadcast without the producer knowing its subscribers |
+| **Observer** | `Fanout` | Broadcast without the producer knowing its subscribers |
 
 ## 4. Effects, not side effects
 
-Handlers are **pure**: `fn(…, &mut State) -> Effects`. They never touch a socket,
-never `await`, never log-and-return-nothing. The core applies the effects.
+A service handler answers `Actions`: it never touches a socket, never writes to
+one directly, never logs-and-returns-nothing. The gateway applies what comes
+back.
 
-This is why the handler tests need no runtime, no socket and no database, and it
-is the single biggest testability gain over the C++ server.
+This is why a service's tests need no socket and no gateway, and it is the
+single biggest testability gain over the C++ server. The handler is still
+`async` because it may have to ask another service something first, which is
+the one way this differs from the pure `fn(..) -> Effects` originally planned.
 
 ## 5. Testing
 
@@ -177,4 +180,4 @@ rather than `expect`: which lints fire depends on how upstream wrapped its
 else's edit. Still narrow the list to the measured minimum rather than a guessed
 one. Everywhere else, the rule above applies in full.
 
-Current suppressions in this workspace: see the list in `PORTING-PLAN.md` §9.
+Current suppressions in this workspace: see the list in `PORTING-PLAN.md` §10.

@@ -18,7 +18,7 @@
 //! Each `Step.Choice` names the channels it reveals and the ACL groups it joins
 //! the user to. That is the feature: the questionnaire is a way of asking which
 //! grants somebody wants, not a survey. Applying those grants is
-//! `PROTOCOL-REDESIGN.md` M2b's remaining half — the wire carries them now, and
+//! `PROTOCOL-MIGRATION.md` M2b's remaining half — the wire carries them now, and
 //! nothing here acts on them yet.
 //!
 //! # What answers are keyed on

@@ -187,7 +187,7 @@ pub struct PendingConnection {
 /// What a connection accepts, as it announced in its `Hello`.
 ///
 /// Recorded rather than acted on: the three features these gate are not built
-/// (`PROTOCOL-REDESIGN.md` M5). The gate exists first so that each lands behind
+/// (`PROTOCOL-MIGRATION.md` M5). The gate exists first so that each lands behind
 /// a flag that is already true or false per connection, instead of arriving
 /// with its own ad-hoc way of asking — which is how one of them ends up sent to
 /// a peer that never agreed to it.

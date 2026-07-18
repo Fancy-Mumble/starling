@@ -3,8 +3,8 @@
 //!
 //! Every other test in the workspace exercises one crate. This is the only
 //! place that proves the composition in `compose::all_in_one` actually wires
-//! a client through the real handshake (`docs/PORTING-PLAN.md` §2.5,
-//! `crates/services/session-lifecycle/src/handshake.rs`) end to end, over a
+//! a client through the real handshake
+//! (`crates/services/session-lifecycle/src/handshake.rs`) end to end, over a
 //! real TCP+TLS socket rather than an in-memory `Inbound`.
 //!
 //! TLS verification is disabled on the client, matching how every Mumble
@@ -906,7 +906,7 @@ impl Client {
 
 /// Drive one client through the full handshake and return its session id.
 ///
-/// Order asserted here is `PORTING-PLAN.md` §2.5's murmur-derived contract:
+/// Order asserted here is `PORTING-PLAN.md` §4's murmur-derived contract:
 /// server `Version` first, then `CryptSetup`/`CodecVersion`/`ChannelState`/
 /// `UserState` in any relative order but all before `ServerSync`, then
 /// `ServerConfig` immediately, then `SuggestConfig`.

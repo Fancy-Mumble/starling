@@ -134,7 +134,7 @@ python3 scripts/check-proto-hygiene.py # ...and none of them breaks its rules
 The two protobuf checks answer different questions, and the second exists
 because the first cannot see its own blind spot: a diff between the trees
 catches one that fell behind, but not a rule all three break the same way.
-Both such rules did — see `docs/PROTOCOL-REDESIGN.md` §9 M6.
+Both such rules did, see `docs/PROTOCOL-MIGRATION.md` M6.
 
 Lint configuration is deliberately mirrored from `vendor/client` and
 `vendor/server/3rdparty/mumble-plugin-host`; keep the three in sync.

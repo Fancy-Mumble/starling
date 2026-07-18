@@ -144,9 +144,8 @@ durable record of the control plane, never a read path for it.
 ### D1 — The database is write-behind, never in a request path
 
 The core is a single actor; a synchronous query inside it stalls every session.
-Writes leave as `Effect::Persist(DbOp)` (the shape `PORTING-PLAN.md` §2.5
-already anticipates, and the one `Effect::Log` already proved), and a writer task
-batches them into one transaction per tick.
+Writes leave as `Effect::Persist(DbOp)`, the shape `Effect::Log` already
+proved, and a writer task batches them into one transaction per tick.
 
 Consequences, stated plainly:
 

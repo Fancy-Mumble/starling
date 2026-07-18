@@ -16,7 +16,7 @@ package starling.fancy.wire.v1;
 // Keyset pagination over a UUIDv7-ordered store. Used by every fetch that
 // pages history: pchat Fetch, text HistoryRequest, audit Query, files
 // ListRequest all carry this trio by hand today and adopt Cursor at the M2
-// rewrite (docs/PROTOCOL-REDESIGN.md §9).
+// rewrite (docs/PROTOCOL-MIGRATION.md).
 //
 // Keyset, not offset: an offset shifts under concurrent inserts and rescans
 // rows the store already paged past. UUIDv7 ids are time-ordered, so `before`

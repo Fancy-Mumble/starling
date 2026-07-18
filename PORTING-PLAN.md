@@ -66,28 +66,14 @@ worth doing *now* rather than in a year:
 
 ### 2.1 Workspace layout
 
-```
-vendor/starling/
-  Cargo.toml                     workspace + shared lints (mirrors client house style)
-  rust-toolchain.toml            pinned 1.95.0, same as mumble-plugin-host
-  crates/
-    starling-proto/              wire only: prost types, TCP framing, message ids,
-                                 version encoding, UDP audio framing
-    starling-model/              pure logic, zero I/O: channel tree, users, groups,
-                                 ACL evaluation, permission cache, bans
-    starling-crypto/             server-side OCB2 CryptState, cert handling,
-                                 PBKDF2 + legacy password hashes, TOTP
-    starling-db/                 sqlx store: murmur-compatible schema + migrations
-    starling-server/             the server: core actor, handlers, fan-out,
-                                 voice routing, TLS listener, connection tasks
-    starling-plugins/            adapter from the core to mumble-plugin-host
-    starling-rpc/                admin API (the Ice replacement, §6)
-    starling/                    binary: .ini config, CLI, supervision, logging
-```
+**Superseded.** This section planned eight crates named `starling-model`,
+`starling-db`, `starling-server`, `starling-plugins` and `starling-rpc`. None of
+them was ever built: the tree went to a gateway plus independent services
+instead, and the layout that actually exists is `docs/ARCHITECTURE.md` §7.
 
-MVP ships `starling-proto`, `starling-model`, `starling-server`, `starling`.
-The other four are introduced at the phase that first needs them, so the tree
-never carries an empty crate.
+The plan is kept for the one thing it still records, which is that the split was
+chosen up front to keep pure logic away from I/O. That survived the rework; the
+crate names did not.
 
 ### 2.2 Sharing the wire layer with the client
 
@@ -102,8 +88,12 @@ The `.proto` files are the contract and they already exist twice
 | Split a `mumble-wire` crate out of the client and git-dep it from both | **Later.** Correct end state, but it is a refactor of a shipping client — not a prerequisite. |
 | **Copy the `.proto` into `starling-proto`, generate independently, CI-enforce byte-identity** | **Yes, for now.** |
 
-The `.proto` is copied from `vendor/server/src/` (the upstream source of truth),
-and `scripts/check-proto-drift.sh` asserts all three copies are byte-identical.
+The `.proto` is copied from `vendor/server/src/` and `scripts/check-proto-drift.sh`
+asserts all three copies are byte-identical. Note what `vendor/server` is not:
+it is the Fancy fork, not upstream Mumble, and an earlier version of this
+sentence called it "the upstream source of truth". Believing that is how the
+field-numbering drift in `docs/PROTOCOL-COMPATIBILITY.md` §1 went unnoticed.
+`scripts/check-proto-compat.py` is the check that actually looks at upstream.
 Duplicating a *generated* artifact is cheap; duplicating the *contract* is what
 must be prevented, and the drift check does exactly that.
 
@@ -112,49 +102,17 @@ client's implementation, not copy-pasted — the server's needs differ (it decod
 what the client encodes and vice versa, and it must be hostile-input-hardened in
 a way a client never is).
 
-### 2.3 Concurrency model — the one decision that matters
+### 2.3 Concurrency model
 
-The C++ server is a Qt event loop plus a coarse `QReadWriteLock qrwlUsers` /
-`qrwlVoiceThread` pair. A literal translation gives `Arc<RwLock<ServerState>>`
-threaded through every handler: same contention, plus Rust's inability to
-re-enter a lock turns murmur's re-entrant call graph into deadlocks.
+**Superseded.** This section specified a single `ServerCore` actor fed by an
+`mpsc<Command>`, handlers shaped `fn(&mut ServerState, ..) -> Effects`, and an
+`ArcSwap<RoutingTable>` for the voice path. None of `ServerCore`, `Command`,
+`ServerState` or `Effects` exists in the tree.
 
-**Starling instead uses a single authoritative state actor with lock-free voice.**
-
-```
-   TCP conn 1 ──read task──┐                        ┌── write task ── socket
-   TCP conn 2 ──read task──┤                        ├── write task ── socket
-   TCP conn N ──read task──┤                        └── write task ── socket
-                           │                             ▲
-                           ▼                             │ Bytes (pre-encoded,
-                    ┌──────────────┐                     │        cloned N×)
-                    │  ServerCore  │─────────────────────┘
-                    │   (1 task)   │
-                    │ owns: channel│  publishes ──► ArcSwap<RoutingTable>
-                    │ tree, users, │                       │
-                    │ ACL cache    │                       ▼
-                    └──────────────┘              UDP socket task(s)
-                                                  (never blocks on the core)
-```
-
-Rules:
-
-- **`ServerCore` serialises every mutation** and is driven by a single
-  `mpsc<Command>`. No locks, no `Arc<Mutex<…>>` in the hot path, no lock ordering
-  to get wrong. Handlers become `fn(&mut ServerState, …) -> Effects`, which makes
-  them **directly unit-testable without a socket** — something murmur cannot do
-  today and the single biggest testability win of the port.
-- **Fan-out encodes once.** The core produces one `Bytes`, clones the handle per
-  recipient, and pushes into each connection's bounded `mpsc`. This is the same
-  idea as murmur's `QByteArray &cache` parameter, made structural.
-- **Voice never queues behind control.** The core publishes an immutable
-  `RoutingTable` (channel → sessions, listeners, whisper targets, mute/deaf bits)
-  into an `ArcSwap` on every state change. The UDP path reads it lock-free and
-  forwards without ever touching the core. A slow ACL recompute cannot stutter
-  audio.
-- **Backpressure is explicit.** A connection whose outbound queue is full is
-  disconnected, not blocked on — that is murmur's behaviour too, but here it is a
-  visible policy rather than an emergent one.
+Two of its conclusions did survive into `docs/ARCHITECTURE.md`, which is where
+they are now written down: fan-out encodes once and clones a handle per
+recipient, and a connection whose outbound queue is full is disconnected rather
+than blocked on. The rest was replaced by the gateway (§1, §5 there).
 
 ### 2.4 Security: compatible by default, modern by negotiation
 
@@ -197,29 +155,9 @@ negotiation can be tested without standing up either cipher.
 
 ### 2.5 Handler shape
 
-As built (`crates/services/state/src/dispatch/handler.rs`):
-
-```rust
-pub trait Handler: std::fmt::Debug + Send + Sync {
-    fn handles(&self) -> TcpMessageType;
-    fn access(&self) -> Access { Access::Authenticated }
-    fn handle(&self, state: &mut ServerState, conn: ConnId, msg: ControlMessage)
-        -> Effects;
-}
-```
-
-`Effects` is a list of `Send { to, msg }` / `Disconnect { conn, reason }` /
-`Log(LogEvent)`. `ServerCore` applies them. This keeps every handler pure w.r.t.
-I/O and gives us per-handler tests with no socket, runtime or database.
-
-`Persist` and `Audit` effects are **planned, not built**, waiting on the
-persistence layer and the audit feature respectively.
-
-**Planned change: `&mut ServerState` becomes `&mut dyn Authority`.** The concrete
-struct on this boundary is a design defect: handler
-implementations use 11 of its 23 methods, while `remove_connection`,
-`channels_mut` and `add_connection` stay in reach of every handler, including
-`Ping`.
+**Superseded**, along with §2.3. There is no `Handler` trait and no
+`Effects` type; a service receives its own gRPC calls and answers with
+`ServerAction`. See `docs/ARCHITECTURE.md` §5.
 
 ---
 
@@ -425,13 +363,7 @@ Two properties make it safe on a server, and both are tested:
 Handlers emit records as `Effect::Log`, so they stay pure and a test can assert
 on what was logged without installing a sink.
 
-## 9. Lint suppressions
-
-Moved to §11, and rewritten: the set changed when the tree was rearranged around
-`docs/ARCHITECTURE.md`.
-
-
-## 10. Status
+## 9. Status
 
 The tree now implements `docs/ARCHITECTURE.md`: a gateway in front, nineteen
 independent gRPC services behind it, and media planes that bypass the gateway.
@@ -480,7 +412,7 @@ The in-process microkernel is gone: no bus, no lanes, no envelopes, no
   the packet codecs and the peer table are all present and tested; the UDP loop
   logs datagrams rather than routing them.
 
-## 11. Lint suppressions
+## 10. Lint suppressions
 
 Per `DESIGN.md` §10, every `#[allow]`/`#[expect]` in the workspace is listed
 here.
