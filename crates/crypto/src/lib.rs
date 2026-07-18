@@ -41,11 +41,9 @@
 //!
 //! # Status
 //!
-//! Phase 0 negotiates and records the suite, and enforces the TLS floor. The
-//! voice ciphers are *specified* here (wire ids, key and nonce sizes, ordering)
-//! but not yet implemented — there is no UDP path until Phase 1, and a cipher
-//! implementation with nothing to encrypt would be untested code guarding the
-//! most security-sensitive part of the server.
+//! Both suites are negotiated, recorded and implemented: [`ocb2`] for the
+//! legacy branch, [`modern`] and [`voice`] for the Fancy one, with the TLS
+//! floor enforced either way.
 
 mod cipher;
 pub mod identity;

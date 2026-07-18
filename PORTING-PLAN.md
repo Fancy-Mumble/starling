@@ -58,7 +58,7 @@ worth doing *now* rather than in a year:
 
 4. **The WebRTC SFU is already an out-of-process/dlopen'd component**
    (`3rdparty/webrtc-sfu`, loaded as `libwebrtc_sfu.so`). Its ABI is unchanged by
-   the port; it is out of scope until Phase 6.
+   the port; it is out of scope until the RPC surface lands.
 
 ---
 
@@ -190,11 +190,10 @@ even Starling's most permissive floor beats murmur's; and `ChaCha20-Poly1305` is
 already in the Fancy client's dependency graph (persistent chat), so the upgrade
 adds no new cryptographic code to review.
 
-Phase 0 negotiates, records and logs the suite, and enforces the TLS floor. The
-voice ciphers are *specified* (wire ids, key/nonce/tag sizes, ordering) but
-implemented in Phase 1 — there is no UDP path yet, and a cipher implementation
-with nothing to encrypt would be untested code guarding the most
-security-sensitive part of the server.
+Both suites are now negotiated, recorded, logged and implemented, with the TLS
+floor enforced either way. The specifications (wire ids, key/nonce/tag sizes,
+ordering) stay separate from the implementations in `crates/crypto`, so the
+negotiation can be tested without standing up either cipher.
 
 ### 2.5 Handler shape
 
@@ -213,8 +212,8 @@ pub trait Handler: std::fmt::Debug + Send + Sync {
 `Log(LogEvent)`. `ServerCore` applies them. This keeps every handler pure w.r.t.
 I/O and gives us per-handler tests with no socket, runtime or database.
 
-`Persist` and `Audit` effects are **planned, not built** — Phase 2 and the audit
-feature respectively.
+`Persist` and `Audit` effects are **planned, not built**, waiting on the
+persistence layer and the audit feature respectively.
 
 **Planned change: `&mut ServerState` becomes `&mut dyn Authority`.** The concrete
 struct on this boundary is a design defect: handler
@@ -265,12 +264,15 @@ Three additional hard requirements this plan commits to:
 
 ---
 
-## 4. Phases
+## 4. The order of work
 
-Each phase ends with a green subset of the real e2e suite. No phase is "done"
-because code exists; it is done when the shipped client passes.
+Each block below ends with a green subset of the real e2e suite. Nothing is
+"done" because code exists; it is done when the shipped client passes. They are
+listed roughly in dependency order rather than numbered, because the numbering
+outlived its accuracy: voice and persistence were built concurrently, and the
+last three overlap to this day.
 
-### Phase 0 — MVP (this commit)
+### MVP
 **Goal:** the smallest server the real client will complete a session against.
 
 - TLS listener; self-signed cert auto-generated on first boot (`rcgen`).
@@ -292,14 +294,14 @@ round-trip) passes against Starling.
 **Explicitly out:** UDP voice, database, ACL evaluation, registration, bans, and
 every Fancy message.
 
-### Phase 1 — Voice
+### Voice
 UDP socket + OCB2 `CryptState`, legacy and protobuf UDP framing, `UDPTunnel`
 fallback, the `ArcSwap<RoutingTable>` routing snapshot, whisper/`VoiceTarget`,
 channel listeners with volume adjustment, per-user bandwidth limiting,
 `UserStats`.
 **Exit:** `voice-state*`, `voice-state-sync`, `audio.resample`.
 
-### Phase 2 — Persistence and authority
+### Persistence and authority
 `starling-db` (sqlx, SQLite first), murmur schema + migration chain, registered
 users, `authenticate()` incl. certificate hash + PBKDF2 + legacy hashes, TOTP,
 bans, channel/ACL/group persistence, textures and comments with blob hashing.
@@ -309,14 +311,14 @@ Full ACL evaluation and permission cache — the 24-bit `ChanACL::Perm` set
 **Exit:** `admin-create-role`, `hidden-channels`, `channels`,
 `registered-name-impersonation`, `root-channel-visibility`, `channelviewer`.
 
-### Phase 3 — Plugin host
+### Plugin host
 Link `mumble-plugin-host` directly (no FFI). Port `PluginHostManager` (797 lines)
 and `ServerEventDistributor` (533 lines) to the `Effects` model. `PluginMessage`,
 `PluginRegistry`, plugin admin list/enable/install/uninstall,
 `PluginDataTransmission`.
 **Exit:** `fileserver`, `forums`, `calendar*`, `link-preview`, `audit-log`.
 
-### Phase 4 — Persistent chat
+### Persistent chat
 `PersistentChatManager` + `PchatProtocolHandlers` + the 8 pchat DB tables. Note
 the server is a *relay and store* for pchat — the E2E crypto lives in the client
 (`mumble-protocol/src/persistent/`), so this phase is storage, fan-out, offline
@@ -324,12 +326,12 @@ queues, key-holder bookkeeping and rate limiting, **not** cryptography.
 **Exit:** `pchat*`, `signal-pchat`, `reactions`, `friend-chat*`,
 `scheduled-messages`, `meetings`.
 
-### Phase 5 — Remaining Fancy surface
+### The remaining Fancy surface
 Push notifications + FCM, read receipts, typing indicators, watch sync, draw
 strokes, onboarding, polls, server/account settings, audit config/query.
 **Exit:** `fancy-control-plane`, `server-compatibility`, remaining specs.
 
-### Phase 6 — SFU and RPC
+### SFU and RPC
 WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 `str0m` only after parity. Ship `starling-rpc` (§6) and the channelviewer shim.
 
@@ -339,9 +341,9 @@ WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
-| R1 | **Ice has no viable Rust implementation.** `MumbleServerIce.cpp` is 2 568 lines and `vendor/channelviewer` consumes it (`getDefaultConf`). | **High** | Do not port. Replace per §6 and ship a shim. Needs explicit sign-off before Phase 2 — this is the one deliberate compatibility break. |
+| R1 | **Ice has no viable Rust implementation.** `MumbleServerIce.cpp` is 2 568 lines and `vendor/channelviewer` consumes it (`getDefaultConf`). | **High** | Do not port. Replace per §6 and ship a shim. Needs explicit sign-off before any of it is persisted; this is the one deliberate compatibility break. |
 | R2 | Schema drift between Starling's migrations and murmur's. | High | Starling reads murmur's existing schema; migrations are additive only. CI runs a murmur-written DB through Starling and asserts data equality. |
-| R3 | Hostile input. A client library trusts the peer; a server cannot. The ported framing must survive fuzzing. | High | `cargo-fuzz` target on the frame decoder from Phase 0. `MAX_PAYLOAD_SIZE` and per-field limits enforced before allocation. |
+| R3 | Hostile input. A client library trusts the peer; a server cannot. The ported framing must survive fuzzing. | High | `cargo-fuzz` target on the frame decoder from the first commit. `MAX_PAYLOAD_SIZE` and per-field limits enforced before allocation. |
 | R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners — `Messages.cpp:775` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
 | R5 | The `messagelimit`/`messageburst` leaky bucket **silently drops** messages (see `fixtures/mumble-server.ini`). Getting this subtly wrong breaks WebRTC signalling in ways that look like client bugs. | Medium | Port the token bucket first (`TokenBucketRateLimiter.cpp` is already isolated), unit-test it against the C++ behaviour, and log drops at `debug` rather than dropping silently. |
 | R6 | Two servers to maintain during the transition. | Medium | Phases are gated on the *same* e2e suite, so both stay honest. Fixture picks the implementation via one env var. |
@@ -349,7 +351,7 @@ WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 | R9 | **Audio bypassing the gateway is an assumption, not a measurement.** The design rests on voice binding its own UDP socket on the same port as the gateway's TCP socket, in a different process. murmur binds them separately (`Server.cpp:125` vs `:193`) so it should hold — but it has never been tried across process boundaries, and legacy clients cannot be redirected if it fails. | **High** | Prove two processes can hold TCP:64738 and UDP:64738 on every target OS before anything else is built. If it fails, voice becomes a gateway sidecar and the deployment story changes. |
 | R11 | **A restarted service has cold caches and no way to say so.** Voice holds ciphers and membership; audio arriving before it re-subscribes is dropped silently. This is the failure mode with no log line. | **High** | `/readyz` gates on cache warm-up and is distinct from `/healthz`. An e2e test restarts voice mid-call and asserts audio resumes without loss beyond the drain window. |
 | R10 | A blocking `call()` can **deadlock** on a cycle (A calls B, B calls A); `send` could not. No rule or mechanism exists. | Medium | Decide the rule before `call()` ships — either a documented acyclic port order or a depth/timeout guard. §4.2 B1. |
-| R7 | Plugin host was built against the C++ FFI contract; removing `ffi.rs` may surface assumptions baked into `context.rs`. | Low | Phase 3 starts by running the existing host test suite against a Rust-native `HostFacade` impl before wiring any real server state. |
+| R7 | Plugin host was built against the C++ FFI contract; removing `ffi.rs` may surface assumptions baked into `context.rs`. | Low | The plugin host work starts by running the existing host test suite against a Rust-native `HostFacade` impl before wiring any real server state. |
 
 ---
 
@@ -433,22 +435,22 @@ Moved to §11, and rewritten: the set changed when the tree was rearranged aroun
 
 The tree now implements `docs/ARCHITECTURE.md`: a gateway in front, nineteen
 independent gRPC services behind it, and media planes that bypass the gateway.
-The phase list below is kept because it is still the honest description of *what
-works*, which is not the same question as *how it is arranged*.
+The list below tracks *what works*, which is not the same question as *how it is
+arranged*.
 
-- [x] Phase 0 — MVP: handshake, channel tree, text fan-out, ping, disconnect
-- [x] Phase 1 — Voice: its own UDP socket, cipher minting per peer, routing core
-- [x] Phase 2 — Persistence and authority: per-service schemas, accounts,
-      authentication, ACL evaluation with inheritance and deny-over-allow
-- [~] Phase 3 — Plugin host: the service, the opaque relay and the namespaced
-      key/value capability exist; linking `mumble-plugin-host` itself does not
-- [x] Phase 4 — Persistent chat: relay and store, UUIDv7-keyed, retention swept
-- [~] Phase 5 — Remaining Fancy surface: push, audit, onboarding, social,
-      link-preview and context-actions each have their service and envelope;
-      several answer a subset of their envelope's messages
-- [~] Phase 6 — SFU and RPC: `operator-api` ships (REST + OpenAPI, pluggable
-      auth, fail-closed audit); the SFU is signalling-only and the channelviewer
-      Ice shim is not written
+- [x] MVP: handshake, channel tree, text fan-out, ping, disconnect
+- [x] Voice: its own UDP socket, cipher minting per peer, routing core
+- [x] Persistence and authority: per-service schemas, accounts, authentication,
+      ACL evaluation with inheritance and deny-over-allow
+- [~] Plugin host: the service, the opaque relay and the namespaced key/value
+      capability exist; linking `mumble-plugin-host` itself does not
+- [x] Persistent chat: relay and store, UUIDv7-keyed, retention swept
+- [~] The remaining Fancy surface: push, audit, onboarding, social, link-preview
+      and context-actions each have their service and envelope; several answer a
+      subset of their envelope's messages
+- [~] SFU and RPC: `operator-api` ships (REST + OpenAPI, pluggable auth,
+      fail-closed audit); the SFU is signalling-only and the channelviewer Ice
+      shim is not written
 
 ### What the architecture rework changed
 

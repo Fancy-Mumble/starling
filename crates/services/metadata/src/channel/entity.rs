@@ -10,8 +10,10 @@ pub struct Channel {
     /// The parent channel, or `None` for the root.
     ///
     /// The Fancy fork also has *detached* channels (out-of-tree, e.g. friend
-    /// chats) which are parentless without being the root. Those arrive in
-    /// Phase 4; until then `None` means "root".
+    /// chats) which are parentless without being the root. Nothing here
+    /// creates one yet, so `None` currently means "root" and callers may treat
+    /// it that way; when detached channels land, every such caller is a site
+    /// that has to learn the difference.
     pub parent: Option<ChannelId>,
     /// Display name.
     pub name: String,

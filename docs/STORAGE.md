@@ -1,4 +1,4 @@
-# Storage design (Phase 2)
+# Storage design
 
 Decisions taken: **greenfield schema plus a migration tool**, SQLite + PostgreSQL
 + MySQL, multi-tenant retained, the event log stays behind `LogSink`, and

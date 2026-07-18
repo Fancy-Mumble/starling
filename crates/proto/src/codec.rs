@@ -24,9 +24,11 @@ pub const HEADER_SIZE: usize = 6;
 ///
 /// Matches the client's limit. `imagemessagelength` in the e2e fixture is 10 MiB
 /// of *image data*, which arrives base64-embedded in HTML and so can legitimately
-/// exceed 8 MiB — Phase 2 raises this to the configured
-/// `max(textmessagelength, imagemessagelength)` once config is wired into the
-/// connection. Until then the MVP does not accept image messages anyway.
+/// exceed 8 MiB. Making the bound the configured
+/// `max(textmessagelength, imagemessagelength)` needs config wired through to
+/// the connection, which it is not; a fixed bound is the conservative half of
+/// that, since it can only refuse a message the configuration would have
+/// allowed, never accept one it would have refused.
 pub const MAX_PAYLOAD_SIZE: u32 = 8 * 1024 * 1024;
 
 /// Encode a message into a framed buffer ready for the wire.

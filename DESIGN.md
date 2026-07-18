@@ -40,9 +40,8 @@ Concretely:
 * Permission checks go through `Permissions`, never through an ACL table.
 * The binary composes the concrete types; nothing below it names them.
 
-The payoff is concrete, not theoretical: Phase 2 swaps in a database-backed
-store and Phase 6 swaps in a different RPC surface, both without touching a
-handler.
+The payoff is concrete, not theoretical: a database-backed store and a
+different RPC surface each swap in without touching a handler.
 
 ## 2. Traits at boundaries
 
@@ -58,9 +57,9 @@ fn handle(users: &Users, …)
 ```
 
 Use `&dyn Trait` for runtime-swapped collaborators and `impl Trait` /
-generics for hot paths where dispatch cost matters (the voice path, from
-Phase 1). Do not introduce a trait with exactly one implementation and no test
-double — that is ceremony, not design.
+generics for hot paths where dispatch cost matters (the voice path). Do not
+introduce a trait with exactly one implementation and no test double: that is
+ceremony, not design.
 
 ## 3. Patterns in use
 
@@ -72,7 +71,7 @@ Named so reviewers recognise them, and so new code reaches for the same shapes.
 | **Command** | `Command` enum into `ServerCore` | Serialises all state mutation onto one owner; makes the actor's inbox explicit |
 | **Strategy** | `Permissions`, `CertificateSource`, `ConfigSource` | Swap policy without touching callers |
 | **Registry / Chain of Responsibility** | `Dispatcher` → `Handler` | Adding a message type is registration, not an edit |
-| **Repository** | `ChannelStore`, `UserRegistry` | Phase 2 replaces in-memory with SQL, handlers unchanged |
+| **Repository** | `ChannelStore`, `UserRegistry` | An SQL implementation replaces the in-memory one, handlers unchanged |
 | **Facade** | `ServerState` | One assembly point for the stores, so handlers take what they need |
 | **Builder** | `Effects` | Ordered, append-only effect lists that read declaratively |
 | **Null Object** | `AllowAll` | A working permission policy before the real evaluator exists |

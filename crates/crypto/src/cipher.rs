@@ -1,9 +1,10 @@
 //! Voice cipher specifications.
 //!
-//! These describe *what* a cipher is on the wire — its identifier, key and nonce
-//! sizes, and whether it is still considered sound. The encryption itself lands
-//! in Phase 1 with the UDP path; specifying the parameters now is what lets the
-//! negotiation in [`super::policy`] be written and tested today.
+//! These describe *what* a cipher is on the wire: its identifier, key and nonce
+//! sizes, and whether it is still considered sound. The encryption itself lives
+//! in [`super::ocb2`] and [`super::modern`]. Keeping the parameters separate
+//! from the implementations is what lets the negotiation in [`super::policy`]
+//! be tested without standing up either cipher.
 
 /// How much confidence a cipher deserves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

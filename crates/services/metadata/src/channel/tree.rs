@@ -7,9 +7,9 @@ use crate::ids::{ChannelId, ROOT_CHANNEL};
 
 /// The channel tree, held entirely in memory.
 ///
-/// The Phase 0 implementation of [`ChannelStore`]; Phase 2 adds a SQL-backed
-/// sibling. All [`ChannelStore`] invariants are enforced here rather than by
-/// callers.
+/// The only implementation of [`ChannelStore`] so far; durability comes from
+/// the service snapshotting this tree rather than from a SQL-backed sibling.
+/// All [`ChannelStore`] invariants are enforced here rather than by callers.
 #[derive(Debug)]
 pub struct ChannelTree {
     channels: HashMap<ChannelId, Channel>,
@@ -112,7 +112,8 @@ mod tests {
 
     /// The [`ChannelStore`] contract, asserted against any implementation.
     ///
-    /// Phase 2's SQL-backed store runs this same function.
+    /// Takes `&mut dyn ChannelStore` rather than a generic so a second store
+    /// runs this exact function, not a copy of it that can drift.
     fn assert_store_contract(store: &mut dyn ChannelStore) {
         // 1. The root exists and cannot be removed.
         assert!(store.contains(ROOT_CHANNEL));
