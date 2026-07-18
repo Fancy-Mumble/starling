@@ -461,7 +461,7 @@ learns the door is open by walking through it.
 |---|---|---|
 | S1 | Zeroconf/Bonjour advertisement | `Zeroconf.cpp` |
 | S2 | The screen-share SFU — no `str0m` dependency exists; `screenshare` is signalling only | Fancy fork |
-| S3 | `zstd` on the Fancy control stream — a workspace dependency no source file uses | Fancy fork |
+| ~~S3~~ | ~~`zstd` on the Fancy control stream~~ **Done.** The gateway batches queued frames and compresses the batch, under outer type 1900, only for a peer that announced `zstd` in its `Hello` | Fancy fork |
 | S4 | A session store that outlives a gateway pod. The resume ring is in-process, so RESUME cannot cross one | `ARCHITECTURE.md` §5 |
 | S5 | Sharding. Every shard key in `scaling.puml` is a design decision; nothing is sharded | |
 | S6 | Ice. Replaced by `operator-api`, which covers accounts, the ban list, config and the SuperUser password — not the whole Ice surface, which `FANCY-PARITY.md` §2 enumerates | `MumbleServerIce.cpp` |
