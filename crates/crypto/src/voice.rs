@@ -22,7 +22,7 @@
 //! | | |
 //! |---|---|
 //! | security | a 16-byte random salt per session and direction, so no birthday bound to reason about and no cross-session reuse |
-//! | speed | `HChaCha20` runs **once per session**, not once per packet — per packet this is plain ChaCha20-Poly1305 |
+//! | speed | `HChaCha20` runs **once per session**, not once per packet, per packet this is plain ChaCha20-Poly1305 |
 //! | size | only a truncated counter goes on the wire, not 24 bytes of nonce |
 //!
 //! # What travels
@@ -39,7 +39,7 @@
 //! # What is deliberately not done
 //!
 //! The counter never wraps. [`PacketCounter::issue`] fails instead, because
-//! wrapping is exactly nonce reuse — the failure that this module exists to make
+//! wrapping is exactly nonce reuse, the failure that this module exists to make
 //! impossible. At 50 packets a second a 64-bit counter lasts longer than the
 //! universe has existed, so the error is unreachable in practice and present
 //! anyway, since "unreachable" is not a security argument.
@@ -212,7 +212,7 @@ impl SequenceWindow {
     /// # Errors
     ///
     /// [`Rejected`] if the packet is a replay or too old to verify. The window is
-    /// left unchanged in both cases, so a rejected packet cannot advance it — the
+    /// left unchanged in both cases, so a rejected packet cannot advance it, the
     /// bug that would let one forged packet silence a stream.
     pub fn accept(&mut self, truncated: u16) -> Result<Sequence, Rejected> {
         let sequence = self.reconstruct(truncated);

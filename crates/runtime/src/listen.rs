@@ -1,6 +1,6 @@
 //! Serving a service's gRPC routes over whichever transport it was given.
 //!
-//! One function, every transport, and the service never learns which — the
+//! One function, every transport, and the service never learns which, the
 //! same asymmetry [`crate::channel`] provides on the calling side. Which
 //! transport it is lives behind [`Transport::bind`]; what is left here is the
 //! part that is identical for all of them, including that every one stops

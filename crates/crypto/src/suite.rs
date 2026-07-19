@@ -1,4 +1,4 @@
-//! Security suites — the Abstract Factory's product families.
+//! Security suites, the Abstract Factory's product families.
 
 use crate::cipher::{Ocb2Aes128Spec, VoiceCipherSpec, XChaCha20Poly1305Spec};
 use crate::tls::TlsFloor;

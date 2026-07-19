@@ -6,7 +6,7 @@ skinparam nodesep 20
 skinparam ranksep 45
 skinparam defaultTextAlignment center
 
-title Deployment — one image, three exposure problems
+title Deployment: one image, three exposure problems
 
 header
 <b>One image.</b>  The entrypoint takes a service name, so Kubernetes runs <b>args: ["text"]</b> and compose runs <b>command: text</b>.
@@ -23,11 +23,11 @@ package "cluster" as K8S #F5F5F5 {
   node "**Ingress**\nHTTPS\n«the only one that fits»" as ing #C8E6C9
 
   node "**gateway** pods\nreplicas: N\nstateful per connection,\n**but resumable elsewhere**" as gwpod #FFE9D6
-  node "**session store**\nsequence + replay buffer\nmeant to outlive any gateway pod\n**«not built»** — in-process today" as sstore #FFE0B2
+  node "**session store**\nsequence + replay buffer\nmeant to outlive any gateway pod\n**«not built»**, in-process today" as sstore #FFE0B2
   node "**voice** pods\nreplicas: N\nholds ciphers + membership cache" as vpod #FFF8E1
   node "**files/http** pods\nstateless" as fpod #E8F5E9
   node "**essential** pods\nsession · permissions\nmetadata · userdata" as epod #FFEBEE
-  node "**optional** pods\npush · audit · polls · …" as opod #E8F5E9
+  node "**optional** pods\npush · audit · polls · ..." as opod #E8F5E9
   node "**directory**\nsingleton per virtual server\nno inbound port at all" as dpod #EDE7F6
 }
 
@@ -35,7 +35,7 @@ cloud "**publist.mumble.info**" as publist #EDE7F6
 dpod -[#4527A0]-> publist : hourly HTTPS
 note right of dpod #EDE7F6
   **The one pod nothing connects to.** No `Service`, no
-  `Ingress`, no port — it only makes an outbound request, so
+  `Ingress`, no port; it only makes an outbound request, so
   there is nothing to expose and nothing to load balance.
   **replicas: 1**, and that is a correctness bound rather than a
   capacity one: each replica announces on its own hourly timer,
@@ -87,12 +87,12 @@ note right of lbudp #FFCDD2
   **Problem 2: client affinity is the wrong affinity.**
   Audio routing is **per channel**, so a channel's members must
   share a voice pod. `sessionAffinity: ClientIP` pins each
-  *client* — which scatters a channel across pods, and there is
+  *client*, which scatters a channel across pods, and there is
   **no inter-pod audio path** in this design. It makes things
   worse, not better.
   Discord assigns a voice *channel* to a voice server and **tells**
   the client which one. Mumble has no such field, and
-  **a legacy client sends UDP to the port it made TCP to** —
+  **a legacy client sends UDP to the port it made TCP to**,
   so it cannot be redirected.
   So, in order of increasing capability:
   · **one voice pod per virtual server** - vertical only, honest
@@ -124,7 +124,7 @@ note as COMPOSE #FFFFFF
   balancers replaced by published ports. `docker-compose.yml`
   runs it: **twenty-one containers** from one image, started in
   tier order, each differing only in its `command`.
-  voice does not need co-locating there — it publishes UDP
+  voice does not need co-locating there, it publishes UDP
   64738 while the gateway publishes TCP 64738, so a legacy
   client still sees one host:port pair.
   **--all-in-one** collapses every pod into one container:

@@ -12,7 +12,7 @@ package starling.control.v1;
 // Implemented by every service that a client can reach.
 //
 // One long-lived bidirectional stream per (gateway process, service). HTTP/2
-// flow control is the backpressure between them — docs/ARCHITECTURE.md §5.
+// flow control is the backpressure between them, docs/ARCHITECTURE.md §5.
 service ClientPlane {
   rpc Attach(stream ClientEvent) returns (stream ServerAction);
 }
@@ -85,15 +85,15 @@ message ServerAction {
 //
 // The gateway cannot decide this for itself: the request arrives inside a
 // payload, and the gateway never parses one (docs/ARCHITECTURE.md §1). So the
-// service that reads the `Hello` instructs it, which keeps that rule intact —
+// service that reads the `Hello` instructs it, which keeps that rule intact,
 // the gateway acts on a control-plane instruction rather than on client bytes.
 message Sequence {
   uint64 conn = 1;
   bool enabled = 2;
   // Whether this connection's control stream may be compressed.
   //
-  // Carried alongside the sequence because both answer the same question — what
-  // this peer agreed to receive — and both are read from the one `Hello`.
+  // Carried alongside the sequence because both answer the same question, what
+  // this peer agreed to receive, and both are read from the one `Hello`.
   // Splitting them into two actions would let a connection end up with one
   // applied and not the other.
   bool compress = 3;
@@ -124,7 +124,7 @@ message Send {
   bytes payload = 4;
   // Audio lane: full means drop the oldest and count it, never disconnect.
   bool audio = 5;
-  // Sessions that must NOT receive this frame — the speaker's own session on a
+  // Sessions that must NOT receive this frame, the speaker's own session on a
   // fan-out, which is otherwise the caller's job to subtract from a broadcast.
   repeated uint32 except = 6;
 }

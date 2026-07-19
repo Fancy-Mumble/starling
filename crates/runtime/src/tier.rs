@@ -1,6 +1,6 @@
 //! What the gateway does when a dependency is down.
 //!
-//! `tier` is not documentation — the gateway reads it and behaves accordingly
+//! `tier` is not documentation, the gateway reads it and behaves accordingly
 //! (`docs/ARCHITECTURE.md` §4).
 //!
 //! | Tier | Down means |
@@ -12,7 +12,7 @@
 //! There is a documented gap in this taxonomy, and it is worth stating here so
 //! nobody tries to close it by adding a tier: the gateway's session store fits
 //! neither answer, because its failure is *deferred and amplifying* rather than
-//! immediate. It is therefore not a service at all and has no tier — see
+//! immediate. It is therefore not a service at all and has no tier, see
 //! `docs/ARCHITECTURE.md` §5.
 
 use serde::{Deserialize, Serialize};

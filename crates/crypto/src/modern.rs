@@ -1,7 +1,7 @@
 //! `XChaCha20-Poly1305` as a two-directional voice cipher.
 //!
-//! [`VoiceSession`] encrypts one direction. A peer needs two — one to seal what
-//! it sends and one to open what it receives — and they must not be the same
+//! [`VoiceSession`] encrypts one direction. A peer needs two, one to seal what
+//! it sends and one to open what it receives, and they must not be the same
 //! session, because a single session sealing and opening would use one keystream
 //! for both halves of a two-party conversation.
 //!
@@ -102,7 +102,7 @@ impl VoiceCipher for XChaCha20Voice {
     /// murmur's resynchronisation swaps an IV, which works because OCB2's nonce
     /// *is* its counter. Here the salt is folded into the subkey by `HChaCha20`
     /// at derivation and never travels again, and the counter's high bits are
-    /// reconstructed by the receiver from the two bytes on the wire — so there is
+    /// reconstructed by the receiver from the two bytes on the wire, so there is
     /// no value this half could hand over that the peer could install.
     ///
     /// Saying so is what lets the caller pick the recovery that does work: a peer
@@ -115,7 +115,7 @@ impl VoiceCipher for XChaCha20Voice {
     /// Refused, for the same reason.
     ///
     /// The counter reconstruction is already self-healing across the wire wrap,
-    /// so there is nothing a peer's claim could repair — and installing one would
+    /// so there is nothing a peer's claim could repair, and installing one would
     /// mean rebuilding both sessions from key material this type no longer holds.
     fn adopt_recv_nonce(&mut self, _nonce: &[u8]) -> bool {
         false
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn a_long_run_stays_in_step_across_the_wire_counter_wrap() {
         // Only two counter bytes reach the wire, so the receiver reconstructs
-        // the high bits. Past 65 536 packets — about 22 minutes of talking —
+        // the high bits. Past 65 536 packets (about 22 minutes of talking)
         // a broken reconstruction goes silent, and nothing before that would
         // have shown it.
         let (mut server, mut client) = pair();

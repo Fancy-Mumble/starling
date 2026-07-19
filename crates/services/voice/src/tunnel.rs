@@ -1,7 +1,7 @@
 //! Audio over TCP: the path for a client whose UDP does not work.
 //!
 //! Every connection starts here and stays until one of its datagrams
-//! authenticates, and a client behind a restrictive firewall never leaves — so
+//! authenticates, and a client behind a restrictive firewall never leaves, so
 //! this is not a degraded mode to be tolerated, it is how a substantial fraction
 //! of a real server's users are heard at all.
 //!
@@ -10,7 +10,7 @@
 //! Connection ids are the gateway's, minted from a counter that starts at 1 in
 //! each pod (`gateway/src/listener.rs`). Sessions are the server's. Addressing
 //! by session is therefore the only form that stays correct when a second
-//! gateway is attached — the pod holding that session delivers, the others drop
+//! gateway is attached, the pod holding that session delivers, the others drop
 //! it, and no service has to know which is which (`runtime/src/plane.rs`).
 
 use bytes::Bytes;
@@ -41,8 +41,8 @@ impl FrameSink for GatewayTunnel {
     /// Hand one already-framed control message to the gateway.
     ///
     /// The header comes back off because the two sides frame at different
-    /// layers: [`FrameSink`] is defined over control messages — which is what
-    /// makes the router's transport-blindness testable — while a `Send` carries
+    /// layers: [`FrameSink`] is defined over control messages, which is what
+    /// makes the router's transport-blindness testable, while a `Send` carries
     /// the type and the payload apart and the gateway reassembles them
     /// (`gateway/src/attach.rs`). Slicing `Bytes` copies nothing, so the round
     /// trip costs one header write per frame and buys a routing core that never

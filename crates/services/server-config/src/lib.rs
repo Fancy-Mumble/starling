@@ -1,4 +1,4 @@
-//! `server-config` — the settings an operator changes while the server runs.
+//! `server-config`: the settings an operator changes while the server runs.
 //!
 //! murmur keeps deployment and operational settings in one `Config` table.
 //! Starling splits them because they have different lifetimes: endpoints and
@@ -11,7 +11,7 @@
 //! the client is sent. A cold start with this down must reject logins rather
 //! than quietly serve on defaults the operator never chose.
 //!
-//! One actor per virtual server, published as a snapshot readers cache — the
+//! One actor per virtual server, published as a snapshot readers cache, the
 //! same pattern metadata uses for membership.
 
 use std::collections::HashMap;

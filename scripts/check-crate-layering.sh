@@ -25,7 +25,7 @@ have() { cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q "\"na
 
 # Resolve a crate's full dependency graph, or fail loudly.
 #
-# A `cargo tree` that errors must NOT be treated as "no violations found" — that
+# A `cargo tree` that errors must NOT be treated as "no violations found", that
 # turns a broken manifest into a green layering check, which is worse than no
 # check at all. This function existing is the fix for that bug.
 # Only edges that ship. A `[dev-dependencies]` entry is not part of the artifact:
@@ -64,7 +64,7 @@ for crate in "${KERNEL_CRATES[@]}"; do
 done
 
 # The domain is passive: data structures, traits and pure functions. It has no
-# runtime presence, so it must not reach a mechanism — least of all the bus.
+# runtime presence, so it must not reach a mechanism, least of all the bus.
 #
 # `docs/diagrams/crates.puml` asserted a `domain -> kernel` edge for a while.
 # Nothing implemented it, and nothing should: a domain type that needs the bus

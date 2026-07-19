@@ -1,8 +1,8 @@
-//! `context-actions` — the menu entries a plugin adds, and the triggers back.
+//! `context-actions`: the menu entries a plugin adds, and the triggers back.
 //!
 //! The server never learns what an action *does*. It carries the plugin's own
 //! identifier alongside each entry, so a trigger routes back to the plugin that
-//! registered it without anything here understanding the feature — the same
+//! registered it without anything here understanding the feature, the same
 //! opacity rule the plugin host follows (`docs/STORAGE.md` L6).
 
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ const TRIGGER_BACKLOG: usize = 256;
 pub struct ContextActionsService {
     /// Keyed by action name, which is therefore unique across owners.
     ///
-    /// That constraint predates the gRPC surface — the client half has always
+    /// That constraint predates the gRPC surface, the client half has always
     /// keyed on it, and a trigger arrives naming only the action, so a second
     /// owner reusing a name would make the routing ambiguous rather than
     /// merely crowded.

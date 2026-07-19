@@ -1,7 +1,7 @@
-//! `onboarding` — the flow a server shows a user on first connection.
+//! `onboarding`: the flow a server shows a user on first connection.
 //!
 //! An operator writes the flow; a client answers it; the answers are stored per
-//! account. Optional, so a server that has no flow simply never sends one —
+//! account. Optional, so a server that has no flow simply never sends one;
 //! there is no "empty flow" a client has to know to skip.
 //!
 //! # What a client is owed
@@ -9,7 +9,7 @@
 //! Two things, and the second is the one that is easy to forget: the flow, and
 //! **whether this user already answered it**. A client that cannot tell "never
 //! answered" from "not told yet" has to guess, and the only safe guess is to
-//! ask again — which is how an onboarded user gets the questionnaire on every
+//! ask again, which is how an onboarded user gets the questionnaire on every
 //! single connect. A `Response` is sent back even when there is nothing stored
 //! (carrying `submitted_at_ms == 0`), because silence is the ambiguity.
 //!
@@ -18,7 +18,7 @@
 //! Each `Step.Choice` names the channels it reveals and the ACL groups it joins
 //! the user to. That is the feature: the questionnaire is a way of asking which
 //! grants somebody wants, not a survey. Applying those grants is
-//! `PROTOCOL-MIGRATION.md` M2b's remaining half — the wire carries them now, and
+//! `PROTOCOL-MIGRATION.md` M2b's remaining half, the wire carries them now, and
 //! nothing here acts on them yet.
 //!
 //! # What answers are keyed on
@@ -26,7 +26,7 @@
 //! The account, never the session. Session ids are per connection and get
 //! recycled, so keying on one means a returning user is a stranger and a later
 //! user can inherit somebody else's answers. An unregistered guest has no
-//! account and therefore cannot be remembered at all — their answers are
+//! account and therefore cannot be remembered at all, their answers are
 //! accepted and dropped rather than stored under something that will not
 //! survive the connection.
 
@@ -51,7 +51,7 @@ use tokio::sync::RwLock;
 /// The channel an onboarding flow is administered from.
 ///
 /// Editing the flow is a server-wide act, and the root channel is where
-/// server-wide authority lives — the same place murmur checks it.
+/// server-wide authority lives, the same place murmur checks it.
 const ROOT_CHANNEL: u32 = 0;
 
 /// The readiness gate that stays closed until the roster has a snapshot.
@@ -64,7 +64,7 @@ const VIEW_GATE: &str = "onboarding_roster_warm";
 ///
 /// Responses are stored whole rather than one row per question. The client
 /// submits a questionnaire in one message stamped with the config revision it
-/// was answering, and that revision is what decides whether to ask again —
+/// was answering, and that revision is what decides whether to ask again,
 /// splitting it into rows would lose the thing the decision is made on.
 const SCHEMA: &[Migration<'static>] = &[
     Migration::new(
@@ -201,7 +201,7 @@ impl OnboardingService {
             None => None,
         };
         // A default `Response` carries `submitted_at_ms == 0`, which is how the
-        // canon says "nothing stored" — distinct from a stored response whose
+        // canon says "nothing stored", distinct from a stored response whose
         // answers happen to be empty, and the distinction a client needs to
         // decide whether to ask.
         vec![to_conn(
@@ -373,7 +373,7 @@ mod tests {
             config: RwLock::new(None),
             roster: Arc::new(Roster::new()),
             // A resolver that reaches nothing. These tests exercise storage,
-            // and a Permit that cannot ask denies — which is the safe way for
+            // and a Permit that cannot ask denies, which is the safe way for
             // it to be wrong if a test ever does reach the ACL path.
             permit: Permit::new(starling_runtime::channel::Resolver::new(
                 Arc::new(starling_runtime::config::Config::default()),

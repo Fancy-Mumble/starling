@@ -8,7 +8,7 @@
 /// Every operation: path, method, summary, and the scope it needs.
 ///
 /// Grouped by path when rendered, because `paths` is a JSON object keyed by
-/// path — emitting one entry per method would repeat the key, and a generator
+/// path, emitting one entry per method would repeat the key, and a generator
 /// reading that keeps whichever it saw last.
 const OPERATIONS: &[(&str, &str, &str, &str)] = &[
     (
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn every_method_on_a_path_survives_into_one_object() {
         // `paths` is keyed by path, so a path emitted once per method loses
-        // every method but the last — and silently, because duplicate keys are
+        // every method but the last, and silently, because duplicate keys are
         // not a parse error. This is the document a client is generated from.
         let parsed: serde_json::Value =
             serde_json::from_str(&description()).expect("the description is valid JSON");

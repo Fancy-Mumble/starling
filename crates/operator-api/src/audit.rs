@@ -44,7 +44,7 @@ impl AuditLog {
     /// # Errors
     ///
     /// The I/O error, which the caller turns into a refusal when
-    /// `fail_closed` is set. With it unset the caller may proceed — that is an
+    /// `fail_closed` is set. With it unset the caller may proceed; that is an
     /// operator's decision to take, and it is not the default.
     pub fn record(&self, record: &AuditRecord) -> std::io::Result<()> {
         let line = format!(

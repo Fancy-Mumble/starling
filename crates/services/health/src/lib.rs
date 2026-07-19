@@ -1,4 +1,4 @@
-//! `health` — the one place that knows how the whole server is.
+//! `health`: the one place that knows how the whole server is.
 //!
 //! Every service reports its own readiness (`starling-runtime`'s
 //! `health_rpc`), and every service reporting it separately is not an answer:
@@ -21,7 +21,7 @@
 //! per viewer per second, and a health surface that falls over when several
 //! people are watching is worse than none. The poll runs once for everybody at
 //! a fixed interval, and every reader gets the last snapshot with the time it
-//! was taken — so a stale picture is visibly stale rather than quietly wrong.
+//! was taken, so a stale picture is visibly stale rather than quietly wrong.
 //!
 //! # Why it is not on the client plane
 //!
@@ -56,14 +56,14 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// Short on purpose. A service that takes longer than this to say how it is
 /// cannot serve traffic either, so waiting longer would only make the whole
-/// sweep as slow as its worst member — and a dashboard that hangs is a
+/// sweep as slow as its worst member, and a dashboard that hangs is a
 /// dashboard that gets closed.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many past sweeps are kept.
 ///
 /// An hour at [`POLL_INTERVAL`], which is the window somebody actually asks
-/// about — "did it wobble while I was at lunch". Bounded in samples rather
+/// about, "did it wobble while I was at lunch". Bounded in samples rather
 /// than time because each is a fixed handful of integers: 720 of them is a few
 /// tens of kilobytes, and a health service that leaks is a poor joke.
 const HISTORY: usize = 720;
@@ -221,8 +221,8 @@ impl Tally {
 /// Separated from the sweep itself because it is the whole of the judgement and
 /// none of the I/O: deciding it needs a name and a `ServiceConfig`, while
 /// running it needs a live server and twenty spawned services. Getting this
-/// wrong is also not visibly wrong — it shows up as a dashboard that is red for
-/// a server that is fine — so it is the part worth pinning with tests.
+/// wrong is also not visibly wrong, it shows up as a dashboard that is red for
+/// a server that is fine, so it is the part worth pinning with tests.
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     /// Dial it and ask how it is.
@@ -244,7 +244,7 @@ impl Plan {
         if name == collector {
             return Self::NothingToAsk;
         }
-        // No endpoint means no gRPC surface, so there is nothing here to dial —
+        // No endpoint means no gRPC surface, so there is nothing here to dial,
         // `operator-api` speaks REST on `listen`, and the announcer only calls
         // out. Reporting those as unreachable was false in the worst way
         // available: the overview's `state` is the worst state present, so one
@@ -426,7 +426,7 @@ mod tests {
         // `operator-api` serves REST on `listen` and has no endpoint to dial.
         // Asking it and calling the failure an outage made the overview's
         // headline `unreachable` on a server whose every real service was
-        // ready — a dashboard that is red when nothing is wrong is worse than
+        // ready, a dashboard that is red when nothing is wrong is worse than
         // one that omits a row, because it is the boy who cried wolf.
         assert_eq!(
             Plan::for_service("operator-api", &configured(None, true), "health"),
@@ -523,7 +523,7 @@ mod tests {
     fn a_sample_records_the_slowest_service_not_the_average() {
         // What a latency plot has to show. An average over twenty services
         // hides the one that is timing out, which is the only one worth
-        // plotting — and it names it, so a spike can be attributed rather
+        // plotting, and it names it, so a spike can be attributed rather
         // than guessed at.
         let overview = Overview {
             state: i32::from(State::Ready),

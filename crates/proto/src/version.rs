@@ -15,7 +15,7 @@ use crate::proto::tcp;
 
 /// A Mumble `major.minor.patch` version.
 ///
-/// `Default` is `0.0.0`, which fails every `>=` feature gate — the safe
+/// `Default` is `0.0.0`, which fails every `>=` feature gate, the safe
 /// direction for a peer that has not told us what it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Version {
@@ -40,7 +40,7 @@ impl Version {
 
     /// Legacy v1 encoding: `(major << 16) | (minor << 8) | patch`.
     ///
-    /// Lossy above patch 255 — that is exactly why v2 exists. Kept because
+    /// Lossy above patch 255; that is exactly why v2 exists. Kept because
     /// pre-1.5 clients read only this field.
     #[must_use]
     pub const fn encode_v1(self) -> u32 {
@@ -77,7 +77,7 @@ impl Version {
     ///
     /// A client that sends only `version_v1` (pre-1.5) still resolves correctly;
     /// one that sends neither is reported as `0.0.0`, which fails every
-    /// `>=` feature gate — the safe direction.
+    /// `>=` feature gate, the safe direction.
     #[must_use]
     pub fn from_message(msg: &tcp::Version) -> Self {
         match (msg.version_v2, msg.version_v1) {
@@ -90,9 +90,9 @@ impl Version {
 
 /// The Mumble version Starling implements.
 ///
-/// One constant, because a server reports its version on two unrelated paths —
+/// One constant, because a server reports its version on two unrelated paths,
 /// the `Version` message at the top of the handshake, and the UDP ping a server
-/// browser sends before connecting at all — and the two disagreeing is a bug
+/// browser sends before connecting at all, and the two disagreeing is a bug
 /// nothing fails on. Both paths encode *this*.
 pub const MUMBLE_VERSION: Version = Version::new(1, 6, 0);
 
@@ -126,8 +126,8 @@ mod tests {
         // A v2 version written as a literal is off by sixteen bits if the patch
         // shift is forgotten, and the result is a plausible-looking number that
         // decodes to a completely different release: 0x0001_0006_0000 is 0.1.6,
-        // not 1.6.0. Nothing on either path fails on that — the handshake
-        // completes and the ping is answered — so it is asserted here.
+        // not 1.6.0. Nothing on either path fails on that, the handshake
+        // completes and the ping is answered, so it is asserted here.
         assert_eq!(MUMBLE_VERSION.encode_v2(), 0x0001_0006_0000_0000);
         assert_eq!(
             Version::decode_v2(MUMBLE_VERSION.encode_v2()),

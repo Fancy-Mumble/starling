@@ -5,7 +5,7 @@
 //! socket is a test nobody writes enough of.
 //!
 //! Every field and every rule below is murmur's `src/murmur/Register.cpp`. The
-//! rules in particular are not ours to relax — they are what the list expects,
+//! rules in particular are not ours to relax; they are what the list expects,
 //! and a server that ignores them is a server whose registration is refused for
 //! reasons nobody can see from here.
 

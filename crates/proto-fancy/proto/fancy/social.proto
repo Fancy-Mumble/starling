@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-// Outer type 1015 — the small social surface that has no upstream message:
+// Outer type 1015, the small social surface that has no upstream message:
 // reactions, read receipts, typing indicators, polls, watch-together and
 // drawing strokes. One service, because each is a few hundred bytes of state
 // and a fan-out, and nineteen services with one message each is worse.
@@ -74,7 +74,7 @@ message PollState {
 }
 
 // Watch-together: a host drives, everyone else follows. The host is explicit
-// because a transfer has to be observable — a silent one desyncs every viewer.
+// because a transfer has to be observable, a silent one desyncs every viewer.
 message WatchSync {
   string session_id = 1;
   uint32 channel = 2;

@@ -23,7 +23,7 @@
 //! the byte above was zero", so early in a connection it rejects the occasional
 //! honest out-of-order packet. Recording absence explicitly costs 256 bytes a
 //! peer and drops nothing. It is safe to differ because the sender never learns
-//! which packets were dropped — this is UDP, and there is no acknowledgement.
+//! which packets were dropped; this is UDP, and there is no acknowledgement.
 
 #[cfg(test)]
 use super::block::BLOCK_LEN;
@@ -33,7 +33,7 @@ use super::block::Block;
 /// How far behind the expected value a packet may be and still be accepted.
 ///
 /// murmur's constant. Thirty packets is 600 ms of audio at Mumble's 20 ms
-/// frames — beyond any jitter buffer, so anything later is indistinguishable
+/// frames, beyond any jitter buffer, so anything later is indistinguishable
 /// from an attack and is treated as one.
 const LATE_TOLERANCE: i32 = 30;
 

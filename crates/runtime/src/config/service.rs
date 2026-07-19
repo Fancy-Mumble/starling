@@ -1,7 +1,7 @@
 //! One service's deployment configuration.
 //!
 //! Every service block takes the same keys, and `types` is the outer message
-//! type from `docs/PROTOCOL-COMPATIBILITY.md` §3 — one number per service,
+//! type from `docs/PROTOCOL-COMPATIBILITY.md` §3, one number per service,
 //! because the service's own message types live in its nested envelope and the
 //! gateway never looks inside. Adding a service is three lines of TOML and no
 //! gateway release.
@@ -22,7 +22,7 @@ pub struct ServiceConfig {
     /// A service the operator has chosen not to run.
     ///
     /// The gateway treats an absent service exactly as it treats an unhealthy
-    /// one, by tier — so switching this off is a supported deployment, not a
+    /// one, by tier, so switching this off is a supported deployment, not a
     /// broken one.
     pub enabled: bool,
 
@@ -40,7 +40,7 @@ pub struct ServiceConfig {
     /// Which rate-limit bucket inbound frames for this service are charged to.
     ///
     /// Absent means the default control bucket, which is murmur's 1/s. Screen
-    /// sharing must not be on that one — see `ratelimit`.
+    /// sharing must not be on that one, see `ratelimit`.
     pub limits: Option<String>,
 
     /// The address this service's own gRPC server binds.
@@ -122,7 +122,7 @@ impl ServiceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StorageConfig {
-    /// `sqlite://…`, `postgres://…` or `mysql://…`.
+    /// `sqlite://...`, `postgres://...` or `mysql://...`.
     pub url: String,
     /// Pool size. In-memory SQLite is capped to one automatically, because five
     /// connections to `:memory:` are five different databases.
@@ -185,7 +185,7 @@ pub struct WebTransport {
     /// Required in practice even when a proxy terminates TLS for every other
     /// surface: this listener is the one the proxy is not terminating. A
     /// self-signed pair is generated here on first boot if absent, which a
-    /// browser will refuse — so a real certificate is the deployed answer.
+    /// browser will refuse, so a real certificate is the deployed answer.
     pub cert: Option<PathBuf>,
     /// The private key, PEM.
     pub key: Option<PathBuf>,

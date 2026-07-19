@@ -1,6 +1,6 @@
 [package]
 name = "starling-crypto"
-description = "Per-peer security negotiation — suites, TLS floors, cipher specs; no I/O"
+description = "Per-peer security negotiation, suites, TLS floors, cipher specs; no I/O"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

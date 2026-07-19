@@ -4,8 +4,8 @@
 //! fn main() -> Result<(), ServiceError> { starling_runtime::serve::<TextService>() }
 //! ```
 //!
-//! Everything a service would otherwise repeat — config, discovery, health,
-//! drain, telemetry, storage, the transport — is here, once. What a service
+//! Everything a service would otherwise repeat, config, discovery, health,
+//! drain, telemetry, storage, the transport, is here, once. What a service
 //! writes is [`Serve::build`], its gRPC routes, and optionally a background
 //! task.
 
@@ -52,7 +52,7 @@ pub struct ServiceContext {
     ///
     /// Every service holds the same one: the writer is process-wide, and a
     /// clone is only a channel handle. Use it for what an operator would want
-    /// to read months later — a login, a refusal, a ban — and `tracing` for
+    /// to read months later (a login, a refusal, a ban) and `tracing` for
     /// what a developer wants while reproducing a bug.
     pub logger: Logger,
     /// Drain.
@@ -86,7 +86,7 @@ impl ServiceContext {
     /// Each service owns its own schema and no service reads another's tables,
     /// so this is deliberately per-service rather than a shared pool. With no
     /// `[services.<name>.storage]` block, a file under the data directory is
-    /// used — a service that persists nothing simply never calls this.
+    /// used, a service that persists nothing simply never calls this.
     ///
     /// # Errors
     ///
@@ -110,7 +110,7 @@ impl ServiceContext {
 /// The URL for `service`'s own database file under `dir`.
 ///
 /// `sqlite:` and not `sqlite://`. Those two slashes introduce a URL *authority*,
-/// so everything up to the next separator is parsed as a host — which for
+/// so everything up to the next separator is parsed as a host, which for
 /// `C:\srv\starling` means the drive letter becomes the host and the database is
 /// looked for at the filesystem root, reported as nothing more than "unable to
 /// open database file". Unix hides the mistake completely, because a data
@@ -131,7 +131,7 @@ fn sqlite_url(dir: &Path, service: &str) -> String {
 /// The async methods are written as `-> impl Future<..> + Send` rather than as
 /// `async fn`. The trait is `Sized`, so nothing here needs boxing, but `run`
 /// below is spawned over a generic `S: Serve` and a plain `async fn` in a trait
-/// gives no way to require its future is `Send` — return-type notation is still
+/// gives no way to require its future is `Send`, return-type notation is still
 /// unstable. Implementations may, and do, write `async fn` regardless.
 pub trait Serve: Send + Sync + Sized + 'static {
     /// The configuration key and log name.
@@ -280,7 +280,7 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         transport.as_ref(),
         &ctx.broker,
         // Every service answers for its own readiness and load, wired in here
-        // rather than by each service's `routes()` — a health surface a
+        // rather than by each service's `routes()`, a health surface a
         // service can forget to implement is one the least-instrumented
         // service lacks, which is the service most worth asking about.
         crate::health_rpc::with_health(service.routes(), &ctx.name, &ctx.health, &ctx.pressure),
@@ -336,7 +336,7 @@ pub fn spawn<S: Serve>(ctx: ServiceContext) -> tokio::task::JoinHandle<Result<()
         if let Err(error) = &result {
             // Distinct from the "service stopped" `run` records on the way out:
             // that one is a service draining normally, this is one that failed.
-            // Same words, opposite meanings — which is why they need different
+            // Same words, opposite meanings, which is why they need different
             // severities rather than one shared line.
             logger.log(
                 LogEvent::error(Category::Server, "service failed")
@@ -408,9 +408,9 @@ mod tests {
 
     #[test]
     fn a_data_directory_is_never_parsed_as_a_url_authority() {
-        // `sqlite://C:\srv\…` reads the drive letter as the host and then opens
-        // nothing. Unix cannot reproduce it — a data directory there starts with
-        // `/`, which leaves the authority empty — so this assertion is the only
+        // `sqlite://C:\srv\...` reads the drive letter as the host and then opens
+        // nothing. Unix cannot reproduce it, a data directory there starts with
+        // `/`, which leaves the authority empty, so this assertion is the only
         // thing standing between the shipped default and a Windows server whose
         // every persisting service dies at startup.
         for dir in [

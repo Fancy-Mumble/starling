@@ -1,8 +1,8 @@
-//! `starling-migrate` — murmur compatibility.
+//! `starling-migrate`: murmur compatibility.
 //!
 //! [`Ini`] reads a `mumble-server.ini`, quirks included, and [`Ini::migrate`]
 //! renders the subset that still has a home in
-//! [`starling_runtime::config::Config`] — the deployment layer
+//! [`starling_runtime::config::Config`]: the deployment layer
 //! (`docs/ARCHITECTURE.md` §4). Everything murmur's `.ini` configures live
 //! (`users`, `bandwidth`, `welcometext`, ...) is now **operational** config
 //! owned by the `server-config` service, which has no migration target yet

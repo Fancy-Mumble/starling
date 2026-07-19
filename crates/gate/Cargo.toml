@@ -1,6 +1,6 @@
 [package]
 name = "starling-gate"
-description = "Feature gating by announced Fancy Mumble version — one table, no guessing"
+description = "Feature gating by announced Fancy Mumble version, one table, no guessing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -8,7 +8,7 @@
 /// The 16-bit message type ids carried in the TCP frame header.
 ///
 /// Only the variants Starling decodes into typed messages are listed. Every
-/// other id is carried as [`ControlMessage::Opaque`](super::ControlMessage) —
+/// other id is carried as [`ControlMessage::Opaque`](super::ControlMessage),
 /// see that type's docs for why that is the right shape for a staged port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]

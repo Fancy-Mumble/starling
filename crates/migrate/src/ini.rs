@@ -98,9 +98,9 @@ impl Ini {
     /// murmur's database settings, as a sqlx connection URL.
     ///
     /// murmur spreads this across six keys and a Qt driver name; sqlx wants one
-    /// string. There is no deployment-config field to put this in yet — each
+    /// string. There is no deployment-config field to put this in yet, each
     /// service owns its own schema and connects independently
-    /// (`docs/STORAGE.md`) — so this is exposed for a future per-service
+    /// (`docs/STORAGE.md`), so this is exposed for a future per-service
     /// migration path rather than wired into [`Self::migrate`].
     ///
     /// An empty `database` with no driver means murmur's own default, which is a
@@ -148,7 +148,7 @@ impl Ini {
     /// Grouped by the phase that implements it, so an operator reading the log
     /// can tell "not yet" from "not ever". Most of these are **operational**
     /// settings that will belong to the `server-config` service once it has a
-    /// schema, not to [`Config`] — murmur kept both in one `Config` table,
+    /// schema, not to [`Config`], murmur kept both in one `Config` table,
     /// Starling splits them (`docs/ARCHITECTURE.md` §4).
     fn warn_about_unimplemented(&self) {
         for (key, phase) in UNIMPLEMENTED {
@@ -195,7 +195,7 @@ impl Ini {
     /// # Errors
     ///
     /// [`MigrateError::Render`] if the migrated config could not be
-    /// serialised — not expected in practice, see that variant's docs.
+    /// serialised, not expected in practice, see that variant's docs.
     pub fn migrate(&self) -> Result<String, MigrateError> {
         Ok(toml::to_string_pretty(&self.to_config())?)
     }
@@ -320,7 +320,7 @@ registerName=Fancy Mumble e2e
     #[test]
     fn sqlite_is_the_default_and_names_murmurs_own_file() {
         // "No database configured" and "murmur's default database" are the same
-        // empty value in a `.ini`, and they mean the same thing — the file
+        // empty value in a `.ini`, and they mean the same thing, the file
         // beside the binary. Guessing "no database" would silently discard every
         // registered account on migration.
         let ini = Ini::parse("");

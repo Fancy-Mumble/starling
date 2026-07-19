@@ -35,7 +35,7 @@ impl SelfSigned {
     /// that neither path exists before it gets here, but a check and a write are
     /// two operations and the file that appears between them belongs to whoever
     /// won the race. Truncating it would swap a live server's key underneath it
-    /// — the fingerprint change that check exists to prevent.
+    /// the fingerprint change that check exists to prevent.
     ///
     /// [`load_or_generate`]: crate::identity::load_or_generate
     fn write(&self, path: &Path, contents: &str) -> Result<(), TlsError> {

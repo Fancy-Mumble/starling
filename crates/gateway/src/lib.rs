@@ -1,9 +1,9 @@
-//! `starling-gateway` — the only component that holds a client's TCP socket.
+//! `starling-gateway`: the only component that holds a client's TCP socket.
 //!
 //! Two facts give it everything else for free (`docs/ARCHITECTURE.md` §2):
 //!
 //! * **it is the single writer to each client socket**, so per-client ordering
-//!   is preserved by construction — a client cannot receive the `UserState`
+//!   is preserved by construction, a client cannot receive the `UserState`
 //!   naming a channel before the `ChannelState` creating it, whatever order the
 //!   services produced them in. The in-process design needed a lane rule and a
 //!   version counter for this;

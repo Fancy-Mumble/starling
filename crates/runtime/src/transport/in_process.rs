@@ -1,7 +1,7 @@
 //! An in-memory pipe, for `--all-in-one`.
 //!
 //! The services still speak gRPC to each other, still serialise, and still see
-//! deadlines and streaming semantics. Only the socket is gone — see
+//! deadlines and streaming semantics. Only the socket is gone, see
 //! [`crate::inproc`] for why that matters more than saving a syscall.
 
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! The token bucket, and the rate an operator writes for it.
 //!
-//! murmur runs **one** shared bucket per user — 1 msg/s sustained, burst 5,
+//! murmur runs **one** shared bucket per user, 1 msg/s sustained, burst 5,
 //! and a **silent drop** when it trips (`RATELIMIT` in `Messages.cpp`).
 //! Starting a screen share legitimately emits several signalling messages back
 //! to back, and that silently ate the loopback viewer's SDP offer in most runs:
@@ -11,7 +11,7 @@
 //!
 //! * buckets are **per route**, so a burst of signalling cannot exhaust the
 //!   budget chat needs (the gateway owns the routes; this type owns the maths)
-//! * a refusal is **returned**, never swallowed — the caller decides whether to
+//! * a refusal is **returned**, never swallowed, the caller decides whether to
 //!   tell a Fancy client or keep the silence a legacy client expects
 
 use std::fmt;
@@ -119,7 +119,7 @@ impl TokenBucket {
     ///
     /// The tokens in hand are **kept**, clamped to the new burst. An operator
     /// lowering `messagelimit` is throttling what happens next, not confiscating
-    /// the allowance a client has already accrued — and refilling to the new
+    /// the allowance a client has already accrued, and refilling to the new
     /// burst instead would make *lowering* the limit hand out a fresh burst.
     ///
     /// This exists because murmur's message limit is live (`setLiveConf`): it
@@ -136,7 +136,7 @@ impl TokenBucket {
     ///
     /// # Errors
     ///
-    /// [`Throttled`] when the bucket is empty, carrying the wait — that value
+    /// [`Throttled`] when the bucket is empty, carrying the wait, that value
     /// is what a Fancy client is told, and what makes the refusal actionable
     /// rather than a mystery.
     pub fn take(&mut self, now_ms: u64) -> Result<(), Throttled> {

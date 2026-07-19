@@ -56,7 +56,7 @@ use crate::state::{Connections, Identity, PendingConnection};
 ///
 /// Encoded rather than written out. The literal this replaced was
 /// `0x0001_0006_0000`, which is missing the sixteen-bit patch shift and decodes
-/// to **0.1.6** — below every feature gate the number exists to pass, and
+/// to **0.1.6**, below every feature gate the number exists to pass, and
 /// invisible because the handshake completes either way.
 const MUMBLE_VERSION_V2: u64 = starling_proto::MUMBLE_VERSION.encode_v2();
 
@@ -77,7 +77,7 @@ const FLAG_HIDDEN: u32 = 1;
 ///
 /// Epoch 1: upstream 0–99 flat and frozen, every Fancy service behind one outer
 /// type ≥ 1000. Starling has never spoken epoch 0's interleaved 100–999 layout,
-/// and cannot — `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
+/// and cannot, `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
 /// unroutable, and §3 is the scheme this number names.
 const FANCY_PROTOCOL: u32 = 1;
 
@@ -92,7 +92,7 @@ pub struct Handshake {
 /// The `Version` Starling sends first, before the client has said anything.
 ///
 /// **`fancy_version` is deliberately absent.** It is a product version, and a
-/// client reads it as "this server implements the Fancy features up to X" —
+/// client reads it as "this server implements the Fancy features up to X",
 /// then sends those features on epoch 0's numbering, which Starling routes
 /// nowhere. Claiming it would therefore *break* clients that work today: with
 /// the field absent they fall back to `PluginDataTransmission`, which is
@@ -114,7 +114,7 @@ pub fn server_version() -> tcp::Version {
 ///
 /// **`Upsert` replaces; it does not merge** (`session-view/src/lib.rs:181`).
 /// session-view keeps exactly the `Session` it is handed, so a field omitted
-/// here is not left alone — it is written as `false`, `0` or empty. Proto3
+/// here is not left alone; it is written as `false`, `0` or empty. Proto3
 /// cannot tell "unset" from "false" for a `bool`, so there is no partial
 /// update to send even in principle.
 ///
@@ -122,7 +122,7 @@ pub fn server_version() -> tcp::Version {
 /// without `mute`, `deaf` or `suppress`, and `voice` reads a speaker's silence
 /// **only** from session-view (`voice/src/view.rs:146`). So a moderator's mute
 /// was applied to the connection record, broadcast to every client, rendered in
-/// every user list — and then un-applied in the one place that decides whether
+/// every user list, and then un-applied in the one place that decides whether
 /// the packets are forwarded. The user showed as muted and stayed audible.
 ///
 /// Written out field by field with no `..Session::default()`, which is what hid
@@ -150,13 +150,13 @@ fn session_record(pending: &PendingConnection) -> Session {
         cert_hash: pending.cert_hash.clone(),
         // An assurance rather than an identifier, and the `strong` ACL group.
         strong_cert: pending.strong_cert,
-        // The access tokens, which `permissions` can reach in no other way — it
+        // The access tokens, which `permissions` can reach in no other way, it
         // resolves a session through the view and nowhere else. Secret: this is
         // the one field here that must not be composed into anything a client
         // or an operator can read back.
         tokens: pending.tokens.clone(),
         // The account's profile, so that every client that builds its roster
-        // from the view — which is every client that was already connected —
+        // from the view (which is every client that was already connected)
         // sees the avatar of someone who joined after it did.
         comment_hash: pending.comment_hash.clone(),
         texture_hash: pending.texture_hash.clone(),
@@ -198,7 +198,7 @@ impl Handshake {
         };
 
         // A second `Authenticate` on a session that already has one is not a
-        // second login — murmur reads it as an access-token edit and nothing
+        // second login, murmur reads it as an access-token edit and nothing
         // else (`vendor/server/src/murmur/Messages.cpp:367`). Letting it fall
         // through would allocate another session for the same connection and
         // announce the user twice.
@@ -313,7 +313,7 @@ impl Handshake {
 
         // Told, not asked. Sent after the announce so `permissions` can resolve
         // the session, and after entering root so the answer is about the
-        // channel the client is actually in — the one its menus are drawn from.
+        // channel the client is actually in, the one its menus are drawn from.
         if let Some(pending) = connections.get(inbound.conn) {
             actions.extend(self.push_permissions(&pending, ROOT_CHANNEL).await);
         }
@@ -332,7 +332,7 @@ impl Handshake {
     /// Split out of [`Self::authenticate`] because neither failure is about
     /// authentication: one is a peer speaking some other protocol at a Mumble
     /// port, the other a frame that outran its own connection's teardown.
-    /// Neither can be answered — a `Reject` needs a connection to address — so
+    /// Neither can be answered (a `Reject` needs a connection to address) so
     /// both are recorded and dropped, and keeping them here leaves the login
     /// itself as a single readable sequence.
     fn opening(
@@ -367,7 +367,7 @@ impl Handshake {
     /// This is how a Mumble client submits a channel password. The user is
     /// refused entry, types the password into the dialog, and the client sends
     /// its whole token list again on the same connection
-    /// (`vendor/server/src/murmur/Messages.cpp:367`) — no reconnection, and no
+    /// (`vendor/server/src/murmur/Messages.cpp:367`), no reconnection, and no
     /// second login. Every other field of the message is ignored here, as it is
     /// upstream: the name and password were settled at the handshake, and
     /// honouring them again would be a way to change identity mid-session.
@@ -380,7 +380,7 @@ impl Handshake {
     /// **Not done here, deliberately:** murmur also re-sends every `ChannelState`
     /// so a client can re-render which channels it may now enter
     /// (`Messages.cpp:385`). That tree belongs to `metadata`, and the entry
-    /// itself works without it — the client simply learns the door is open by
+    /// itself works without it; the client simply learns the door is open by
     /// walking through it rather than by seeing it un-greyed.
     async fn retoken(
         &self,
@@ -389,7 +389,7 @@ impl Handshake {
         request: &tcp::Authenticate,
     ) -> Actions {
         if !connections.set_tokens(inbound.conn, request.tokens.clone()) {
-            // Unchanged — which is the common case, since a stock client sends
+            // Unchanged, which is the common case, since a stock client sends
             // its token list on every reconnect whether or not it has any.
             return Actions::new();
         }
@@ -414,7 +414,7 @@ impl Handshake {
     ///
     /// Pushed through the fan-out rather than returned with this connection's
     /// actions, because the ghost may be held by a different gateway pod
-    /// entirely — the pod that does not have it ignores the frame, which is
+    /// entirely, the pod that does not have it ignores the frame, which is
     /// exactly the broadcast contract the plane already relies on.
     ///
     /// The `UserRemove` every other client needs is not sent here: closing the
@@ -503,7 +503,7 @@ impl Handshake {
             })),
         });
 
-        // Legacy clients get no subscription and no resync on demand — the
+        // Legacy clients get no subscription and no resync on demand, the
         // flood is the only way they ever learn someone joined
         // (`docs/ARCHITECTURE.md` §6). Excluding the new session is not an
         // optimisation: it already received this exact `UserState` as its own
@@ -514,14 +514,14 @@ impl Handshake {
             name: Some(name.to_owned()),
             channel_id: Some(0),
             // Everyone else's user list is built from this one message, so it
-            // needs the registration marker — and the certificate hash — just
+            // needs the registration marker (and the certificate hash) just
             // as much as the client's own copy above does.
             user_id: account.map(|id| id as u32),
             hash: hex_hash(&pending.cert_hash),
             // And the stored profile, for the same reason: this is the only
             // message the already-connected clients get about the new arrival,
             // so an avatar left out here is one nobody but its owner ever sees.
-            // The hashes, not the bodies — the client fetches those with
+            // The hashes, not the bodies, the client fetches those with
             // `RequestBlob` if it wants them, which is what keeps a 500 KiB
             // picture out of a broadcast to every session on the server.
             comment_hash: blob_hash(&identity.comment_hash),
@@ -545,13 +545,13 @@ impl Handshake {
     /// of this check sat before [`Self::identify`], where there is no identity
     /// to consult, and so refused everybody.
     ///
-    /// **The SuperUser is exempt**, and upstream exempts it the same way — that
+    /// **The SuperUser is exempt**, and upstream exempts it the same way, that
     /// line guards on `id != 0`. The administrator account deliberately carries
     /// no certificate: [`Accounts::write_superuser`][w] leaves `cert_hash` empty
     /// so that the one login which can repair a broken server is always
     /// something you *know*. Enforcing this against it locks the owner out the
     /// moment they switch the setting on and leaves no account anywhere that
-    /// can switch it back off — a server bricked by a checkbox.
+    /// can switch it back off, a server bricked by a checkbox.
     ///
     /// The *presence* of a certificate, not its strength: murmur admits a
     /// self-signed one here and that is a Mumble client's default, so requiring
@@ -560,7 +560,7 @@ impl Handshake {
     ///
     /// `NoCertificate` rather than a generic refusal, because it is the one
     /// rejection a Mumble client answers by offering to generate a certificate
-    /// — which is exactly what this peer needs to do next.
+    /// which is exactly what this peer needs to do next.
     ///
     /// [w]: https://docs.rs/starling-userdata
     fn certificate_gate(
@@ -657,7 +657,7 @@ impl Handshake {
         if matches!(outcome, auth_result::Outcome::Ok) {
             // `Option<Account>`, kept as an option. Flattening an absent account
             // to 0 here is what made a guest indistinguishable from the
-            // SuperUser, whose account id *is* 0 — see
+            // SuperUser, whose account id *is* 0, see
             // `starling_proto_fancy::identity`.
             //
             // `guest` is authoritative when the two disagree: userdata sets it
@@ -733,8 +733,8 @@ impl Handshake {
 
     /// Tell a client what it may do in a channel, without being asked.
     ///
-    /// murmur pushes this on every channel entry — the channel and its parent
-    /// (`Server.cpp:2319`) — and a client builds its UI from it: an action it
+    /// murmur pushes this on every channel entry, the channel and its parent
+    /// (`Server.cpp:2319`), and a client builds its UI from it: an action it
     /// holds no permission for is not greyed out, it is *absent*. Starling only
     /// ever answered an explicit `PermissionQuery`, so a client that did not
     /// ask (or asked before the tree it wanted to ask about existed) rendered
@@ -746,7 +746,7 @@ impl Handshake {
     /// does attempt is authorised again on its own path.
     /// The identity is taken from the connection record, not asserted blank.
     /// `effective` trusts the `Subject` it is handed, and a default one is an
-    /// unregistered guest — so asking with only a session id would report the
+    /// unregistered guest, so asking with only a session id would report the
     /// administrator's own permissions as a stranger's and hide every action
     /// from them. This service is the authority on who just authenticated, so
     /// it is entitled to state it, through `identity` rather than by comparing
@@ -773,7 +773,7 @@ impl Handshake {
                     // The tokens and the channel the client is standing in are
                     // both *inputs* to the answer: a `#password` entry and every
                     // `in`/`out`/`sub` rule read them, so omitting either shows
-                    // the user a menu built from permissions they do not have —
+                    // the user a menu built from permissions they do not have,
                     // or, worse, hides the ones they do.
                     tokens: pending.tokens.clone(),
                     channel: pending.channel,
@@ -808,7 +808,7 @@ impl Handshake {
     /// Whether this session may see a hidden channel.
     ///
     /// Asked of `permissions` through `CheckSession`, which resolves who the
-    /// session is server-side — the identity is never the caller's to state.
+    /// session is server-side, the identity is never the caller's to state.
     ///
     /// **Denies on any failure**, including `permissions` being unreachable.
     /// The alternative is that an outage reveals every private room on the
@@ -863,8 +863,8 @@ impl Handshake {
 
         // A hidden channel is only sent to a client that holds `SeeChannel` on
         // it. Without this the flag was decorative: `SEE_CHANNEL` was defined
-        // and never read, so every private room — and, because the client
-        // builds its tree from these messages, everyone sitting in one — was
+        // and never read, so every private room, and, because the client
+        // builds its tree from these messages, everyone sitting in one, was
         // announced to every user who connected.
         //
         // Only hidden channels cost a permission check. The common case is a
@@ -917,22 +917,22 @@ impl Handshake {
             // The certificate hash, hex-encoded as murmur sends it
             // (`Server.cpp:1686`). A client will not offer "Register" for a
             // user it believes has no certificate
-            // (`vendor/server/src/mumble/MainWindow.cpp:1817`) — registration
+            // (`vendor/server/src/mumble/MainWindow.cpp:1817`), registration
             // binds an account to a certificate, so without one there is
             // nothing to bind. Omitting this greys the entry out for everybody,
             // including the administrator.
             hash: hex_hash(&pending.cert_hash),
             // `user_id` is the *only* thing that marks a user as registered to
             // a Mumble client: it is what draws the authenticated icon and what
-            // "Registered Users" is keyed by. Leaving it unset — which every
-            // `UserState` here used to do — renders the administrator as an
+            // "Registered Users" is keyed by. Leaving it unset, which every
+            // `UserState` here used to do, renders the administrator as an
             // anonymous guest, however carefully the server authenticated them.
             //
             // Absent for a guest rather than 0, because 0 is the SuperUser's id.
             user_id: identity.account.map(|id| id as u32),
             // The profile stored on the account, which is how a picture set
-            // anywhere other than this client — the web user manager, another
-            // device, a previous session — is on the user the moment they
+            // anywhere other than this client, the web user manager, another
+            // device, a previous session, is on the user the moment they
             // connect. Without these two the avatar existed on the account, in
             // the blob store and in nobody's user list.
             comment_hash: blob_hash(&identity.comment_hash),
@@ -1004,7 +1004,7 @@ impl Handshake {
     /// the client may need its own session id before it can process listeners
     /// (`Messages.cpp:843`), and `ServerSync` is the message that carries it.
     /// Called from [`Self::authenticate`] rather than [`Self::welcome`] for that
-    /// reason — everything `welcome` builds precedes the sync.
+    /// reason, everything `welcome` builds precedes the sync.
     pub async fn restore_and_announce(
         &self,
         connections: &Connections,
@@ -1048,7 +1048,7 @@ impl Handshake {
 
         // Two messages, because one message cannot have two audiences: everyone
         // else gets the channels, and the owner gets the channels *and* the
-        // gains — murmur sends the same message twice, appending the
+        // gains, murmur sends the same message twice, appending the
         // adjustments before the second send (`Messages.cpp:851`).
         let mut actions = Actions::new();
         if !restored.added.is_empty() {
@@ -1073,7 +1073,7 @@ impl Handshake {
     ///
     /// Built from the connection record rather than from the arguments to hand,
     /// so that "up" and "changed" cannot describe the same session differently
-    /// — the address, certificate and client version are on the record and were
+    /// the address, certificate and client version are on the record and were
     /// being dropped here.
     async fn announce_up(&self, connections: &Connections, conn: u64) {
         let Some(pending) = connections.get(conn) else {
@@ -1155,7 +1155,7 @@ impl Handshake {
 
     /// Add, remove and re-weight `session`'s channel listeners.
     ///
-    /// `None` when metadata could not be reached — the same distinction
+    /// `None` when metadata could not be reached, the same distinction
     /// [`Self::enter`] draws, and for the same reason: an unreachable authority
     /// must not be reported to a user as a permission they lack.
     ///
@@ -1217,7 +1217,7 @@ impl Handshake {
     fn on_hello(&self, connections: &Connections, inbound: &Inbound, hello: &starling_proto_fancy::fancy::session::Hello) -> Actions {
             // Recorded, not discarded. This used to drop the message on the
             // floor, so a client announcing `zstd` had no way to learn
-            // whether anything heard it — and the three features these gate
+            // whether anything heard it, and the three features these gate
             // would each have had to invent their own way of asking.
             connections.touch(inbound.conn);
             connections.set_capabilities(
@@ -1239,7 +1239,7 @@ impl Handshake {
                 return Actions::new();
             }
             // Sequencing starts here and not before. The gateway cannot
-            // decide it — the request is inside a payload it never parses —
+            // decide it (the request is inside a payload it never parses)
             // so this instructs it, and the `ResumeAck` afterwards is what
             // tells the client to start expecting eight more bytes per
             // frame. Both are queued in that order, and the gateway is the
@@ -1277,7 +1277,7 @@ impl Handshake {
     fn on_subscribe(&self, connections: &Connections, inbound: &Inbound, subscribe: &starling_proto_fancy::fancy::session::LazySubscribe) -> Actions {
             // Only honoured from a peer that announced it can read deltas.
             // Otherwise this would quietly stop sending a client state it
-            // still expects as the full flood — the failure mode being a
+            // still expects as the full flood, the failure mode being a
             // roster that silently stops updating.
             if !connections.capabilities(inbound.conn).lazy_subscribe {
                 tracing::debug!(
@@ -1303,7 +1303,7 @@ impl Handshake {
             // than routing: only the pod holding the socket knows what it
             // already wrote to it. This used to answer
             // `full_resync_required` unconditionally, which made the whole
-            // feature a stub — the ring was filled on every frame and never
+            // feature a stub, the ring was filled on every frame and never
             // read from.
             //
             // Whether the gap can actually be covered is the gateway's to
@@ -1411,7 +1411,7 @@ impl Handshake {
     /// Refuse a login: tell the client why, then hang up.
     ///
     /// Every refusal in the handshake goes through here, which is what makes
-    /// "nobody can log in" answerable from the log alone — the client is told a
+    /// "nobody can log in" answerable from the log alone; the client is told a
     /// `Reject` type it usually renders as one generic sentence, and without
     /// this the server's own reason existed only as the argument to a function
     /// that discarded it.
@@ -1425,7 +1425,7 @@ impl Handshake {
     ///
     /// The result was a connection that had been refused and was still open.
     /// The client showed "Server connection rejected", drew the root channel it
-    /// had already been sent, and went on pinging — so the idle sweep never
+    /// had already been sent, and went on pinging, so the idle sweep never
     /// reaped it either, because a connection that keeps talking is never
     /// timed out. What the user saw was a session that was half there: no
     /// audio, no roster, no way to act, and no disconnect.
@@ -1456,7 +1456,7 @@ impl Handshake {
 
 /// The two actions a refusal is made of, in the order they must travel.
 ///
-/// A free function so the pairing can be asserted without a deployment — see
+/// A free function so the pairing can be asserted without a deployment, see
 /// the tests at the foot of this file. The half that went missing was the
 /// second one, and it went missing silently: sending only the `Reject` still
 /// compiles, still logs, still tells the user they were refused, and leaves
@@ -1487,7 +1487,7 @@ const fn refuse_for_certificate(required: bool, has_certificate: bool, superuser
 ///   and it is the case that matters in practice: a client whose connection
 ///   dropped reconnects before the server has noticed, and refusing would lock
 ///   somebody out of their own name until a timeout they cannot see.
-/// * **The same certificate.** Identity without registration — proof enough
+/// * **The same certificate.** Identity without registration, proof enough
 ///   that this is the same person on a different network.
 ///
 /// Anything else is a stranger taking a name that is in use, which is the case
@@ -1514,7 +1514,7 @@ fn may_replace(
 /// Compared without the port deliberately: a reconnect is a *new* TCP
 /// connection and so always has a different source port, and comparing the
 /// whole `host:port` string would mean the same-address rule never once
-/// matched — turning every reconnect after a drop into `UsernameInUse`.
+/// matched, turning every reconnect after a drop into `UsernameInUse`.
 fn address_of(peer: &str) -> &str {
     // An IPv6 literal is bracketed, so its own colons are not the separator.
     match peer.strip_prefix('[') {
@@ -1527,7 +1527,7 @@ fn address_of(peer: &str) -> &str {
 ///
 /// A table rather than eight arms inline, because what this is *is* a mapping:
 /// userdata decides the outcome, and the wire needs the murmur reject code and
-/// something a human can read. `Ok` is absent on purpose — it is not a refusal,
+/// something a human can read. `Ok` is absent on purpose; it is not a refusal,
 /// and giving it a row here would mean inventing a reason for a success.
 fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'static str) {
     use auth_result::Outcome;
@@ -1538,8 +1538,8 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
         // property rather than a nicety. This outcome is murmur's `id == -1`:
         // the name belongs to a registered account and the peer proved nothing
         // (`Messages.cpp:381`, "Wrong certificate or password for existing
-        // user"). `UsernameInUse` says something else entirely — that somebody
-        // is *online* under the name — and a client told that reconnects under
+        // user"). `UsernameInUse` says something else entirely, that somebody
+        // is *online* under the name, and a client told that reconnects under
         // a suffixed name, quietly turning a failed impersonation into a
         // successful login as a lookalike. It also leaks liveness: it answers
         // "is this person connected right now" to anyone who asks.
@@ -1562,7 +1562,7 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
             "this account requires a one-time code",
         ),
         Outcome::TotpInvalid => (RejectType::TotpInvalid, "that one-time code is wrong"),
-        // `Ok` cannot reach here — the caller returns before asking — and an
+        // `Ok` cannot reach here (the caller returns before asking) and an
         // unknown account is the catch-all the enum's default already is.
         Outcome::UnknownAccount | Outcome::Ok => {
             (RejectType::AuthenticatorFail, "authentication failed")
@@ -1629,7 +1629,7 @@ const LISTENERS_SINCE: u64 = 0x0001_0004_0000;
 /// its user has no way to see that somebody outside the room is hearing them.
 /// The server is the only thing in a position to say so.
 ///
-/// Sent only when the feature is actually reachable — both ceilings non-zero,
+/// Sent only when the feature is actually reachable, both ceilings non-zero,
 /// exactly as upstream gates it. A deployment that has not configured listeners
 /// has nothing to warn about, and a warning nobody can act on is noise that
 /// teaches users to ignore server messages.
@@ -1668,7 +1668,7 @@ fn listener_warning(conn: u64, mumble_version: u64, config: &Snapshot) -> Action
 /// A gain map as the wire carries it.
 ///
 /// Sorted by channel, because the map is a `HashMap` and an unstable order would
-/// make the same server state produce different bytes on every handshake — which
+/// make the same server state produce different bytes on every handshake, which
 /// is invisible in production and turns any test that reads the message into a
 /// coin flip.
 fn volume_adjustments(volume: &HashMap<u32, f32>) -> Vec<tcp::user_state::VolumeAdjustment> {
@@ -1726,7 +1726,7 @@ mod tests {
         // The regression this file exists to prevent, at unit speed.
         //
         // Starling used to send the `Reject` alone. The client showed
-        // "Server connection rejected", then sat there — connected, rendering
+        // "Server connection rejected", then sat there, connected, rendering
         // the root channel, pinging often enough that the idle sweep never
         // reaped it. murmur sends the same `Reject` and calls
         // `disconnectSocket()` in the next statement
@@ -1764,8 +1764,8 @@ mod tests {
     #[test]
     fn every_kind_of_refusal_hangs_up() {
         // Not one path: all of them. The refusals are spread across the
-        // handshake — a bad server password, a name in use, a full server, a
-        // missing certificate, an unreachable account service — and a peer
+        // handshake, a bad server password, a name in use, a full server, a
+        // missing certificate, an unreachable account service, and a peer
         // left connected is the same failure whichever one produced it.
         for kind in [
             tcp::reject::RejectType::WrongUserPw,
@@ -1787,7 +1787,7 @@ mod tests {
 
     #[test]
     fn cert_required_refuses_a_certificate_less_peer_and_nobody_else() {
-        // `docs/GAP-ANALYSIS.md` A3. Off, it must refuse nobody — a setting that
+        // `docs/GAP-ANALYSIS.md` A3. Off, it must refuse nobody, a setting that
         // is not switched on has to be invisible.
         assert!(!refuse_for_certificate(false, false, false));
         assert!(!refuse_for_certificate(false, false, true));
@@ -1798,7 +1798,7 @@ mod tests {
 
     #[test]
     fn cert_required_never_locks_the_administrator_out_of_their_own_server() {
-        // The SuperUser carries no certificate on purpose — `write_superuser`
+        // The SuperUser carries no certificate on purpose, `write_superuser`
         // leaves `cert_hash` empty so the administrator login is always
         // something you know. Refusing it here would mean an operator ticking
         // this box and losing the only account that could untick it, with no
@@ -1814,7 +1814,7 @@ mod tests {
         // A client will not offer "Register" for a user it believes has no
         // certificate (`vendor/server/src/mumble/MainWindow.cpp:1817`), because
         // registration binds an account to one. Omitting this greys the entry
-        // out for everybody, administrator included — which is what it did.
+        // out for everybody, administrator included, which is what it did.
         assert_eq!(
             hex_hash(&[0xaf, 0x08, 0xa1]),
             Some("af08a1".to_owned()),
@@ -1825,7 +1825,7 @@ mod tests {
     #[test]
     fn a_peer_without_one_announces_no_hash_at_all() {
         // Absent, not empty. The client tests emptiness to decide whether
-        // registration is possible, so both answer the question the same way —
+        // registration is possible, so both answer the question the same way,
         // but only one of them costs a field on every `UserState`.
         assert_eq!(hex_hash(&[]), None);
     }
@@ -1842,7 +1842,7 @@ mod tests {
         // and a client acting on it sends those features on epoch 0's
         // numbering, which this server routes nowhere. Claiming it would break
         // clients that work today, because with it absent they fall back to
-        // `PluginDataTransmission` — epoch-independent, and relayed correctly.
+        // `PluginDataTransmission`: epoch-independent, and relayed correctly.
         let version = server_version();
         assert_eq!(version.fancy_protocol, Some(FANCY_PROTOCOL));
         assert_eq!(
@@ -1894,8 +1894,8 @@ mod tests {
 
     #[test]
     fn an_unrelated_change_does_not_silently_lift_a_mute() {
-        // The shape of the original failure: a *different* edit — moving
-        // channel, setting a comment — rebuilt the whole record, and every one
+        // The shape of the original failure: a *different* edit, moving
+        // channel, setting a comment, rebuilt the whole record, and every one
         // of those announcements un-muted the user in session-view. Anything
         // that rebuilds from the connection must carry the flags it did not set.
         let mut pending = PendingConnection {
@@ -1935,7 +1935,7 @@ mod tests {
         // murmur's "allow reuse of name from same IP" (`Messages.cpp:428`).
         // This is the case that actually happens: a dropped connection the
         // server has not noticed yet, and the same person coming back. The
-        // ports differ because a reconnect is always a new TCP connection —
+        // ports differ because a reconnect is always a new TCP connection,
         // comparing them would make this rule dead.
         let ghost = peer("10.0.0.1:50000", &[]);
         let arriving = peer("10.0.0.1:61234", &[]);

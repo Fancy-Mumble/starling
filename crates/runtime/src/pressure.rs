@@ -5,7 +5,7 @@
 //! dropped, clients disconnected, requests refused. That is the right shape for
 //! a refusal and the wrong shape for a queue, because by the time a refusal is
 //! counted the decision has been made. An operator watching a server fill up
-//! wants the interval *before* that — the queue at 80% of its budget, climbing.
+//! wants the interval *before* that, the queue at 80% of its budget, climbing.
 //!
 //! So this holds **occupancy**: how much of a bounded thing is in use right
 //! now, against what it is bounded by.
@@ -19,7 +19,7 @@
 //!
 //! So each gauge also keeps the high-water mark since it was last read, and
 //! reading it clears it. That makes a sample mean "the worst this got during
-//! the interval you are drawing", which is what a dashboard's bar should be —
+//! the interval you are drawing", which is what a dashboard's bar should be,
 //! and it is why exactly one reader may exist. The collector is that reader.
 //!
 //! # Why capacity is optional
@@ -27,7 +27,7 @@
 //! Some bounded things have a number (the gateway's control lane is 4 MiB) and
 //! some are bounded only by the machine (a service's in-flight RPCs). A
 //! capacity of zero means "no declared limit", and a dashboard must show those
-//! as a count rather than a percentage — inventing a denominator would turn an
+//! as a count rather than a percentage, inventing a denominator would turn an
 //! unknown into a reassuring number.
 
 use std::collections::BTreeMap;
@@ -110,7 +110,7 @@ impl Gauge {
     ///
     /// Saturating rather than wrapping because an unbalanced release is a bug
     /// that should read as an empty queue, not as one holding 18 quintillion
-    /// items — a wrapped gauge discredits every other number beside it.
+    /// items, a wrapped gauge discredits every other number beside it.
     pub fn release(&self, n: u64) {
         let _ = self
             .0
@@ -124,14 +124,14 @@ impl Gauge {
     ///
     /// [`Self::add`] and [`Self::release`] own the number; this only watches
     /// one. That is the right shape when many things share one bound and the
-    /// interesting figure is the worst of them — the gateway's control lane is
+    /// interesting figure is the worst of them, the gateway's control lane is
     /// budgeted **per client**, so "the aggregate across clients" has no
     /// meaningful percentage while "the client closest to its budget" is
     /// exactly the number that predicts the next disconnect.
     ///
     /// [`Load::peak`] is then the worst reading in the interval, which is what
     /// a dashboard should draw. [`Load::used`] is merely the most recent
-    /// reading, and with several reporters that is whichever spoke last — true,
+    /// reading, and with several reporters that is whichever spoke last, true,
     /// but not a total, and not to be presented as one.
     pub fn observe(&self, value: u64) {
         self.0.used.store(value, Ordering::Relaxed);
@@ -173,7 +173,7 @@ impl Gauge {
 /// Every occupancy gauge in one service.
 ///
 /// Shaped like [`Metrics`](crate::metrics::Metrics) deliberately: same
-/// create-on-first-mention rule, for the same reason — a gauge that has to be
+/// create-on-first-mention rule, for the same reason, a gauge that has to be
 /// declared up front is a gauge that exists in the code and is missing from the
 /// registry, and nobody notices until the queue it describes overflows.
 #[derive(Debug, Clone, Default)]

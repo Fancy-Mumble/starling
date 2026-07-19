@@ -1,9 +1,9 @@
-//! A bucket per route, per client — and a refusal that is never silent.
+//! A bucket per route, per client, and a refusal that is never silent.
 //!
 //! murmur runs one shared leaky bucket per user: 1 msg/s sustained, burst 5,
 //! **silent drop**. Starting a screen share legitimately emits several
 //! signalling messages back to back, and that ate the loopback viewer's SDP
-//! offer in most runs — the client logged success, the server logged nothing.
+//! offer in most runs, the client logged success, the server logged nothing.
 //!
 //! So: buckets are per route, and a throttled message produces a [`Verdict`]
 //! the caller must act on. Fancy clients are told they were throttled; legacy
@@ -36,7 +36,7 @@ pub enum Verdict {
 /// The control-bucket numbers an operator can change while the server runs.
 ///
 /// `message_limit` and `message_burst` were in `server-config`, read back by
-/// `operator-api`, and applied nowhere — the gateway sized its buckets from the
+/// `operator-api`, and applied nowhere, the gateway sized its buckets from the
 /// deployment TOML, so murmur's runtime-tunable rate limit was not tunable at
 /// runtime (`docs/GAP-ANALYSIS.md` §5).
 ///
@@ -44,7 +44,7 @@ pub enum Verdict {
 /// rather than a lock: a mutex here would put every client's frames behind one
 /// another for a value that changes about once a month.
 ///
-/// Absent — `rate` of zero — means "the operator has said nothing", and the
+/// Absent (`rate` of zero) means "the operator has said nothing", and the
 /// TOML stands. That distinction has to exist: a deployment that tuned its
 /// `control` bucket must not have it silently reset to murmur's 1/s by a
 /// `server-config` that merely came up with its defaults.
@@ -234,7 +234,7 @@ mod tests {
     fn the_operators_message_limit_reaches_a_connection_that_is_already_open() {
         // §5's `message_limit`/`message_burst`: read back by `operator-api` and
         // applied nowhere, because the buckets came from the deployment TOML.
-        // Raising it must reach a client that never reconnects — which is what
+        // Raising it must reach a client that never reconnects, which is what
         // murmur's `setLiveConf` does and what a per-connection bucket built at
         // connect time cannot.
         let live = Arc::new(MessageLimit::default());

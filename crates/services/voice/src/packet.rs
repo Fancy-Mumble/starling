@@ -8,18 +8,18 @@
 //!
 //! [`AudioPacket`] is what the server actually works with. [`AudioCodec`] is the
 //! strategy that gets it to and from bytes, and [`codec_for`] picks the
-//! implementation from the peer's negotiated [`UdpFormat`] — decided once at
+//! implementation from the peer's negotiated [`UdpFormat`], decided once at
 //! handshake, not sniffed per packet.
 //!
 //! Sniffing would be the obvious shortcut: the legacy header's type field is 4
 //! for Opus and the protobuf prefix is 0 or 1, so they look distinguishable. They
-//! are not, reliably — legacy type 0 is CELT alpha, which collides with protobuf
+//! are not, reliably, legacy type 0 is CELT alpha, which collides with protobuf
 //! Audio. Guessing per packet would mean a peer could switch formats mid-stream,
 //! and the server would follow it.
 //!
 //! # Why the server parses audio at all
 //!
-//! It could relay opaque bytes, and for the payload it very nearly does — the
+//! It could relay opaque bytes, and for the payload it very nearly does, the
 //! Opus data is never decoded. But the target field decides who receives the
 //! frame, and the sender field has to be *overwritten* with the true session on
 //! the way out, or any peer could impersonate any other by writing someone
@@ -113,7 +113,7 @@ pub enum PacketError {
 ///
 /// The union of what both formats can carry. Fields the legacy format has no
 /// room for are `None` after decoding it, and are dropped again when encoding
-/// back to legacy — a 1.4 client cannot be told about a volume adjustment, so
+/// back to legacy, a 1.4 client cannot be told about a volume adjustment, so
 /// the server applies what it can and discards the rest rather than pretending.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioPacket {
@@ -126,8 +126,8 @@ pub struct AudioPacket {
 
     /// Who spoke.
     ///
-    /// Ignored on the way in — a peer's claim about its own identity is not
-    /// evidence — and overwritten with the authenticated session before the
+    /// Ignored on the way in, a peer's claim about its own identity is not
+    /// evidence, and overwritten with the authenticated session before the
     /// frame is relayed.
     pub sender: SessionId,
 
@@ -169,7 +169,7 @@ impl AudioPacket {
 /// A datagram on the audio port.
 ///
 /// Ping shares the port with audio and must be answered before the peer is
-/// authenticated — it is how a client discovers whether UDP works at all, and
+/// authenticated; it is how a client discovers whether UDP works at all, and
 /// how the public server list measures a server it has never connected to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datagram {
@@ -223,7 +223,7 @@ pub trait AudioCodec: std::fmt::Debug + Send + Sync {
     /// Not the inverse of [`Self::encode_audio`], and cannot be: the legacy
     /// format carries a session field only in the server-to-client direction, so
     /// what a client sends and what a server sends are different layouts. The
-    /// server only ever does one of each, so the asymmetry costs nothing —
+    /// server only ever does one of each, so the asymmetry costs nothing,
     /// except a contract test that has to state both directions explicitly.
     ///
     /// # Errors
@@ -319,7 +319,7 @@ impl AudioCodec for LegacyCodec {
                     opus,
                     terminator: header & LEGACY_TERMINATOR_BIT != 0,
                     // Anything left is positional data. Absent is the common
-                    // case — most clients never enable it.
+                    // case, most clients never enable it.
                     positional: read_position(&mut reader),
                     volume_adjustment: None,
                 }))
@@ -506,7 +506,7 @@ mod tests {
     /// The contract needs both directions, and only one of them is a method:
     /// `decode` reads what a client sent, `encode_audio` writes what a server
     /// sends, and for the legacy format those are different layouts. Spelling
-    /// out the inbound shape here is the honest way to test the reader — the
+    /// out the inbound shape here is the honest way to test the reader, the
     /// alternative, feeding it the server's own output, would test the codec
     /// against itself and pass even if both halves were wrong the same way.
     fn as_a_client_would_send(format: UdpFormat, packet: &AudioPacket) -> Bytes {

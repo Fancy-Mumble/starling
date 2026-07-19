@@ -16,14 +16,14 @@
 //! # What it is not
 //!
 //! **Not a service.** [`COMPRESSED_BATCH`] is a property of the connection, not
-//! a destination on it — what comes out of a batch is ordinary frames that
+//! a destination on it, what comes out of a batch is ordinary frames that
 //! route exactly as they did before. That is why it is numbered far from the
 //! service block rather than taking the next free slot there.
 //!
 //! # Who sees one
 //!
 //! Only a peer that announced `zstd` in its `Hello`. A stock Mumble client
-//! never announces anything, so it never receives a type it cannot parse — the
+//! never announces anything, so it never receives a type it cannot parse, the
 //! same rule the resume sequence follows, and the reason both are safe to add
 //! to a protocol whose whole point is that murmur's clients keep working.
 
@@ -35,8 +35,8 @@ use crate::connection::Outbound;
 /// Below this, a batch is sent uncompressed.
 ///
 /// zstd on forty bytes of `UserState` spends CPU to produce something no
-/// smaller, and often slightly larger. The interesting payloads — a reconnect
-/// flood, a page of chat history — are far above it.
+/// smaller, and often slightly larger. The interesting payloads, a reconnect
+/// flood, a page of chat history, are far above it.
 const WORTH_COMPRESSING: usize = 256;
 
 /// The compression level.
@@ -49,8 +49,8 @@ const LEVEL: i32 = 1;
 
 /// Join `frames` into one compressed batch, or `None` if it is not worth it.
 ///
-/// The frames go in whole — `type ‖ len ‖ payload` each, exactly as they would
-/// have been written — so the receiver decompresses and then reads frames with
+/// The frames go in whole, `type ‖ len ‖ payload` each, exactly as they would
+/// have been written, so the receiver decompresses and then reads frames with
 /// the parser it already has. Nothing needs to know what is inside them, which
 /// is what keeps this out of the routing layer entirely.
 #[must_use]
@@ -74,7 +74,7 @@ pub fn batch(frames: &[Outbound]) -> Option<Outbound> {
     let compressed = zstd::stream::encode_all(joined.as_ref(), LEVEL).ok()?;
     // A batch that did not shrink is sent as it was. Compression that makes a
     // payload larger is a cost with no benefit, and protobuf that is mostly
-    // random bytes — sealed pchat ciphertext, an avatar — does exactly that.
+    // random bytes (sealed pchat ciphertext, an avatar) does exactly that.
     if compressed.len() >= total {
         return None;
     }
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(
             out.as_ref(),
             expected.as_slice(),
-            "what comes out must be the frames that went in, byte for byte — a \
+            "what comes out must be the frames that went in, byte for byte, a \
              receiver parses them with the decoder it already has"
         );
     }
@@ -221,7 +221,7 @@ mod tests {
         // makes random data slightly *larger*. Sending the batch anyway would
         // cost bandwidth to save none.
         // xorshift64, because the obvious `i * prime + j` generator produces a
-        // pattern zstd finds immediately — which made this test assert the
+        // pattern zstd finds immediately, which made this test assert the
         // opposite of what it meant to.
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
         let mut next = move || {

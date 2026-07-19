@@ -3,7 +3,7 @@ syntax = "proto3";
 // Registered accounts, profiles, account settings and content-addressed blobs.
 //
 // Account settings live here rather than in server-config: they are per-user
-// profile data, and belong with the profile — docs/ARCHITECTURE.md §4.
+// profile data, and belong with the profile, docs/ARCHITECTURE.md §4.
 package starling.userdata.v1;
 
 import "common.proto";

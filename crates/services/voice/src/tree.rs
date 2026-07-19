@@ -10,14 +10,14 @@
 //!
 //! That is the worst shape a feature can fail in. A shout with links ticked
 //! reaches the base channel and stops, which is indistinguishable from a shout
-//! that worked — the speaker is heard by *someone*, so nobody reports it, and
+//! that worked, the speaker is heard by *someone*, so nobody reports it, and
 //! the people the operator linked the channel for hear nothing.
 //!
 //! # Why a subscription and not a lookup
 //!
 //! The same rule the membership cache follows: **nothing on the packet path may
 //! make a request** (`docs/ARCHITECTURE.md` §3). `metadata` owns the tree and
-//! publishes it — snapshot first, then deltas — so this keeps a copy and the
+//! publishes it (snapshot first, then deltas) so this keeps a copy and the
 //! packet path reads it without asking anyone.
 //!
 //! # What a stale tree costs
@@ -43,8 +43,8 @@ pub struct ChannelTree {
 
 /// One channel's place in the tree.
 ///
-/// Only the two fields a shout can travel along. The rest of a `Channel` — its
-/// name, description, position, flags — is `metadata`'s business and copying it
+/// Only the two fields a shout can travel along. The rest of a `Channel`, its
+/// name, description, position, flags, is `metadata`'s business and copying it
 /// here would be a second tree to keep in agreement with the first.
 #[derive(Debug, Clone, Default)]
 struct Relations {
@@ -55,7 +55,7 @@ struct Relations {
 }
 
 impl ChannelTree {
-    /// An empty tree — every channel an island.
+    /// An empty tree, every channel an island.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -129,7 +129,7 @@ impl ChannelTree {
             for link in &relations.links {
                 // Only one direction of each pair is written. `with_link` records
                 // both, so writing the mirror when the other end reports it would
-                // put every link in the snapshot twice — and a shout would then
+                // put every link in the snapshot twice, and a shout would then
                 // resolve the same audience once per copy.
                 if *id < *link {
                     snapshot = snapshot.with_link(ChannelId(*id), ChannelId(*link));
@@ -191,7 +191,7 @@ mod tests {
     fn a_shout_carries_into_a_linked_channel() {
         // The whole reason this module exists. Without the tree the snapshot has
         // no links, `include_links` matches nothing, and the shout reaches the
-        // base channel only — which looks like a shout that worked.
+        // base channel only, which looks like a shout that worked.
         let tree = ChannelTree::new();
         tree.replace(vec![
             channel(LOBBY, None, &[ANNEX]),
@@ -208,7 +208,7 @@ mod tests {
     fn a_link_is_not_doubled_when_both_ends_report_it() {
         // `metadata` records links on both channels and `with_link` already
         // records both directions, so writing every reported edge would put each
-        // link in twice — and a shout would then resolve its audience once per
+        // link in twice, and a shout would then resolve its audience once per
         // copy. Deduplication is invisible until something counts recipients.
         let tree = ChannelTree::new();
         tree.replace(vec![
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn a_shout_carries_into_a_grandchild() {
         // The tree is walked upward from each candidate, so depth is not a
-        // special case — but nothing else asserts it, and a walk that stopped at
+        // special case, but nothing else asserts it, and a walk that stopped at
         // one level would pass every other test here.
         let tree = ChannelTree::new();
         tree.replace(vec![

@@ -8,7 +8,7 @@
 //! Draining a gateway is the interesting case: it holds client sockets, and
 //! dropping ten thousand at once produces ten thousand simultaneous reconnects
 //! and full floods. So the drain is staggered and clients are given jittered
-//! reconnect hints — required whether or not the resume store exists, because
+//! reconnect hints, required whether or not the resume store exists, because
 //! legacy clients can never resume.
 
 use std::sync::Arc;
@@ -98,7 +98,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_after_the_drain_has_started_returns_immediately() {
         // A task spawned during the drain must not block forever on a signal
-        // that has already fired — that is how a pod hangs until SIGKILL.
+        // that has already fired; that is how a pod hangs until SIGKILL.
         let shutdown = Shutdown::new();
         shutdown.drain();
         tokio::time::timeout(std::time::Duration::from_millis(100), shutdown.wait())

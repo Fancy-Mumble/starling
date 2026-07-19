@@ -4,7 +4,7 @@
 //! plainest case of one is a group name. Upstream reads four prefixes and six
 //! reserved words, and the difference is not cosmetic: `!~sub,0,1,1` is a
 //! perfectly ordinary thing for an operator to write, and a server that compares
-//! it to a group name with `==` reads it as a group nobody is in — so the entry
+//! it to a group name with `==` reads it as a group nobody is in, so the entry
 //! is silently inert, which is the failure mode this module exists to end
 //! (`docs/GAP-ANALYSIS.md` G3).
 //!
@@ -13,20 +13,20 @@
 //! Every predicate here is evaluated against a **context channel**, and the
 //! whole grammar turns on which one that is:
 //!
-//! * [`Context::target`] — the channel permissions are being computed *for*.
+//! * [`Context::target`]: the channel permissions are being computed *for*.
 //!   The default context.
-//! * [`Context::acl_channel`] — the ancestor the entry was actually written on.
+//! * [`Context::acl_channel`]: the ancestor the entry was actually written on.
 //!   Selected by the `~` prefix.
 //!
 //! They differ exactly when an entry is inherited. `in` on a parent's entry
 //! therefore means "the user is in the channel we are asking about", while
-//! `~in` means "the user is in the channel the rule was written on" — which is
+//! `~in` means "the user is in the channel the rule was written on", which is
 //! how upstream expresses "members of this room may do this in every room
 //! below it".
 //!
 //! # What is deliberately not here
 //!
-//! murmur's `qsTemporary` — group membership granted to a live session rather
+//! murmur's `qsTemporary`, group membership granted to a live session rather
 //! than to an account, by Ice or a plugin. There is no surface in Starling that
 //! grants one, so implementing the lookup would be implementing a read of a
 //! table nothing writes.
@@ -46,9 +46,9 @@ pub struct Context<'a> {
     pub acls: &'a Acls,
     /// The virtual server.
     pub scope: u32,
-    /// The channel being evaluated for — murmur's `currentChannel`.
+    /// The channel being evaluated for, murmur's `currentChannel`.
     pub target: u32,
-    /// The channel the entry is written on — murmur's `aclChannel`.
+    /// The channel the entry is written on, murmur's `aclChannel`.
     ///
     /// The same as [`Self::target`] for an entry on the channel itself, and an
     /// ancestor of it for an inherited one.
@@ -59,7 +59,7 @@ pub struct Context<'a> {
 ///
 /// Named fields rather than a `(i32, i32, i32)`, because the three are read in
 /// a different order than they are written and two of them are bounds on the
-/// same quantity — a tuple here is three chances to transpose a pair silently.
+/// same quantity, a tuple here is three chances to transpose a pair silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Sub {
     /// How far from the context channel the required ancestor sits.
@@ -85,23 +85,23 @@ impl Default for Sub {
 /// What a specification resolves to once its prefixes are stripped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind<'a> {
-    /// `#name` — an access token the client presented.
+    /// `#name`: an access token the client presented.
     Token(&'a str),
-    /// `$hash` — the peer's certificate fingerprint.
+    /// `$hash`: the peer's certificate fingerprint.
     CertHash(&'a str),
-    /// `none` — nobody, which is how an entry is disabled without deleting it.
+    /// `none`: nobody, which is how an entry is disabled without deleting it.
     Nobody,
-    /// `all` — everybody, including guests.
+    /// `all`: everybody, including guests.
     Everybody,
-    /// `auth` — a registered account.
+    /// `auth`: a registered account.
     Registered,
-    /// `strong` — a certificate that chained to a configured CA.
+    /// `strong`: a certificate that chained to a configured CA.
     Strong,
-    /// `in` — standing in the context channel.
+    /// `in`: standing in the context channel.
     In,
-    /// `out` — standing anywhere else.
+    /// `out`: standing anywhere else.
     Out,
-    /// `sub[,offset[,min[,max]]]` — standing somewhere below the context channel.
+    /// `sub[,offset[,min[,max]]]`: standing somewhere below the context channel.
     Sub(Sub),
     /// Anything else: an actual group name.
     Named(&'a str),
@@ -110,9 +110,9 @@ enum Kind<'a> {
 /// One parsed specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Spec<'a> {
-    /// `!` — the result is negated.
+    /// `!`: the result is negated.
     negate: bool,
-    /// `~` — evaluate against the channel the entry was written on.
+    /// `~`: evaluate against the channel the entry was written on.
     at_acl_channel: bool,
     kind: Kind<'a>,
 }
@@ -121,12 +121,12 @@ impl<'a> Spec<'a> {
     /// Read a specification, or `None` when there is nothing left to read.
     ///
     /// Prefixes are stripped in a loop and in any order, exactly as upstream
-    /// does (`Group.cpp:112`) — `!~name` and `~!name` are the same rule, and a
+    /// does (`Group.cpp:112`), `!~name` and `~!name` are the same rule, and a
     /// parser that fixed an order would reject tables murmur accepts.
     ///
     /// A specification that is *only* prefixes is refused **without** applying
     /// the negation, which looks like an oversight upstream and is not: it is
-    /// the difference between `!` meaning "nobody, inverted" — everybody — and
+    /// the difference between `!` meaning "nobody, inverted" (everybody) and
     /// meaning nothing at all. `Group.cpp:139` returns a bare `false`, and an
     /// entry reading `!` granting the whole server is not a bug worth
     /// reproducing faithfully in the other direction.
@@ -264,14 +264,14 @@ fn is_cert(subject: &Subject, hash: &str) -> bool {
     held.eq_ignore_ascii_case(hash)
 }
 
-/// `sub[,offset,min,max]` — whether the subject stands below the context channel.
+/// `sub[,offset,min,max]`: whether the subject stands below the context channel.
 ///
 /// Transcribed from `Group.cpp:162`, including the arithmetic, because every
 /// part of it is load-bearing:
 ///
 /// * `offset` moves the *required ancestor* along the target's own chain, so
 ///   `sub,-1` asks about the context channel's parent.
-/// * The subject must actually be under that ancestor — otherwise no depth
+/// * The subject must actually be under that ancestor, otherwise no depth
 ///   counts.
 /// * `min` and `max` bound how far under it they may be, measured from the
 ///   ancestor and not from the root.
@@ -283,7 +283,7 @@ fn in_subtree(subject: &Subject, context: &Context<'_>, channel: u32, sub: Sub) 
     let home = context.acls.ancestry(context.scope, subject.channel);
     let current = context.acls.ancestry(context.scope, context.target);
 
-    // The context channel is on the target's chain by construction — it is
+    // The context channel is on the target's chain by construction; it is
     // either the target itself or an ancestor whose entry we are applying. A
     // table that says otherwise is one whose parent links have not caught up
     // with a move, so this refuses rather than picking an arbitrary index.
@@ -326,8 +326,8 @@ fn in_subtree(subject: &Subject, context: &Context<'_>, channel: u32, sub: Sub) 
 /// name may be declared on several channels in a chain, and two flags decide
 /// which of those declarations are in play:
 ///
-/// * `inherit` — this declaration ignores anything its ancestors said.
-/// * `inheritable` — descendants may see this declaration at all.
+/// * `inherit`: this declaration ignores anything its ancestors said.
+/// * `inheritable`: descendants may see this declaration at all.
 ///
 /// The surviving declarations are then applied from the top down, so the
 /// closest one wins: a parent that adds an account and a child that removes it
@@ -335,7 +335,7 @@ fn in_subtree(subject: &Subject, context: &Context<'_>, channel: u32, sub: Sub) 
 ///
 /// **A guest can hold a temporary membership and nothing else.** Permanent
 /// membership is recorded by account id, so a subject with no account is only
-/// ever in a named group by way of a session-scoped grant — which is the whole
+/// ever in a named group by way of a session-scoped grant, which is the whole
 /// reason that mechanism exists upstream. The account, when there is one, is
 /// read through `identity` rather than by trusting `account`, which is `0` for
 /// a guest and `0` for the SuperUser alike.
@@ -354,8 +354,8 @@ fn in_named_group(subject: &Subject, context: &Context<'_>, channel: u32, name: 
             .into_iter()
             .find(|group| group.name == name);
         // A channel with temporary members but no declaration still takes part.
-        // Upstream cannot tell the two apart — `addUserToGroup` constructs a
-        // `Group` to hang them on — and the constructed one carries the same
+        // Upstream cannot tell the two apart, `addUserToGroup` constructs a
+        // `Group` to hang them on, and the constructed one carries the same
         // defaults this treats a missing declaration as: inheriting, and
         // inheritable.
         if declared.is_none() && !context.acls.has_temporary(context.scope, *id, name) {
@@ -383,10 +383,10 @@ fn in_named_group(subject: &Subject, context: &Context<'_>, channel: u32, name: 
             member = true;
         }
         // Consulted at each level alongside `add`, exactly where upstream reads
-        // it (`vendor/server/src/Group.cpp:242`) — so a `remove` on a closer
+        // it (`vendor/server/src/Group.cpp:242`), so a `remove` on a closer
         // channel overrides a temporary membership granted further up, and a
         // temporary membership granted closer overrides a `remove` above it.
-        // Session 0 is "no session" — an operator acting through `Check`, or a
+        // Session 0 is "no session", an operator acting through `Check`, or a
         // connection mid-handshake. Asking about it would match a grant nobody
         // could have made, since no allocator issues 0.
         if subject.session != 0
@@ -575,7 +575,7 @@ mod tests {
     fn the_tilde_prefix_moves_the_question_to_the_channel_the_rule_was_written_on() {
         // The reason both channels are carried. An entry written on channel 1
         // and inherited into channel 2 asks about 2 by default, and about 1
-        // with `~` — which is how "members of this room, everywhere below it"
+        // with `~`, which is how "members of this room, everywhere below it"
         // is expressed.
         let acls = nested();
         let inherited = context(&acls, 2, 1);
@@ -623,8 +623,8 @@ mod tests {
     fn a_named_group_is_resolved_through_the_chain_not_looked_up_flat() {
         // A parent adds the account and a child removes it; the closest
         // declaration wins, so the account is in the group above and out of it
-        // below. Comparing the specification to a name — which is what this
-        // replaced — cannot express any of that.
+        // below. Comparing the specification to a name, which is what this
+        // replaced, cannot express any of that.
         let acls = nested();
         acls.set(
             1,
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_guest_is_in_no_named_group() {
-        // Membership is by account id and a guest has none — but a guest is
+        // Membership is by account id and a guest has none, but a guest is
         // written as `account = 0`, which is also the SuperUser's id, so a
         // group naming account 0 would otherwise contain every anonymous
         // visitor on the server.

@@ -26,8 +26,8 @@
 pub enum UdpFormat {
     /// Pre-1.5.0: a hand-rolled binary framing with a type byte per codec.
     ///
-    /// Upstream's `LegacyUDPMessageType` has five variants — CELT alpha, Ping,
-    /// Speex, CELT beta, Opus — because the codec was part of the packet type
+    /// Upstream's `LegacyUDPMessageType` has five variants, CELT alpha, Ping,
+    /// Speex, CELT beta, Opus, because the codec was part of the packet type
     /// rather than a field. Any client older than 1.5.0 speaks only this, which
     /// includes every Mumble release from 1.2 through 1.4.
     Legacy,
@@ -58,7 +58,7 @@ pub enum AudioCodec {
 /// dependency; `starling-crypto::for_choice` turns it into a spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CipherChoice {
-    /// OCB2-AES128 — what every stock Mumble client assumes without negotiating.
+    /// OCB2-AES128, what every stock Mumble client assumes without negotiating.
     Ocb2Aes128,
     /// XChaCha20-Poly1305 + HKDF-SHA256, for Fancy 0.4.0 and later.
     XChaCha20Poly1305,

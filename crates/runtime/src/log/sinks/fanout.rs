@@ -5,7 +5,7 @@ use crate::log::sink::{LogSink, SinkError};
 
 /// Writes every record to each of its children.
 ///
-/// Composite: a `FanoutSink` *is* a [`LogSink`], so it nests — a fanout of a
+/// Composite: a `FanoutSink` *is* a [`LogSink`], so it nests, a fanout of a
 /// fanout is fine, and nothing that takes a sink needs to know how many are
 /// really behind it.
 ///

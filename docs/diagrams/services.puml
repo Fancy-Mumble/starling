@@ -23,13 +23,13 @@ cloud "**publist.mumble.info**\nthe public server list" as publist #EDE7F6
 
 component "**gateway**\nTLS · framing · rate limit\n**single writer per client socket**\nroutes by type, config-driven" as gw #FFE9D6
 
-database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring\nno client, no message type, no tier\n—\n**«not built»: the ring is in-process**, so it does\nnot outlive a pod and RESUME cannot cross one" as sstore #FFE0B2
+database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring\nno client, no message type, no tier\n--\n**«not built»: the ring is in-process**, so it does\nnot outlive a pod and RESUME cannot cross one" as sstore #FFE0B2
 
 ' ═══════════════════════════════════════════════════════════════════════════
-package "**control plane** — gRPC only; no client reaches these directly" as CTRL #FAFAFA {
+package "**control plane**, gRPC only; no client reaches these directly" as CTRL #FAFAFA {
 
-  package "essential — down means nobody logs in" as ESS #FFEBEE {
-    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeout sweep\n—\n**UserState (9)** — moves, self-mute,\nmoderator mute/deafen, priority\nspeaker, registration\n**UserStats (22)** — uptime, idle,\nclient build, certificate\n«both were routed to userdata,\nwhich had no handler for either»\n0,2,3,4,5,**9**,15,21,**22** + **1000**" as slife #FFF9C4
+  package "essential, down means nobody logs in" as ESS #FFEBEE {
+    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeout sweep\n--\n**UserState (9)**, moves, self-mute,\nmoderator mute/deafen, priority\nspeaker, registration\n**UserStats (22)**, uptime, idle,\nclient build, certificate\n«both were routed to userdata,\nwhich had no handler for either»\n0,2,3,4,5,**9**,15,21,**22** + **1000**" as slife #FFF9C4
     component "**session-view**\n«the domain edge»\nthe composed live view of\nevery connected session.\nThe whole domain reads here.\nOwns nothing, writes nothing.\n**no client-facing type**" as sview #FFF9C4
     component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms #FFFFFF
     component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta #FFFFFF
@@ -37,32 +37,32 @@ package "**control plane** — gRPC only; no client reaches these directly" as C
     component "**server-config**\nruntime-mutable,\nper virtual server\n24,25 + **1013**" as scfg #FFFFFF
   }
 
-  package "core — a feature dies" as CORE #FFF8E1 {
+  package "core: a feature dies" as CORE #FFF8E1 {
     component "**text**\nhistory: **UUIDv7**\n11 + **1005**" as text #FFFFFF
     component "**pchat**\nE2EE · key mgmt\nhistory: **UUIDv7**\n**1006**" as pchat #FFFFFF
-    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n—\nchecked on the **root** channel:\nremoval is from the server, not\na room. `Ban` to ban, `Ban` **or**\n`Kick` to kick. Keyed to **address**\n**and certificate** — either alone\nis trivially evaded\n8,10 + **1007**" as mod #FFFFFF
+    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n--\nchecked on the **root** channel:\nremoval is from the server, not\na room. `Ban` to ban, `Ban` **or**\n`Kick` to kick. Keyed to **address**\n**and certificate**, either alone\nis trivially evaded\n8,10 + **1007**" as mod #FFFFFF
   }
 
-  package "optional — nobody notices" as OPT #E8F5E9 {
+  package "optional, nobody notices" as OPT #E8F5E9 {
     component "**plugins**  26 + **1010**\n**push** «FCM»  **1011**\n**audit** «UUIDv7»  **1012**\n**onboarding**  **1014**\n**social**  **1015**\n· reactions · receipts · typing\n· polls · watch · whiteboard\n**link-preview**  **1016**\n**context-actions**  16,17 + **1017**" as opt #FFFFFF
   }
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
-package "**realtime plane** — UDP / WebRTC, client connects **directly**" as RT #FFEBEE {
-  component "**voice**  «core»\n**mints the ciphers** · answers the ping\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n—\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied\n—\naudio routes both ways: a datagram on its own\nsocket, or **UDPTunnel** through the gateway for\na UDP-blocked client. Membership is read from a\n`session-view` subscription, never asked per packet\n—\n**«not built»**: whisper/shout — `VoiceTarget` (19)\nis still a stub, so only channel speech routes" as voice #FFFFFF
-  component "**screenshare**  «optional»\nsignalling only\n**1008**\n—\n**«not built»: no SFU.** There is no str0m\ndependency; media has nowhere to go" as share #FFFFFF
+package "**realtime plane**, UDP / WebRTC, client connects **directly**" as RT #FFEBEE {
+  component "**voice**  «core»\n**mints the ciphers** · answers the ping\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n--\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied\n--\naudio routes both ways: a datagram on its own\nsocket, or **UDPTunnel** through the gateway for\na UDP-blocked client. Membership is read from a\n`session-view` subscription, never asked per packet\n--\n**«not built»**: whisper/shout, `VoiceTarget` (19)\nis still a stub, so only channel speech routes" as voice #FFFFFF
+  component "**screenshare**  «optional»\nsignalling only\n**1008**\n--\n**«not built»: no SFU.** There is no str0m\ndependency; media has nowhere to go" as share #FFFFFF
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
-package "**HTTP plane** — plain HTTPS, client connects **directly**" as HTTP #E8F5E9 {
+package "**HTTP plane**, plain HTTPS, client connects **directly**" as HTTP #E8F5E9 {
   component "**files / http**  «optional»\nsigned URLs · uploads · blobs\nplugin binaries · audit exports\n**1009**" as files #FFFFFF
   component "**operator-api**  «admin»\nREST + OpenAPI\nauth **pluggable**: OIDC · JWT\nmTLS · token\ndefault **off**, localhost-bound" as opapi #F3E5F5
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
-package "**outward plane** — this server talking about itself" as OUT #EDE7F6 {
-  component "**directory**  «optional»\nhourly announcement to the\npublic Mumble server list\n—\n**no client, no wire type, no endpoint**\nnothing dials it; it dials out" as dirsvc #FFFFFF
+package "**outward plane**, this server talking about itself" as OUT #EDE7F6 {
+  component "**directory**  «optional»\nhourly announcement to the\npublic Mumble server list\n--\n**no client, no wire type, no endpoint**\nnothing dials it; it dials out" as dirsvc #FFFFFF
 }
 
 ' ══════════════════════ control: TCP through the gateway ═══════════════════
@@ -70,12 +70,12 @@ legacy -[#000000]-> gw : **TCP 64738**\nTLS + framing
 fancy  -[#000000]-> gw : **TCP 64738**\n+ **zstd** stream «not built»
 
 gw -[#1565C0]-> CTRL  : gRPC
-gw -[#1565C0]-> RT : gRPC — signalling\nand UDPTunnel only
-gw -[#1565C0]-> files : gRPC — mint a signed URL
+gw -[#1565C0]-> RT : gRPC, signalling\nand UDPTunnel only
+gw -[#1565C0]-> files : gRPC, mint a signed URL
 note on link #E3F2FD
-  Payload forwarded **verbatim** — already protobuf, never
-  re-encoded. A **local socket** when co-located — a Unix socket,
-  or a named pipe on Windows — and TCP when not.
+  Payload forwarded **verbatim**, already protobuf, never
+  re-encoded. A **local socket** when co-located, a Unix socket,
+  or a named pipe on Windows, and TCP when not.
   **Circuit breaker per service**, inbound shed by `tier`.
   **RESUME**: a sequence number per session, so a rolling deploy
   is not 10 000 simultaneous full floods. **«not built»**: the
@@ -87,7 +87,7 @@ note on link #FFE0B2
   **Why this is not in a tier.** `tier` decides what the gateway does
   when a dependency is down, and both answers are wrong here:
   **essential** would reject logins over a lost *optimisation*, and
-  **optional** claims nobody notices — false, because its absence
+  **optional** claims nobody notices, false, because its absence
   bites at the worst possible moment and the resulting herd can
   saturate metadata, which *is* essential.
   It is not a service at all: no client reaches it, it has no
@@ -95,7 +95,7 @@ note on link #FFE0B2
   gateway's own durable state, externalised so a pod can die.
   **Legacy clients can never RESUME**, so staggered drain and
   jittered reconnect hints are required regardless. This store
-  optimises a path that must already survive without it — which is
+  optimises a path that must already survive without it, which is
   what "not essential" means.
   It is reported in readiness as a **warning**, never as unready.
 end note
@@ -104,7 +104,7 @@ end note
 legacy -[#C62828]-> voice : **UDP 64738**
 fancy  -[#C62828]-> voice : **UDP 64738**
 note on link #FFEBEE
-  Same port, different protocol, **different process** — murmur
+  Same port, different protocol, **different process**, murmur
   binds these separately, Server.cpp:125 vs 193. So audio never
   traverses the gateway. Only UDPTunnel, the UDP-blocked
   fallback, comes through the control plane.
@@ -135,7 +135,7 @@ note on link #EDE7F6
   the list keys an entry to the same fingerprint clients pin and
   nobody can update somebody else's listing.
   Refused unless the operator set a name, a secret and a URL, and
-  **never** for a password-protected server — a public list is a
+  **never** for a password-protected server, a public list is a
   directory of servers people can join. Both rules are murmur's.
   The count comes from **session-view**, not from a gateway: with
   two gateways either one sees a fraction.
@@ -145,7 +145,7 @@ legacy -[#C62828].-> voice : **UDP ping**, unauthenticated
 note on link #FFEBEE
   How a server browser measures a server it has never connected
   to: version, users, limits. Answered from the packet path, so
-  the numbers are **pushed in on a timer** — a fetch per ping
+  the numbers are **pushed in on a timer**, a fetch per ping
   would make an open UDP port a lever on session-view.
   murmur's `allowping` gates **this** ping only. Gating the
   connectivity ping a connected peer sends would silently push
@@ -167,10 +167,10 @@ OPT  -[#1565C0].-> sview
 RT   -[#1565C0].-> sview
 gw   -[#1565C0].-> sview
 note on link #FFF9C4
-  **Read here and nowhere else** — otherwise every service depends
+  **Read here and nowhere else**, otherwise every service depends
   on four others, with four caches each to keep warm.
   It **forwards but never decides**, and is a
-  **subscription hub, not a proxy** — nothing on the audio path
+  **subscription hub, not a proxy**, nothing on the audio path
   makes a request.
   **Every mailbox is bounded**, with a shed policy.
 end note
@@ -196,10 +196,10 @@ note on link #F3E5F5
 end note
 
 note as OPLOG #FFE0B2
-  **The operator log — every service writes it, no service owns it.**
+  **The operator log, every service writes it, no service owns it.**
   Distinct from `tracing`, which is a developer's dial and defaults
-  to `warn`. This is the record an operator keeps — **who connected,**
-  **what was refused, what an administrator changed** — categorised
+  to `warn`. This is the record an operator keeps, **who connected,**
+  **what was refused, what an administrator changed**, categorised
   (server · session · channel · message · permission · security ·
   plugin · admin) and levelled independently of `RUST_LOG`.
   Configured under `[logging]`, written by a **dedicated OS thread**
@@ -213,7 +213,7 @@ note bottom of ESS #FFFFFF
   **Each service owns its own schema.** No service reads
   another's tables. One migration tool, many schemas.
   Built: `sqlx` over the `Any` driver, so the backend is chosen
-  by URL scheme — **SQLite, MySQL or PostgreSQL**. With no
+  by URL scheme, **SQLite, MySQL or PostgreSQL**. With no
   `[storage]` block a service gets its own SQLite file named
   after it, under the shared data directory.
   Twelve services keep one: userdata, metadata, server-config,
@@ -230,8 +230,8 @@ legend bottom
 | <color:#C62828>**red**</color> | realtime | UDP or WebRTC, **direct to the service** |
 | <color:#2E7D32>**green**</color> | bulk | HTTPS, signed URL, out of band |
 | <color:#6A1B9A>**purple**</color> | admin | HTTPS + REST in, gRPC out, pluggable auth, default off |
-| <color:#4527A0>**indigo**</color> | outward | HTTPS out to the public server list — the only edge Starling opens |
-| <color:#1565C0>**blue**</color> | internal | gRPC — solid is a call, dotted is a cached subscription |
+| <color:#4527A0>**indigo**</color> | outward | HTTPS out to the public server list, the only edge Starling opens |
+| <color:#1565C0>**blue**</color> | internal | gRPC, solid is a call, dotted is a cached subscription |
 Anything marked **«not built»** is drawn because the design depends on it, and
 labelled because it does not exist yet. See `README.md` in this directory.
 endlegend

@@ -1,7 +1,7 @@
 //! ACL evaluation: the ancestor walk, deny over allow, and groups.
 //!
 //! Transcribed from murmur's `src/ACL.cpp:104`: walk the chain from the root to
-//! the target channel, and at each level apply the entries that reach it —
+//! the target channel, and at each level apply the entries that reach it,
 //! `apply_here` on the channel itself, `apply_subs` on its descendants. Within
 //! a level, **deny wins over allow**, and a channel with inheritance off starts
 //! from nothing rather than from its parent's result.
@@ -34,7 +34,7 @@ const ROOT_CHANNEL: u32 = 0;
 pub enum Member {
     /// A registered account, held until removed or until the server restarts.
     Account(u64),
-    /// A live session — the only way to put an *unregistered* user in a group,
+    /// A live session, the only way to put an *unregistered* user in a group,
     /// and dropped the moment that session goes.
     Session(u32),
 }
@@ -67,7 +67,7 @@ pub struct Acls {
 
 impl Acls {
     /// No ACLs anywhere, which by the rules below grants nothing except to the
-    /// superuser — so a server with no ACL tables at all still lets its owner
+    /// superuser, so a server with no ACL tables at all still lets its owner
     /// in and nobody else.
     #[must_use]
     pub fn new() -> Self {
@@ -80,7 +80,7 @@ impl Acls {
     /// kept; the rest go.** That is upstream's rule, and it is not obvious from
     /// either side: `Messages.cpp:2842` stashes every group's temporary set
     /// before deleting the old `Group` objects, and `:2900` restores it while
-    /// looping over the *new* ones — so a group the operator deleted takes its
+    /// looping over the *new* ones, so a group the operator deleted takes its
     /// temporary members with it, and a group they merely edited does not.
     ///
     /// Getting this wrong is silent in both directions. Dropping everything
@@ -184,7 +184,7 @@ impl Acls {
     /// Drop **every** session-scoped membership, keeping account-scoped ones.
     ///
     /// For the case where this service can no longer be sure it has seen every
-    /// departure — a dropped `session-view` subscription. Account grants are
+    /// departure, a dropped `session-view` subscription. Account grants are
     /// unaffected because they are not tied to a connection and nothing about
     /// them has become uncertain.
     pub fn forget_every_session(&self) {
@@ -203,7 +203,7 @@ impl Acls {
     /// re-queues a departing session's id for reuse
     /// (`vendor/server/src/murmur/Server.cpp:1904`) and Starling's allocator
     /// does the same, so a grant that outlived its holder would be inherited by
-    /// whoever is issued that id next — silently, and carrying whatever the
+    /// whoever is issued that id next, silently, and carrying whatever the
     /// group was granted.
     ///
     /// A scan of the whole table rather than a reverse index. Temporary grants
@@ -261,7 +261,7 @@ impl Acls {
 
     /// Record the tree shape the walk needs.
     ///
-    /// Permissions does not own the tree — metadata does — so it is told rather
+    /// Permissions does not own the tree (metadata does) so it is told rather
     /// than asking per evaluation, which would put a network hop inside the hot
     /// path of every check.
     pub fn set_parent(&self, scope: u32, channel: u32, parent: u32) {
@@ -297,7 +297,7 @@ impl Acls {
 
     /// The groups a subject is in at `channel`, for a client to display.
     ///
-    /// The *identity* groups only — the ones that describe who somebody is.
+    /// The *identity* groups only, the ones that describe who somebody is.
     /// `in`, `out` and `sub` are relations between two channels rather than
     /// memberships, so there is no honest way to list them here, and an entry
     /// naming one is still evaluated by [`crate::group::applies`] like any
@@ -318,7 +318,7 @@ impl Acls {
             acl_channel: channel,
         };
         let mut groups = vec!["all".to_owned()];
-        // `@auth` is `iId >= 0` upstream (`vendor/server/src/Group.cpp:154`) —
+        // `@auth` is `iId >= 0` upstream (`vendor/server/src/Group.cpp:154`),
         // *registered*, not "connected". Reading it as the latter puts every
         // anonymous guest in the group an operator granted to their members.
         if identity::is_authenticated(subject.registered) {
@@ -346,7 +346,7 @@ impl Acls {
 /// `account` here, and that indirection is load-bearing in both directions. This
 /// function used to hold `const SUPERUSER: u64 = 1`, which granted every
 /// permission to the first ordinary registered account while leaving the real
-/// administrator — account 0 — subject to its own ACLs. Changing the constant to
+/// administrator (account 0) subject to its own ACLs. Changing the constant to
 /// 0 without also requiring registration would have been worse still, because an
 /// unregistered guest is written as `account = 0`.
 #[must_use]
@@ -358,7 +358,7 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
     let chain = acls.ancestry(scope, channel);
     // murmur seeds the walk with a default set rather than with nothing
     // (`vendor/server/src/ACL.cpp:130`). Starting from `NONE` made an
-    // unconfigured server grant nobody anything at all — every client showing
+    // unconfigured server grant nobody anything at all, every client showing
     // every action greyed out, with no ACL entry anywhere to explain it.
     let mut granted = Perm::DEFAULT;
 
@@ -374,8 +374,8 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
             granted = Perm::DEFAULT;
         }
 
-        // Registered users — not the SuperUser, which returned above, and not
-        // guests — can read the account directory from the root by default, so
+        // Registered users, not the SuperUser, which returned above, and not
+        // guests, can read the account directory from the root by default, so
         // an offline user can be resolved and invited
         // (`vendor/server/src/ACL.cpp:147`). Seeded before this channel's own
         // entries, so a root ACL denying it can still take it away.
@@ -416,13 +416,13 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
 /// (`vendor/server/src/ACL.cpp:154`, `matchUser || matchGroup`) rather than
 /// letting the account short-circuit the group. The client's editor writes one
 /// or the other, so the difference only shows on a table written by hand or by
-/// Ice — where preferring one would silently drop half of the rule.
+/// Ice, where preferring one would silently drop half of the rule.
 ///
 /// The account is compared through [`identity::account`] and not by reading
 /// `subject.account`. That is the third place this mistake has been made in
 /// this file (`docs/GAP-ANALYSIS.md` G4): an unregistered guest goes on the
 /// wire as `account = 0, registered = false`, and `0` is also the SuperUser's
-/// id — so a comparison of the number alone means an entry granting something
+/// id, so a comparison of the number alone means an entry granting something
 /// to the administrator's account grants it to **every anonymous visitor on the
 /// server**. The pair is only ever meaningful read together.
 fn matches(entry: &AclEntry, subject: &Subject, context: &Context<'_>) -> bool {
@@ -629,7 +629,7 @@ mod tests {
     fn an_acl_on_a_parent_reaches_its_children() {
         // Inheritance, which needs the parent table to be populated. Until the
         // tree subscription existed nothing wrote it outside tests, so every
-        // channel evaluated as a root and an entry on a parent reached nothing —
+        // channel evaluated as a root and an entry on a parent reached nothing,
         // visibly present in the ACL editor, silently never consulted.
         let acls = Acls::new();
         acls.set_parent(1, 5, 0);
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn an_unconfigured_server_lets_people_talk() {
         // The regression this exists for: starting the walk from `NONE` made a
-        // server with no ACL table grant nobody anything — every action greyed
+        // server with no ACL table grant nobody anything, every action greyed
         // out in every client, with no entry anywhere to blame. murmur seeds
         // the walk with these six (`ACL.cpp:130`).
         let granted = Perm::from_bits_truncate(evaluate(&Acls::new(), 1, &Subject::default(), 0));
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn the_superuser_is_never_locked_out_by_an_acl_table() {
         // A server whose administrator cannot get in is a server nobody can
-        // repair. Note `registered: true` — this test used to assert the same
+        // repair. Note `registered: true`, this test used to assert the same
         // thing about `account: 1`, which is why nothing caught the evaluator
         // and userdata disagreeing about which account this is.
         let superuser = Subject {
@@ -766,7 +766,7 @@ mod tests {
         ] {
             assert!(granted.contains(expected), "missing {expected:?}");
         }
-        // But **not** speaking or whispering — murmur excludes exactly those
+        // But **not** speaking or whispering, murmur excludes exactly those
         // two (`ACL.cpp:106`), so an operator who logs in to fix something is
         // not silently transmitting into whatever channel they land in.
         assert!(!granted.contains(Perm::SPEAK));
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn only_a_registered_subject_is_in_the_auth_group() {
-        // `@auth` is `iId >= 0` upstream — registered. It was read as "has a
+        // `@auth` is `iId >= 0` upstream, registered. It was read as "has a
         // session", which every connected client does, so anonymous guests were
         // getting whatever an operator granted to `@auth`.
         let acls = Acls::new();
@@ -837,7 +837,7 @@ mod tests {
         // `docs/GAP-ANALYSIS.md` G4, and the third appearance of one mistake in
         // this file. An unregistered guest is written as
         // `account = 0, registered = false`, which is the same *number* the
-        // SuperUser carries — so comparing `entry.account == subject.account`
+        // SuperUser carries, so comparing `entry.account == subject.account`
         // handed every anonymous visitor whatever an operator granted to the
         // administrator's own account.
         let acls = Acls::new();
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn a_reported_group_list_agrees_with_what_the_evaluator_will_do() {
         // `groups_of` used to scan the ancestry flat and read `add` directly,
-        // ignoring `inheritable` — so a client was shown a membership the
+        // ignoring `inheritable`, so a client was shown a membership the
         // evaluator did not honour, which is a UI offering an action that is
         // then refused.
         let acls = Acls::new();
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(!may_enter(&acls, &guest(7)), "a guest starts outside");
 
         // Adding them to the group's `add` list cannot work: `add` is account
-        // ids, and a guest's account is 0 — which is the SuperUser's.
+        // ids, and a guest's account is 0, which is the SuperUser's.
         acls.set(
             1,
             AclSet {

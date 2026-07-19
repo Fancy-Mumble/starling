@@ -3,13 +3,13 @@
 //! | Range | Use |
 //! |---|---|
 //! | 0–99 | upstream Mumble, flat, **frozen** (0–26 in use) |
-//! | 100–999 | **burned** — the interleaved Fancy layout shipped in released clients |
+//! | 100–999 | **burned**, the interleaved Fancy layout shipped in released clients |
 //! | 1000+ | one outer type per service, nested envelope |
 //!
 //! 100–999 is burned rather than reclaimed because today's numbering is
 //! interleaved rather than blocked: `WebRtcSignal` is 120, sitting between
 //! pchat's 100–119 and 121. Reusing those numbers risks a deployed client's
-//! message landing on a service that would read it as something else — silent
+//! message landing on a service that would read it as something else, silent
 //! misinterpretation, the worst failure class available.
 //!
 //! See `docs/PROTOCOL-COMPATIBILITY.md` §2–3.
@@ -31,13 +31,13 @@ pub const SERVICE_BASE: u16 = 1000;
 /// **Not a service, and deliberately far from where they are allocated.** This
 /// is a property of the connection rather than a destination on it: the gateway
 /// writes it and a client unwraps it, and what comes out is ordinary frames
-/// that route as they always did. Numbering it 1018 — the next service slot —
+/// that route as they always did. Numbering it 1018 (the next service slot)
 /// would have made it look like the eighteenth service to every reader of this
 /// table and to every capture.
 ///
 /// The payload is one or more whole frames, `type ‖ len ‖ payload` each, zstd
 /// compressed. Only ever sent to a peer that announced `zstd` in its `Hello`,
-/// so a stock Mumble client and an older Fancy one never see it — and a peer
+/// so a stock Mumble client and an older Fancy one never see it, and a peer
 /// that did announce it is by definition able to unwrap it.
 pub const COMPRESSED_BATCH: u16 = 1900;
 
@@ -49,41 +49,41 @@ pub const COMPRESSED_BATCH: u16 = 1900;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ServiceKind {
-    /// 1000 — negotiation, authentication, resume.
+    /// 1000, negotiation, authentication, resume.
     SessionLifecycle,
-    /// 1001 — ACL evaluation.
+    /// 1001, ACL evaluation.
     Permissions,
-    /// 1002 — the channel tree.
+    /// 1002, the channel tree.
     Metadata,
-    /// 1003 — accounts and account settings.
+    /// 1003, accounts and account settings.
     Userdata,
-    /// 1004 — audio routing.
+    /// 1004, audio routing.
     Voice,
-    /// 1005 — chat and its history.
+    /// 1005, chat and its history.
     Text,
-    /// 1006 — persistent, end-to-end encrypted chat.
+    /// 1006, persistent, end-to-end encrypted chat.
     Pchat,
-    /// 1007 — bans and kicks.
+    /// 1007, bans and kicks.
     Moderation,
-    /// 1008 — screen-share signalling.
+    /// 1008, screen-share signalling.
     Screenshare,
-    /// 1009 — bulk transfer.
+    /// 1009, bulk transfer.
     Files,
-    /// 1010 — the plugin host.
+    /// 1010, the plugin host.
     Plugins,
-    /// 1011 — push notifications.
+    /// 1011, push notifications.
     Push,
-    /// 1012 — the operator record.
+    /// 1012, the operator record.
     Audit,
-    /// 1013 — runtime-mutable settings.
+    /// 1013, runtime-mutable settings.
     ServerConfig,
-    /// 1014 — onboarding flows.
+    /// 1014, onboarding flows.
     Onboarding,
-    /// 1015 — reactions, receipts, typing, polls, watch, drawing.
+    /// 1015, reactions, receipts, typing, polls, watch, drawing.
     Social,
-    /// 1016 — link previews.
+    /// 1016, link previews.
     LinkPreview,
-    /// 1017 — plugin-defined menu entries.
+    /// 1017, plugin-defined menu entries.
     ContextActions,
 }
 

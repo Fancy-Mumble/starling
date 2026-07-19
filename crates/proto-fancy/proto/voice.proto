@@ -1,21 +1,21 @@
 syntax = "proto3";
 
 // Voice's control surface. Audio never appears here: clients send UDP straight
-// to voice's own socket, and only UDPTunnel reaches it through the gateway —
+// to voice's own socket, and only UDPTunnel reaches it through the gateway,
 // docs/ARCHITECTURE.md §3.
 package starling.voice.v1;
 
 import "common.proto";
 
 service Voice {
-  // CryptSetup (15) is a control message, so session-lifecycle delivers it —
+  // CryptSetup (15) is a control message, so session-lifecycle delivers it,
   // but the key seals UDP, so voice mints it. Key material never crosses a
   // service boundary in the clear: what comes back is the encoded CryptSetup
   // payload, ready to forward verbatim.
   rpc Mint(MintRequest) returns (CryptMaterial);
   // CryptSetup (15) again, mid-session: a peer whose UDP nonce has drifted
   // asking to be put back in step. The answer is a CryptSetup to forward, or
-  // nothing at all — see ResyncRequest.
+  // nothing at all, see ResyncRequest.
   rpc Resync(ResyncRequest) returns (CryptMaterial);
   rpc Forget(ForgetRequest) returns (starling.common.v1.Ack);
   rpc Stats(StatsRequest) returns (PeerStats);
@@ -28,7 +28,7 @@ message MintRequest {
   starling.common.v1.Scope scope = 1;
   uint32 session = 2;
   // The Fancy version the client announced. It, not the Mumble version,
-  // decides the cipher — the two axes are independent (starling-gate).
+  // decides the cipher, the two axes are independent (starling-gate).
   uint64 fancy_version = 3;
   // The Mumble protocol version, which decides the UDP wire format.
   uint64 mumble_version = 4;
@@ -48,8 +48,8 @@ message ResyncRequest {
   //
   // Absent and present mean opposite things, so this is `optional` and not a
   // bare `bytes`: absent is "tell me yours" and is answered, present is "adopt
-  // mine" and is not. A zero-length nonce is a third thing again — a peer that
-  // meant to hand one over and sent nothing — and collapsing it into absent
+  // mine" and is not. A zero-length nonce is a third thing again, a peer that
+  // meant to hand one over and sent nothing, and collapsing it into absent
   // would answer a request nobody made.
   optional bytes client_nonce = 3;
 }

@@ -1,8 +1,8 @@
-# Starling — a 100% Rust port of the Fancy Mumble server
+# Starling, a 100% Rust port of the Fancy Mumble server
 
 > **Codename rationale.** Starlings fly in *murmurations*. The name stays in the
 > Mumble/Murmur family, describes exactly what the server does (coordinate a
-> flock of voices into one motion), and — unlike `murmur`, `chorus` or `mumble` —
+> flock of voices into one motion), and (unlike `murmur`, `chorus` or `mumble`)
 > is unique enough to grep for.
 
 This document is the porting plan for replacing `vendor/server` (C++/Qt murmur,
@@ -17,14 +17,14 @@ against upstream Mumble: every scope number below was measured in this tree.
 
 | Area | Path | Lines | Port difficulty |
 |---|---|---:|---|
-| Server core + handlers | `src/murmur/*.{cpp,h}` | 36 410 | High — the bulk of the work |
-| ↳ of which message handlers | `src/murmur/Messages.cpp` | 5 304 | High — 90+ handlers |
-| ↳ of which core/session/voice | `src/murmur/Server.cpp` | 3 813 | High — concurrency rewrite |
+| Server core + handlers | `src/murmur/*.{cpp,h}` | 36 410 | High, the bulk of the work |
+| ↳ of which message handlers | `src/murmur/Messages.cpp` | 5 304 | High, 90+ handlers |
+| ↳ of which core/session/voice | `src/murmur/Server.cpp` | 3 813 | High, concurrency rewrite |
 | ↳ of which Ice RPC | `src/murmur/MumbleServerIce.cpp` | 2 568 | **Replace, do not port** (§6) |
-| ↳ of which DB wrapper | `src/murmur/DBWrapper.cpp` | 1 735 | Medium — mechanical |
-| Generic DB layer | `src/database/` + `src/murmur/database/` | 14 323 | Medium — collapses hard under `sqlx` |
-| Shared model/protocol | `src/{ACL,Channel,Group,User,Ban,MumbleProtocol,Version}.cpp`, `PacketDataStream.h` | ~3 100 | Medium — pure logic, very testable |
-| Crypto | `src/crypto/` | 688 | Low — OCB2 already exists in Rust (§2.2) |
+| ↳ of which DB wrapper | `src/murmur/DBWrapper.cpp` | 1 735 | Medium, mechanical |
+| Generic DB layer | `src/database/` + `src/murmur/database/` | 14 323 | Medium, collapses hard under `sqlx` |
+| Shared model/protocol | `src/{ACL,Channel,Group,User,Ban,MumbleProtocol,Version}.cpp`, `PacketDataStream.h` | ~3 100 | Medium, pure logic, very testable |
+| Crypto | `src/crypto/` | 688 | Low, OCB2 already exists in Rust (§2.2) |
 
 **~55 000 lines of C++ in scope.** Expected Rust equivalent: **18–25 kLOC**, because
 `sqlx` deletes most of the 14 kLOC DB layer, prost deletes the serialisation
@@ -85,7 +85,7 @@ The `.proto` files are the contract and they already exist twice
 |---|---|
 | Cross-repo `path` dependency on `mumble-protocol` | **No.** The submodules are pinned independently; a path dep across them cannot be expressed in Cargo and would make the client's release cadence gate the server's. |
 | Publish `mumble-protocol` to crates.io | **No.** It is `publish = false` by design and carries client-only concerns (audio pipeline, denoisers, work queue). |
-| Split a `mumble-wire` crate out of the client and git-dep it from both | **Later.** Correct end state, but it is a refactor of a shipping client — not a prerequisite. |
+| Split a `mumble-wire` crate out of the client and git-dep it from both | **Later.** Correct end state, but it is a refactor of a shipping client, not a prerequisite. |
 | **Copy the `.proto` into `starling-proto`, generate independently, CI-enforce byte-identity** | **Yes, for now.** |
 
 The `.proto` is copied from `vendor/server/src/` and `scripts/check-proto-drift.sh`
@@ -98,7 +98,7 @@ Duplicating a *generated* artifact is cheap; duplicating the *contract* is what
 must be prevented, and the drift check does exactly that.
 
 Hand-written wire code (framing, message-id table, OCB2) is ported by reading the
-client's implementation, not copy-pasted — the server's needs differ (it decodes
+client's implementation, not copy-pasted, the server's needs differ (it decodes
 what the client encodes and vice versa, and it must be hostile-input-hardened in
 a way a client never is).
 
@@ -124,7 +124,7 @@ opportunity to fix both **without** costing backwards compatibility:
   exposure, but nobody would choose it today.
 * murmur accepts **TLS 1.0 and later** (`Server.cpp:1660`).
 
-Starling cannot simply raise the floor — the acceptance rule below requires the
+Starling cannot simply raise the floor, the acceptance rule below requires the
 shipped stock client to keep working. So security choices are negotiated
 per peer by an **Abstract Factory** over what the peer announced:
 
@@ -140,7 +140,7 @@ per peer by an **Abstract Factory** over what the peer announced:
 A stock client behaves exactly as it does against murmur; a Fancy client is held
 to modern primitives. Neither is a special case in a handler. `ModernOnly` is
 available for deployments that control their client fleet and would rather
-*refuse* a legacy client than carry OCB2 — and it refuses explicitly, never by
+*refuse* a legacy client than carry OCB2, and it refuses explicitly, never by
 silent downgrade.
 
 Two things fall out for free: rustls implements **only** TLS 1.2 and 1.3, so
@@ -174,7 +174,7 @@ already written. Restating the binding rule:
 Three additional hard requirements this plan commits to:
 
 1. **On-the-wire byte compatibility with the shipped client.** Not "compatible
-   enough" — the e2e suite drives the real packaged FancyMumble binary.
+   enough", the e2e suite drives the real packaged FancyMumble binary.
 2. **Read the existing murmur SQLite/Postgres/MySQL schema in place.** The e2e
    fixture and any real deployment share `/data/mumble-server.sqlite`. Starling
    must open an existing murmur DB, run its migration chain, and preserve data.
@@ -184,7 +184,7 @@ Three additional hard requirements this plan commits to:
 3. **Storage: greenfield schema plus a migration tool** (decided 2026-07-25).
    Starling does *not* reuse murmur's schema. murmur's is EAV-based, nearly
    index-free, and stores the unbounded chat table's pagination cursor as an
-   unindexed `TEXT` UUID — see `docs/STORAGE.md` for the measurements. Rollback
+   unindexed `TEXT` UUID, see `docs/STORAGE.md` for the measurements. Rollback
    safety comes instead from `starling migrate-db`, which reads murmur's database
    **non-destructively**, so the C++ server keeps working off the original file.
    Backends: SQLite (default), PostgreSQL, MySQL. Multi-tenancy (`server_id`) is
@@ -193,7 +193,7 @@ Three additional hard requirements this plan commits to:
 4. **Config: TOML natively, `.ini` as a migration path.** Configuration is *not*
    part of the wire contract, so it is the one place the port deliberately
    modernises rather than reproduces. Starling's own format is `starling.toml`
-   (typed, sectioned, comments, unknown keys rejected — see
+   (typed, sectioned, comments, unknown keys rejected, see
    `starling.example.toml`). murmur `.ini` files still load, detected by
    extension, so the e2e fixture can drive either server from one file while the
    port is staged; `starling migrate-config <file.ini>` prints the equivalent
@@ -222,7 +222,7 @@ last three overlap to this day.
 - In-memory channel tree (root only), session allocation, TCP `Ping` echo with
   counters, `TextMessage` fan-out, `UserState` self-mute/deaf, `UserRemove` on
   disconnect.
-- Permissions are an allow-all `Permissions` trait impl — the seam is real, the
+- Permissions are an allow-all `Permissions` trait impl, the seam is real, the
   implementation is a stub.
 - `.ini` parsing for the subset the MVP honours.
 
@@ -243,7 +243,7 @@ channel listeners with volume adjustment, per-user bandwidth limiting,
 `starling-db` (sqlx, SQLite first), murmur schema + migration chain, registered
 users, `authenticate()` incl. certificate hash + PBKDF2 + legacy hashes, TOTP,
 bans, channel/ACL/group persistence, textures and comments with blob hashing.
-Full ACL evaluation and permission cache — the 24-bit `ChanACL::Perm` set
+Full ACL evaluation and permission cache, the 24-bit `ChanACL::Perm` set
 (`ACL.h:21`) including the Fancy additions (`SubscribePush`, `ShareFiles`,
 `ShareFilesPublic`, `KeyOwner`, `ManageEmotes`, `ReadRegister`, `SeeChannel`).
 **Exit:** `admin-create-role`, `hidden-channels`, `channels`,
@@ -258,7 +258,7 @@ and `ServerEventDistributor` (533 lines) to the `Effects` model. `PluginMessage`
 
 ### Persistent chat
 `PersistentChatManager` + `PchatProtocolHandlers` + the 8 pchat DB tables. Note
-the server is a *relay and store* for pchat — the E2E crypto lives in the client
+the server is a *relay and store* for pchat, the E2E crypto lives in the client
 (`mumble-protocol/src/persistent/`), so this phase is storage, fan-out, offline
 queues, key-holder bookkeeping and rate limiting, **not** cryptography.
 **Exit:** `pchat*`, `signal-pchat`, `reactions`, `friend-chat*`,
@@ -282,13 +282,13 @@ WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 | R1 | **Ice has no viable Rust implementation.** `MumbleServerIce.cpp` is 2 568 lines and `vendor/channelviewer` consumes it (`getDefaultConf`). | **High** | Do not port. Replace per §6 and ship a shim. Needs explicit sign-off before any of it is persisted; this is the one deliberate compatibility break. |
 | R2 | Schema drift between Starling's migrations and murmur's. | High | Starling reads murmur's existing schema; migrations are additive only. CI runs a murmur-written DB through Starling and asserts data equality. |
 | R3 | Hostile input. A client library trusts the peer; a server cannot. The ported framing must survive fuzzing. | High | `cargo-fuzz` target on the frame decoder from the first commit. `MAX_PAYLOAD_SIZE` and per-field limits enforced before allocation. |
-| R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners — `Messages.cpp:775` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
+| R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners, `Messages.cpp:775` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
 | R5 | The `messagelimit`/`messageburst` leaky bucket **silently drops** messages (see `fixtures/mumble-server.ini`). Getting this subtly wrong breaks WebRTC signalling in ways that look like client bugs. | Medium | Port the token bucket first (`TokenBucketRateLimiter.cpp` is already isolated), unit-test it against the C++ behaviour, and log drops at `debug` rather than dropping silently. |
 | R6 | Two servers to maintain during the transition. | Medium | Phases are gated on the *same* e2e suite, so both stay honest. Fixture picks the implementation via one env var. |
 | R8 | **The gRPC hop cost has never been measured on the target platform.** The bus experiments it replaces were Windows-only on 24 unconstrained cores; the target is Linux containers, plausibly CPU-limited. A hop that is free on a workstation is not automatically free under a cgroup quota. | **High** | Measure gateway-to-service round-trip on Linux under quota, over both a Unix socket and TCP, before the first service ships. |
-| R9 | **Audio bypassing the gateway is an assumption, not a measurement.** The design rests on voice binding its own UDP socket on the same port as the gateway's TCP socket, in a different process. murmur binds them separately (`Server.cpp:125` vs `:193`) so it should hold — but it has never been tried across process boundaries, and legacy clients cannot be redirected if it fails. | **High** | Prove two processes can hold TCP:64738 and UDP:64738 on every target OS before anything else is built. If it fails, voice becomes a gateway sidecar and the deployment story changes. |
+| R9 | **Audio bypassing the gateway is an assumption, not a measurement.** The design rests on voice binding its own UDP socket on the same port as the gateway's TCP socket, in a different process. murmur binds them separately (`Server.cpp:125` vs `:193`) so it should hold, but it has never been tried across process boundaries, and legacy clients cannot be redirected if it fails. | **High** | Prove two processes can hold TCP:64738 and UDP:64738 on every target OS before anything else is built. If it fails, voice becomes a gateway sidecar and the deployment story changes. |
 | R11 | **A restarted service has cold caches and no way to say so.** Voice holds ciphers and membership; audio arriving before it re-subscribes is dropped silently. This is the failure mode with no log line. | **High** | `/readyz` gates on cache warm-up and is distinct from `/healthz`. An e2e test restarts voice mid-call and asserts audio resumes without loss beyond the drain window. |
-| R10 | A blocking `call()` can **deadlock** on a cycle (A calls B, B calls A); `send` could not. No rule or mechanism exists. | Medium | Decide the rule before `call()` ships — either a documented acyclic port order or a depth/timeout guard. §4.2 B1. |
+| R10 | A blocking `call()` can **deadlock** on a cycle (A calls B, B calls A); `send` could not. No rule or mechanism exists. | Medium | Decide the rule before `call()` ships, either a documented acyclic port order or a depth/timeout guard. §4.2 B1. |
 | R7 | Plugin host was built against the C++ FFI contract; removing `ffi.rs` may surface assumptions baked into `context.rs`. | Low | The plugin host work starts by running the existing host test suite against a Rust-native `HostFacade` impl before wiring any real server state. |
 
 ---
@@ -301,7 +301,7 @@ ZeroC Ice implementation, and writing one is a larger project than the server.
 Proposal:
 
 - Ship `starling-rpc` as a **gRPC (tonic) admin API** mirroring the
-  `MumbleServer.ice` interface — it is already an IDL-shaped, strongly-typed RPC
+  `MumbleServer.ice` interface; it is already an IDL-shaped, strongly-typed RPC
   surface, so the translation is mechanical.
 - Ship a small **Ice↔gRPC shim** (or patch `vendor/channelviewer` to speak gRPC
   directly; it only needs `getDefaultConf` and the channel tree, per the fixture
@@ -324,7 +324,7 @@ Not "Rust good". Concretely, in this tree:
 - **The plugin ecosystem stops being second-class.** Today Rust plugins reach the
   C++ server through a hand-written 481-line C ABI shim. That shim disappears.
 - **One toolchain.** Client, plugins, and server all build with `cargo` on the
-  same pinned 1.95.0 — no Qt6, no Ice, no CMake option matrix, no
+  same pinned 1.95.0, no Qt6, no Ice, no CMake option matrix, no
   `Qt6::QMYSQLDriverPlugin` gymnastics.
 - **The concurrency rewrite is the actual prize.** The single-actor + lock-free
   voice-routing design (§2.3) is not expressible cheaply in the current codebase;
@@ -335,8 +335,8 @@ Not "Rust good". Concretely, in this tree:
 
 ## 8. The server event log
 
-Operator-facing records — who connected, what was refused, what an administrator
-changed — are a separate concern from `tracing`'s developer diagnostics, and live
+Operator-facing records, who connected, what was refused, what an administrator
+changed, are a separate concern from `tracing`'s developer diagnostics, and live
 in `starling-log`. Where they go is a Strategy:
 
 ```text
@@ -344,7 +344,7 @@ in `starling-log`. Where they go is a Strategy:
  (never blocks)                                       ├── ConsoleSink
                                                       ├── FileSink (size rotation)
                                                       ├── MemorySink (ring, for the admin API)
-                                                      ├── FanoutSink ── [ … ]   (Composite)
+                                                      ├── FanoutSink ── [ ... ]   (Composite)
                                                       ├── FilterSink ── sink    (Decorator)
                                                       └── NullSink              (Null Object)
 ```
@@ -355,7 +355,7 @@ arm in `config/logging.rs`; nothing else in the server changes.
 Two properties make it safe on a server, and both are tested:
 
 * **`Logger::log` never blocks.** The writer is a dedicated OS thread, not an
-  async task — logging must keep working while the runtime is saturated, which is
+  async task, logging must keep working while the runtime is saturated, which is
   exactly when the records matter most.
 * **Overflow is counted and reported, never silent.** A log that quietly loses
   records is worse than no log, because it is trusted.
@@ -401,7 +401,7 @@ The in-process microkernel is gone: no bus, no lanes, no envelopes, no
 
 * **The session store is in-memory.** The resume ring lives in the gateway
   process, so a resuming client must land on the pod it left. The interface
-  does not change when it is externalised — that is why the decision it is
+  does not change when it is externalised; that is why the decision it is
   waiting on (frames or events, §5) can still be made.
 * **JWT and OIDC verification.** `operator-api` refuses every token in those
   modes rather than accepting one it has not verified. The static-token and

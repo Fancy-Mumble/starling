@@ -2,9 +2,9 @@
 //!
 //! | Sink | Pattern | Use |
 //! |---|---|---|
-//! | [`ConsoleSink`] | — | Human-readable output to stderr, or any writer |
-//! | [`FileSink`] | — | Append to a file, rotating by size |
-//! | [`MemorySink`] | — | Ring buffer, for the admin API and tests |
+//! | [`ConsoleSink`] |, | Human-readable output to stderr, or any writer |
+//! | [`FileSink`] |, | Append to a file, rotating by size |
+//! | [`MemorySink`] |, | Ring buffer, for the admin API and tests |
 //! | [`FanoutSink`] | Composite | Several sinks at once |
 //! | [`FilterSink`] | Decorator | Severity and category gating around any sink |
 //! | [`NullSink`] | Null Object | Discard, so "no logging" needs no `Option` |

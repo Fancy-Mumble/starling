@@ -1,7 +1,7 @@
 //! Authentication as a Strategy, chosen in the TOML.
 //!
 //! A new mode is a new implementation of [`Authenticator`], never a new arm in
-//! a `match` — which is what lets an operator's existing identity provider
+//! a `match`, which is what lets an operator's existing identity provider
 //! become the admin plane's without touching this crate
 //! (`docs/ARCHITECTURE.md` §3, `DESIGN.md` §3).
 
@@ -72,7 +72,7 @@ pub trait Authenticator: std::fmt::Debug + Send + Sync {
 /// # Errors
 ///
 /// A message when the mode is configured but its block is missing, or when a
-/// static token names an environment variable that is not set — both are
+/// static token names an environment variable that is not set, both are
 /// startup failures rather than a surface that silently accepts nothing.
 pub fn authenticator(config: OperatorAuth) -> Result<Arc<dyn Authenticator>, String> {
     match config.mode {

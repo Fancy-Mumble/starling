@@ -18,8 +18,8 @@
 //!
 //! # Why a trait and not an enum
 //!
-//! Each transport owns *both* halves of its scheme — how a service is served on
-//! it, and how a caller dials it — in one file implementing [`Transport`].
+//! Each transport owns *both* halves of its scheme, how a service is served on
+//! it, and how a caller dials it, in one file implementing [`Transport`].
 //! [`parse`] is the single place that maps a configured string to one, so
 //! [`crate::listen`] and [`crate::channel`] hold no per-transport knowledge at
 //! all: they take a `dyn Transport` and call it.
@@ -63,7 +63,7 @@ pub use unix::Unix;
 ///
 /// Services spawn concurrently, so a caller can win the race and dial before
 /// the callee has created its socket. That is a startup ordering fact, not an
-/// outage — `ENOENT`/`ECONNREFUSED` get a short retry window before the error
+/// outage, `ENOENT`/`ECONNREFUSED` get a short retry window before the error
 /// is allowed through, matching the gateway's own attach loop
 /// (`starling-gateway/src/attach.rs`).
 const DIAL_RETRY_WINDOW: Duration = Duration::from_secs(2);
@@ -102,7 +102,7 @@ pub struct MalformedEndpoint(String);
 ///
 /// Both halves live on the same type deliberately. They have to agree about
 /// what a given string means, and a transport that could be served but not
-/// dialled is a deployment that half works — a failure that shows up as a
+/// dialled is a deployment that half works, a failure that shows up as a
 /// caller timing out against a service that is running perfectly well.
 #[async_trait]
 pub trait Transport: fmt::Debug + Send + Sync + 'static {
@@ -137,8 +137,8 @@ type Parser = fn(&str) -> Option<Arc<dyn Transport>>;
 
 /// Every transport, in the order a configured string is offered to them.
 ///
-/// The order is written here rather than left to link order — which is what a
-/// self-registering (`inventory`-style) registry would give — because these are
+/// The order is written here rather than left to link order, which is what a
+/// self-registering (`inventory`-style) registry would give, because these are
 /// *prefix* matchers. Two schemes sharing a prefix would otherwise resolve
 /// differently depending on how the binary happened to be linked, and the
 /// transport is the one decision where "it worked in my build" is unaffordable:
@@ -184,7 +184,7 @@ pub fn in_process(service: &str) -> Arc<dyn Transport> {
 ///
 /// On Windows the directory is made absolute first. `\\.\pipe\` is one flat
 /// namespace for the whole machine with no working directory, so a relative
-/// `run_dir` — which is what the binary defaults to — would hand two servers
+/// `run_dir` (which is what the binary defaults to) would hand two servers
 /// started in different directories the same names, and the second would refuse
 /// to start. Absolute paths restore exactly the isolation the Unix form gets
 /// from the filesystem.
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn the_default_local_endpoint_is_one_this_build_can_actually_serve() {
         // The defaults are generated, so nothing else would catch a platform
-        // whose generated endpoint no registered transport claims — it would
+        // whose generated endpoint no registered transport claims; it would
         // look like a configuration error in a file the operator never wrote.
         let written = local_endpoint(Path::new("starling-data/run"), "text");
         let transport = parse(&written)

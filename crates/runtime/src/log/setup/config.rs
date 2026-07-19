@@ -3,7 +3,7 @@
 //! Lives here rather than in the binary because it *is* logging: the fields, the
 //! defaults, and what an unrecognised level name should do are all this crate's
 //! business. The binary previously owned this on the argument that it owned the
-//! file format — but `serde` field names are format-agnostic, and the section
+//! file format, but `serde` field names are format-agnostic, and the section
 //! name (`[logging]`) comes from the field the binary declares in its own
 //! settings struct, not from anything here. There was no format coupling to
 //! protect, only a responsibility in the wrong crate.
@@ -151,8 +151,8 @@ mod tests {
     use crate::log::Category;
 
     /// What this file is responsible for is the **mapping**. The behaviour that
-    /// used to be asserted here — filtering, fallback on an unopenable file,
-    /// clamping a zero queue — moved with the code, to
+    /// used to be asserted here, filtering, fallback on an unopenable file,
+    /// clamping a zero queue, moved with the code, to
     /// `crate::log::setup::runtime`.
     fn spec_of(section: &LogConfig) -> LogSpec {
         section.to_spec().0

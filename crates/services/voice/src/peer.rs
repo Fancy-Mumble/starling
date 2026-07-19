@@ -8,7 +8,7 @@
 //!
 //! # Why the cipher is boxed and the codec is not
 //!
-//! A cipher has per-packet state — counters, replay windows, key schedules —
+//! A cipher has per-packet state (counters, replay windows, key schedules)
 //! and there is exactly one per peer per direction. A codec has none: it is a
 //! pure function of bytes, so every peer on the same format shares one static.
 //!
@@ -96,7 +96,7 @@ impl VoicePeer {
     /// Forget the proven address, sending this peer's audio down the tunnel.
     ///
     /// A client that starts tunnelling has told us its UDP path stopped working
-    /// — murmur reads exactly that from an arriving `UDPTunnel` and clears
+    /// murmur reads exactly that from an arriving `UDPTunnel` and clears
     /// `aiUdpFlag` (`Server.cpp:1911`). Without it the server keeps sending
     /// datagrams into a path that no longer delivers, and the user is audible
     /// but hears nobody, which is a failure no counter reports and the affected
@@ -109,7 +109,7 @@ impl VoicePeer {
     ///
     /// # Errors
     ///
-    /// [`VoiceError`] when the packet is short, a replay, or not authentic —
+    /// [`VoiceError`] when the packet is short, a replay, or not authentic,
     /// which for an unattributed datagram is the *expected* outcome, since the
     /// router tries candidates until one works.
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>, VoiceError> {
@@ -128,7 +128,7 @@ impl VoicePeer {
     /// The nonce this peer's audio is sealed under, when its cipher has one.
     ///
     /// `None` for a cipher that cannot be resynchronised by swapping a nonce,
-    /// which is a real answer and not a failure — the caller's recovery for such
+    /// which is a real answer and not a failure, the caller's recovery for such
     /// a peer is to re-key it. See [`VoiceCipher::send_nonce`].
     #[must_use]
     pub fn send_nonce(&self) -> Option<Vec<u8>> {
@@ -138,7 +138,7 @@ impl VoicePeer {
     /// Adopt the nonce this peer says it is sending under.
     ///
     /// Reports whether the cipher took it. A refusal means the peer must be
-    /// re-keyed instead, and both outcomes leave a working session — which is
+    /// re-keyed instead, and both outcomes leave a working session, which is
     /// why this returns a `bool` rather than an error nobody could act on
     /// differently.
     pub fn adopt_recv_nonce(&mut self, nonce: &[u8]) -> bool {
@@ -151,7 +151,7 @@ impl VoicePeer {
     /// inside TLS, so there is nothing left for the voice cipher to protect
     /// against, and murmur sends the bare audio frame here
     /// (`Server.cpp:tcpTransmitData`). Sealing it would hand the client
-    /// ciphertext where it expects a packet — every frame silently discarded.
+    /// ciphertext where it expects a packet, every frame silently discarded.
     ///
     /// Framing it as a control message is not optional either: this shares the
     /// socket with `UserState`, `Ping` and everything else, so raw bytes would

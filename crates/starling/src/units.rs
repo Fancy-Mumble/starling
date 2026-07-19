@@ -2,7 +2,7 @@
 //!
 //! One entry per service, and the only place the concrete service types are
 //! named. Everything below this file depends on the `Serve` trait and nothing
-//! else — which is what makes the composition swappable without a service
+//! else, which is what makes the composition swappable without a service
 //! knowing it has been composed.
 
 use starling_runtime::serve::{ServiceContext, ServiceError};
@@ -103,9 +103,9 @@ mod tests {
     /// Every config file this repository ships, by the name an operator knows
     /// it as.
     ///
-    /// Both, not just the example. They are edited by hand and separately —
+    /// Both, not just the example. They are edited by hand and separately,
     /// `starling.example.toml` addresses services over unix sockets and
-    /// `deploy/starling.toml` over the compose network — so a block added to
+    /// `deploy/starling.toml` over the compose network, so a block added to
     /// one is not a block added to the other, and the guard is only worth
     /// having if it covers the file each deployment actually mounts.
     fn shipped_configs() -> [(&'static str, &'static std::path::Path); 2] {
@@ -133,7 +133,7 @@ mod tests {
         // with it, so a service a config file forgets is a service the operator
         // silently turns off by passing a config file at all. That failed for
         // `health` in both files: the collector is simply absent, and
-        // `/v1/health` — the one route a dashboard opens on — answers 502
+        // `/v1/health` (the one route a dashboard opens on) answers 502
         // "health is unreachable" with nothing to say why.
         //
         // Through the real loader, not `toml::from_str`: this asserts what an

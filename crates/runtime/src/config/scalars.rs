@@ -45,7 +45,7 @@ impl FromStr for HumanDuration {
         // factor. They panic on overflow, where `value * 60` wrapped silently in
         // a release build, so the range is checked first and something too long
         // to represent comes back as the parse error this function already
-        // returns — an operator's typo is not a reason to take the server down.
+        // returns, an operator's typo is not a reason to take the server down.
         let duration = match unit.trim() {
             "ms" => Duration::from_millis(value),
             "s" => Duration::from_secs(value),

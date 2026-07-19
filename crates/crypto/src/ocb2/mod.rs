@@ -10,7 +10,7 @@
 //! Three bytes of tag, against sixteen. That is one forgery accepted per 2^24
 //! attempts, and an attacker who can send 50 packets a second gets there in
 //! about four days. Mumble's answer is that a forged *audio* frame is a burst of
-//! noise, not a compromise — there is no parser behind it to attack, because the
+//! noise, not a compromise; there is no parser behind it to attack, because the
 //! Opus payload is passed through untouched.
 //!
 //! It also needed a mitigation for a 2019 break of OCB2 itself, which is carried
@@ -100,7 +100,7 @@ impl Ocb2 {
     ///
     /// The client sends this when it has decided the server is too far out of
     /// step to recover. Trusting it is safe only because the tag still has to
-    /// verify afterwards — the nonce is a hint about where to look, not a
+    /// verify afterwards, the nonce is a hint about where to look, not a
     /// credential.
     pub fn resync_to(&mut self, client_nonce: Block) {
         self.recv = RecvNonce::new(client_nonce);
@@ -173,7 +173,7 @@ impl VoiceCipher for Ocb2 {
         Ok(opened.plain)
     }
 
-    /// The IV this server sends under — murmur's `getEncryptIV`.
+    /// The IV this server sends under, murmur's `getEncryptIV`.
     ///
     /// What a client sets its *decrypt* IV from, which is why the send half is
     /// the right one: answering with the receive half would tell the client to
@@ -183,7 +183,7 @@ impl VoiceCipher for Ocb2 {
         Some(self.send.get().0.to_vec())
     }
 
-    /// Adopt the IV a client says it is sending under — murmur's `setDecryptIV`.
+    /// Adopt the IV a client says it is sending under, murmur's `setDecryptIV`.
     ///
     /// A wrong width is refused rather than padded. murmur checks the same size
     /// and logs "Messed up nonce"; padding would leave the receiver expecting a
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn a_thousand_packets_stay_in_step_across_the_wrap() {
         // Four wraps of the wire byte. If the high bytes diverge, the tag stops
-        // matching and the call goes silent — the failure that only shows up
+        // matching and the call goes silent, the failure that only shows up
         // after four seconds of talking.
         let (mut sender, mut receiver) = pair();
         for i in 0..1000_u32 {
@@ -412,7 +412,7 @@ mod tests {
     fn the_seam_answers_a_resync_the_way_murmur_does() {
         // The whole `CryptSetup`(15) round trip, through the trait the voice
         // service reaches this cipher by rather than through `Ocb2`'s own
-        // methods — which is what the service can actually call.
+        // methods, which is what the service can actually call.
         //
         // `sender` is the server here: it hands over the nonce it seals under,
         // the client installs that as what it expects, and the stream that had
@@ -443,7 +443,7 @@ mod tests {
     fn a_nonce_of_the_wrong_width_is_refused_rather_than_padded() {
         // murmur checks the same size and logs "Messed up nonce". Padding or
         // truncating would leave the receiver expecting a nonce the peer never
-        // sends — silence, reported as a successful resync.
+        // sends, silence, reported as a successful resync.
         let (_, mut receiver) = pair();
         for len in [0, 1, 8, 15, 17, 24] {
             assert!(

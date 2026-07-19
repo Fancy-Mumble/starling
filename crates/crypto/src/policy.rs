@@ -14,7 +14,7 @@ use crate::suite::{FancySuite, LegacySuite, SecuritySuite};
 /// 1. [`Self::negotiate`] must be **total**: every peer gets a suite, or the
 ///    policy explicitly refuses it. There is no "no security" outcome.
 /// 2. A policy must never hand a peer a suite it cannot speak. Selecting on
-///    announced capabilities only — never on a guess — is what guarantees this.
+///    announced capabilities only (never on a guess) is what guarantees this.
 /// 3. [`Self::refuses`] must agree with [`Self::negotiate`]: a peer that is
 ///    refused gets `None`, and one that is not gets `Some`.
 pub trait SecurityPolicy: std::fmt::Debug + Send + Sync {

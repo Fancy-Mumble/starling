@@ -7,7 +7,7 @@
 //!
 //! Three buckets rather than one, for the reason [`starling_runtime::ratelimit`]
 //! gives: a burst of key management must not exhaust the budget a conversation
-//! needs. They are separate because they cost different things — a fetch is a
+//! needs. They are separate because they cost different things, a fetch is a
 //! database scan, a message is an insert, and key management is neither but is
 //! the half of the wire that decides who can read a channel.
 //!
@@ -80,7 +80,7 @@ impl Limits {
     /// Drop everything held for `conn`.
     ///
     /// Without this the map grows one entry per (connection, operation) for the
-    /// life of the process — the same defect the C++ limiter had, where the
+    /// life of the process, the same defect the C++ limiter had, where the
     /// eviction method existed and nothing ever called it.
     pub(crate) fn forget(&self, conn: u64) {
         if let Ok(mut buckets) = self.buckets.lock() {

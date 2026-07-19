@@ -17,7 +17,7 @@ use super::{BoxedIo, Io};
 ///
 /// The wrapper exists only to carry [`Connected`]; every read and write is
 /// delegated. `ConnectInfo` is `()` because neither a Unix socket nor an
-/// in-memory pipe has a peer address worth reporting — the peer is the same
+/// in-memory pipe has a peer address worth reporting, the peer is the same
 /// host by construction, and inventing one would put a fake into a log.
 #[derive(Debug)]
 pub struct LocalStream<T>(T);
@@ -34,7 +34,7 @@ impl<T: Io> LocalStream<T> {
     ///
     /// tonic serves one stream type per call, so the transports have to agree
     /// on one. Erasing here rather than making each transport's listener type
-    /// visible is what keeps [`super::Transport`] object-safe — and since the
+    /// visible is what keeps [`super::Transport`] object-safe, and since the
     /// wrapper is already pure delegation it costs one vtable hop per read,
     /// and nothing per byte.
     #[must_use]

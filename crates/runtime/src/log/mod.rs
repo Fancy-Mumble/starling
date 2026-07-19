@@ -1,4 +1,4 @@
-//! `starling-log` — the server event log.
+//! `starling-log`: the server event log.
 //!
 //! Distinct from `tracing`, which carries developer diagnostics. This is the
 //! **operator-facing** record: who connected, what was refused, what an
@@ -13,12 +13,12 @@
 //!  (never blocks)                                       ├── ConsoleSink
 //!                                                       ├── FileSink
 //!                                                       ├── MemorySink
-//!                                                       ├── FanoutSink ── [ … ]   (Composite)
+//!                                                       ├── FanoutSink ── [ ... ]   (Composite)
 //!                                                       ├── FilterSink ── sink    (Decorator)
 //!                                                       └── NullSink              (Null Object)
 //! ```
 //!
-//! Anything implementing [`LogSink`] can receive events — a file, a database, a
+//! Anything implementing [`LogSink`] can receive events, a file, a database, a
 //! syslog socket, an HTTP endpoint, several of those at once via
 //! [`FanoutSink`]. The server never learns which.
 //!

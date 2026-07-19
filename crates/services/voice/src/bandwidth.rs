@@ -2,7 +2,7 @@
 //!
 //! `max_bandwidth` was advertised in `ServerSync`, in `ServerConfig` and in the
 //! server-browser ping, and enforced by nothing (`docs/GAP-ANALYSIS.md` §5). A
-//! client that ignored the number — or was built to — could transmit at any
+//! client that ignored the number (or was built to) could transmit at any
 //! rate the network carried, and every other client in the channel paid for it
 //! in bytes they had to receive.
 //!
@@ -32,8 +32,8 @@ pub const PACKET_OVERHEAD: usize = 20 + 8 + 4;
 
 /// How many seconds of budget a peer may bank.
 ///
-/// One. A talkspurt is bursty at its start — a client sends several frames back
-/// to back when transmission opens — and a bucket with no headroom would clip
+/// One. A talkspurt is bursty at its start, a client sends several frames back
+/// to back when transmission opens, and a bucket with no headroom would clip
 /// the first word of every sentence. More than a second would let a peer save
 /// up a quiet minute and spend it at once, which is the thing being prevented.
 const BURST_SECONDS: f64 = 1.0;
@@ -45,7 +45,7 @@ pub struct Bandwidth {
     /// The budget every bucket is currently sized for, in bytes per second.
     ///
     /// Kept so a change of `max_bandwidth` can be applied to peers that are
-    /// already connected — which is the whole difference between a live
+    /// already connected, which is the whole difference between a live
     /// setting and one that takes effect at the next reconnect.
     budget: u32,
 }
@@ -55,7 +55,7 @@ impl Bandwidth {
     ///
     /// Returns whether it may be routed. `max_bandwidth` of zero is unlimited,
     /// as every other limit here is, and is also what a voice service that has
-    /// not yet heard from `server-config` holds — so an unconfigured server
+    /// not yet heard from `server-config` holds, so an unconfigured server
     /// relays audio rather than silencing everybody.
     pub fn admit(&mut self, conn: ConnId, payload: usize, max_bandwidth: u32, now_ms: u64) -> bool {
         if max_bandwidth == 0 {
@@ -82,7 +82,7 @@ impl Bandwidth {
     #[allow(
         clippy::iter_over_hash_type,
         reason = "every bucket is retuned to the same rate independently, so the \
-                  visit order changes nothing observable — and the map is keyed by \
+                  visit order changes nothing observable, and the map is keyed by \
                   live connection on the audio path, where a BTreeMap's ordering \
                   would be paid for on every packet and used by nothing"
     )]

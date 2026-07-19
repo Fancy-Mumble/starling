@@ -1,8 +1,8 @@
-//! `files` — bulk transfer, off the control stream.
+//! `files`: bulk transfer, off the control stream.
 //!
 //! Mumble has no file transfer; `RequestBlob` (23) moves avatars and comments
 //! over the control connection, where anything large head-of-line blocks every
-//! control message behind it — and the control-overflow-disconnects rule would
+//! control message behind it, and the control-overflow-disconnects rule would
 //! then kill clients mid-upload (`docs/ARCHITECTURE.md` §3).
 //!
 //! So this service gets its own HTTP listener. The gateway hands out a
@@ -88,7 +88,7 @@ impl Files for FilesRpc {
         let op = sign_request::Op::try_from(req.op).unwrap_or(sign_request::Op::Get);
         if matches!(op, sign_request::Op::Put) && req.max_bytes > self.0.max_upload {
             // The client is told, but the operator is the one who can raise the
-            // limit — and cannot if the refusal never reaches them.
+            // limit, and cannot if the refusal never reaches them.
             self.0.logger.log(
                 LogEvent::notice(Category::Permission, "upload refused: over the size limit")
                     .with("key", req.key.clone())

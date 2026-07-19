@@ -1,12 +1,12 @@
-//! `audit` — the hash-chained operator record.
+//! `audit`: the hash-chained operator record.
 //!
 //! Every entry carries the hash of the one before it, so a deletion from the
 //! middle is **detectable** rather than silent. That is the property that makes
 //! an audit log worth keeping: a log that can be edited without evidence tells
 //! you only what its editor wanted you to see.
 //!
-//! The shape — typed columns, composite indexes led by `server_id`, a retention
-//! column with an index to sweep it — is the one the existing audit plugin
+//! The shape, typed columns, composite indexes led by `server_id`, a retention
+//! column with an index to sweep it, is the one the existing audit plugin
 //! already uses (`docs/STORAGE.md` L5). What is deliberately *not* copied is
 //! its own database file per plugin: one database, one pool, one backup.
 
@@ -107,19 +107,19 @@ impl AuditService {
 
     /// Delete entries older than `log_days`, for one virtual server.
     ///
-    /// Returns how many went, so the operator log can say so — a retention
+    /// Returns how many went, so the operator log can say so, a retention
     /// sweep that silently removes a month of records is exactly the kind of
     /// deletion this service exists to make visible.
     ///
     /// **The chain is not re-linked.** Every surviving entry keeps the
     /// `prev_hash` it was written with, so a verify across the seam reports a
-    /// break — which is correct and is the point: retention *is* a deletion,
+    /// break, which is correct and is the point: retention *is* a deletion,
     /// and an audit log that could delete its own history and still verify
     /// clean would be an audit log that can be edited without evidence. The
     /// sweep is announced in the log so the break has a documented cause.
     ///
     /// Zero days is "keep for ever", the same convention every other limit
-    /// here uses, and it is also what an unreachable `server-config` yields —
+    /// here uses, and it is also what an unreachable `server-config` yields,
     /// so the failure mode of this path is keeping too much, never deleting
     /// something an operator meant to keep.
     pub async fn sweep(&self, scope: u32, now_ms: u64) -> u64 {
@@ -231,7 +231,7 @@ impl AuditService {
         // applied**: the statement bound `scope` and `since_ms` and nothing
         // else, so an operator narrowing by category, by target or by time
         // window got the unfiltered log back and no indication of it. A filter
-        // that is accepted and ignored is worse than one that is refused —
+        // that is accepted and ignored is worse than one that is refused,
         // whoever is reading the result believes it.
         //
         // A `QueryBuilder` rather than an assembled string: every clause sits
@@ -643,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn every_entry_hashes_over_the_one_before_it() {
         // Without the previous hash in the input, a row could be removed and
-        // the rest would still verify — which is the whole failure this is
+        // the rest would still verify, which is the whole failure this is
         // built to make visible.
         let first = chain_hash(&[], &entry("ban"));
         let second = chain_hash(&first, &entry("ban"));
@@ -680,7 +680,7 @@ mod tests {
     /// How many entries the log holds for scope 1.
     ///
     /// The limit is explicit because `QueryRequest::default()` asks for zero,
-    /// which the query clamps to one — a count taken through the default would
+    /// which the query clamps to one, a count taken through the default would
     /// read "1" however many entries survived.
     async fn held(service: &AuditService) -> usize {
         service

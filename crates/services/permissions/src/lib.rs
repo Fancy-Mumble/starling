@@ -1,4 +1,4 @@
-//! `permissions` — ACL evaluation.
+//! `permissions`: ACL evaluation.
 //!
 //! Stateless, and scaled out by **coalescing** identical in-flight queries
 //! rather than by caching. That is Discord's data-services trick, and the
@@ -7,7 +7,7 @@
 //! invalidation while coalescing does not
 //! (`docs/ARCHITECTURE.md` §6, `docs/diagrams/scaling.puml`).
 //!
-//! **A stale deny is safe; a stale grant is a security bug** — so a revocation
+//! **A stale deny is safe; a stale grant is a security bug**, so a revocation
 //! is published to subscribers before it is acknowledged, and a grant may
 //! arrive lazily.
 
@@ -58,8 +58,8 @@ const EVENT_BUFFER: usize = 256;
 ///
 /// Stored as the encoded `AclSet` rather than a row per entry, the same shape
 /// `server-config` uses for its snapshot. An ACL set is replaced wholesale by
-/// `SetAcl` and is never queried by parts — the evaluator reads the whole set
-/// for a channel — so a row per entry would buy a join and cost the ordering
+/// `SetAcl` and is never queried by parts, the evaluator reads the whole set
+/// for a channel, so a row per entry would buy a join and cost the ordering
 /// within a set, which is load-bearing: deny beats allow *at the same level*.
 const SCHEMA: &[Migration<'static>] = &[Migration::new(
     "0001_channel_acl",
@@ -85,7 +85,7 @@ pub struct PermissionsService {
     /// Where the ACL tables live between restarts.
     ///
     /// `None` in tests. In a deployment an absent store would mean every grant
-    /// an operator makes is lost on the next restart — and since an ACL entry is
+    /// an operator makes is lost on the next restart, and since an ACL entry is
     /// the only way to hand out anything beyond the default set, that is the
     /// whole of a server's configured authority disappearing silently.
     store: Option<Store>,
@@ -102,7 +102,7 @@ impl PermissionsService {
     ///
     /// **Every** requested bit must be held, and an empty request is refused.
     /// murmur asks with one bit at a time and tests `granted & perm != 0`, which
-    /// for a multi-bit question answers "any of them" — an authorisation check
+    /// for a multi-bit question answers "any of them", an authorisation check
     /// that says yes when half the requirement is met. Asking for nothing is
     /// refused because there is no action to authorise, so a caller that
     /// computed a permission mask and got zero is told no rather than yes.
@@ -114,7 +114,7 @@ impl PermissionsService {
     /// Evaluate and record, returning what the caller should be told.
     ///
     /// One path, so the answer and the record cannot disagree about what was
-    /// decided — and so a new caller cannot get the decision without the log.
+    /// decided, and so a new caller cannot get the decision without the log.
     fn decide(&self, scope: u32, subject: &Subject, channel: u32, permission: u32) -> Decision {
         let granted = evaluate(&self.acls, scope, subject, channel);
         let allowed = Self::permits(granted, permission);
@@ -156,7 +156,7 @@ impl PermissionsService {
     /// Write-*through*, not write-behind. Everywhere else in the control plane
     /// the durable record may lag the memory it was derived from, because losing
     /// the tail costs a little state. Here the tail is an operator's grant or,
-    /// worse, their revocation — and a revocation that was acknowledged and then
+    /// worse, their revocation, and a revocation that was acknowledged and then
     /// lost in a restart is a permission somebody keeps holding after being told
     /// they had lost it.
     async fn persist(&self, scope: u32, acls: &AclSet) {
@@ -192,7 +192,7 @@ impl PermissionsService {
     /// Follow the channel tree, so the ancestor walk has a tree to walk.
     ///
     /// Evaluation inherits from a channel's parents, and until this existed the
-    /// parent table was only ever written by tests — so in a running server
+    /// parent table was only ever written by tests, so in a running server
     /// every channel evaluated as though it were the root, and an ACL set on a
     /// parent reached none of its children. That is silent: the entry is there,
     /// it is simply never consulted.
@@ -203,7 +203,7 @@ impl PermissionsService {
     /// first and deltas after, so the table is complete from the first message.
     ///
     /// Re-subscribes on failure. A metadata restart is a rolling deploy, not an
-    /// incident — but note what a stale tree means here: a channel whose parent
+    /// incident, but note what a stale tree means here: a channel whose parent
     /// changed keeps inheriting from the old one until the stream reconnects.
     /// That is why the retry is short.
     async fn follow_tree(&self, scope: u32) {
@@ -327,7 +327,7 @@ impl PermissionsService {
     /// validated differently from the revocation that undoes it.
     ///
     /// Not persisted, and the invalidation is published before the caller is
-    /// acknowledged — the same order every other write here uses, for the same
+    /// acknowledged, the same order every other write here uses, for the same
     /// reason: a revocation that races an acknowledgement is a stale grant.
     async fn temporary(
         &self,
@@ -414,7 +414,7 @@ impl PermissionsService {
     ///
     /// A subscription rather than a call from `session-lifecycle`, because this
     /// service already learns who a session is through `session-view` and that
-    /// is the edge `docs/ARCHITECTURE.md` §4 draws — a disconnect hook pointing
+    /// is the edge `docs/ARCHITECTURE.md` §4 draws, a disconnect hook pointing
     /// the other way would be a second one.
     ///
     /// **Fail-safe is not "carry on" here.** A lost `Gone` leaves a grant
@@ -507,7 +507,7 @@ impl PermissionsRpc for PermissionsGrpc {
     async fn check(&self, request: Request<CheckRequest>) -> Result<Response<Decision>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
-        // The caller states the identity. Only two callers legitimately can —
+        // The caller states the identity. Only two callers legitimately can,
         // `session-view`, which *is* the authority on who a session is, and
         // `operator-api`, which carries an operator rather than a session. A
         // service enforcing a client's action must use `CheckSession` instead,
@@ -525,7 +525,7 @@ impl PermissionsRpc for PermissionsGrpc {
         let scope = scope_of(req.scope);
         // No identity, no authorisation. This is an *enforcement* answer, so an
         // unresolvable session is refused outright rather than answered as a
-        // guest — otherwise `session-view` being down would quietly grant every
+        // guest, otherwise `session-view` being down would quietly grant every
         // caller the default set.
         let Some(mut subject) = self.0.resolve(scope, req.session).await else {
             return Ok(Response::new(Decision {
@@ -534,7 +534,7 @@ impl PermissionsRpc for PermissionsGrpc {
                 reason: "the session could not be identified".to_owned(),
             }));
         };
-        // Tokens the caller sent with *this* request — a channel password typed
+        // Tokens the caller sent with *this* request, a channel password typed
         // into the join dialog. Added to the session's own for the length of
         // this call and no longer, which is upstream's scope for them
         // (`Messages.cpp:110`, where a destructor takes them away again).
@@ -580,7 +580,7 @@ impl PermissionsRpc for PermissionsGrpc {
 
         // Published *before* the caller is acknowledged: a revocation that
         // races an acknowledgement is a stale grant, and a stale grant is a
-        // security bug. The channel list is empty on purpose — an ACL change on
+        // security bug. The channel list is empty on purpose, an ACL change on
         // an inheriting parent can alter any descendant, and computing the
         // exact set here would duplicate the evaluator in every subscriber.
         let _ = self.0.invalidations.send(Invalidation {
@@ -665,13 +665,13 @@ impl PermissionsService {
     /// An `Inbound` carries a session id and no identity, and the whole answer
     /// turns on identity: the SuperUser bypasses evaluation, a registered user
     /// is in `@auth`, a guest is in neither. Answering from the frame alone
-    /// reports every client — including the administrator — as an anonymous
+    /// reports every client (including the administrator) as an anonymous
     /// guest, which is what left every action greyed out in the client with no
     /// ACL entry anywhere to explain it.
     ///
     /// **A lookup per query, not a cached snapshot.** `docs/ARCHITECTURE.md` §4
     /// prefers a subscription, and the reason it gives is that *nothing on the
-    /// audio path may make a request* — this is not the audio path. A
+    /// audio path may make a request*; this is not the audio path. A
     /// `PermissionQuery` is a control message on murmur's 1/s bucket, and
     /// murmur evaluates it synchronously too. A snapshot subscription is the
     /// upgrade when this becomes hot; it is a cache with an invalidation
@@ -700,7 +700,7 @@ impl PermissionsService {
     /// The subject holding `session`, or `None` when that cannot be established.
     ///
     /// The distinction matters and used to be lost. Resolving to "an anonymous
-    /// guest" is a real answer — a guest holds the default permissions and may
+    /// guest" is a real answer, a guest holds the default permissions and may
     /// speak and type. *Failing* to resolve is not that answer: it happens when
     /// `session-view` is unreachable or the session has gone, and treating it as
     /// "guest" would mean that taking `session-view` down promotes every caller
@@ -749,7 +749,7 @@ impl PermissionsService {
         let subject = self.asker(inbound).await;
         let granted = self.effective(inbound.scope, &subject, channel).await;
         // What the client's menus are gated on. A wrong mask here is invisible
-        // in the UI — the action is simply absent — so the answer is worth
+        // in the UI (the action is simply absent) so the answer is worth
         // being able to read back.
         tracing::debug!(
             session = inbound.session,
@@ -771,19 +771,19 @@ impl PermissionsService {
         )]
     }
 
-    /// A client rewriting a channel's ACL table — the editor's Save.
+    /// A client rewriting a channel's ACL table, the editor's Save.
     ///
     /// This used to be refused outright on the grounds that rewriting ACLs is
     /// an operator action. That was wrong twice over: murmur has always allowed
     /// it (`Messages.cpp:2599`), and the client's ACL and role editors are
-    /// built on it — they read correctly and then saved nothing, silently, so a
+    /// built on it, they read correctly and then saved nothing, silently, so a
     /// role appeared to be created and was gone on the next read
     /// (`docs/GAP-ANALYSIS.md` G1).
     ///
     /// **`Write` on the channel *or* on the root**, which is murmur's rule and
     /// not a convenience: without the root clause, a user who may create a
     /// channel can deny `Write` to everyone inside it and make it ungovernable
-    /// — an admin could no longer edit the very ACL that locked them out.
+    /// an admin could no longer edit the very ACL that locked them out.
     ///
     /// The table is replaced wholesale. The editor sends what it is showing,
     /// so merging would restore whatever the operator had just deleted.
@@ -832,7 +832,7 @@ impl PermissionsService {
         // The editor re-reads after saving, and murmur answers that read from
         // the stored table. Sending the stored set straight back saves the
         // round trip and, more usefully, shows the client what was actually
-        // kept — inherited rows dropped, defaults filled in.
+        // kept, inherited rows dropped, defaults filled in.
         let stored = self.acls.get(inbound.scope, channel);
         vec![to_conn(
             inbound.conn,
@@ -851,7 +851,7 @@ impl PermissionsService {
 
         // Reading a channel's ACL table takes `Write` on it, as murmur asks.
         // The table names accounts and groups, and says which of them can do
-        // what — handing that to anyone who asks is a map of the server's
+        // what, handing that to anyone who asks is a map of the server's
         // administrators and of every private channel's membership.
         //
         // Resolved here rather than through `Permit`: this *is* the permission
@@ -863,9 +863,9 @@ impl PermissionsService {
             .await;
         // `here` *or* the root, exactly as `on_acl_write` next door decides it.
         // Write at the root administers the whole tree in murmur, so an operator
-        // who can save a table must be able to read it back — and checking only
+        // who can save a table must be able to read it back, and checking only
         // `here` made saving self-locking: the editor wrote a set it was then
-        // refused sight of. It also papers over a real race while it lasts —
+        // refused sight of. It also papers over a real race while it lasts,
         // `follow_tree` learns a new channel's parent asynchronously, and until
         // that arrives the ancestor walk finds nothing and returns the seed set,
         // which is why the refusal was intermittent rather than constant.
@@ -876,7 +876,7 @@ impl PermissionsService {
             // Said out loud, as the write path next door already does. A client
             // reading an ACL waits for an `ACL` and skips anything else, so a
             // silent refusal here is indistinguishable from the server never
-            // answering — the editor simply hangs, and nothing anywhere names
+            // answering, the editor simply hangs, and nothing anywhere names
             // the permission that was missing.
             tracing::info!(
                 session = inbound.session,
@@ -910,7 +910,7 @@ impl Serve for PermissionsService {
             }
             Err(error) => {
                 // Said loudly rather than shrugged off. Running without a store
-                // works — evaluation is entirely in memory — but every ACL an
+                // works (evaluation is entirely in memory) but every ACL an
                 // operator sets is then lost on the next restart, and the only
                 // symptom is permissions quietly reverting.
                 tracing::error!(%error, "no ACL storage; grants will not survive a restart");
@@ -1083,7 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn an_unidentifiable_session_is_refused_rather_than_treated_as_a_guest() {
         // The fail-closed property. A guest is a real identity that holds the
-        // default set — it may speak and type. A session that cannot be resolved
+        // default set; it may speak and type. A session that cannot be resolved
         // is *not* a guest: it means session-view is unreachable or the session
         // has gone, and answering "guest" there would make taking session-view
         // down a way to hand everyone the default permissions.
@@ -1182,7 +1182,7 @@ mod tests {
     }
 
     /// A `Write` grant to everybody at `channel`, so a test with no
-    /// `session-view` — where every asker resolves to a stranger — can still
+    /// `session-view` (where every asker resolves to a stranger) can still
     /// reach the authorised path.
     fn write_granted_at(channel: u32) -> AclSet {
         AclSet {
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_without_write_changes_nothing_and_is_told_so() {
-        // The refusal half of G1. It must *answer* — silence is what made the
+        // The refusal half of G1. It must *answer*, silence is what made the
         // ACL editor look like it had saved.
         let service = service();
         let submitted = starling_proto::proto::tcp::Acl {
@@ -1229,7 +1229,7 @@ mod tests {
     async fn a_client_holding_write_can_rewrite_a_channels_acl_table() {
         // G1 itself: `on_acl_query` used to refuse every `ACL`(13) whose `query`
         // flag was false, so the client's editor submitted and silently changed
-        // nothing — a role appeared to be created and was gone on the next read.
+        // nothing, a role appeared to be created and was gone on the next read.
         let service = service();
         service.acls.set(1, write_granted_at(3));
         let mut invalidations = service.invalidations.subscribe();
@@ -1287,7 +1287,7 @@ mod tests {
     async fn write_at_the_root_is_enough_to_repair_a_channel_that_locked_everyone_out() {
         // murmur's rule, and not a convenience: without it, a user who may
         // create a channel can deny `Write` inside it and make it ungovernable
-        // — the admin could no longer edit the ACL that locked them out.
+        // the admin could no longer edit the ACL that locked them out.
         let service = service();
         service.acls.set(1, write_granted_at(0));
         // The channel itself denies `Write` to everybody.
@@ -1354,7 +1354,7 @@ mod tests {
         let granted = service.effective(1, &holder, 0).await;
         assert!(Perm::from_bits_truncate(granted).contains(Perm::MUTE_DEAFEN));
 
-        // The same subject without it holds nothing extra — and the coalescer
+        // The same subject without it holds nothing extra, and the coalescer
         // keys on the session, so this also proves one client's answer is not
         // being served to the next.
         let stranger = Subject {

@@ -3,7 +3,7 @@
 //! Mumble servers are conventionally self-signed: clients identify a server by
 //! its certificate fingerprint (trust-on-first-use), not by a CA chain, and the
 //! e2e fixture connects with validation disabled. So generating one on first
-//! boot is the normal path, not a fallback — which is why both are
+//! boot is the normal path, not a fallback, which is why both are
 //! [`CertificateSource`] implementations rather than a success path and an
 //! error path.
 
@@ -24,9 +24,9 @@ pub struct TlsIdentity {
 /// Attach the path an I/O error happened at, so `?` can carry it.
 ///
 /// Six call sites wrote the `TlsError::Io { path, source }` struct literal by
-/// hand. `#[from]` cannot replace it — a bare `io::Error` says "No such file or
+/// hand. `#[from]` cannot replace it, a bare `io::Error` says "No such file or
 /// directory" without saying *which* file, which is the only detail an operator
-/// needs — so the context stays and the ceremony goes.
+/// needs, so the context stays and the ceremony goes.
 pub trait PathContext<T> {
     /// Convert into [`TlsError::Io`], recording `path`.
     ///

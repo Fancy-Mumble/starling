@@ -73,7 +73,7 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
 
         // Services first, gateway last: the gateway attaches to whatever it
         // finds, and starting it first would mean a reconnect for every one of
-        // them. Not a correctness problem — attachments retry — but a second of
+        // them. Not a correctness problem (attachments retry) but a second of
         // log noise on every boot is a second of log noise nobody reads after.
         let mut handles = Vec::new();
         let mut skipped = Vec::new();

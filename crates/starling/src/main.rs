@@ -1,4 +1,4 @@
-//! `starling` — one image, one entrypoint.
+//! `starling`: one image, one entrypoint.
 //!
 //! **One image, many deployments.** A single binary whose entrypoint takes the
 //! service name, so Kubernetes runs `args: ["text"]` and a VPS runs
@@ -64,7 +64,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
             // Every key murmur honours that has no home yet is reported rather
             // than dropped, so a migration is reviewable. `migrate` reports them
             // through `tracing`, which goes nowhere at all unless a subscriber
-            // is installed first — so one is, on stderr, leaving stdout to carry
+            // is installed first, so one is, on stderr, leaving stdout to carry
             // the TOML alone for `starling migrate-config x.ini > starling.toml`.
             let _ = tracing_subscriber::fmt()
                 .with_writer(io::stderr)

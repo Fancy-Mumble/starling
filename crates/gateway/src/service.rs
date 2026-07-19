@@ -1,6 +1,6 @@
 //! The gateway as something the runtime can start.
 //!
-//! It is not a gRPC service — it is the process that *calls* them — but it
+//! It is not a gRPC service (it is the process that *calls* them) but it
 //! wants the same config loading, health endpoints, drain and telemetry every
 //! service gets. So it implements [`Serve`] with an empty route set and does
 //! its work in [`Serve::run`].
@@ -25,9 +25,9 @@ impl Serve for GatewayService {
     ///
     /// This was `false`, on the argument that an endpoint nobody dials is one
     /// more thing to misconfigure. That argument held until there was a
-    /// collector, and its consequence was that the gateway — the process every
+    /// collector, and its consequence was that the gateway, the process every
     /// client connects to, holding every control queue and every audio buffer
-    /// in the server — was the one component absent from the health dashboard.
+    /// in the server, was the one component absent from the health dashboard.
     /// Its `listener` and `session store` gates existed and had no reader.
     ///
     /// The runtime's `with_health` adds the health surface to the empty route

@@ -1,8 +1,8 @@
-//! `link-preview` — previews fetched by the server, never by the client.
+//! `link-preview`: previews fetched by the server, never by the client.
 //!
 //! A preview fetched by the viewer turns every chat link into a way to probe
 //! that viewer's network and learn their address. Fetching here moves both to
-//! the server, which is the point — and makes the SSRF guard the server's
+//! the server, which is the point, and makes the SSRF guard the server's
 //! problem, where it can actually be enforced.
 //!
 //! The guard is a deny list of destinations no legitimate preview target ever
@@ -29,7 +29,7 @@ use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 pub enum Refusal {
     /// Not `http` or `https`.
     Scheme,
-    /// A host that resolves — or is written as — an address inside the
+    /// A host that resolves (or is written as) an address inside the
     /// deployment rather than out on the internet.
     PrivateAddress,
     /// No host at all.
@@ -66,10 +66,10 @@ pub fn vet(url: &str) -> Result<(), Refusal> {
         .filter(|authority| !authority.is_empty())
         .ok_or(Refusal::Malformed)?;
     // An IPv6 literal is bracketed precisely so its own colons cannot be
-    // mistaken for the port separator — `[::1]:8080`. Stripping the port by
+    // mistaken for the port separator, `[::1]:8080`. Stripping the port by
     // splitting on the first `:` instead treats `[::1]` as the malformed host
     // `[`, which is not a recognised address and so was never checked against
-    // the private-range deny list — a bracketed loopback or link-local
+    // the private-range deny list, a bracketed loopback or link-local
     // literal would sail straight through.
     let host = if let Some(literal) = authority.strip_prefix('[') {
         literal.split(']').next().unwrap_or(literal)
@@ -90,7 +90,7 @@ pub fn vet(url: &str) -> Result<(), Refusal> {
 ///
 /// Textual rather than resolved, deliberately: this is the first gate, and the
 /// second is the resolver refusing to connect to a private address. Both, not
-/// either — a DNS name can resolve to 169.254.169.254 whatever it looks like.
+/// either, a DNS name can resolve to 169.254.169.254 whatever it looks like.
 fn is_private(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
         return true;

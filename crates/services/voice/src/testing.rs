@@ -5,7 +5,7 @@
 //! half of a peer's cipher and codec, so `speak` produces a genuinely encrypted
 //! packet and `hear` genuinely decrypts one.
 //!
-//! Hand-built frames would have been easier and would have tested nothing — a
+//! Hand-built frames would have been easier and would have tested nothing, a
 //! router that never decrypted anything would pass them all.
 
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ use starling_proto::proto::udp as mumble_udp;
 /// deliberately not inverses. Legacy audio carries a session field only
 /// server-to-client, and protobuf audio uses `target` inbound against `context`
 /// outbound. Reusing the server's codec here would make every test agree with
-/// the implementation by construction and catch none of those asymmetries — it
+/// the implementation by construction and catch none of those asymmetries, it
 /// did, until three tests were written that could tell the difference.
 #[derive(Debug, Clone, Copy)]
 struct ClientCodec(UdpFormat);
@@ -96,7 +96,7 @@ impl ClientCodec {
                 let mut reader = Reader::new(bytes);
                 let header = reader.u8().expect("header");
                 assert_eq!(header >> 5, 4, "not an Opus packet");
-                // The session varint the server adds and the client reads —
+                // The session varint the server adds and the client reads,
                 // the field that does not exist in the other direction.
                 let sender = reader.count().expect("session");
                 let frame_number = reader.count().expect("sequence");
@@ -227,7 +227,7 @@ impl RecordingDatagrams {
 
     /// Forget everything sent so far.
     ///
-    /// For setting up a peer's UDP path — which a client does by *sending*, so
+    /// For setting up a peer's UDP path, which a client does by *sending*, so
     /// the setup itself produces traffic a test must not then assert on.
     pub(crate) fn clear(&self) {
         if let Ok(mut sent) = self.sent.lock() {
@@ -304,7 +304,7 @@ impl TestPeer {
     /// A client keyed as `CryptSetup` would key it.
     pub(crate) fn new(conn: ConnId, session: SessionId, format: UdpFormat) -> Self {
         // Distinct per session so that a packet from one peer cannot decrypt
-        // under another's key — which is exactly what attribution relies on.
+        // under another's key, which is exactly what attribution relies on.
         let key = [u8::try_from(session.0 & 0xFF).unwrap_or(0) ^ 0x5A; 16];
         let client_nonce = Block::from_padded(&[0x10, u8::try_from(session.0 & 0xFF).unwrap_or(0)]);
         let server_nonce = Block::from_padded(&[0x20, u8::try_from(session.0 & 0xFF).unwrap_or(0)]);

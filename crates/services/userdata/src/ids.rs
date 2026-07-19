@@ -2,7 +2,7 @@
 //!
 //! Owned here because userdata is the account authority
 //! (`docs/ARCHITECTURE.md` §4). A *connected session* is a different thing
-//! with a different lifetime — see `SessionId` in `starling-session-view` —
+//! with a different lifetime (see `SessionId` in `starling-session-view`)
 //! and a user need not be registered to hold one.
 
 /// A *registered* user's persistent id.

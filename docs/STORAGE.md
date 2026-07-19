@@ -5,7 +5,7 @@ Decisions taken: **greenfield schema plus a migration tool**, SQLite + PostgreSQ
 **speed is the top priority**.
 
 This document records what we learned from murmur's schema, from the Fancy
-plugin ecosystem, and from the client — and what the greenfield design does
+plugin ecosystem, and from the client, and what the greenfield design does
 differently because of it.
 
 ---
@@ -14,7 +14,7 @@ differently because of it.
 
 Every item below was measured in this tree, not assumed.
 
-### L1 — Entity-attribute-value property tables
+### L1, Entity-attribute-value property tables
 
 `UserPropertyTable` and `ChannelPropertyTable` are both
 `(server_id, owner_id, key INTEGER, value TEXT)`.
@@ -29,7 +29,7 @@ parses, to produce data that fits in a few hundred kilobytes.
 
 **Greenfield:** typed columns. A channel is one row.
 
-### L2 — Almost no indexes
+### L2, Almost no indexes
 
 Index declarations across the whole schema:
 
@@ -46,7 +46,7 @@ Index declarations across the whole schema:
 **Greenfield:** every table carries the composite index its actual query shape
 needs, and the query shapes are written down next to them.
 
-### L3 — The worst query in the system
+### L3, The worst query in the system
 
 `PchatFetch` (`Mumble.proto:840`) paginates with `before_id` / `after_id`, which
 are **UUID strings**. `PChatMessageTable` stores `message_id` as `TEXT`, with no
@@ -59,43 +59,43 @@ Two query shapes hit this table, and murmur serves both with a full scan:
 | User opens a channel | `before_id=None, limit=50` | newest 50 in channel C | full scan + sort |
 | User scrolls back | `before_id=<uuid>` | 50 before cursor X in channel C | scan to find X, then scan again |
 
-The second is the worse one — an unindexed `TEXT` UUID lookup on the largest
+The second is the worse one, an unindexed `TEXT` UUID lookup on the largest
 table in the system, at exactly the moment that table is largest.
 
 The client mitigates but does not avoid this. It caches per session
 (`VolatileMessageProvider`, a `HashMap`; plus an `EncryptedFileProvider` that can
 offload to disk) and guards with a `fetched_channels` set, so it fetches **once
-per channel per connection** — but that set is per-connection state, so every
+per channel per connection**, but that set is per-connection state, so every
 reconnect pays the initial fetch again for every channel the user visits.
 
 **Greenfield:** UUIDv7 stored as `BLOB(16)`, primary key
 `(server_id, channel_id, id)`. Because UUIDv7 is time-ordered, that key is
 *physically* ordered by tenant → channel → time, so **both** shapes become one
-index range scan — newest-50 is a backwards scan from the end of the channel's
+index range scan, newest-50 is a backwards scan from the end of the channel's
 range, and scroll-back is a backwards scan from the cursor. No sort, no secondary
 lookup, and inserts append at the end of the index instead of scattering like
 UUIDv4. 16 bytes instead of 36.
 
 The wire type stays `string message_id`, so no protocol change.
 
-### L4 — Blobs are not content-addressed in storage
+### L4, Blobs are not content-addressed in storage
 
 The protocol *is* content-addressed: `texture_hash` / `comment_hash` are sent,
 and the client asks for the bytes with `RequestBlob` only when it lacks them.
-Storage does not match — murmur hashes on the way in (`Server.cpp:2689`) but
+Storage does not match, murmur hashes on the way in (`Server.cpp:2689`) but
 keeps the bytes per user.
 
 **Greenfield:** a `blob` table keyed by hash, with a refcount. Identical avatars
 are stored once, and `RequestBlob` becomes a primary-key lookup.
 
-### L5 — The plugin ecosystem already solved this, better
+### L5, The plugin ecosystem already solved this, better
 
 `3rdparty/mumble-plugin-host/audit/src/store.rs` opens its own SQLite database
 and creates:
 
 ```sql
-CREATE TABLE server_audit ( id INTEGER PRIMARY KEY AUTOINCREMENT, server_id …,
-                            ts_ms INTEGER, …, prev_hash BLOB, entry_hash BLOB );
+CREATE TABLE server_audit ( id INTEGER PRIMARY KEY AUTOINCREMENT, server_id ...,
+                            ts_ms INTEGER, ..., prev_hash BLOB, entry_hash BLOB );
 CREATE INDEX idx_audit_server_ts       ON server_audit(server_id, ts_ms);
 CREATE INDEX idx_audit_server_target   ON server_audit(server_id, target_user_id, ts_ms);
 CREATE INDEX idx_audit_server_expiry   ON server_audit(server_id, expires_at_ms);
@@ -105,7 +105,7 @@ CREATE UNIQUE INDEX idx_audit_offset   ON server_audit(server_id, event_offset)
 
 Typed columns, composite indexes led by `server_id`, a retention column with an
 index to sweep it, and a partial unique index for idempotency. This is the house
-style the core never adopted — **so adopt it.**
+style the core never adopted, **so adopt it.**
 
 The part to *not* copy: each plugin opens its own database file. That means N
 connection pools, N `fsync` streams competing for the same disk, no transaction
@@ -113,11 +113,11 @@ spanning a plugin write and the server state it describes, and N things to back
 up consistently.
 
 **Greenfield:** one database, one pool. Plugins get a namespaced schema
-(`plugin_<id>_*`) through an opaque storage capability — see L6.
+(`plugin_<id>_*`) through an opaque storage capability, see L6.
 
-### L6 — Plugins must stay opaque, and that is a *schema* rule
+### L6, Plugins must stay opaque, and that is a *schema* rule
 
-From `HANDOVER-audit-opaque.md`: *"plugins must be fully opaque to the server —
+From `HANDOVER-audit-opaque.md`: *"plugins must be fully opaque to the server,
 the server may only shuttle opaque data and provide generic callbacks
 (permissions, sessions, config), never know a plugin's name, message schema, or
 feature semantics."*
@@ -126,10 +126,10 @@ That principle was applied to the wire protocol. It applies equally to storage:
 **the core schema must contain no plugin-specific tables.** A plugin gets a
 namespace and manages its own tables inside it; the server never names them.
 
-### L7 — The control plane is already RAM-resident
+### L7, The control plane is already RAM-resident
 
 murmur loads the channel tree at boot (`initializeChannels`,
-`initializeChannelDetails`, `initializeChannelLinks` — three passes) and keeps
+`initializeChannelDetails`, `initializeChannelLinks`, three passes) and keeps
 ACLs in `AclSubsystem`'s in-memory cache, invalidated on change. The database is
 never on a permission-check path.
 
@@ -141,7 +141,7 @@ durable record of the control plane, never a read path for it.
 
 ## 2. Design decisions
 
-### D1 — The database is write-behind, never in a request path
+### D1, The database is write-behind, never in a request path
 
 The core is a single actor; a synchronous query inside it stalls every session.
 Writes leave as `Effect::Persist(DbOp)`, the shape `Effect::Log` already
@@ -151,18 +151,18 @@ Consequences, stated plainly:
 
 * Voice and chat never wait on `fsync`.
 * Durability is bounded by the batch interval, not by the request. A crash loses
-  at most one tick of control-plane changes — the same trade the log makes.
+  at most one tick of control-plane changes, the same trade the log makes.
 * The one read that cannot be deferred is authentication. Registered accounts are
   cached in memory at boot and maintained write-through, so `Authenticate` stays
   a pure, synchronous handler.
 
-### D2 — Boot loads the whole control plane in a fixed number of queries
+### D2, Boot loads the whole control plane in a fixed number of queries
 
 Four, independent of channel count: channels, channel links, ACL entries +
 groups, accounts. No per-entity property lookups, because there are no property
 rows.
 
-### D3 — Portable SQL, verified not assumed
+### D3, Portable SQL, verified not assumed
 
 No vendor extensions, no `RETURNING`, no upsert syntax that differs across the
 three. Transactions are retry-aware, because CockroachDB and TiDB hand back
@@ -170,7 +170,7 @@ retryable serialization errors under load. CI runs the compatibility suite
 against SQLite, PostgreSQL and MySQL; a distributed engine is added to the matrix
 before we claim it works.
 
-### D4 — Growth tables carry retention from day one
+### D4, Growth tables carry retention from day one
 
 `pchat_message` and any plugin table that grows get an `expires_at_ms` column and
 an index to sweep it, following the audit plugin's pattern. Retention is a schema
@@ -203,12 +203,12 @@ channel_link(server_id, channel_id, linked_id, PRIMARY KEY (server_id, channel_i
 -- Channel listeners: hearing a room without being in it ---------------------
 -- Keyed by *account*, not session: the point of the table is that the listener
 -- survives the visit. Guests therefore have none, and temporary channels are
--- never written here — the id is reused when the channel is collected, so a
+-- never written here, the id is reused when the channel is collected, so a
 -- restored row would subscribe the user to whatever room got the number next.
 --
 -- `enabled` rather than deleting the row, because the volume has to outlive
 -- un-listening: a user who turns a room off and back on gets the level they
--- chose. No secondary index — the only query is "every listener of one account
+-- chose. No secondary index, the only query is "every listener of one account
 -- on one server", and the primary key is a left prefix of exactly that.
 channel_listener(
   server_id INTEGER, account_id INTEGER, channel_id INTEGER,
@@ -264,7 +264,7 @@ CREATE INDEX ix_pchat_expiry ON pchat_message(server_id, expires_at_ms);
 ```
 
 `PRIMARY KEY (server_id, channel_id, id)` on `pchat_message` is the single most
-important line in the schema — it turns the O(n) fetch of L3 into a range scan.
+important line in the schema, it turns the O(n) fetch of L3 into a range scan.
 
 ---
 
@@ -286,7 +286,7 @@ Requirements, in priority order:
 3. **Resumable and idempotent**, so a large pchat history can be migrated in
    passes and a failure does not mean starting over.
 4. **Loud about what it could not map.** Every dropped or approximated value is
-   reported, never silently discarded — the same rule the `.ini` reader follows.
+   reported, never silently discarded, the same rule the `.ini` reader follows.
 5. **Per-tenant.** `--server-id` migrates one virtual server; omitted, it
    migrates all of them.
 
@@ -304,7 +304,7 @@ keeps a `legacy_id` mapping column so any client cursor still resolves.
 
 Nothing. The plugin capability surface (`api/src/host_facade.rs`, and the WIT
 `host` interface for WASM) offers sessions, channels, permissions, config and
-messaging — **no storage of any kind**.
+messaging, **no storage of any kind**.
 
 Native plugins work around it: `get_config("storage_path")` (audit
 `lib.rs:528`), then `Connection::open(path)` with `rusqlite`. The audit plugin's
@@ -312,7 +312,7 @@ own comment calls this "the file-server storage pattern", so at least three
 plugins do it.
 
 WASM plugins cannot work around it. `host/src/wasm.rs:439` builds *"a
-deliberately empty WASI context: no preopened directories"* — no filesystem, no
+deliberately empty WASI context: no preopened directories"*, no filesystem, no
 network, no environment. **A WASM plugin currently has no way to persist a single
 byte.**
 
@@ -324,7 +324,7 @@ is the largest data owner in the system.
 | Requirement | Source |
 |---|---|
 | Host never learns a plugin's schema or semantics | L6 |
-| Works for WASM plugins (no handles, no pointers — bytes across a WIT boundary) | `wasm.rs:439` |
+| Works for WASM plugins (no handles, no pointers, bytes across a WIT boundary) | `wasm.rs:439` |
 | One database, one pool, one backup | L5 |
 | Range scans fast enough for pchat's unbounded table | L3, "speed first" |
 | Same behaviour on SQLite, PostgreSQL and MySQL | D3 |
@@ -334,10 +334,10 @@ is the largest data owner in the system.
 
 | | Own DB file (today) | **Ordered KV** | SQL passthrough | Declared schema |
 |---|---|---|---|---|
-| Works for WASM | ❌ | ✅ | ✅ | ✅ |
-| Host stays schema-blind | ✅ | ✅ | ✅ | partly — host sees columns |
-| One database | ❌ | ✅ | ✅ | ✅ |
-| Fast range scans | ✅ | ✅ | ✅ | ✅ |
+| Works for WASM | no | yes | yes | yes |
+| Host stays schema-blind | yes | yes | yes | partly, host sees columns |
+| One database | no | yes | yes | yes |
+| Fast range scans | yes | yes | yes | yes |
 | Secondary indexes | free | **manual** | free | declared |
 | Aggregates (`COUNT`) | free | **manual** | free | free |
 | Backend-portability burden | host | **host** | **on the plugin author** | host |
@@ -345,7 +345,7 @@ is the largest data owner in the system.
 
 **Recommendation: ordered, namespaced key/value with atomic batches.**
 
-SQL passthrough is the tempting one — it is the most powerful, and executing
+SQL passthrough is the tempting one; it is the most powerful, and executing
 opaque SQL is philosophically identical to shuttling opaque messages. It loses on
 two practical points: every plugin author would have to write SQL portable across
 three dialects (or ship three variants), and the host would have to parse SQL to
@@ -361,7 +361,7 @@ kv-scan:   func(scope: server-id, start: list<u8>, end: list<u8>,
 kv-write:  func(scope: server-id, ops: list<kv-op>) -> result<_, plugin-error>;
 ```
 
-`kv-write` takes a **batch and applies it atomically** — that is what lets a
+`kv-write` takes a **batch and applies it atomically**; that is what lets a
 plugin keep its own secondary indexes consistent with its records, which is the
 one thing KV genuinely costs it.
 
@@ -383,7 +383,7 @@ plugin_kv(
 ```
 
 A scan is `WHERE plugin_id = ? AND server_id = ? AND key >= ? AND key < ?
-ORDER BY key [DESC] LIMIT ?` — an index range scan on the clustered primary key,
+ORDER BY key [DESC] LIMIT ?`, an index range scan on the clustered primary key,
 with no dialect-specific syntax.
 
 ### 5.6 Why this is not slower for pchat
@@ -402,7 +402,7 @@ What KV genuinely costs, stated plainly:
 
 * **Secondary indexes are manual.** The audit plugin has five (by time, target,
   actor, category, expiry). On KV those become additional key ranges the plugin
-  writes itself — e.g. `\x01actor‖<actor_id>‖<uuidv7> → <primary key>` — kept
+  writes itself (e.g. `\x01actor‖<actor_id>‖<uuidv7> → <primary key>`) kept
   consistent by the atomic batch. Standard KV practice, but it is real work and
   a real place to introduce bugs.
 * **Aggregates are manual.** `PchatFetchResponse.total_stored` is a `COUNT`;
@@ -418,12 +418,12 @@ on the same feature at once. Before committing to both: implement pchat's exact
 query shapes (newest-50, scroll-back, retention sweep, `total_stored`) against
 the KV API and measure them against the §3 dedicated-table schema. If KV loses,
 the fallback is to keep pchat core with its own table and give plugins KV
-regardless — WASM plugins need it either way.
+regardless, WASM plugins need it either way.
 
 ## 6. Open questions
 
 1. **Persistent chat becomes a plugin** (decided 2026-07-25). The core schema
-   therefore drops `pchat_message` — it moves to plugin storage (§5), subject to
+   therefore drops `pchat_message`, it moves to plugin storage (§5), subject to
    the measurement in §5.7. Core keeps config, tree, accounts, ACL, bans, blobs.
 2. **How long is the write-behind batch interval?** It sets the durability window
    for control-plane changes. 100 ms is a reasonable default; it is a knob.

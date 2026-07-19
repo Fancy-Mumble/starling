@@ -43,7 +43,7 @@ impl Health {
     /// Declare a gate that starts cold.
     ///
     /// Declaring is separate from satisfying so a service cannot be ready
-    /// *before* it has said what it is waiting for — the race that makes a
+    /// *before* it has said what it is waiting for, the race that makes a
     /// cold cache look warm for one scrape interval.
     pub fn gate(&self, name: &str) {
         self.set(name, Readiness::Warming);

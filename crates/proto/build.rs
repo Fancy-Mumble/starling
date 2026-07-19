@@ -2,11 +2,11 @@
 //!
 //! Compiles the Mumble protobuf definitions with `prost-build`. Unlike the
 //! client's `mumble-protocol`, the generated sources go to `OUT_DIR` and are
-//! `include!`d rather than checked in — there is no reason to review generated
+//! `include!`d rather than checked in; there is no reason to review generated
 //! code in review, and it keeps the tree honest about what is hand-written.
 //!
 //! The `.proto` files here, in `vendor/server/src/` and in the client are three
-//! copies of one contract. **None of them is upstream** — `vendor/server` is the
+//! copies of one contract. **None of them is upstream**, `vendor/server` is the
 //! Fancy fork, and taking it for upstream's source of truth is how the field
 //! numbering in `docs/PROTOCOL-COMPATIBILITY.md` §1 drifted unnoticed. A change
 //! is adjudicated and then applied to all three; `scripts/check-proto-drift.sh`

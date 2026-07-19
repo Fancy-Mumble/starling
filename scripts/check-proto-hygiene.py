@@ -10,12 +10,12 @@ broke once, silently:
 **Numbering.** Upstream Mumble owns field numbers 1-999 in every upstream
 message; Fancy fields start at 1000. Seven extended messages once took
 upstream's *immediate next* number, so upstream's next release would have given
-two meanings to one field — and proto resolves by number and type, so the
+two meanings to one field, and proto resolves by number and type, so the
 symptom is wrong data with nothing in any log.
 
 **The dead block.** The proto2 envelopes that used to sit in `Mumble.proto`
 were superseded by the proto3 canon and tombstoned with a comment, which stops
-readers and not compilers — the onboarding service bound itself to them anyway,
+readers and not compilers, the onboarding service bound itself to them anyway,
 so outer type 1014 meant one thing to it and another to every service beside
 it. They are deleted now (M3) and this keeps them from coming back by import.
 
@@ -35,7 +35,7 @@ All of it is structural, offline, and cheap. Run from anywhere:
 
 Through the interpreter, not the shebang: Windows has `python` and no
 `python3`, and there the shebang resolves to a Microsoft Store stub that
-prints an install prompt and exits 49 — a check that fails to *launch* looks
+prints an install prompt and exits 49, a check that fails to *launch* looks
 exactly like a check that failed, and is worse than not having one.
 
 Exits non-zero on a violation, listing each with its file and line.
@@ -56,7 +56,7 @@ BURNED_RANGE = range(100, FANCY_FIELD_MIN)
 
 # The one deliberate exception, and why it cannot move: every shipped Fancy peer
 # reads this field to decide whether extensions exist at all. Relocating it
-# would not break loudly — it would make this server look like plain Mumble to
+# would not break loudly; it would make this server look like plain Mumble to
 # all of them.
 PINNED = {("Version", 6)}
 
@@ -71,7 +71,7 @@ def check_numbering(proto: pathlib.Path) -> list[str]:
     """Every field number must be upstream's (<100) or Fancy's (>=1000).
 
     Enum *values* are deliberately not checked: they are not field numbers and
-    an enum may legitimately use any value — `PermissionDenied.DenyType.H9K` is
+    an enum may legitimately use any value, `PermissionDenied.DenyType.H9K` is
     5 and always will be.
     """
     problems: list[str] = []
@@ -98,7 +98,7 @@ def check_numbering(proto: pathlib.Path) -> list[str]:
         if tag in BURNED_RANGE:
             problems.append(
                 f"{proto}:{number}: {owner} field {tag} is in the burned "
-                f"100-{FANCY_FIELD_MIN - 1} range — Fancy fields start at "
+                f"100-{FANCY_FIELD_MIN - 1} range, Fancy fields start at "
                 f"{FANCY_FIELD_MIN} ({stripped})"
             )
     return problems
@@ -135,7 +135,7 @@ def check_dead_block(root: pathlib.Path) -> list[str]:
 #
 # **Per set, not per date.** A blanket freeze on a chosen day would lock in
 # whatever state the canon happened to be in, and several services are still on
-# the relay precisely because their canon is incomplete — freezing those would
+# the relay precisely because their canon is incomplete, freezing those would
 # make finishing them expensive for no gain, since nothing encodes them.
 #
 # A set joins this list when both ends encode it and a build carrying it could
@@ -153,7 +153,7 @@ def field_tags(proto: pathlib.Path) -> dict[str, int]:
     """Every `Message.field` in `proto`, mapped to its number.
 
     Keyed by name because that is what survives a rename of the *file* and not
-    of the field — and a field that vanishes is as much a break as one that
+    of the field, and a field that vanishes is as much a break as one that
     moves, so both have to be visible to the comparison.
     """
     tags: dict[str, int] = {}
@@ -253,7 +253,7 @@ def check_outer_types(here: pathlib.Path, root: pathlib.Path) -> list[str]:
             continue
         if int(value) != expected:
             problems.append(
-                f"{client}: {name} is {value}, but ServiceKind says {expected} — "
+                f"{client}: {name} is {value}, but ServiceKind says {expected}, "
                 f"frames would arrive at the wrong service and be silently skipped"
             )
     if not problems:

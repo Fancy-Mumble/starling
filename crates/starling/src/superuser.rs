@@ -1,4 +1,4 @@
-//! `starling set-superuser-password` — murmur's `--set-su-pw`.
+//! `starling set-superuser-password`: murmur's `--set-su-pw`.
 //!
 //! # Why this exists next to the operator API
 //!
@@ -36,7 +36,7 @@ use starling_userdata::Accounts;
 pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
     let password = positional(arguments)
         .ok_or("set-superuser-password needs a password\n\nusage: starling set-superuser-password <password> [--server <id>] [--config <file>]")?;
-    // Refused rather than stored. murmur refuses the same thing — "empty" reads
+    // Refused rather than stored. murmur refuses the same thing, "empty" reads
     // as "disable the account", which is a different operation, and storing it
     // would leave an administrator login that any password opens.
     if password.trim().is_empty() {
@@ -55,7 +55,7 @@ pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
         scope.unwrap_or_else(|| config.virtual_servers.first().map_or(1, |server| server.id));
 
     // The configured logger, not `Logger::null()`. This command resets the
-    // administrator credential while deliberately bypassing the operator API —
+    // administrator credential while deliberately bypassing the operator API,
     // the route this module's own documentation calls "authenticated, scoped
     // and audited". Leaving it unlogged means the one path that skips the audit
     // trail is also the one that leaves no trace, which is precisely backwards:
@@ -94,7 +94,7 @@ pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
 
     // Stdout as well as the log: this is a command that was asked for and
     // answered, and the answer is what the caller is waiting for. The password
-    // itself is deliberately not echoed — whoever ran this typed it.
+    // itself is deliberately not echoed, whoever ran this typed it.
     crate::out(&format!(
         "superuser password set on virtual server {scope}\n"
     ))

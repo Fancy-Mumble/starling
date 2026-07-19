@@ -1,8 +1,8 @@
 //! Getting the document to the list, and the seam that keeps that testable.
 //!
 //! The transport is a [`Registrar`] rather than an inlined HTTP call, for the
-//! usual reason a port exists: everything interesting about registration — the
-//! preconditions, the payload, the cadence — can then be tested without a
+//! usual reason a port exists: everything interesting about registration, the
+//! preconditions, the payload, the cadence, can then be tested without a
 //! network, and the one part that cannot be is small enough to read in full.
 
 use std::future::Future;
@@ -82,7 +82,7 @@ pub trait Registrar: std::fmt::Debug + Send + Sync {
 /// The real thing: an HTTPS POST authenticated by the server's own certificate.
 ///
 /// The client certificate *is* the authentication. The list ties an entry to the
-/// fingerprint that presents it, which is the same fingerprint clients pin — so
+/// fingerprint that presents it, which is the same fingerprint clients pin, so
 /// nobody can update somebody else's listing without their private key.
 #[derive(Debug)]
 pub struct PublicList {
@@ -106,7 +106,7 @@ impl PublicList {
         trust_store: &Path,
     ) -> Result<Self, RegisterError> {
         // rustls 0.23 installs no crypto backend on its own. Ignored if another
-        // component in this process got there first — the workspace enables
+        // component in this process got there first, the workspace enables
         // exactly one provider, so a second install is the same one.
         let _ = rustls::crypto::ring::default_provider().install_default();
 

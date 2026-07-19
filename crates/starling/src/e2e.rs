@@ -47,7 +47,7 @@ use tokio_rustls::client::TlsStream;
 /// sixteen-bit patch shift and decodes to **0.1.6**, which is below every
 /// feature gate the number exists to pass.
 ///
-/// It was invisible here for exactly as long as nothing depended on it — the
+/// It was invisible here for exactly as long as nothing depended on it, the
 /// handshake completes either way. The moment audio was wired up, this client
 /// was handed the pre-1.5 legacy framing and then sent protobuf audio, and
 /// every frame it spoke was dropped as malformed.
@@ -71,7 +71,7 @@ const SERVER_LOOPBACK: u32 = 31;
 /// How long to keep re-sending a frame before deciding audio does not route.
 ///
 /// A real client transmits fifty frames a second, so re-sending is what one
-/// actually does — and it is what makes this test insensitive to *when* voice's
+/// actually does, and it is what makes this test insensitive to *when* voice's
 /// membership subscription happens to warm, without pretending that a single
 /// dropped frame at start-up is a failure.
 const AUDIO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -80,16 +80,16 @@ const AUDIO_ATTEMPT: Duration = Duration::from_millis(250);
 
 /// One deployment at a time, however many threads the test harness uses.
 ///
-/// Each of these tests starts a **whole server** — twenty services, most of them
-/// opening their own database pool — inside this one process. Three of those at
+/// Each of these tests starts a **whole server**, twenty services, most of them
+/// opening their own database pool, inside this one process. Three of those at
 /// once do not fail because anything is wrong with them; they fail because sixty
 /// services contending on start-up push `userdata` past the two-second window a
 /// caller retries a cold dial for, and the first login is then refused for real.
 ///
 /// Serialising them is not hiding a race. What these tests exercise is one
 /// deployment answering a client, and running three servers in one process is a
-/// property no deployment has. The alternative — raising every timeout until it
-/// fits — would make a genuine startup regression invisible.
+/// property no deployment has. The alternative, raising every timeout until it
+/// fits, would make a genuine startup regression invisible.
 static ONE_AT_A_TIME: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -132,8 +132,8 @@ impl Deployment {
         config.gateway.listen_tcp = format!("127.0.0.1:{port}");
         // Voice binds a *real* UDP socket, and the shipped default is the fixed
         // 0.0.0.0:64738 every Mumble server wants. In a test that makes two
-        // deployments fight over one port — two of these tests in parallel, or
-        // one of them next to a server the developer happens to be running — and
+        // deployments fight over one port, two of these tests in parallel, or
+        // one of them next to a server the developer happens to be running, and
         // the loser reports `Address already in use` and never starts. Ephemeral
         // and loopback-only, for the same reason the gateway's port above is.
         //
@@ -150,7 +150,7 @@ impl Deployment {
         let broker = Broker::new();
 
         // A real log runtime rather than `Logger::null()`, so a deployment
-        // under test exercises the same path a deployed one does — and so a
+        // under test exercises the same path a deployed one does, and so a
         // failing test can be read with the records that led to it. It keeps
         // the ring the admin surface reads, and stays off the console, where it
         // would interleave with the tracing output above.
@@ -199,7 +199,7 @@ impl Deployment {
         //
         // This is the readiness the runtime does not expose. `/readyz` is an
         // in-process gate with no listener behind it, and the in-process broker
-        // is not the signal either — a service resolves its *own* endpoint
+        // is not the signal either, a service resolves its *own* endpoint
         // through `broker.has`, which is false until it has registered, so under
         // `--all-in-one` it binds the configured socket rather than a pipe and
         // never registers at all. What is observable is the socket appearing.
@@ -224,7 +224,7 @@ impl Deployment {
     ///
     /// Through metadata's own gRPC rather than the client plane, because
     /// creating a channel takes `MakeChannel` and the default ACL deliberately
-    /// withholds it — this is deployment set-up, not the behaviour under test.
+    /// withholds it; this is deployment set-up, not the behaviour under test.
     async fn create_channel(&self, name: &str) -> u32 {
         use starling_proto_fancy::metadata::metadata_client::MetadataClient;
         use starling_proto_fancy::metadata::{Channel, CreateRequest};
@@ -377,8 +377,8 @@ impl Deployment {
 /// Block until each of `services` has bound the endpoint it was configured with.
 ///
 /// **Both local transports are waited on.** This used to look only for a
-/// `unix:` path, which meant that on Windows — where every local endpoint is a
-/// named pipe — it matched nothing, skipped every service, and returned
+/// `unix:` path, which meant that on Windows, where every local endpoint is a
+/// named pipe, it matched nothing, skipped every service, and returned
 /// immediately. The wait was a no-op on that platform, so a client connected to
 /// a deployment whose services had not finished binding and the handshake timed
 /// out. It presented as intermittent, and as a transport fault rather than as
@@ -477,7 +477,7 @@ fn audio_frame(target: u32, opus: &[u8]) -> Vec<u8> {
     let mut out = vec![0_u8];
     let _ = udp::Audio {
         // `target` inbound. The server answers with `context`, which is a
-        // different field of the same oneof — they are not interchangeable.
+        // different field of the same oneof; they are not interchangeable.
         header: Some(udp::audio::Header::Target(target)),
         sender_session: 0,
         frame_number: 1,
@@ -577,7 +577,7 @@ impl ServerCertVerifier for TrustAnyCertificate {
 /// Every service, including the gateway, is spawned concurrently and binds
 /// its listener asynchronously, so a connect attempt immediately after
 /// `Deployment::start` returns is a startup-ordering race, not a real
-/// failure — retry until the deadline rather than requiring the caller to
+/// failure, retry until the deadline rather than requiring the caller to
 /// know how long that takes.
 async fn connect_with_retry(port: u16) -> TcpStream {
     let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
@@ -592,7 +592,7 @@ async fn connect_with_retry(port: u16) -> TcpStream {
     }
 }
 
-/// A raw Mumble client: frames in, frames out, no generated stubs — the same
+/// A raw Mumble client: frames in, frames out, no generated stubs, the same
 /// view of the wire the gateway itself has (`docs/ARCHITECTURE.md` §1).
 struct Client {
     stream: TlsStream<TcpStream>,
@@ -687,7 +687,7 @@ impl Client {
     /// Whether the server hangs up within `within`.
     ///
     /// The fallible counterpart to [`Self::next_frame`], which asserts the
-    /// connection stays open — right for every test that expects to keep
+    /// connection stays open, right for every test that expects to keep
     /// talking, and useless for the one asserting the server rings off.
     ///
     /// Anything still arriving is consumed and discarded: a refusal is
@@ -713,7 +713,7 @@ impl Client {
 
     /// This connection's half of the voice cipher.
     ///
-    /// OCB2, because this client announces no Fancy version — the same cipher
+    /// OCB2, because this client announces no Fancy version, the same cipher
     /// every stock Mumble client is given.
     ///
     /// Note the crossover: the client sends under the *client* nonce and expects
@@ -821,8 +821,8 @@ impl Client {
     ///
     /// Closing the socket is not the same as the server having processed the
     /// disconnect, and a test that depends on the *consequences* of a departure
-    /// — a session id returning to the pool, a session-scoped grant being
-    /// dropped — has to wait for the second thing, not the first.
+    /// a session id returning to the pool, a session-scoped grant being
+    /// dropped, has to wait for the second thing, not the first.
     async fn close(mut self) {
         let _ = self.stream.shutdown().await;
         drop(self);
@@ -834,12 +834,12 @@ impl Client {
     /// The server's answer to a channel-switch request: the move, or the refusal.
     ///
     /// Both are legitimate answers and a test asserting one has to be able to
-    /// see the other — a locked channel that quietly moves nobody and a locked
+    /// see the other, a locked channel that quietly moves nobody and a locked
     /// channel that says so are the same timeout otherwise.
     /// Ask to enter `channel`, and wait for the server's answer.
     ///
-    /// The pair is always used together — a bare `UserState` with no answer
-    /// read proves nothing, and reading an answer nobody asked for hangs — so
+    /// The pair is always used together, a bare `UserState` with no answer
+    /// read proves nothing, and reading an answer nobody asked for hangs, so
     /// they are one call. `why` names the step, because a timeout here is
     /// otherwise an unattributed ten seconds in a test with several of them.
     async fn enter(
@@ -917,7 +917,7 @@ async fn handshake(client: &mut Client, username: &str) -> u32 {
 /// The same handshake, presenting access tokens.
 ///
 /// `Authenticate` is the only message that carries them, and a client sends the
-/// ones it has stored for this server at login — which is how a channel
+/// ones it has stored for this server at login, which is how a channel
 /// password the user saved once opens the channel on every later connection.
 async fn handshake_with_tokens(client: &mut Client, username: &str, tokens: Vec<String>) -> u32 {
     let (greeting_type, greeting_payload) = client.recv().await;
@@ -1007,7 +1007,7 @@ async fn two_clients_complete_the_handshake_and_exchange_text() {
     // Not `recv`: the handshake is followed by a pushed `PermissionQuery` for
     // the channel the client landed in, as murmur sends one on every entry
     // (`Server.cpp:2319`). It is a server-initiated frame with no request
-    // behind it, so it can be the first thing waiting here — asserting on the
+    // behind it, so it can be the first thing waiting here, asserting on the
     // *next* frame made this test fail for a message it was not about.
     let (before_text, bob_payload) = bob.recv_until(11).await;
     assert!(
@@ -1020,8 +1020,8 @@ async fn two_clients_complete_the_handshake_and_exchange_text() {
     assert_eq!(received.actor, Some(alice_session));
 
     // Mumble never echoes a message back to its own sender. Alice may still
-    // see bob's join broadcast (UserState, 9) land before her pong — that is
-    // a real, unrelated notification racing the reply, not an echo — so scan
+    // see bob's join broadcast (UserState, 9) land before her pong; that is
+    // a real, unrelated notification racing the reply, not an echo, so scan
     // past anything but a TextMessage rather than requiring the very next
     // frame to be the pong.
     alice
@@ -1064,7 +1064,7 @@ async fn one_client_is_heard_by_another_over_the_tunnel() {
     // Re-sent until it lands, as a real client transmitting fifty frames a
     // second effectively does. Voice subscribes to `session-view` on start-up
     // and retries a second later if that service was not up yet, so *when* the
-    // first routable frame is accepted is a start-up race — and one dropped
+    // first routable frame is accepted is a start-up race, and one dropped
     // frame at start-up is not the failure this test is looking for.
     let deadline = tokio::time::Instant::now() + AUDIO_TIMEOUT;
     let received = loop {
@@ -1099,8 +1099,8 @@ async fn a_datagram_on_the_voice_port_is_relayed_to_the_channel() {
     // *attributed* to a session by decrypting under that session's key, and the
     // frame is re-encoded for a listener on a different transport.
     //
-    // Bob is tunnelled — he has sent no datagram, so the server has no proven
-    // address for him — which makes this the mixed case a real server is in
+    // Bob is tunnelled; he has sent no datagram, so the server has no proven
+    // address for him, which makes this the mixed case a real server is in
     // constantly: UDP in, TCP out.
     let data_dir = TempDir::new("udp-audio");
     let deployment = Deployment::start(data_dir.path()).await;
@@ -1118,7 +1118,7 @@ async fn a_datagram_on_the_voice_port_is_relayed_to_the_channel() {
 
     // The connectivity probe a real client sends before trusting UDP with
     // anything: the server echoes target 31 back to the speaker alone. It also
-    // proves the return direction, which nothing else here does — bob receives
+    // proves the return direction, which nothing else here does, bob receives
     // over TCP.
     let echo = loop_back(&socket, voice, &mut cipher).await;
     assert_eq!(echo, b"probe", "voice did not echo the loopback target");
@@ -1180,7 +1180,7 @@ async fn a_client_whose_nonce_drifted_asks_for_a_resync_and_is_answered() {
         "voice did not echo the loopback target"
     );
 
-    // Now break exactly what packet loss breaks — this client's idea of where
+    // Now break exactly what packet loss breaks, this client's idea of where
     // the server's counter has got to. Its *sending* half is untouched, which is
     // what makes this the real failure rather than a dead connection: the server
     // still hears alice perfectly while alice hears nothing.
@@ -1227,7 +1227,7 @@ async fn a_refused_login_is_told_why_and_then_hung_up_on() {
     // difference looked like to a user: "Server connection rejected: Wrong
     // certificate or password", then a client still sitting there rendering
     // the root channel, still pinging, still switching to TCP when its UDP
-    // probe failed thirty seconds later. A session that is half present —
+    // probe failed thirty seconds later. A session that is half present,
     // no audio, no roster, nothing it can do, and no disconnect either.
     //
     // The idle sweep never rescued it: a connection that keeps pinging is
@@ -1250,7 +1250,7 @@ async fn a_refused_login_is_told_why_and_then_hung_up_on() {
         .await;
 
     // SuperUser is registered on every deployment and has a password, so
-    // getting it wrong is a refusal that needs no set-up to arrange — and it
+    // getting it wrong is a refusal that needs no set-up to arrange, and it
     // is exactly the refusal in the report.
     client
         .send(
@@ -1290,8 +1290,8 @@ async fn a_self_muted_speaker_stops_being_relayed() {
     // version of this bug: every client's UI says she is not being heard.
     //
     // Driven end to end because the enforcement and the fact are three services
-    // apart — session-lifecycle records the flag, session-view publishes it, and
-    // voice reads it off a subscription — and each of the three can be right on
+    // apart, session-lifecycle records the flag, session-view publishes it, and
+    // voice reads it off a subscription, and each of the three can be right on
     // its own while the chain does nothing.
     let data_dir = TempDir::new("self-mute");
     let deployment = Deployment::start(data_dir.path()).await;
@@ -1358,7 +1358,7 @@ async fn a_self_muted_speaker_stops_being_relayed() {
 async fn a_whisper_reaches_the_person_it_names_and_not_the_room() {
     // `VoiceTarget`(19), which is what fills in one of the thirty slots Mumble's
     // five-bit target field addresses. Without it a client can register a
-    // whisper, see no error, press the key, and reach nobody — the routing core
+    // whisper, see no error, press the key, and reach nobody, the routing core
     // resolves slots correctly and no slot was ever filled.
     //
     // Bob is the control. He shares alice's channel, so nothing but the target
@@ -1375,7 +1375,7 @@ async fn a_whisper_reaches_the_person_it_names_and_not_the_room() {
     let carol_session = handshake(&mut carol, "carol").await;
 
     // Slot 3 means "carol", and nothing else. Whispering takes `Whisper` in the
-    // target's channel, which the default ACL grants — so this is the ordinary
+    // target's channel, which the default ACL grants, so this is the ordinary
     // case rather than one propped up by an ACL the test installed.
     alice
         .send(
@@ -1487,7 +1487,7 @@ async fn loop_back(socket: &UdpSocket, voice: SocketAddr, cipher: &mut Ocb2) -> 
 #[tokio::test]
 async fn a_client_can_switch_channels_and_everyone_is_told() {
     // Reported as "I can't switch channels". The request is a `UserState`
-    // carrying `channel_id`, and nothing read that field — so the server parsed
+    // carrying `channel_id`, and nothing read that field, so the server parsed
     // it, ignored it, and replied with the self-mute echo, which looks like a
     // successful answer and moves nobody.
     //
@@ -1535,7 +1535,7 @@ async fn an_operator_can_moderate_a_live_session_from_outside() {
     // external bot could watch somebody misbehave and do nothing about them.
     //
     // Driven over gRPC and asserted on the *socket*, because the two halves fail
-    // separately — a change that lands in the connection table and is never
+    // separately, a change that lands in the connection table and is never
     // broadcast leaves every other client rendering the old state, which is the
     // same class of bug as the missing `actor` above.
     use starling_proto_fancy::sessioncontrol::SetStateRequest;
@@ -1575,7 +1575,7 @@ async fn an_operator_can_moderate_a_live_session_from_outside() {
     assert!(applied.deaf, "the deafen was not applied");
     assert!(applied.mute, "deafening must imply muting, as it does in murmur");
 
-    // And everyone is told — the mover included. Asserted from bob as well
+    // And everyone is told, the mover included. Asserted from bob as well
     // because a client builds its user list from these: a moderation action only
     // the subject hears about leaves everybody else rendering them unmuted and
     // in the wrong channel.
@@ -1598,7 +1598,7 @@ async fn a_move_names_who_made_it_and_not_the_server() {
     // The difference is one field. `actor` names who caused the change, murmur
     // sets it on every `UserState` it rebroadcasts
     // (`vendor/server/src/murmur/Messages.cpp:1052`), and Starling set it on
-    // none — so a client had nobody to attribute the move to and fell back to
+    // none, so a client had nobody to attribute the move to and fell back to
     // blaming the server. Every voluntary move then read as an administrator
     // dragging the user around, which is alarming rather than merely wrong.
     let data_dir = TempDir::new("attribution");
@@ -1665,7 +1665,7 @@ async fn a_client_holding_write_can_save_an_acl_table_and_read_it_back() {
     // `docs/GAP-ANALYSIS.md` G1, end to end and from outside. The ACL editor in
     // every Mumble client is built on this one message: `ACL`(13) with `query`
     // unset is a save. Starling refused every one of them for everybody,
-    // including the SuperUser, and said nothing — so a role was created in the
+    // including the SuperUser, and said nothing, so a role was created in the
     // editor, appeared to stick, and was gone on the next read.
     //
     // Asserted through a *second* read rather than only through the reply,
@@ -1753,7 +1753,7 @@ async fn a_channel_password_admits_whoever_presents_it_and_nobody_else() {
     // G2 and G3 together, which is how a user meets them: a channel password is
     // an `Enter` denied to `all` and granted back to `#token`, and it needs the
     // grammar to parse `#hunter2` as a token *and* the token itself to reach the
-    // evaluator. Either half missing leaves the same symptom — a channel nobody
+    // evaluator. Either half missing leaves the same symptom, a channel nobody
     // can enter, including the people who were given the password.
     //
     // Both ways a client can present one are covered, because they are different
@@ -1772,7 +1772,7 @@ async fn a_channel_password_admits_whoever_presents_it_and_nobody_else() {
             inherit: true,
             acls: vec![
                 entry("all", Perm::empty(), Perm::ENTER),
-                // Deny first and grant second is not the reason this works —
+                // Deny first and grant second is not the reason this works,
                 // deny wins at the same level regardless of order. What admits
                 // the holder is that the second entry does not match anybody
                 // else at all.
@@ -1933,11 +1933,11 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
     //
     // A channel gated on a named group is shut to every unregistered visitor
     // and cannot be opened to one by editing the ACL table: membership is
-    // recorded by *account* id, and a guest has no account — they go on the
+    // recorded by *account* id, and a guest has no account, they go on the
     // wire as account 0, which is the SuperUser's. A session-scoped grant is
     // the only mechanism upstream has for it (`Group.cpp:242`, reading
     // `qsTemporary` for `-session`), and it is what an external authenticator
-    // uses to map something the server cannot know — a game lobby, a rota —
+    // uses to map something the server cannot know (a game lobby, a rota)
     // onto somebody who never registered.
     //
     // Asserted from outside because every part of this is wiring: the grant is
@@ -2029,8 +2029,8 @@ async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
 #[tokio::test]
 async fn a_session_scoped_grant_does_not_pass_to_the_next_holder_of_that_session() {
     // The hazard that makes clearing this on disconnect a requirement rather
-    // than tidiness: session ids are pooled and reissued — murmur re-queues
-    // them at `Server.cpp:1904` and Starling's allocator does the same — so a
+    // than tidiness: session ids are pooled and reissued, murmur re-queues
+    // them at `Server.cpp:1904` and Starling's allocator does the same, so a
     // grant that outlived its holder would silently admit whoever is handed
     // that id next.
     //
@@ -2043,7 +2043,7 @@ async fn a_session_scoped_grant_does_not_pass_to_the_next_holder_of_that_session
     let data_dir = TempDir::new("temp-groups-reuse");
     // A pool of exactly one id, so the reuse this is about happens on the very
     // next connection instead of after two hundred. The pool is `max_users * 2`
-    // and FIFO — sized and ordered to *delay* reuse, which is the right default
+    // and FIFO, sized and ordered to *delay* reuse, which is the right default
     // and the reason a test cannot wait for it.
     let deployment = Deployment::start_with(data_dir.path(), |config| {
         if let Some(service) = config.services.get_mut("session-lifecycle") {
@@ -2119,7 +2119,7 @@ async fn a_session_scoped_grant_does_not_pass_to_the_next_holder_of_that_session
 async fn the_same_name_twice_replaces_the_first_rather_than_joining_it() {
     // Reported from a live deployment: the same user connected three times and
     // the server held three sessions, so every client rendered three copies of
-    // one person. murmur never allows that (`Messages.cpp:418`) — the second
+    // one person. murmur never allows that (`Messages.cpp:418`), the second
     // connection is the same user coming back from the same address, so it is
     // admitted and the first is disconnected as a ghost.
     let data_dir = TempDir::new("dupe");
@@ -2158,8 +2158,8 @@ async fn the_same_name_twice_replaces_the_first_rather_than_joining_it() {
 async fn a_login_and_a_refusal_both_reach_the_operator_log() {
     // The whole point of the operator log: reading it afterwards answers who
     // connected and who was turned away. Asserted end to end, because every
-    // piece of this — the config section, the runtime, the logger on the
-    // context, the call in the handshake — can be present and still not
+    // piece of this, the config section, the runtime, the logger on the
+    // context, the call in the handshake, can be present and still not
     // produce a record if one of them is not wired to the next.
     let data_dir = TempDir::new("operator-log");
     let deployment = Deployment::start(data_dir.path()).await;
@@ -2255,8 +2255,8 @@ mod example_config {
 
     #[test]
     fn a_shipped_file_routes_every_type_where_the_defaults_do() {
-        // The routing table exists twice — once as the built-in defaults, once
-        // per shipped file — and nothing made them agree. They drifted, and the
+        // The routing table exists twice, once as the built-in defaults, once
+        // per shipped file, and nothing made them agree. They drifted, and the
         // drift was invisible: `UserState` and `UserStats` were moved to
         // session-lifecycle in code, both files went on naming userdata, and so
         // the fix worked under `--all-in-one` and did nothing whatsoever in the
@@ -2284,8 +2284,8 @@ mod example_config {
     #[test]
     fn a_shipped_file_charges_every_service_to_the_bucket_the_defaults_do() {
         // The same drift as the test above, on the axis that silences people
-        // rather than misrouting them. Voice was charged to `control` —
-        // murmur's 1 message per second — and tunnelled audio is a hundred
+        // rather than misrouting them. Voice was charged to `control`,
+        // murmur's 1 message per second, and tunnelled audio is a hundred
         // frames a second, so a client behind a UDP-blocking firewall was cut
         // off after its first few frames with no error anywhere.
         //
@@ -2322,7 +2322,7 @@ mod example_config {
         // docker-compose.yml puts every service in its own container, so the
         // Unix sockets the example ships are unreachable there. A `unix:`
         // endpoint surviving into this file would bind a socket inside one
-        // container that no other container can dial — a stack that comes up
+        // container that no other container can dial, a stack that comes up
         // healthy and answers nothing.
         let config = shipped("deploy/starling.toml");
         for (name, service) in &config.services {
@@ -2355,14 +2355,14 @@ mod example_config {
 // bearing rather than tidiness.
 //
 // `#[tokio::test]` gives a current-thread runtime, and these tests start a whole
-// deployment — twenty-one services plus the gateway — on it. A real Starling
+// deployment (twenty-one services plus the gateway) on it. A real Starling
 // process runs multi-threaded, so a single-threaded one is not a smaller
 // deployment, it is a different one.
 //
 // It bites here in particular because the event bridges are background tasks
 // nothing else awaits. On one thread they are scheduled only when everything
 // else yields, and during a cold start they lose that race often enough to be
-// flaky — the subscriber attaches, no bridge has run, and a task that never
+// flaky, the subscriber attaches, no bridge has run, and a task that never
 // executed writes no log. The symptom is silence, which is exactly why it first
 // read as a transport fault.
 
@@ -2377,11 +2377,11 @@ const LIVE_TOKEN: &str = "e2e-live-channel-token";
 /// A deployment with the admin plane switched on, and the port it listens on.
 ///
 /// `operator-api` ships disabled, so a plain [`Deployment::start`] does not run
-/// it — which is correct, and means a test that wants it has to configure it
+/// it, which is correct, and means a test that wants it has to configure it
 /// the way an operator would.
 #[expect(
     unsafe_code,
-    reason = "edition 2024 has no safe way to set an environment variable, and               token auth deliberately names a variable rather than holding a               secret — so a test of it has to set one"
+    reason = "edition 2024 has no safe way to set an environment variable, and               token auth deliberately names a variable rather than holding a               secret, so a test of it has to set one"
 )]
 async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
     use starling_runtime::config::{AuthMode, OperatorAuth, ServiceConfig, StaticToken, TokenAuth};
@@ -2395,7 +2395,7 @@ async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
     let data_dir_for_endpoint = data_dir.to_path_buf();
     let deployment = Deployment::start_with(data_dir, move |config| {
         // Inserted rather than adjusted: `operator-api` is not a `ServiceKind`
-        // — it owns no wire type and the gateway never routes to it — so
+        // (it owns no wire type and the gateway never routes to it) so
         // `Config::with_defaults` creates no entry for it, and an absent entry
         // is exactly what `compose::enabled` reads as "off" for this one
         // service.
@@ -2407,7 +2407,7 @@ async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
                     // The deployment's own directory, never a fixed path: on
                     // Windows the local endpoint is a named pipe whose name is
                     // derived from it, so a hard-coded root would give every
-                    // deployment in this process the same pipe — and the second
+                    // deployment in this process the same pipe, and the second
                     // one to start would find it busy.
                     &starling_runtime::transport::local_endpoint(
                         &data_dir_for_endpoint,
@@ -2483,7 +2483,7 @@ async fn next_event(
 
 /// Wait for the bridge's opening `started`.
 ///
-/// Longer than [`FRAME_TIMEOUT`], because it is not waiting for a frame — it is
+/// Longer than [`FRAME_TIMEOUT`], because it is not waiting for a frame; it is
 /// waiting for twenty services to finish coming up. `started` is sent to a
 /// joining subscriber only once the state below the bridge is readable
 /// (`operator-api/src/live.rs:86`), so a subscriber that attaches during
@@ -2669,8 +2669,8 @@ async fn the_live_channel_answers_a_command_and_refuses_an_unknown_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
     // The highest-privilege surface in the system. The refusal happens before
-    // the upgrade, because a socket that opens and then closes is — to most
-    // clients — indistinguishable from a network fault.
+    // the upgrade, because a socket that opens and then closes is, to most
+    // clients, indistinguishable from a network fault.
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     let data_dir = TempDir::new("live-unauthorised");
@@ -2695,7 +2695,7 @@ async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
 /// Register an account the way an operator does, over userdata's own gRPC.
 ///
 /// Deployment set-up rather than the behaviour under test, on the same grounds
-/// as [`Deployment::create_channel`] — and for one more: registering *from a
+/// as [`Deployment::create_channel`], and for one more: registering *from a
 /// client* requires the target to have presented a certificate, and this
 /// harness dials with `with_no_client_auth`. What the tests below assert is
 /// what a client can then see and do about the accounts this put there.
@@ -2751,14 +2751,14 @@ async fn next_directory(client: &mut Client) -> Result<tcp::UserList, tcp::Permi
 async fn the_registered_user_directory_shows_an_operator_more_than_a_guest() {
     // `docs/GAP-ANALYSIS.md` UserList(18)/A1. The message was routed to
     // `userdata`, which had no arm for it, so an operator registered somebody
-    // successfully and found the dialog they would check it in empty — with
+    // successfully and found the dialog they would check it in empty, with
     // nothing logged, because dropping an unhandled frame is normal and silent.
     //
     // Both views are asserted from one deployment because the *difference* is
     // the rule (`Messages.cpp:3153`), and a server that answered everybody with
     // the administrator's view would pass any test that looked at only one of
     // them. `Register` manages the directory and comes with the whole record;
-    // `ReadRegister` is a lookup permission — enough to find somebody who is
+    // `ReadRegister` is a lookup permission, enough to find somebody who is
     // offline and invite them, not enough to learn when they were last here.
     use starling_proto_fancy::perm::Perm;
     use starling_proto_fancy::permissions::AclSet;
@@ -2772,9 +2772,9 @@ async fn the_registered_user_directory_shows_an_operator_more_than_a_guest() {
             channel: 0,
             inherit: true,
             acls: vec![
-                // Everybody may look somebody up…
+                // Everybody may look somebody up...
                 entry("all", Perm::READ_REGISTER, Perm::empty()),
-                // …and the operators may manage the directory.
+                // ...and the operators may manage the directory.
                 entry("ops", Perm::REGISTER, Perm::empty()),
             ],
             groups: Vec::new(),
@@ -2861,15 +2861,15 @@ async fn a_guest_with_no_grant_at_all_is_refused_the_directory() {
 #[tokio::test]
 async fn a_moderator_moves_another_user_by_either_half_of_murmurs_rule() {
     // `docs/GAP-ANALYSIS.md` U2, and the shape of the gap is worth recording:
-    // `on_move` already held the whole rule — `Move` on the channel the user is
+    // `on_move` already held the whole rule, `Move` on the channel the user is
     // being taken out of, then `Move` on the destination **or** the moved
-    // user's own `Enter` — and was unreachable for anybody but the sender,
+    // user's own `Enter`, and was unreachable for anybody but the sender,
     // because the cross-session refusal above it dropped the message first.
     // Nothing failed and nothing was logged; the user simply did not move.
     //
     // Both halves of the *or* are exercised, because implementing one of them
     // is indistinguishable from implementing both until the day an operator
-    // drags somebody into a room that person cannot enter alone — which is the
+    // drags somebody into a room that person cannot enter alone, which is the
     // entire point of a `Move` permission.
     use starling_proto_fancy::perm::Perm;
     use starling_proto_fancy::permissions::{AclEntry, AclSet};
@@ -2970,7 +2970,7 @@ async fn a_moderator_moves_another_user_by_either_half_of_murmurs_rule() {
     );
 
     // Half two: the **moved user's** own `Enter`. Alice holds `Move` in the
-    // Vault, so she may take bob out of it — and holds none in the Lobby, so
+    // Vault, so she may take bob out of it, and holds none in the Lobby, so
     // putting him *there* can only be allowed by bob's own default `Enter`.
     alice
         .send(
@@ -3110,8 +3110,8 @@ async fn a_peer_that_never_authenticated_reaches_nobody() {
     //
     // The gateway has **no authentication gate**: `dispatch` routes any frame
     // whose type has a route, and an unauthenticated connection simply carries
-    // `session = 0`. What actually stops it is the layer below — `Permit`
-    // refuses session 0 without even asking `permissions` — so the safety of
+    // `session = 0`. What actually stops it is the layer below, `Permit`
+    // refuses session 0 without even asking `permissions`, so the safety of
     // the whole front door rests on every service failing closed.
     //
     // That is a real property and worth a test, because it is invisible: it
@@ -3129,7 +3129,7 @@ async fn a_peer_that_never_authenticated_reaches_nobody() {
     let _ = handshake(&mut bob, "bob").await;
 
     // Completes TLS and `Version`, then skips `Authenticate` entirely and
-    // starts talking — which a stock client cannot do and a hostile one can.
+    // starts talking, which a stock client cannot do and a hostile one can.
     let mut intruder = Client::connect(deployment.port).await;
     let _ = intruder.recv().await;
     intruder
@@ -3180,7 +3180,7 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
     // that nothing collects, or a collector that reaches nobody.
     //
     // What only this level can show is that the runtime's injected health RPC
-    // is actually *served* by every service — it is added in `serve`, so a
+    // is actually *served* by every service; it is added in `serve`, so a
     // service that composes its routes unusually could silently lack it, and
     // the collector would report the healthiest service on the server as
     // unreachable.
@@ -3262,7 +3262,7 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
 async fn a_channel_listener_hears_a_room_without_being_in_it() {
     // `docs/GAP-ANALYSIS.md` V5. The routing core could already fan out to a
     // listener and the tree could already hold one, but `UserState`'s
-    // `listening_channel_add` was never read — so a user clicked "listen" in
+    // `listening_channel_add` was never read, so a user clicked "listen" in
     // their client, the server parsed the message, ignored it, and answered
     // nothing. Every piece worked and the feature did not exist.
     //
@@ -3363,7 +3363,7 @@ async fn a_channel_listener_hears_a_room_without_being_in_it() {
         "a frame reached through a channel listener must say so"
     );
 
-    // And it stops when she says so — the half that a server which only ever
+    // And it stops when she says so, the half that a server which only ever
     // adds listeners passes without implementing.
     carol
         .send(
@@ -3396,7 +3396,7 @@ async fn a_channel_listener_hears_a_room_without_being_in_it() {
     deployment.stop();
 }
 
-/// The `context` the server put on a frame — 0 normal, 1 shout, 2 whisper,
+/// The `context` the server put on a frame, 0 normal, 1 shout, 2 whisper,
 /// 3 through a channel listener.
 fn listener_context(payload: &[u8]) -> u32 {
     assert_eq!(payload.first(), Some(&0), "not an audio packet");

@@ -1,8 +1,8 @@
-//! `session-lifecycle` — a connection's existence.
+//! `session-lifecycle`: a connection's existence.
 //!
 //! Negotiate the version, authenticate, hand over `CryptSetup`, answer `Ping`,
 //! notice a timeout, tear down. It is a state machine per connection, and it is
-//! **the only half of session a client ever talks to** — `session-view` owns
+//! **the only half of session a client ever talks to**, `session-view` owns
 //! the composed read model and has no client-facing type at all
 //! (`docs/ARCHITECTURE.md` §4).
 //!
@@ -67,14 +67,14 @@ const PERMISSION_DENIED: u16 = 12;
 /// The murmur behaviour is one broadcast to everybody, which is why control
 /// fan-out grows with the square of the population (`PROTOCOL-REDESIGN.md` §5,
 /// S1). This splits the audience instead: peers that did not ask for deltas get
-/// exactly what murmur sends, and peers that did get a `SyncDelta` — but only
+/// exactly what murmur sends, and peers that did get a `SyncDelta`, but only
 /// if they are looking at the channel it happened in. **A subscriber looking
 /// elsewhere is sent nothing at all**, and that omission is the whole saving.
 ///
 /// The `UserState` is encoded **once** and the same bytes are placed in both,
 /// because a length-delimited protobuf field is identical whether it is
 /// declared `bytes` or a message (§4, Z3). Nothing is re-encoded per recipient.
-/// `subject` is the session the change is *about* — not the one that caused it.
+/// `subject` is the session the change is *about*, not the one that caused it.
 /// A moderator muting somebody in another channel is a change in the *target's*
 /// channel, and choosing the audience by the actor would send it to the wrong
 /// set of people. Looked up here rather than at each call site, because that
@@ -86,7 +86,7 @@ fn announce_user_state(connections: &Connections, subject: u32, state: &tcp::Use
         .map_or(0, |pending| pending.channel);
     let (flood, subscribed) = connections.audience(channel);
 
-    // Nobody is subscribed and nobody is addressable — the roster is empty or a
+    // Nobody is subscribed and nobody is addressable, the roster is empty or a
     // lock was lost. Fall back to the unaddressed broadcast, which is what this
     // did before subscriptions existed: a state change that reaches nobody is a
     // client rendering a world that has moved on.
@@ -173,7 +173,7 @@ impl ClientService for SessionLifecycleService {
             PING => self.on_ping(&inbound),
             USER_STATS => self.on_user_stats(&inbound).await,
             // `CodecVersion` travels server→client only. A client never sends
-            // one, so there is nothing to handle — reading Opus support from it
+            // one, so there is nothing to handle, reading Opus support from it
             // meant waiting for a message that never comes and reporting every
             // client as having no Opus. It is announced in `Authenticate`
             // instead, and read there.
@@ -189,7 +189,7 @@ impl ClientService for SessionLifecycleService {
 
     async fn closed(&self, conn: u64, reason: &str) -> Actions {
         // Asked before the close, which is what drops the entry the name lives
-        // in — afterwards there is only a session number to report.
+        // in, afterwards there is only a session number to report.
         let name = self
             .connections
             .get(conn)
@@ -232,7 +232,7 @@ impl ClientService for SessionLifecycleService {
 ///
 /// The out-of-band half of what `on_speak_state` and `on_move` do in band. It
 /// deliberately reuses both of their mechanisms rather than reaching into the
-/// connection table directly — an operator's mute has to couple deafen to mute
+/// connection table directly, an operator's mute has to couple deafen to mute
 /// the same way a moderator's does, and an operator's move has to be refused by
 /// the same `Enter` check, or the two planes disagree about the same server.
 #[derive(Debug, Clone)]
@@ -302,7 +302,7 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
 
         // Who did it, not just that somebody did. operator-api holds the
         // authoritative record, but this line is what an operator reads when
-        // they are looking at the *server* — and "by operator" without a name
+        // they are looking at the *server*, and "by operator" without a name
         // is unattributable in exactly the situation it gets read in.
         let by = req.actor.as_ref().and_then(|actor| actor.who.as_ref()).map_or_else(
             String::new,
@@ -370,7 +370,7 @@ impl SessionLifecycleService {
     ///
     /// Starling already sent its own `Version` first, on TLS establishment
     /// (`opened`, matching `Server.cpp:1668`), so the client's copy is recorded
-    /// rather than answered — the next thing the client sends is `Authenticate`,
+    /// rather than answered, the next thing the client sends is `Authenticate`,
     /// and answering twice confuses a stock client.
     fn on_version(&self, inbound: &Inbound) -> Actions {
         let Ok(version) = tcp::Version::decode(inbound.payload.as_slice()) else {
@@ -402,7 +402,7 @@ impl SessionLifecycleService {
         // Everything the Information window shows under "Ping Statistics" and
         // the "To Client" row arrives here, measured by the client
         // (`Messages.cpp:2918`). The server stores the latest set so it can
-        // repeat them to whoever asks about this user — including the user
+        // repeat them to whoever asks about this user, including the user
         // themselves. Without this the whole panel reads zero, which looks like
         // a dead link rather than an unreported one.
         self.connections.record_reported(
@@ -450,7 +450,7 @@ impl SessionLifecycleService {
     /// # Why it goes to voice
     ///
     /// The nonce belongs to the cipher, and the cipher lives on the packet path
-    /// — this service has never held one, and key material does not cross a
+    /// this service has never held one, and key material does not cross a
     /// service boundary in a form anything else could read
     /// (`docs/ARCHITECTURE.md` §4). What comes back is a ready-made payload, or
     /// nothing when the peer handed over its own nonce and murmur would send no
@@ -512,7 +512,7 @@ impl SessionLifecycleService {
     /// `UserStats`: what a client shows under right-click → Information.
     ///
     /// This request used to be routed to `userdata`, which had no arm for it
-    /// and returned no actions — so the window never opened and nothing was
+    /// and returned no actions, so the window never opened and nothing was
     /// logged, because dropping an unhandled frame is normal and silent. The
     /// data it wants is connection state, which is this service's.
     ///
@@ -521,9 +521,9 @@ impl SessionLifecycleService {
     /// The dialog is mostly two group boxes, and **each is hidden unless the
     /// reply carries the fields that fill it** (`UserInformation.cpp:154`):
     ///
-    /// * *Connection* — shown only if `certificates`, `address` or `version` is
+    /// * *Connection*, shown only if `certificates`, `address` or `version` is
     ///   present. These are murmur's `details`.
-    /// * *UDP statistics* — shown only if `from_client` **and** `from_server`
+    /// * *UDP statistics*, shown only if `from_client` **and** `from_server`
     ///   are present. These are murmur's `local`.
     ///
     /// Omit both and the window opens empty, which is what an earlier version
@@ -551,7 +551,7 @@ impl SessionLifecycleService {
         };
 
         // murmur's `extend` (`Messages.cpp:3206`): yourself, or an
-        // administrator — one holding Ban on the root channel.
+        // administrator, one holding Ban on the root channel.
         let extend = wanted == inbound.session || self.may_see_everything(inbound).await;
         let details = extend && !request.stats_only.unwrap_or(false);
         // murmur's `local` (`Messages.cpp:3214`): the packet counters go to
@@ -574,7 +574,7 @@ impl SessionLifecycleService {
     ///
     /// Ban on the root channel (`Messages.cpp:3206`). Asked of the permissions
     /// service rather than decided here, so that "who is an admin" has one
-    /// answer in this system rather than one per service — and the superuser
+    /// answer in this system rather than one per service, and the superuser
     /// short-circuit already lives there.
     ///
     /// Any failure is a `false`: the consequence is a sparser dialog, whereas
@@ -626,7 +626,7 @@ impl SessionLifecycleService {
     /// murmur treats these as one group with one rule
     /// (`Messages.cpp:1130`): `MuteDeafen` on the *target's* channel, never on
     /// the actor's. That is what makes it a moderator power over a room rather
-    /// than a property of the person exercising it — and it is why this is
+    /// than a property of the person exercising it, and it is why this is
     /// refused for a user's own session too unless they hold it.
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
@@ -644,8 +644,8 @@ impl SessionLifecycleService {
         //
         // **Priority speaker is deliberately outside the guard, and murmur has
         // it inside.** Upstream refuses all four flags in one block, so there is
-        // no account on a murmur server — not even the SuperUser acting on
-        // itself — that can make the administrator a priority speaker. That
+        // no account on a murmur server, not even the SuperUser acting on
+        // itself; that can make the administrator a priority speaker. That
         // looks like the four flags travelling together rather than a rule about
         // this one: the guard exists so that nothing can be *taken away* from
         // the account that repairs a broken ACL table, and priority speaker
@@ -662,7 +662,7 @@ impl SessionLifecycleService {
 
         // `suppress` is the server's own statement that a user lacks `Speak`
         // here. murmur refuses any client that sets it, however privileged
-        // (`Messages.cpp:1135`) — a moderator who wants silence uses `mute`.
+        // (`Messages.cpp:1135`), a moderator who wants silence uses `mute`.
         if state.suppress.is_some() {
             tracing::info!(
                 session = inbound.session,
@@ -723,7 +723,7 @@ impl SessionLifecycleService {
             .announce_changed(&self.connections, target.conn)
             .await;
 
-        // Asked for, or changed underneath — never simply "all of them".
+        // Asked for, or changed underneath, never simply "all of them".
         //
         // A Mumble client logs one line per field **present** in this message,
         // not per field changed (`vendor/server/src/mumble/Messages.cpp:600`
@@ -733,7 +733,7 @@ impl SessionLifecycleService {
         // undeafened X", both from fields that were merely restated as `false`.
         //
         // murmur sends the client's own message back with the couplings it
-        // actually forced written into it (`Messages.cpp:1303`) — so a field it
+        // actually forced written into it (`Messages.cpp:1303`), so a field it
         // did not touch is absent, and that absence is what keeps the log
         // honest. The applied value is still what travels, because deafening
         // also mutes and a client told only what it asked for would render a
@@ -761,7 +761,7 @@ impl SessionLifecycleService {
     ///
     /// murmur's rule (`Messages.cpp:1203`): `SelfRegister` on the **root**
     /// channel when the target is the sender and `Register` on root when it is
-    /// somebody else — two permissions because a server may well let people
+    /// somebody else, two permissions because a server may well let people
     /// claim their own name while reserving the right to name anyone else. In
     /// both cases the target must not already be registered, and must have
     /// presented a certificate.
@@ -770,7 +770,7 @@ impl SessionLifecycleService {
     /// stores no password, and userdata keeps none for an empty one
     /// (`accounts.rs:336`). An account is then claimed on the next connection
     /// either by certificate or by password, and `authenticate` refuses a
-    /// password-less account claimed by name alone (`accounts.rs:227`) —
+    /// password-less account claimed by name alone (`accounts.rs:227`),
     /// correctly, since anyone could type the name. So registering a
     /// certificate-less user would write an account its own owner cannot log
     /// into, while permanently taking the name: every later connection under it
@@ -792,7 +792,7 @@ impl SessionLifecycleService {
 
         // Already registered. murmur folds this into the same refusal as a
         // missing permission (`Messages.cpp:1205` tests both in one condition),
-        // and the alternative — registering again — would mint a second account
+        // and the alternative (registering again) would mint a second account
         // for somebody who has one and strand the first.
         if target.account.is_some() {
             tracing::info!(
@@ -907,7 +907,7 @@ impl SessionLifecycleService {
     ///
     /// murmur asks three questions in two steps (`Messages.cpp:1075`, `:1080`):
     ///
-    /// 1. dragging *somebody else* takes `Move` on the channel they are in now —
+    /// 1. dragging *somebody else* takes `Move` on the channel they are in now,
     ///    the power is over the room they are being taken out of;
     /// 2. and then, for the destination, either the mover holds `Move` there
     ///    **or** the person being moved holds `Enter` there.
@@ -949,7 +949,7 @@ impl SessionLifecycleService {
         }
 
         // Dragging *somebody else* takes `Move` on the channel they are in
-        // now (`vendor/server/src/murmur/Messages.cpp:1075`) — the power is
+        // now (`vendor/server/src/murmur/Messages.cpp:1075`), the power is
         // over the room they are being taken out of, which is why it is checked
         // there and not on the mover.
         if moved != inbound.session
@@ -992,7 +992,7 @@ impl SessionLifecycleService {
         }
 
         let Some(result) = self.handshake.enter(inbound.scope, moved, target).await else {
-            // metadata is unreachable. Not a refusal — saying "you lack Enter"
+            // metadata is unreachable. Not a refusal, saying "you lack Enter"
             // would blame the user for an outage.
             tracing::error!(
                 session = moved,
@@ -1062,8 +1062,8 @@ impl SessionLifecycleService {
             .is_some_and(|session| session != inbound.session);
         if elsewhere && !moderates(&state) {
             // Everything below this point acts on the sender's own session.
-            // Moderation is the exception — acting on somebody else is the
-            // *usual* case for those fields — so they are let through to their
+            // Moderation is the exception, acting on somebody else is the
+            // *usual* case for those fields, so they are let through to their
             // own permission check rather than refused here.
             return Actions::new();
         }
@@ -1083,7 +1083,7 @@ impl SessionLifecycleService {
         //
         // murmur kicks (`Messages.cpp:1417`), and the severity is the point:
         // the flag is the client's own voluntary disclosure, so the only
-        // client this can catch is an honest one — and the answer to an honest
+        // client this can catch is an honest one, and the answer to an honest
         // client doing a forbidden thing is to stop the session, not to drop
         // the field and leave it recording in the belief that it may.
         if state.recording == Some(true) {
@@ -1105,7 +1105,7 @@ impl SessionLifecycleService {
         // A channel switch is a `UserState` carrying `channel_id`
         // (`vendor/server/src/murmur/Messages.cpp:1070`). This was not read at
         // all, so clicking a channel sent a request the server parsed, ignored,
-        // and answered with the self-mute echo below — a reply that looks like
+        // and answered with the self-mute echo below, a reply that looks like
         // success and moves nobody.
         if let Some(channel) = state.channel_id {
             let moved = state.session.unwrap_or(inbound.session);
@@ -1149,7 +1149,7 @@ impl SessionLifecycleService {
         };
 
         // Setting your *own* comment or avatar needs no permission, as in murmur
-        // — only clearing somebody else's does, and this method already refused
+        // only clearing somebody else's does, and this method already refused
         // every cross-session edit above. What they do need is a size limit,
         // because both are stored and then handed to every client that asks.
         let mut comment_hash = None;
@@ -1197,7 +1197,7 @@ impl SessionLifecycleService {
         // `comment_hash` and `texture_hash` and fetch the body with
         // `RequestBlob` if they want it
         // (`vendor/server/src/murmur/Messages.cpp:1517`), which keeps an avatar
-        // out of a broadcast to every connected client — the whole reason the
+        // out of a broadcast to every connected client, the whole reason the
         // hash fields exist.
         let echo = tcp::UserState {
             session: Some(session),
@@ -1208,8 +1208,8 @@ impl SessionLifecycleService {
             texture_hash,
             ..tcp::UserState::default()
         };
-        // A self-mute is the highest-rate presence change there is — a
-        // push-to-talk binding emits two per utterance — so it is the one most
+        // A self-mute is the highest-rate presence change there is, a
+        // push-to-talk binding emits two per utterance, so it is the one most
         // worth not sending to ten thousand people who are looking elsewhere.
         announce_user_state(&self.connections, session, &echo)
     }
@@ -1222,7 +1222,7 @@ impl SessionLifecycleService {
     ///
     /// **Strictly the sender's own.** murmur refuses a `UserState` that names
     /// somebody else and carries `listening_channel_add` or `_remove`
-    /// (`Messages.cpp:1285`), and this refuses the volume adjustments too —
+    /// (`Messages.cpp:1285`), and this refuses the volume adjustments too,
     /// upstream leaves those out of the same guard, which lets a moderator turn
     /// down a room in another person's client. Subscribing or re-mixing
     /// somebody else's audio is not a moderation power that exists.
@@ -1286,7 +1286,7 @@ impl SessionLifecycleService {
 
         // A limit met is not a permission missing, and a client told the wrong
         // one renders "you lack the Listen permission" for a room that is simply
-        // full — a condition an operator can lift and a user can wait out.
+        // full, a condition an operator can lift and a user can wait out.
         denials.extend(
             outcome
                 .refused
@@ -1355,7 +1355,7 @@ impl SessionLifecycleService {
     /// murmur's rule, and both halves of it matter (`Messages.cpp:1236` for the
     /// comment, `:1263` for the avatar):
     ///
-    /// * `ResetUserContent` on the **root** channel — it is a server-wide power
+    /// * `ResetUserContent` on the **root** channel; it is a server-wide power
     ///   over people, not a power over a room, so it is not checked where the
     ///   target happens to be standing;
     /// * **the value must be empty.** It is a *reset*, not an edit. A moderator
@@ -1439,7 +1439,7 @@ impl SessionLifecycleService {
 
         // The empty **body**, not an empty hash. murmur only swaps a body for
         // its hash when the hash is non-empty (`Messages.cpp:1591`), and after a
-        // reset it is not — so what travels is `comment = ""`, which is the one
+        // reset it is not, so what travels is `comment = ""`, which is the one
         // form every client reads as "this is now blank" rather than as "fetch
         // it yourself".
         let echo = tcp::UserState {
@@ -1506,7 +1506,7 @@ impl SessionLifecycleService {
     /// Store one piece of a user's own content, and return its hash.
     ///
     /// The body goes to `userdata`'s content-addressed blob store, which is what
-    /// `RequestBlob` already serves — so storing it here is what makes it
+    /// `RequestBlob` already serves, so storing it here is what makes it
     /// fetchable, for a guest as much as for a registered user. Content
     /// addressing earns its keep on avatars in particular: everyone using the
     /// same default picture stores it once.
@@ -1563,7 +1563,7 @@ impl SessionLifecycleService {
                 })
                 .await;
             if let Err(status) = update {
-                // Still readable this session — the blob is stored — but it will
+                // Still readable this session (the blob is stored) but it will
                 // not come back after a reconnect.
                 tracing::warn!(
                     %status,
@@ -1580,7 +1580,7 @@ impl SessionLifecycleService {
 
 /// A piece of content a user sets about themselves.
 ///
-/// The two travel identically — a blob plus a hash on the account — and differ
+/// The two travel identically (a blob plus a hash on the account) and differ
 /// only in which account field the hash lands in and which limit bounds them.
 /// One enum rather than two near-identical methods, because the pair that got
 /// out of step was exactly this: comments were handled and avatars were decoded
@@ -1589,7 +1589,7 @@ impl SessionLifecycleService {
 enum UserContent {
     /// `UserState.comment`, bounded by `text_message_length`.
     Comment,
-    /// `UserState.texture` — the avatar — bounded by `image_message_length`.
+    /// `UserState.texture` (the avatar) bounded by `image_message_length`.
     Texture,
 }
 
@@ -1605,7 +1605,7 @@ impl UserContent {
 
 /// Whether `len` exceeds a configured limit.
 ///
-/// Zero means no limit, as it does throughout murmur's configuration — so a
+/// Zero means no limit, as it does throughout murmur's configuration, so a
 /// limit that has been switched off must not be read as "nothing is allowed".
 const fn over(len: usize, limit: u32) -> bool {
     limit != 0 && len > limit as usize
@@ -1652,15 +1652,15 @@ impl Serve for SessionLifecycleService {
     /// Reap connections nothing has been heard from.
     ///
     /// [`Connections::timed_out`] existed, and the module header promised to
-    /// "notice a timeout", but nothing ever called it — so a client that went
+    /// "notice a timeout", but nothing ever called it, so a client that went
     /// away without its TCP connection noticing stayed in the tree for the life
     /// of the process. That is a laptop closing its lid, a phone losing signal,
     /// a cable pulled: the socket is not closed, it is *silent*, and no amount
     /// of handling close correctly at the gateway will ever reap it.
     ///
     /// The disconnect is asked for rather than applied locally, because the
-    /// gateway owns the socket and everything else — the removal, telling the
-    /// other services, the `UserRemove` other clients need — already hangs off
+    /// gateway owns the socket and everything else, the removal, telling the
+    /// other services, the `UserRemove` other clients need, already hangs off
     /// the gateway noticing the connection end.
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let timeout = timeout_ms(&ctx);
@@ -1698,7 +1698,7 @@ const SWEEP_INTERVAL_MS: u64 = 5_000;
 
 /// The `UserStats` reply for `target` under murmur's two disclosure gates.
 ///
-/// A free function so the rule can be tested without a running deployment —
+/// A free function so the rule can be tested without a running deployment,
 /// and the rule is worth testing, because *which fields are present* is not a
 /// cosmetic detail. The client decides whether to show each half of the dialog
 /// by asking whether the fields that fill it arrived at all
@@ -1743,8 +1743,8 @@ fn user_stats(target: &PendingConnection, details: bool, local: bool, now: u64) 
         tcp_ping_avg: Some(target.reported.tcp_ping_avg),
         tcp_ping_var: Some(target.reported.tcp_ping_var),
         // `from_server` is what the client reports having received *from* the
-        // server, so it is the client's figures. `from_client` is the mirror —
-        // the server's own crypt counters for packets it received — and those
+        // server, so it is the client's figures. `from_client` is the mirror,
+        // the server's own crypt counters for packets it received, and those
         // live in the voice service, which does not report them here yet. It is
         // sent zeroed rather than omitted because the client hides the whole
         // statistics box unless both halves are present.
@@ -1762,7 +1762,7 @@ fn user_stats(target: &PendingConnection, details: bool, local: bool, now: u64) 
 /// Whether this `UserState` is a moderator's speak-state change.
 ///
 /// Grouped exactly as murmur groups them (`Messages.cpp:1130`), because they
-/// share one permission and one refusal — splitting them would mean four
+/// share one permission and one refusal, splitting them would mean four
 /// chances to check three of them.
 fn is_speak_state(state: &tcp::UserState) -> bool {
     state.mute.is_some()
@@ -1787,8 +1787,8 @@ fn is_listen_state(state: &tcp::UserState) -> bool {
 ///
 /// Two shapes, decided by `broadcast_volume`:
 ///
-/// * **on** — one message to everybody, gains included.
-/// * **off** (the default) — the channels to everybody and the gains to their
+/// * **on**, one message to everybody, gains included.
+/// * **off** (the default), the channels to everybody and the gains to their
 ///   owner alone, which takes two messages because one message cannot have two
 ///   audiences. murmur sends the same `UserState` twice, appending the
 ///   adjustments before the second send (`Messages.cpp:1599`).
@@ -1821,8 +1821,8 @@ fn announce_listeners(
     // Deliberately still the flood, unlike the presence changes above.
     //
     // A listener is about a channel the user is *not* in, so there are two
-    // defensible audiences — everyone rendering the listener, and everyone
-    // rendering the channel being listened to — and they are not the same set.
+    // defensible audiences, everyone rendering the listener, and everyone
+    // rendering the channel being listened to, and they are not the same set.
     // Choosing wrong hides state from people who should see it, which is a
     // worse failure than sending it to people who do not need it. The saving
     // here is small besides: listeners change when somebody clicks, not twice
@@ -1890,19 +1890,19 @@ fn is_user_content(state: &tcp::UserState) -> bool {
 /// a dropped `UserState` looks exactly like a server that is working. That is
 /// how moving another user (`docs/GAP-ANALYSIS.md` U2) came to be fully
 /// implemented in [`SessionLifecycleService::on_move`], permission checks and
-/// all, and unreachable — the dispatch above it dropped the message before the
+/// all, and unreachable, the dispatch above it dropped the message before the
 /// handler was ever asked.
 ///
 /// Every one of these is checked against a permission by the handler it reaches.
 /// This decides only *which question gets asked*, never the answer.
 fn moderates(state: &tcp::UserState) -> bool {
-    // Mute, deafen, suppress, priority speaker — `MuteDeafen` on the target's
+    // Mute, deafen, suppress, priority speaker, `MuteDeafen` on the target's
     // channel.
     is_speak_state(state)
-        // A move — `Move` on the source, and `Move` on the destination or the
+        // A move, `Move` on the source, and `Move` on the destination or the
         // moved user's own `Enter`.
         || state.channel_id.is_some()
-        // A reset — `ResetUserContent` on the root, and only ever to empty.
+        // A reset, `ResetUserContent` on the root, and only ever to empty.
         || is_user_content(state)
 }
 
@@ -1911,7 +1911,7 @@ fn moderates(state: &tcp::UserState) -> bool {
 /// The same group as [`is_speak_state`] minus `priority_speaker`, and the
 /// distinction the SuperUser guard turns on: those three silence somebody,
 /// while priority speaker grants them precedence. A message carrying both is
-/// restrictive — otherwise attaching a grant to a mute would carry the mute
+/// restrictive, otherwise attaching a grant to a mute would carry the mute
 /// past the guard.
 fn restricts(state: &tcp::UserState) -> bool {
     state.mute.is_some() || state.deaf.is_some() || state.suppress.is_some()
@@ -1920,7 +1920,7 @@ fn restricts(state: &tcp::UserState) -> bool {
 /// Whether a speak-state field belongs in the echo, and what it should say.
 ///
 /// Present when the moderator asked for it, or when the server changed it on
-/// its own through murmur's couplings — deafening also mutes, un-muting also
+/// its own through murmur's couplings, deafening also mutes, un-muting also
 /// un-deafens. Absent when it was neither asked for nor touched, because a
 /// client reads a *present* field as an event worth announcing: restating an
 /// unchanged `false` is how a mute came to be logged as three separate actions.
@@ -1948,7 +1948,7 @@ const fn registration_permission(own: bool) -> Perm {
 
 /// A refusal carrying prose, for a failure that is not about permissions.
 ///
-/// murmur's `DenyType::Text` — the client renders `reason` verbatim. Used where
+/// murmur's `DenyType::Text`, the client renders `reason` verbatim. Used where
 /// the request was allowed but could not be carried out, which a permission
 /// refusal would describe wrongly: the user would go looking for a missing
 /// grant that nobody can give them.
@@ -1985,8 +1985,8 @@ fn seconds_since(then_ms: u64, now_ms: u64) -> u32 {
 /// A peer address as Mumble's wire form: sixteen raw bytes.
 ///
 /// Not the `host:port` string it is stored as. Mumble's `HostAddress` is always
-/// an IPv6 address — an IPv4 peer is carried as the v4-mapped `::ffff:a.b.c.d`
-/// — and a client that is handed anything else renders the address field as
+/// an IPv6 address, an IPv4 peer is carried as the v4-mapped `::ffff:a.b.c.d`
+/// and a client that is handed anything else renders the address field as
 /// nonsense rather than failing visibly.
 fn address_bytes(peer: &str) -> Vec<u8> {
     let host = match peer.strip_prefix('[') {
@@ -2077,7 +2077,7 @@ mod tests {
     #[test]
     fn an_address_is_encoded_as_the_sixteen_bytes_mumble_expects() {
         // Mumble's `HostAddress` is always IPv6; a v4 peer travels v4-mapped.
-        // Sending the `host:port` string instead — which is how it is stored —
+        // Sending the `host:port` string instead (which is how it is stored)
         // makes a client render the address field as rubbish.
         let v4 = address_bytes("172.26.0.1:51454");
         assert_eq!(v4.len(), 16);
@@ -2126,7 +2126,7 @@ mod tests {
         !stats.certificates.is_empty() || stats.address.is_some() || stats.version.is_some()
     }
 
-    /// …and the *UDP statistics* box only if both of these did.
+    /// ...and the *UDP statistics* box only if both of these did.
     fn statistics_box_shown(stats: &tcp::UserStats) -> bool {
         stats.from_client.is_some() && stats.from_server.is_some()
     }
@@ -2154,7 +2154,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_user_gets_a_dialog_with_something_in_it() {
-        // No details for somebody else — murmur withholds those too — but the
+        // No details for somebody else (murmur withholds those too) but the
         // statistics half must still arrive, or the window opens blank. This
         // is the exact regression: correct data, nothing rendered.
         let stats = user_stats(&somebody(), false, true, 9_000);
@@ -2212,7 +2212,7 @@ mod tests {
     #[test]
     fn a_peer_that_has_reported_nothing_yet_reports_zeros_not_stale_figures() {
         // A connection that has not sent a `Ping` yet has nothing to repeat.
-        // Zero is the honest answer here — unlike `bandwidth` below, these are
+        // Zero is the honest answer here, unlike `bandwidth` below, these are
         // counters whose true value at this moment *is* zero, and the panel
         // that displays them is already visible.
         let stats = user_stats(&somebody(), true, true, 9_000);
@@ -2312,14 +2312,14 @@ mod tests {
     #[test]
     fn restating_a_field_at_the_value_it_already_held_still_counts_as_asking() {
         // Muting an already-muted user is a no-op in state but not in intent,
-        // and murmur echoes what it was sent. The line is honest — somebody did
-        // press mute — so this is deliberately not filtered out.
+        // and murmur echoes what it was sent. The line is honest, somebody did
+        // press mute, so this is deliberately not filtered out.
         assert_eq!(echoed(Some(true), true, true), Some(true));
     }
 
     #[test]
     fn claiming_your_own_name_and_naming_someone_else_are_different_permissions() {
-        // Swapping these is invisible — registration still works, and every
+        // Swapping these is invisible, registration still works, and every
         // user who may claim their own name may now register anybody.
         assert_eq!(registration_permission(true), Perm::SELF_REGISTER);
         assert_eq!(registration_permission(false), Perm::REGISTER);
@@ -2347,8 +2347,8 @@ mod tests {
     #[test]
     fn dragging_somebody_into_a_channel_reaches_its_handler() {
         // The U2 regression, and the shape of it is worth keeping: `on_move`
-        // had the whole rule — `Move` on the source, `Move` or the target's own
-        // `Enter` on the destination — and was unreachable for anyone but the
+        // had the whole rule, `Move` on the source, `Move` or the target's own
+        // `Enter` on the destination, and was unreachable for anyone but the
         // sender, because the cross-session refusal above it dropped the
         // message first. Nothing failed and nothing was logged; the user simply
         // did not move.

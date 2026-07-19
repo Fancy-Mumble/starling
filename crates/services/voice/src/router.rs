@@ -1,7 +1,7 @@
 //! The packet path: attribute, decrypt, route, encrypt, deliver.
 //!
 //! Everything the voice service does to a frame, with no `async` anywhere. That
-//! is deliberate — this is the part worth testing exhaustively, and a test that
+//! is deliberate; this is the part worth testing exhaustively, and a test that
 //! needs a runtime and a socket is a test nobody writes enough of.
 //!
 //! # The shape of one packet
@@ -114,7 +114,7 @@ pub struct Router {
     /// Whether an *unauthenticated* ping is answered. murmur's `allowping`.
     ///
     /// Only the anonymous path. The connectivity ping a connected peer sends is
-    /// never gated by this — murmur does not gate it either
+    /// never gated by this; murmur does not gate it either
     /// (`Server.cpp:1165`), and it is how a client works out whether its UDP
     /// path functions at all. Gating it would silence audio for every client on
     /// a server whose operator only meant to leave the public list.
@@ -125,7 +125,7 @@ pub struct Router {
     /// What each peer is allowed to send, per second.
     ///
     /// Charged against `details.max_bandwidth`, which is already refreshed from
-    /// `server-config` on a timer for the server-browser ping — so the cap an
+    /// `server-config` on a timer for the server-browser ping, so the cap an
     /// operator sets is enforced with the same number a browser is told, and
     /// there is no second path for the two to disagree along.
     bandwidth: Bandwidth,
@@ -157,7 +157,7 @@ impl Router {
     /// Separate from construction because a UDP socket binds later than the
     /// service starts and binding can fail. Until this is called the router
     /// tunnels everything over TCP, which is the same path a client behind a
-    /// UDP-blocking firewall uses for its whole session — so "no socket yet" is
+    /// UDP-blocking firewall uses for its whole session, so "no socket yet" is
     /// a working state, not a broken one.
     pub fn use_datagrams(&mut self, datagrams: Box<dyn Datagrams>) {
         self.datagrams = datagrams;
@@ -188,7 +188,7 @@ impl Router {
     /// Whether an unauthenticated ping is answered at all.
     ///
     /// murmur's `allowping`. Off means a server browser cannot measure this
-    /// server and it cannot appear on the public list — which is why
+    /// server and it cannot appear on the public list, which is why
     /// registration refuses to run without it.
     pub const fn set_allow_ping(&mut self, allow: bool) {
         self.allow_ping = allow;
@@ -214,8 +214,8 @@ impl Router {
 
     /// Forget a peer and every index that mentions it.
     ///
-    /// A leak here is unbounded — one entry per disconnect, for the life of the
-    /// process — so every map is cleared, not just the obvious one.
+    /// A leak here is unbounded, one entry per disconnect, for the life of the
+    /// process, so every map is cleared, not just the obvious one.
     pub fn detach(&mut self, conn: ConnId) {
         let Some(peer) = self.peers.remove(&conn) else {
             return;
@@ -258,8 +258,8 @@ impl Router {
 
     /// The nonce a session's audio is sealed under, for answering its resync.
     ///
-    /// `None` covers two different things on purpose — no such session, and a
-    /// cipher with no nonce to offer — because the caller does the same thing
+    /// `None` covers two different things on purpose, no such session, and a
+    /// cipher with no nonce to offer, because the caller does the same thing
     /// for both: re-key the peer, which is the recovery that works either way.
     #[must_use]
     pub fn send_nonce(&self, session: SessionId) -> Option<Vec<u8>> {
@@ -310,7 +310,7 @@ impl Router {
     ///
     /// The port carries three things that can only be told apart by trying:
     /// audio from a connected peer, that peer's *encrypted* ping, and an
-    /// **anonymous** ping from something that has never connected — a client's
+    /// **anonymous** ping from something that has never connected, a client's
     /// server browser, or the public list measuring a server it has not spoken
     /// to.
     ///
@@ -340,7 +340,7 @@ impl Router {
 
     /// Route one frame to whoever should hear it, if anything claims it.
     ///
-    /// Returns whether a peer authenticated the frame — the caller decides what
+    /// Returns whether a peer authenticated the frame, the caller decides what
     /// an unclaimed one means, because that differs by transport: on the tunnel
     /// it can only be a fault, and on the UDP port it is usually an anonymous
     /// ping or simply the internet.
@@ -382,7 +382,7 @@ impl Router {
         true
     }
 
-    /// Say why a frame that decrypted could not be parsed — but not every time.
+    /// Say why a frame that decrypted could not be parsed, but not every time.
     ///
     /// The failure with no other symptom worth having: the peer is attributed,
     /// its cipher works, its packets are counted as received, and the audio is
@@ -437,7 +437,7 @@ impl Router {
         self.report_unattributed(from, len);
     }
 
-    /// Say something about a datagram nobody claimed — but not every time.
+    /// Say something about a datagram nobody claimed, but not every time.
     ///
     /// An open UDP port receives whatever the internet sends it, so a line per
     /// stray datagram is a denial of service anyone can trigger. The first few
@@ -484,7 +484,7 @@ impl Router {
             // travelled inside TLS and the voice cipher exists for the UDP path,
             // which has no protection of its own.
             //
-            // Decrypting here fails every frame and drops it — and a client that
+            // Decrypting here fails every frame and drops it, and a client that
             // has fallen back to tunnelling never goes back to UDP, so it goes
             // silent for the rest of the session while every counter looks fine.
             AudioSource::Tunnel(conn) => self
@@ -562,7 +562,7 @@ impl Router {
         // murmur charges the frame here too (`Server.cpp:1334`): after the
         // speaker is known and before anyone is worked out to send it to, so a
         // peer over its budget costs one bucket update rather than a fan-out.
-        // Dropped in silence, as upstream drops it — there is no field in the
+        // Dropped in silence, as upstream drops it; there is no field in the
         // audio protocol to say "slow down", and the client's own bandwidth
         // negotiation is what is supposed to have prevented this.
         if !self.bandwidth.admit(
@@ -641,7 +641,7 @@ impl Router {
     ///
     /// Sealing matters and is easy to forget: a connected client decrypts
     /// everything on its voice path, so a plaintext reply is not a readable
-    /// reply — it is a packet the client discards. Only the *anonymous* ping is
+    /// reply; it is a packet the client discards. Only the *anonymous* ping is
     /// unencrypted, and that one never reaches this method because there is no
     /// session to encrypt it under.
     fn reply(&mut self, conn: ConnId, origin: Attributed, frame: &[u8]) {
@@ -721,7 +721,7 @@ mod tests {
     /// The same lobby, with both peers' UDP paths proven.
     ///
     /// A client proves its path by sending, so the setup produces traffic of its
-    /// own — cleared afterwards, or every test would start one datagram behind.
+    /// own, cleared afterwards, or every test would start one datagram behind.
     fn lobby_on_udp() -> (Router, RecordingDatagrams, TestPeer, TestPeer) {
         let (mut router, sent, mut alice, mut bob) = lobby();
         let probe = alice.speak(b"probe");
@@ -832,7 +832,7 @@ mod tests {
     fn allow_ping_off_does_not_silence_a_connected_peers_connectivity_ping() {
         // The bug this test exists for: gating both would leave every client on
         // the server unable to confirm its UDP path, so all of them would fall
-        // back to tunnelling audio over TCP — from a setting whose description
+        // back to tunnelling audio over TCP, from a setting whose description
         // is about being listed publicly. murmur does not gate this one either
         // (`Server.cpp:1165`).
         let (mut router, sent, mut alice, _bob) = lobby_on_udp();
@@ -948,8 +948,8 @@ mod tests {
 
     #[test]
     fn a_peer_that_starts_tunnelling_stops_being_sent_datagrams() {
-        // UDP breaking mid-call is routine — a NAT entry expiring, a network
-        // changing — and the client's response is to tunnel. If the server kept
+        // UDP breaking mid-call is routine, a NAT entry expiring, a network
+        // changing, and the client's response is to tunnel. If the server kept
         // sending datagrams into the dead path, that person would remain
         // audible to everyone and hear nobody, with every counter healthy.
         let (mut router, sent, mut alice, mut bob) = lobby_on_udp();
@@ -985,7 +985,7 @@ mod tests {
         // carried, and every other client in the channel paid for it.
         //
         // The same peer sends the same fifty frames twice, and the only
-        // difference is the cap — which is the assertion §5 needs, because a
+        // difference is the cap, which is the assertion §5 needs, because a
         // test that read the value back would have passed before this existed.
         const FRAME: &[u8] = b"0123456789";
         let cost = (FRAME.len() + crate::bandwidth::PACKET_OVERHEAD) as u32;
@@ -1041,8 +1041,8 @@ mod tests {
 
     #[test]
     fn a_speaker_over_the_cap_is_counted_apart_from_a_silenced_one() {
-        // "Why is this user choppy" has two very different answers — a
-        // moderator muted them, or they are over a ceiling — and one counter
+        // "Why is this user choppy" has two very different answers, a
+        // moderator muted them, or they are over a ceiling, and one counter
         // for both would not distinguish them.
         let (mut router, _sent, mut alice, _bob) = lobby();
         router.set_details(ServerDetails {
@@ -1172,7 +1172,7 @@ mod tests {
     fn a_whisper_reaches_the_person_it_names_and_nobody_else() {
         // The feature, at the level the router is responsible for. Carol is in
         // another channel, so nothing but the registered target can carry to
-        // her — and Bob shares the lobby, so nothing but the target *not*
+        // her, and Bob shares the lobby, so nothing but the target *not*
         // carrying to him can keep him out of it.
         const CAROL: SessionId = SessionId(3);
         let (mut router, mut alice, bob, mut carol) = three_peers();
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn an_unregistered_slot_reaches_nobody() {
         // Falling back to the speaker's channel would send a whisper to exactly
-        // the people it was aimed away from — the worst available default.
+        // the people it was aimed away from, the worst available default.
         let (mut router, mut alice, bob, carol) = three_peers();
         let frame = alice.speak_tunnelled_to(7, b"nowhere");
         router.accept(AudioSource::Tunnel(1), &frame);
@@ -1382,7 +1382,7 @@ mod tests {
     fn tunnelled_audio_is_not_decrypted() {
         // The bug this file exists to remember: `UDPTunnel` runs inside TLS and
         // carries plaintext (murmur, `Server.cpp:1905`). Decrypting it fails
-        // every frame — and a real client that falls back to tunnelling never
+        // every frame, and a real client that falls back to tunnelling never
         // goes back to UDP, so it is silent for the rest of the session while
         // every aggregate counter still looks healthy.
         let (mut router, _, mut alice, bob) = lobby();
@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     fn a_sealed_frame_on_the_tunnel_is_refused() {
         // The other half. Nothing should be encrypting on this path, so a sealed
-        // frame arriving here means a peer is confused about the transport —
+        // frame arriving here means a peer is confused about the transport,
         // and it must not be mistaken for audio.
         let (mut router, _, mut alice, bob) = lobby();
         let sealed = alice.speak(b"wrongly sealed");
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn tunnelled_audio_leaves_as_a_control_message() {
         // Raw audio bytes on the TLS socket would be read as a message header
-        // and desynchronise the connection outright — a far worse failure than
+        // and desynchronise the connection outright, a far worse failure than
         // silence, and one that would look like a protocol error somewhere else.
         let (mut router, _, mut alice, bob) = lobby();
         let plain = alice.speak_tunnelled(b"framed");

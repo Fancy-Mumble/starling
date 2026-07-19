@@ -13,7 +13,7 @@ ARG RUST_VERSION=1.95
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
-# prost-build 0.14 shells out to `protoc` rather than bundling one — the same
+# prost-build 0.14 shells out to `protoc` rather than bundling one, the same
 # package .github/workflows/ci.yml installs for the Linux job.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -42,8 +42,8 @@ FROM debian:bookworm-slim AS runtime
 # store fails that in a way that looks like the remote host being down.
 #
 # bash is already present (Debian Essential) and is load-bearing for the
-# compose healthchecks: this build serves no HTTP /healthz to curl — health is
-# an in-process readiness gate, not an endpoint — so the only honest liveness
+# compose healthchecks: this build serves no HTTP /healthz to curl, health is
+# an in-process readiness gate, not an endpoint, so the only honest liveness
 # probe from outside is a TCP connect, which bash does with /dev/tcp and dash
 # cannot do at all.
 RUN apt-get update \
@@ -60,7 +60,7 @@ COPY --from=builder /usr/local/bin/starling /usr/local/bin/starling
 USER starling
 WORKDIR /var/lib/starling
 
-# Documentation, not publication — compose decides what is actually reachable.
+# Documentation, not publication, compose decides what is actually reachable.
 #   64738/tcp  gateway, control plane, TLS terminates there
 #   64738/udp  voice, its own socket; audio never touches the gateway
 #   50051/tcp  this service's gRPC surface, internal to the network

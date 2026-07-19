@@ -21,7 +21,7 @@ pub struct GatewayConfig {
     pub control_queue: usize,
 
     /// Per client, for tunnelled audio. Full means drop the oldest and count
-    /// it — a late audio frame is worthless.
+    /// it, a late audio frame is worthless.
     pub audio_queue: usize,
 
     /// Per gRPC call, unless a route overrides it.
@@ -106,7 +106,7 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
         // channel tree issues one `ACL`(13) query **per channel**, so a server
         // with thirty channels emits thirty queries in a second or two. On the
         // shared control bucket the first five arrive and the rest are dropped
-        // in silence — an administrator sees a tree that renders empty
+        // in silence, an administrator sees a tree that renders empty
         // permissions for most of it and no error anywhere.
         //
         // Measured, not guessed: a single e2e run dropped 120 `ACL` frames.
@@ -119,7 +119,7 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
         ),
         // Chat. A person typing several short messages in a row legitimately
         // emits them faster than one a second, and the burst is shared with
-        // every other control message their client is sending — so a client
+        // every other control message their client is sending, so a client
         // that is also announcing a channel change or a mute can exhaust it
         // between two sentences and lose one.
         //
@@ -208,8 +208,8 @@ mod tests {
     #[test]
     fn audio_is_not_charged_to_the_control_bucket() {
         // The bug this exists for: tunnelled audio was routed to `control`,
-        // which is murmur's 1 message per second. A client talking over TCP —
-        // everyone behind a UDP-blocking firewall — was throttled off the air
+        // which is murmur's 1 message per second. A client talking over TCP,
+        // everyone behind a UDP-blocking firewall, was throttled off the air
         // after its first five frames, and the only symptom was silence.
         let limits = GatewayConfig::default().limits;
         let audio = limits.get("audio").copied().expect("audio bucket");

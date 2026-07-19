@@ -8,7 +8,7 @@
 //!
 //! XChaCha20-Poly1305 is defined as `HChaCha20` to derive a subkey from the first
 //! 16 nonce bytes, then ChaCha20-Poly1305 on the remaining 8. This does exactly
-//! that, with the first 16 bytes fixed per session — so a peer holding the same
+//! that, with the first 16 bytes fixed per session, so a peer holding the same
 //! key can encrypt with an off-the-shelf `XChaCha20Poly1305` and a 24-byte nonce
 //! of `salt ‖ counter` and interoperate byte for byte. The client already has
 //! that implementation, and
@@ -115,12 +115,12 @@ impl VoiceSession {
             .unwrap_or_else(|_| unreachable!("32 bytes is within HKDF's output limit"));
 
         // `R20` and not `R12`/`R8`: it is the 20-round ChaCha the AEAD below
-        // uses, and it is the same round count the previous `U10` asked for —
+        // uses, and it is the same round count the previous `U10` asked for,
         // that spelled ten *double* rounds, which `Rounds::COUNT` still records
         // as 10 for `R20`. Naming the variant after the rounds rather than the
         // doublings is the whole of the change; picking a neighbour here would
         // weaken the cipher without failing anything.
-        // `(&…).into()` rather than the deprecated `Key::from_slice`: both
+        // `(&...).into()` rather than the deprecated `Key::from_slice`: both
         // arrays are fixed at 32 bytes by their types, so the conversion
         // cannot fail and needs no unwrap to say so.
         let subkey = chacha20::hchacha::<chacha20::R20>((&directional).into(), salt.into());
@@ -173,13 +173,13 @@ impl VoiceSession {
     /// not verify.
     ///
     /// The replay window is advanced **before** the tag is checked, and rolled
-    /// back if authentication fails — see the note in the body for why.
+    /// back if authentication fails, see the note in the body for why.
     pub fn open(&mut self, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, VoiceError> {
         if packet.len() < MIN_PACKET_LEN {
             return Err(VoiceError::Truncated { len: packet.len() });
         }
-        // The length check above is the real bound — a packet also needs a tag,
-        // not just a counter — but reading the counter through
+        // The length check above is the real bound, a packet also needs a tag,
+        // not just a counter, but reading the counter through
         // `split_first_chunk` keeps that read correct on its own terms rather
         // than resting on a check five lines away.
         let Some((header, body)) = packet.split_first_chunk::<WIRE_COUNTER_BYTES>() else {
@@ -233,7 +233,7 @@ impl crate::stream::VoiceCipher for VoiceSession {
 
     /// Nothing: this is one direction of the cipher
     /// [`XChaCha20Voice`](crate::XChaCha20Voice) pairs, and it resynchronises the
-    /// same way that type does — by being re-keyed. The salt is already inside
+    /// same way that type does, by being re-keyed. The salt is already inside
     /// the derived subkey and the counter's high bits are reconstructed from the
     /// wire, so there is no nonce to exchange.
     fn send_nonce(&self) -> Option<Vec<u8>> {

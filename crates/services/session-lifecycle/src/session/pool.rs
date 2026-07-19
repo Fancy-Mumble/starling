@@ -9,7 +9,7 @@ use crate::ids::SessionId;
 ///
 /// Mirrors murmur (`Server.cpp:244`): ids `1..max_users * 2` are enqueued at
 /// startup and returned to the *back* of the queue on disconnect
-/// (`Server.cpp:1881`). The FIFO discipline matters — it maximises the time
+/// (`Server.cpp:1881`). The FIFO discipline matters, it maximises the time
 /// before an id is reused, which keeps a reconnecting client from colliding
 /// with stale references to its previous session. An exhausted pool refuses the
 /// connection rather than growing (`Server.cpp:1625`).

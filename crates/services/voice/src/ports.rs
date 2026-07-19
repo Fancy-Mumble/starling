@@ -2,7 +2,7 @@
 //!
 //! These were a shared trait hub in the in-process design. They live here now
 //! because voice is the only thing that uses them, and a crate everyone depends
-//! on for four types is a coupling with no payoff — `docs/ARCHITECTURE.md`
+//! on for four types is a coupling with no payoff, `docs/ARCHITECTURE.md`
 //! supersedes the `starling-api` hub entirely.
 //!
 //! Both sinks are deliberately fire-and-forget. Audio that cannot be queued
@@ -48,7 +48,7 @@ impl std::fmt::Display for ChannelId {
 pub enum AudioSource {
     /// Inside a `UDPTunnel` on an established TLS connection.
     ///
-    /// The identity is already known — TLS established it — so nothing has to
+    /// The identity is already known (TLS established it) so nothing has to
     /// be attributed. This is the fallback for a UDP-blocked client.
     Tunnel(ConnId),
     /// A datagram on the voice port.
@@ -78,7 +78,7 @@ pub trait Datagrams: std::fmt::Debug + Send + Sync {
 /// Somewhere an already-framed control message can be written.
 ///
 /// This is the tunnelled audio path, which is per client rather than per
-/// listener — the only audio that reaches the control plane at all.
+/// listener, the only audio that reaches the control plane at all.
 pub trait FrameSink: std::fmt::Debug + Send + Sync {
     /// Try to queue a frame without blocking.
     ///

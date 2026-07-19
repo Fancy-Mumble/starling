@@ -7,7 +7,7 @@
 //! # Two unidirectional streams, not one bidirectional
 //!
 //! A WebTransport `BidiStream` implements sending and receiving on one object,
-//! so reading and writing it concurrently would mean sharing it behind a lock —
+//! so reading and writing it concurrently would mean sharing it behind a lock,
 //! and a lock held across a write would stall event delivery whenever a command
 //! arrived. Two unidirectional streams have no such coupling: the server opens
 //! one for events, the client opens one for commands, and neither waits on the
@@ -210,7 +210,7 @@ async fn pump(
         .await?;
     }
 
-    // Registered context entries, withdrawn when this session ends — the same
+    // Registered context entries, withdrawn when this session ends, the same
     // contract the WebSocket keeps, for the same reason.
     let mut registered: Vec<String> = Vec::new();
     // Commands arrive newline-delimited and a read may split one, so partial

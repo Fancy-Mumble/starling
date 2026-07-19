@@ -1,4 +1,4 @@
-//! `text` — chat that is not end-to-end encrypted, and its history.
+//! `text`: chat that is not end-to-end encrypted, and its history.
 //!
 //! Rows are keyed by **`UUIDv7`**: time-sortable and coordination-free, so
 //! "newest 50 in this channel" is a backwards range scan off the end of an
@@ -7,7 +7,7 @@
 //!
 //! Fan-out **addresses** its recipients. It used to name the speaker as an
 //! exclusion and leave the rest to the gateway, on the reasoning that only the
-//! gateway knows which sessions it holds — but a `Send` naming no sessions goes
+//! gateway knows which sessions it holds, but a `Send` naming no sessions goes
 //! to every authenticated client on the server, so excluding the speaker left
 //! everyone else *on the server* rather than everyone else in the channel.
 //! Membership comes from `session-view` through a [`Roster`], and a cold roster
@@ -65,8 +65,8 @@ const EVENT_BACKLOG: usize = 1024;
 /// The schema.
 ///
 /// The primary key is `(server_id, channel_id, id)`, so the table is physically
-/// ordered tenant → channel → time and both query shapes — newest page and
-/// scroll-back — are one range scan.
+/// ordered tenant → channel → time and both query shapes, newest page and
+/// scroll-back, are one range scan.
 const SCHEMA: &[Migration<'static>] = &[Migration::new(
     "0001_text_message",
     &[
@@ -403,7 +403,7 @@ impl Text for TextRpc {
         );
 
         // Watchers see server-originated messages too, flagged as such, so a
-        // watcher can tell a message the server sent from one a user did —
+        // watcher can tell a message the server sent from one a user did,
         // including one it caused itself.
         let _ = self.0.events.send(MessageEvent {
             sender_session: 0,
@@ -528,7 +528,7 @@ impl TextService {
             return denial;
         }
         // A body that was only markup is now empty, and an empty message is
-        // not delivered — murmur returns here too rather than broadcasting a
+        // not delivered, murmur returns here too rather than broadcasting a
         // blank line to a channel.
         if message.message.is_empty() {
             return Actions::new();
@@ -538,7 +538,7 @@ impl TextService {
         // channel it is addressed to: a message naming five channels the sender
         // may not write to must not reach the one they may. murmur refuses the
         // whole message rather than delivering it partially, and a partial
-        // delivery is the worse answer — the sender is told nothing and some
+        // delivery is the worse answer, the sender is told nothing and some
         // recipients saw it.
         for channel in message
             .channel_id
@@ -587,7 +587,7 @@ impl TextService {
 
         // Published after the message is stored and before it is returned for
         // delivery. A watcher is an observer, so this is never allowed to
-        // decide whether the message goes out — `send` failing means only that
+        // decide whether the message goes out, `send` failing means only that
         // nobody is watching.
         let _ = self.events.send(MessageEvent {
             sender_session: inbound.session,
@@ -627,7 +627,7 @@ impl TextService {
     /// Who a client's message is actually for.
     ///
     /// The union of the sessions it names outright, the members of every
-    /// channel it names, and the members of every channel under a `tree_id` —
+    /// channel it names, and the members of every channel under a `tree_id`,
     /// minus the sender, who already has it.
     async fn recipients_of(
         &self,
@@ -987,7 +987,7 @@ mod tests {
         // §5's first entry. The limit was applied to comments and to nothing
         // else, so an operator who set it watched clients keep posting past it.
         //
-        // The same body, twice, with only the setting different — asserting it
+        // The same body, twice, with only the setting different, asserting it
         // round-trips through the API would reproduce the bug being fixed.
         use starling_proto::proto::tcp::permission_denied::DenyType;
         let body = "x".repeat(64);
@@ -1005,7 +1005,7 @@ mod tests {
         );
 
         // With a limit that admits it, the message reaches the permission
-        // check instead — which denies here, because these tests point at a
+        // check instead, which denies here, because these tests point at a
         // `permissions` nothing is serving. A different refusal is the proof
         // the length check is no longer the one refusing.
         let lenient = service_with(starling_proto_fancy::serverconfig::Snapshot {

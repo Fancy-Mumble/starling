@@ -4,8 +4,8 @@
 #   starling text          --config starling.toml
 #
 # This file is the *deployment* layer: endpoints, ports, TLS paths, storage
-# URLs, tiers and routes. Everything an operator changes while the server runs —
-# bandwidth, message limits, the welcome text — belongs to the `server-config`
+# URLs, tiers and routes. Everything an operator changes while the server runs,
+# bandwidth, message limits, the welcome text, belongs to the `server-config`
 # service instead, because the two have different lifetimes (docs/CONFIGURATION.md).
 #
 # Unknown keys are rejected at startup rather than ignored, so a typo fails
@@ -93,7 +93,7 @@ log_format = "text"          # json | text
 
 # The operator event log: who connected, what was refused, what an
 # administrator changed. Distinct from [telemetry] above, which carries
-# developer diagnostics and is driven by RUST_LOG — this one is the record you
+# developer diagnostics and is driven by RUST_LOG, this one is the record you
 # are entitled to keep, and it has its own level and destinations.
 #
 # Developer diagnostics are the other dial: RUST_LOG=debug shows per-connection
@@ -121,13 +121,13 @@ records = 1000
 # -- Services ---------------------------------------------------------------
 #
 # Every block takes the same keys. `types` is the outer message type from
-# docs/PROTOCOL-COMPATIBILITY.md §3 — one number per service, because a
+# docs/PROTOCOL-COMPATIBILITY.md §3, one number per service, because a
 # service's own message types live in its nested envelope and the gateway never
 # looks inside. Adding a service is three lines and no gateway release.
 #
 # The `unix:` endpoints below are the co-located deployment on a Unix host. On
-# Windows the equivalent is `pipe:` — a named pipe, whose ACL is the boundary
-# file permissions are here — and a `unix:` endpoint is refused at startup
+# Windows the equivalent is `pipe:`, a named pipe, whose ACL is the boundary
+# file permissions are here, and a `unix:` endpoint is refused at startup
 # rather than quietly served over something else. Running with no --config at
 # all picks the right one for the platform; see docs/CONFIGURATION.md.
 
@@ -166,7 +166,7 @@ types = [24, 25, 1013]
 endpoint = "unix:/run/starling/voice.sock"
 tier = "core"
 types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
-udp_listen = "0.0.0.0:64738" # voice's OWN socket — audio skips the gateway
+udp_listen = "0.0.0.0:64738" # voice's OWN socket, audio skips the gateway
 limits = "audio"             # never the 1/s control bucket: this is speech
 
 [services.text]
@@ -247,7 +247,7 @@ types = [16, 17, 1017]
 
 # The gateway's own block.
 #
-# It owns no wire types — it is the process that *routes* them — and nothing
+# It owns no wire types (it is the process that *routes* them) and nothing
 # dials it to do work. It needs an endpoint anyway, because the `health`
 # collector dials every service to ask how it is, and without one the gateway
 # is the single component missing from the health dashboard: the process every
@@ -257,7 +257,7 @@ enabled = true
 endpoint = "unix:/run/starling/gateway.sock"
 # `core`, the default. The tier says what the *gateway* does while a service is
 # unhealthy, so the gateway's own tier is a value it would only ever consult
-# about itself — there is no answer for it to act on.
+# about itself; there is no answer for it to act on.
 tier = "core"
 types = []
 
@@ -265,7 +265,7 @@ types = []
 #
 # Neither owns a wire type, because no client addresses them: they are things
 # the server does rather than things a client asks for. `Config::with_defaults`
-# has always created both, so a server started with no `--config` runs them —
+# has always created both, so a server started with no `--config` runs them,
 # but `--config` **replaces** the defaults outright, so a file that omits them
 # is a file that turns them off. That is why they are written out here.
 
@@ -282,7 +282,7 @@ types = []
 #
 # Unlike the announcer this one *is* dialled, so it needs a real endpoint.
 # Without it the service fails at startup with "has no endpoint in the
-# configuration" and `/v1/health` answers 502 — up, reachable, and with nothing
+# configuration" and `/v1/health` answers 502, up, reachable, and with nothing
 # behind it.
 [services.health]
 enabled = true

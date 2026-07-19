@@ -1,6 +1,6 @@
 //! The service: the UDP loop, the cipher mint, and the membership cache.
 //!
-//! **A restarted service has cold caches and no way to say so** — voice holds
+//! **A restarted service has cold caches and no way to say so**, voice holds
 //! ciphers and membership, and audio arriving before it has re-subscribed is
 //! dropped silently. That is the failure mode with no log line
 //! (`PORTING-PLAN.md` R11), so readiness gates on the subscription being warm
@@ -55,7 +55,7 @@ const VOICE_TARGET: u16 = 19;
 ///
 /// Short, because of what a stale membership table costs: a session missing
 /// from it is a session nobody hears and who hears nobody, and there is no log
-/// line for that — the call simply has a silent participant.
+/// line for that, the call simply has a silent participant.
 const VIEW_RETRY: Duration = Duration::from_secs(1);
 
 /// The readiness gate this service is useless without.
@@ -66,7 +66,7 @@ const VIEW_GATE: &str = "session view";
 /// Pushed in on a timer rather than fetched when a ping arrives, for two
 /// reasons. **Nothing on the packet path may make a request**
 /// (`docs/ARCHITECTURE.md` §3), and a ping is answered from that path. And the
-/// peer asking is unauthenticated — a fetch per ping would turn an open UDP
+/// peer asking is unauthenticated, a fetch per ping would turn an open UDP
 /// port into a lever anyone can pull on `session-view`, which is the one
 /// service every other service reads through.
 ///
@@ -131,7 +131,7 @@ impl VoiceService {
     ///
     /// Both halves belong here because they are one decision. The cipher is
     /// chosen from the **Fancy** version the client announced and the wire
-    /// format from its **Mumble** version — the two axes are independent, and
+    /// format from its **Mumble** version, the two axes are independent, and
     /// conflating them is the classic Mumble porting bug (`starling-gate`).
     /// [`CompatibilityFirstProfiles`] is what holds them together: legacy
     /// framing has nowhere to put a cipher id, so a peer on it is served OCB2
@@ -142,7 +142,7 @@ impl VoiceService {
 
         let Ok(profile) = CompatibilityFirstProfiles.build(mumble, gate) else {
             // The default factory serves every client that exists, so this is
-            // a deployment running a stricter one — not a client fault.
+            // a deployment running a stricter one, not a client fault.
             tracing::warn!(
                 session = request.session,
                 "this deployment does not serve this peer's voice profile"
@@ -200,7 +200,7 @@ impl VoiceService {
     /// Put one peer on the packet path, or replace the one already there.
     ///
     /// Called from minting rather than from `opened`, because a peer is not
-    /// routable until it has both a session id and a key — before that there is
+    /// routable until it has both a session id and a key, before that there is
     /// nothing to attribute a datagram to and nothing to seal a frame with.
     ///
     /// A resync goes through here too, and replacing is the correct outcome:
@@ -212,7 +212,7 @@ impl VoiceService {
             SessionId(request.session),
             format,
             secrets.server_cipher(),
-            // Tunnelled until one of this peer's datagrams authenticates —
+            // Tunnelled until one of this peer's datagrams authenticates,
             // which is where every connection starts, and where a client behind
             // a UDP-blocking firewall stays.
             Box::new(GatewayTunnel::new(self.fanout.clone(), request.session)),
@@ -244,7 +244,7 @@ impl VoiceService {
             socket.forget(SessionId(session));
         }
         // The slots go with the session. Left behind they are a leak of one
-        // entry per disconnect — and worse, a recycled session id would inherit
+        // entry per disconnect, and worse, a recycled session id would inherit
         // whoever last held it as its whisper list.
         drop(sessions);
         self.forget_targets(SessionId(session));
@@ -255,7 +255,7 @@ impl VoiceService {
     /// Re-subscribes on failure: a `session-view` restart is a rolling deploy,
     /// not an incident. The stream is also dropped deliberately when this
     /// subscriber falls behind, because a missed delta cannot be repaired from
-    /// the next one — reconnecting replaces the whole table, which is the only
+    /// the next one, reconnecting replaces the whole table, which is the only
     /// way back to agreement.
     fn follow_view(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -308,7 +308,7 @@ impl VoiceService {
             Some(view_event::Event::Gone(gone)) => {
                 self.view.remove(gone.session);
                 // A session that has gone takes its slots with it. Skipping this
-                // leaks one entry per disconnect for the life of the process —
+                // leaks one entry per disconnect for the life of the process,
                 // and a recycled session id would inherit a stranger's whisper
                 // list, which is the same leak wearing a much worse face.
                 self.forget_targets(SessionId(gone.session));
@@ -342,7 +342,7 @@ impl VoiceService {
 
     /// Rebuild the view the packet path routes against, from all three sources.
     ///
-    /// Membership, then the tree, then the registered targets — in that order
+    /// Membership, then the tree, then the registered targets, in that order
     /// because each is a layer over the last, and because a snapshot rebuilt
     /// from membership alone silently drops every whisper anyone had registered.
     /// That was the shape of the bug this ordering exists to prevent: a shout
@@ -500,7 +500,7 @@ impl Voice for VoiceRpc {
     ///
     /// murmur's `Server::msgCryptSetup` (`Messages.cpp:2117`), with one
     /// divergence that the cipher axis forces. Upstream has exactly one cipher
-    /// and so exactly one answer — swap an IV — while here the answer depends on
+    /// and so exactly one answer (swap an IV) while here the answer depends on
     /// whether the peer's cipher *has* an IV to swap:
     ///
     /// | asked | OCB2 | `XChaCha20-Poly1305` |
@@ -526,7 +526,7 @@ impl Voice for VoiceRpc {
 
         match starling_crypto::ResyncRequest::classify(req.client_nonce.as_deref()) {
             // The peer says where it is. Believing it is safe only because every
-            // packet still has to authenticate afterwards — the nonce is a hint
+            // packet still has to authenticate afterwards, the nonce is a hint
             // about where to look, not a credential.
             starling_crypto::ResyncRequest::AdoptTheirs { nonce } => {
                 if self.0.router().adopt_recv_nonce(session, nonce) {
@@ -547,7 +547,7 @@ impl Voice for VoiceRpc {
             }
 
             // The peer is lost and wants ours. Answering with the nonce we seal
-            // under — never the one we expect from it — is what makes this
+            // under (never the one we expect from it) is what makes this
             // recoverable: the client installs it as what to *expect*, and
             // handing over the receive half would tell it to look for its own
             // packets coming back.
@@ -579,7 +579,7 @@ impl Voice for VoiceRpc {
         // but the key material is carried across from the original mint:
         // re-deriving the profile from a fresh guess would hand a stock client
         // the modern cipher on its second try, or protobuf framing to a 1.4
-        // client — a silent, one-sided upgrade halfway through a call.
+        // client, a silent, one-sided upgrade halfway through a call.
         let Some(previous) = self
             .0
             .sessions
@@ -652,21 +652,21 @@ impl ClientService for VoiceService {
         match inbound.type_id {
             // The tunnelled path: the same bytes a datagram would have carried,
             // demultiplexed onto the same routing. Upstream's own handler
-            // asserts unreachable for exactly this reason — two implementations
+            // asserts unreachable for exactly this reason, two implementations
             // would be two copies differing only in how the bytes arrived.
             //
             // TLS has already proved who sent this and already protected it, so
             // it is **not** decrypted: the voice cipher exists for the UDP path,
             // which has nothing else guarding it. Opening it here would fail
             // every frame, and a client that has fallen back to tunnelling never
-            // returns to UDP — so it would be silent for the rest of its session
+            // returns to UDP, so it would be silent for the rest of its session
             // with every counter looking healthy.
             UDP_TUNNEL => {
                 self.router()
                     .accept(AudioSource::Tunnel(inbound.conn), &inbound.payload);
                 // Nothing is returned. The recipients of this frame are *other*
                 // connections, and each was sealed and queued individually on
-                // the way through — an `Actions` reply goes back to the sender,
+                // the way through, an `Actions` reply goes back to the sender,
                 // who is the one person who must not hear it.
                 Actions::new()
             }
@@ -677,7 +677,7 @@ impl ClientService for VoiceService {
 
     async fn closed(&self, conn: u64, _reason: &str) -> Actions {
         // Every service is told about every disconnect, so this arrives without
-        // voice having to be asked. Skipping it leaks a peer — and its cipher —
+        // voice having to be asked. Skipping it leaks a peer (and its cipher)
         // per connection, for the life of the process.
         self.detach(conn);
         Actions::new()
@@ -698,8 +698,8 @@ impl VoiceService {
     /// Shouting into a channel takes `Whisper` there, and whispering to a person
     /// takes `Whisper` in *their* channel (`Messages.cpp`, murmur's
     /// `Server::processMsg`). Asking `permissions` per packet is out of the
-    /// question — **nothing on the packet path may make a request**
-    /// (`docs/ARCHITECTURE.md` §3) — so it is asked once, here, and the slot
+    /// question, **nothing on the packet path may make a request**
+    /// (`docs/ARCHITECTURE.md` §3), so it is asked once, here, and the slot
     /// stores only what was allowed. murmur reaches the same place from the
     /// other direction: it checks at cache-build time and reuses the answer.
     ///
@@ -723,7 +723,7 @@ impl VoiceService {
             return Actions::new();
         };
 
-        // Five bits on the wire, so anything wider cannot arrive honestly — but
+        // Five bits on the wire, so anything wider cannot arrive honestly, but
         // this is a TCP message and a hostile peer writes what it likes.
         let Some(slot) = request.id.and_then(|id| u8::try_from(id).ok()) else {
             tracing::debug!(
@@ -740,8 +740,8 @@ impl VoiceService {
         for entry in &request.targets {
             // An ACL group narrows a shout to that group's members, and murmur
             // takes `Speak` rather than `Whisper` for it. Voice knows nobody's
-            // group membership — it is `permissions`' to resolve, and there is
-            // no per-packet route to it — so this is dropped rather than widened
+            // group membership; it is `permissions`' to resolve, and there is
+            // no per-packet route to it, so this is dropped rather than widened
             // to the whole channel. Widening would send a shout meant for one
             // group to everyone in the room, which is the unsafe direction.
             if entry.group.as_deref().is_some_and(|g| !g.is_empty()) {
@@ -873,7 +873,7 @@ impl Serve for VoiceService {
             .map(|(host, port)| (host.to_owned(), port.parse().unwrap_or(64738)));
 
         // The router always exists. Its datagram half is the socket's write
-        // half when there is one and a discard when there is not — because the
+        // half when there is one and a discard when there is not, because the
         // *other* half, the tunnel, has to work either way: it is the path
         // every connection starts on and the only one a firewalled client ever
         // gets.
@@ -961,7 +961,7 @@ impl VoiceService {
 ///
 /// murmur's `qhHostUsers`, keyed the same way: by the address the *control*
 /// connection came from. It is a hint that narrows an unproven datagram to a
-/// few candidate keys — never a conclusion, because the peer is whoever's key
+/// few candidate keys, never a conclusion, because the peer is whoever's key
 /// authenticates the packet.
 ///
 /// An address that will not parse costs this peer its UDP path and nothing
@@ -986,7 +986,7 @@ pub const fn outer_type() -> u16 {
 
 /// What a session was minted from.
 ///
-/// Everything a *second* mint for the same session needs, and no key material —
+/// Everything a *second* mint for the same session needs, and no key material,
 /// the keys went into the peer on the packet path, which is the only thing that
 /// uses them.
 ///
@@ -1058,7 +1058,7 @@ mod tests {
             // Points at a socket nothing is serving, so every permission check
             // denies. That is the right default for a test double: a whisper
             // that works here works because it was allowed, not because nobody
-            // asked — and `Permit` failing closed is itself asserted in
+            // asked, and `Permit` failing closed is itself asserted in
             // `starling-runtime`.
             permit: Permit::new(Resolver::new(
                 Arc::new(starling_runtime::config::Config::with_defaults(
@@ -1136,8 +1136,8 @@ mod tests {
     /// One frame of speech, as a 1.6 client puts it on the wire.
     ///
     /// Built with the *client's* encoder, not the server's. The two are not
-    /// inverses — the protobuf header field is `target` inbound and `context`
-    /// outbound — so a test that speaks with the server's encoder agrees with
+    /// inverses, the protobuf header field is `target` inbound and `context`
+    /// outbound, so a test that speaks with the server's encoder agrees with
     /// the implementation by construction and would catch none of that.
     fn speech(opus: &[u8]) -> Bytes {
         as_client_sends(UdpFormat::Protobuf, opus)
@@ -1173,7 +1173,7 @@ mod tests {
     #[test]
     fn a_legacy_framed_peer_is_downgraded_rather_than_given_a_cipher_it_cannot_frame() {
         // A Fancy build on an old protocol base. Legacy framing is the packet
-        // type, so there is nowhere to put a cipher id — the peer would fail to
+        // type, so there is nowhere to put a cipher id, the peer would fail to
         // decode its very first packet.
         let modern = Capability::ModernVoiceCrypto.since().to_wire();
         let mumble_1_4 = 1_u64 << 48 | 4_u64 << 32;
@@ -1220,8 +1220,8 @@ mod tests {
     #[tokio::test]
     async fn a_peer_asking_where_the_counter_is_gets_the_nonce_and_keeps_its_key() {
         // murmur's answer (`Messages.cpp:2117`): the nonce the server seals
-        // under, and nothing else. Re-keying instead would work — the client
-        // accepts a full `CryptSetup` — but it throws away a good key and drops
+        // under, and nothing else. Re-keying instead would work, the client
+        // accepts a full `CryptSetup`, but it throws away a good key and drops
         // the peer back to tunnelling until its next datagram authenticates, for
         // a peer that only needed telling where the counter had got to.
         let service = service();
@@ -1263,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_offering_its_own_nonce_is_adopted_and_told_nothing() {
         // The other direction, and murmur sends no reply for it. A `CryptSetup`
-        // the client did not ask for is one it may act on — installing a nonce
+        // the client did not ask for is one it may act on, installing a nonce
         // it never requested, from a message it read as an answer.
         let service = service();
         let _ = service.mint(&mint_request(1, 43, 0, MUMBLE_1_6));
@@ -1284,7 +1284,7 @@ mod tests {
     #[tokio::test]
     async fn a_nonce_the_cipher_cannot_use_falls_back_to_re_keying() {
         // The peer meant to hand one over and the cipher refused the width. Left
-        // there it would be a resync that reported success and changed nothing —
+        // there it would be a resync that reported success and changed nothing,
         // so the fallback that always works is taken instead.
         let service = service();
         let first = service.mint(&mint_request(1, 44, 0, MUMBLE_1_6));
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_shout_nobody_authorised_is_refused_and_the_client_is_told() {
-        // `permissions` is unreachable in this double, so every check denies —
+        // `permissions` is unreachable in this double, so every check denies,
         // which is the property being asserted. A voice service that let a
         // shout through because it could not reach the permission service would
         // put audio into a channel on the strength of an outage.
@@ -1411,8 +1411,8 @@ mod tests {
     #[tokio::test]
     async fn a_group_scoped_shout_reaches_nobody_rather_than_everybody() {
         // murmur narrows such a target to that ACL group's members. Voice cannot
-        // resolve group membership — it is `permissions`' to answer and there is
-        // no per-packet route to it — so the entry is dropped. Widening it to
+        // resolve group membership; it is `permissions`' to answer and there is
+        // no per-packet route to it, so the entry is dropped. Widening it to
         // the whole channel would send audio meant for one group to the room,
         // which is the unsafe direction to be wrong in.
         let service = service();
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_departed_session_takes_its_slots_with_it() {
-        // A leak here is one entry per disconnect for the life of the process —
+        // A leak here is one entry per disconnect for the life of the process,
         // and a recycled session id would inherit a stranger's whisper list,
         // which is the same leak wearing a much worse face.
         let service = service();
@@ -1684,7 +1684,7 @@ mod tests {
             .router()
             .accept_datagram("203.0.113.7:60000".parse().expect("address"), &sealed);
 
-        // Bob has no proven UDP address of his own, so his copy tunnels — which
+        // Bob has no proven UDP address of his own, so his copy tunnels, which
         // is the mixed case a real server is in constantly.
         let sends = pushed(&mut gateway);
         assert_eq!(sends.len(), 1, "the datagram was not attributed");
@@ -1728,7 +1728,7 @@ mod tests {
     fn tunnelled_audio_is_framed_as_a_control_message_by_the_gateway() {
         // Raw audio bytes on the TLS socket would be read as a message header
         // and desynchronise the connection outright. The service hands over the
-        // type and the payload apart, and the gateway reassembles them — so
+        // type and the payload apart, and the gateway reassembles them, so
         // what must be asserted here is that the type is right and the payload
         // carries no second header.
         let service = service();

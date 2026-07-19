@@ -1,10 +1,10 @@
-//! `metadata` — the channel tree and who is in it.
+//! `metadata`: the channel tree and who is in it.
 //!
 //! One actor per virtual server, sharded by server id: the guild-process
 //! pattern, and simultaneously the answer to running several virtual servers
 //! (`docs/ARCHITECTURE.md` §6). Because it is the single writer of channel
 //! state, the order it applies mutations is a **total order**, and the
-//! gateway's single-writer socket carries that order through to the wire — so
+//! gateway's single-writer socket carries that order through to the wire, so
 //! a client can never see a `UserState` naming a channel before the
 //! `ChannelState` that created it.
 //!
@@ -70,12 +70,12 @@ const SCHEMA: &[Migration<'static>] = &[
     // * keyed by **account**, not by session, because a session is one visit and
     //   the point of the table is that the listener outlives it;
     // * `enabled` rather than deleting the row, because the volume has to
-    //   survive un-listening — a user who turns a room off and back on gets the
+    //   survive un-listening, a user who turns a room off and back on gets the
     //   level they chose, not a silent reset to full.
     //
     // One statement, and deliberately: the only query against this table is
     // "every listener of one account on one server", and the primary key is a
-    // left prefix of exactly that — so a separate index on
+    // left prefix of exactly that, so a separate index on
     // `(server_id, account_id)` would be a second copy of one the table already
     // has, paid for on every write forever. It also costs a `fsync` at boot,
     // which is not free either: every service migrates its own SQLite file at
@@ -126,7 +126,7 @@ pub struct MetadataService {
     /// Where channel listeners are kept between visits.
     ///
     /// `None` when the deployment has no storage configured, which is a running
-    /// server with listeners that last exactly one session — the same degradation
+    /// server with listeners that last exactly one session, the same degradation
     /// a guest gets, rather than a refusal.
     store: Option<Store>,
 }
@@ -191,7 +191,7 @@ impl MetadataService {
     /// Only the client path asks for these. The gRPC surface passes
     /// [`TreeLimits::UNLIMITED`], because an operator building a tree through
     /// `operator-api` is the person who set the limit and refusing them their
-    /// own ceiling turns a deliberate action into a mystery — which is where
+    /// own ceiling turns a deliberate action into a mystery, which is where
     /// murmur draws the same line: `canNest` and the count check are in
     /// `msgChannelState`, the *client* handler.
     fn limits(&self, scope: u32) -> TreeLimits {
@@ -423,7 +423,7 @@ impl Metadata for MetadataRpc {
                     .with("scope", scope),
             );
         }
-        // Who is listening to what is an operator-visible fact about a room —
+        // Who is listening to what is an operator-visible fact about a room,
         // "was anyone able to hear that channel" is exactly the question asked
         // after the fact, and it cannot be answered from a log that only records
         // the refusals.
@@ -512,7 +512,7 @@ impl MetadataService {
     ///   be matched against, so there is nothing to key a row on
     ///   (`Server.cpp:3224`).
     /// * **not for temporary channels.** The channel is gone when its last
-    ///   member leaves, and the id is reused — a restored row would subscribe
+    ///   member leaves, and the id is reused, a restored row would subscribe
     ///   the user to whatever room got the number next.
     /// * **disabled, not deleted.** Un-listening keeps the row so the volume
     ///   survives it, which is what makes toggling a channel off and on again
@@ -585,7 +585,7 @@ impl MetadataService {
             // Upserted rather than updated: murmur stores a gain for a listener
             // that does not exist yet (`Server.cpp:3242` consults the database
             // when the manager has never heard of it), so the row may have to be
-            // created here — disabled, because setting a volume is not asking to
+            // created here, disabled, because setting a volume is not asking to
             // listen.
             let result = sqlx::query(
                 "INSERT INTO channel_listener \
@@ -607,7 +607,7 @@ impl MetadataService {
     /// Say so when a listener write fails, on the operator's own record.
     ///
     /// The change has already taken effect in memory, so the difference is
-    /// invisible until a restart quietly undoes it — which is exactly the class
+    /// invisible until a restart quietly undoes it, which is exactly the class
     /// of fault nobody connects to its cause.
     fn report_listener_write(&self, error: Option<sqlx::Error>, scope: u32, channel: u32) {
         let Some(error) = error else {
@@ -799,14 +799,14 @@ impl MetadataService {
     ///
     /// murmur gates the same broadcast per recipient with `canSee`
     /// (`Server.cpp:2100`, `sendProtoToChannelObserversExcept`), and notes that
-    /// for a non-hidden channel `canSee` is always true — so the ordinary case
+    /// for a non-hidden channel `canSee` is always true, so the ordinary case
     /// is an ordinary broadcast. That shape is kept here: an empty session list
     /// means "everyone", and only a hidden channel pays for the filtering.
     ///
     /// Without this, creating a hidden channel announced it to every connected
     /// client. The login flood already filtered them, so the room was invisible
     /// to anyone who connected *afterwards* and visible to everyone who was
-    /// already online — the kind of split that looks like a caching bug.
+    /// already online, the kind of split that looks like a caching bug.
     ///
     /// A session that cannot be checked is left out. The cost of excluding
     /// someone wrongly is a channel they must reconnect to see; the cost of
@@ -929,7 +929,7 @@ impl MetadataService {
         };
         // Named against the channel the limit is *about*: the parent a channel
         // would have been created under, or the channel a move would have
-        // re-parented — which is the one the client has on screen.
+        // re-parented, which is the one the client has on screen.
         if !result.applied
             && let Some(denial) = self.limit_denial(inbound, &result, channel_asked_about)
         {
@@ -940,8 +940,8 @@ impl MetadataService {
             _ => Actions::new(),
         };
         let Some(channel) = result.channel else {
-            // Refused for a reason that is not a limit — a duplicate name, a
-            // parent that has gone — or a no-op. The client is told nothing
+            // Refused for a reason that is not a limit, a duplicate name, a
+            // parent that has gone, or a no-op. The client is told nothing
             // either way, so this is the only record that it was attempted.
             tracing::debug!(
                 conn = inbound.conn,
@@ -1010,7 +1010,7 @@ impl MetadataService {
     ///
     /// murmur's rule (`Messages.cpp:2053`): `LinkChannel` on the channel being
     /// edited, **and** on each channel being linked *to*. Unlinking needs it
-    /// only on the near side — taking an edge away cannot expose anything, and
+    /// only on the near side, taking an edge away cannot expose anything, and
     /// requiring the far end's permission would mean an operator who linked two
     /// rooms and then lost access to one could never separate them again.
     async fn authorise_links(
@@ -1069,7 +1069,7 @@ impl MetadataService {
             serialize::link_state(channel, added, removed).encode_to_vec(),
         ));
         // The far ends, each as their own frame. A client keys a `ChannelState`
-        // by `channel_id`, so one message can only ever describe one channel —
+        // by `channel_id`, so one message can only ever describe one channel,
         // and the far end's link set changed too.
         for target in added.iter().chain(removed.iter()) {
             let near = [channel];
@@ -1101,7 +1101,7 @@ impl MetadataService {
     /// Record a link change in both the diagnostic log and the operator trail.
     ///
     /// Linking two channels joins two rooms' audio, which is the kind of change
-    /// somebody asks about weeks later — and `LinkChannel` is a permission an
+    /// somebody asks about weeks later, and `LinkChannel` is a permission an
     /// operator grants deliberately, so its use belongs on the record.
     fn record_links(&self, inbound: &Inbound, channel: u32, edit: &ChannelEdit) {
         self.logger.log(
@@ -1128,8 +1128,8 @@ impl MetadataService {
     /// thing an operator can change, while the `Permission` type every other
     /// refusal here carries would render as a permission they do not lack.
     ///
-    /// `None` for a refusal that is not a limit — a duplicate name, a parent
-    /// that has gone — which keeps this from turning every no-op into a
+    /// `None` for a refusal that is not a limit, a duplicate name, a parent
+    /// that has gone, which keeps this from turning every no-op into a
     /// message murmur does not send.
     fn limit_denial(
         &self,
@@ -1193,7 +1193,7 @@ impl MetadataService {
                 .actor(session_actor(inbound.session), String::new())
                 .target_channel(remove.channel_id),
         );
-        // The cancellations first, then the removal — the client has to be able
+        // The cancellations first, then the removal; the client has to be able
         // to match `listening_channel_remove` to a channel it still has.
         let mut actions = unlisten_broadcast(&removal.unlistened);
         actions.push(to_sessions(

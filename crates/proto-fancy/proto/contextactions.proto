@@ -2,8 +2,8 @@ syntax = "proto3";
 
 // Context-menu entries an external system adds, and the triggers back.
 //
-// The service already carried the client half — a plugin's entries, and the
-// trigger routed back to it — but had no gRPC surface at all, so nothing
+// The service already carried the client half, a plugin's entries, and the
+// trigger routed back to it, but had no gRPC surface at all, so nothing
 // outside a connected client could add an entry or be told it was chosen.
 //
 // The server never learns what an action *does*. An entry carries its owner's

@@ -77,7 +77,7 @@ impl Transport for Unix {
 
 /// Make a Unix socket bindable: create the directory, remove a stale file.
 ///
-/// A stale socket after an unclean exit is the normal case, not an exception —
+/// A stale socket after an unclean exit is the normal case, not an exception,
 /// refusing to start because a previous process died badly would turn a crash
 /// into an outage that needs a human.
 fn prepare_socket_path(path: &Path) -> Result<(), ListenError> {

@@ -1,7 +1,7 @@
 //! The sequence number and its replay ring.
 //!
 //! Restart a gateway holding ten thousand clients and every one reconnects and
-//! pulls a full flood of every `ChannelState` and `UserState` at once — a
+//! pulls a full flood of every `ChannelState` and `UserState` at once, a
 //! self-inflicted `DDoS` on `metadata` and `session-view`. With a sequence number
 //! per session a Fancy client replays only the gap.
 //!
@@ -31,7 +31,7 @@ use bytes::Bytes;
 ///
 /// The ring used to be bounded in **frames only**, which counts a 40-byte
 /// `UserState` and a 128 KiB avatar the same. At the shipped 256 frames and the
-/// default `image_message_length` that is 32 MiB per session — 32 GiB across a
+/// default `image_message_length` that is 32 MiB per session, 32 GiB across a
 /// thousand clients, for a feature whose whole job is to save a reconnect some
 /// work.
 ///
@@ -41,7 +41,7 @@ const DEFAULT_BYTE_BUDGET: usize = 256 * 1024;
 
 /// How long a ring outlives its last use.
 ///
-/// Rings must survive a disconnect — resuming after one is the entire point —
+/// Rings must survive a disconnect (resuming after one is the entire point)
 /// so they cannot be freed when the socket closes. But nothing freed them
 /// *ever*: `forget` had no callers, so every session that had ever connected
 /// kept its ring for the life of the process. Ten minutes is far longer than a
@@ -83,7 +83,7 @@ pub enum ResumeOutcome {
 ///
 /// In-memory here. The design calls for this to outlive the pod so a resuming
 /// client can land on another one; the interface is the same either way, which
-/// is why the storage decision — frames or events — can still be made without
+/// is why the storage decision (frames or events) can still be made without
 /// touching a caller.
 #[derive(Debug, Clone, Default)]
 pub struct ResumeStore {
@@ -107,7 +107,7 @@ struct Ring {
     /// be *empty* and still have a floor: one frame larger than the whole
     /// budget is dropped outright, and a client asking for anything at or below
     /// it has to be told to resync rather than handed a replay with a hole in
-    /// it. That hole is the failure this module's own header warns about — a
+    /// it. That hole is the failure this module's own header warns about, a
     /// client that believes it caught up and did not.
     floor: u64,
     /// Last stamp or resume, for eviction.
@@ -156,8 +156,8 @@ impl ResumeStore {
         Self::evict_expired(&mut sessions, self.ttl, now);
 
         // `get_mut` first: the common case is a ring that exists, and
-        // `entry(token.to_owned())` allocates a `String` on *every* stamp —
-        // once per recipient per broadcast — just to look one up.
+        // `entry(token.to_owned())` allocates a `String` on *every* stamp,
+        // once per recipient per broadcast, just to look one up.
         let ring = if let Some(ring) = sessions.get_mut(token) {
             ring
         } else {
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn one_session_cannot_hold_more_than_its_byte_budget() {
         // The bound that was missing. The ring was capped in *frames*, so a
-        // client trading avatars held 256 x image_message_length — 32 MiB each,
+        // client trading avatars held 256 x image_message_length, 32 MiB each,
         // 32 GiB across a thousand of them, for a reconnect optimisation.
         let store = ResumeStore::with_limits(256, 64 * 1024, Duration::from_secs(600));
         for _ in 0..200 {
@@ -346,7 +346,7 @@ mod tests {
     fn a_frame_larger_than_the_budget_is_dropped_rather_than_evicting_everything() {
         // An avatar bigger than the whole ring. Keeping it would throw away
         // every ordinary frame to hold one blob that a resume cannot use
-        // anyway — the client can simply ask for it again.
+        // anyway; the client can simply ask for it again.
         let store = ResumeStore::with_limits(256, 16 * 1024, Duration::from_secs(600));
         let _ = store.stamp("tok", 7, &payload(100));
         let seq = store.stamp("tok", 23, &payload(64 * 1024));
@@ -366,7 +366,7 @@ mod tests {
     fn a_ring_nothing_has_touched_is_eventually_freed() {
         // `forget` existed and had no callers, so every session that had ever
         // connected kept its ring for the life of the process. Rings cannot be
-        // freed on disconnect — surviving one is the whole point — so the
+        // freed on disconnect (surviving one is the whole point) so the
         // bound has to be a TTL.
         let store = ResumeStore::with_limits(16, 64 * 1024, Duration::from_millis(50));
         let _ = store.stamp("old", 7, &payload(10));
@@ -403,7 +403,7 @@ mod tests {
     fn a_broadcast_shares_one_buffer_across_every_recipient() {
         // The per-recipient copy. `stamp` took a slice and owned a fresh `Vec`,
         // so one broadcast to a thousand clients made a thousand copies of the
-        // same payload. Refcounted, the buffer is shared — which is only
+        // same payload. Refcounted, the buffer is shared, which is only
         // observable as the pointer being the same one.
         let store = ResumeStore::with_limits(16, 64 * 1024, Duration::from_secs(600));
         let shared = payload(4096);

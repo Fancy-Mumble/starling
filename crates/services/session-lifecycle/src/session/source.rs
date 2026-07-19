@@ -6,7 +6,7 @@ use crate::ids::SessionId;
 ///
 /// # Contract
 ///
-/// 1. [`Self::allocate`] returns `None` when exhausted — implementations must
+/// 1. [`Self::allocate`] returns `None` when exhausted, implementations must
 ///    **never** fabricate an id. Reusing a live session's id would let one
 ///    client's traffic be attributed to another.
 /// 2. An id returned by [`Self::release`] may be handed out again, but not

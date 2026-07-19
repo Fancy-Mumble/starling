@@ -1,7 +1,7 @@
 //! Endpoint discovery: a service name in, a gRPC channel out.
 //!
 //! A caller names the service it wants and never learns which transport it got
-//! — that is the whole point of [`Transport`], and it is what makes
+//! that is the whole point of [`Transport`], and it is what makes
 //! `--all-in-one` a configuration choice rather than a code path. Nothing here
 //! knows what the transports are: dialling is [`Transport::connect`], and the
 //! only thing this module decides is *which* transport a name resolves to.
@@ -130,7 +130,7 @@ mod tests {
         let _incoming = broker.register("text").expect("register");
         let resolved = resolver(true, broker).transport("text").expect("resolve");
         // `dyn Transport` is not `Eq`, so the description stands in for the
-        // value — which is the string an operator would have written anyway.
+        // value, which is the string an operator would have written anyway.
         assert_eq!(resolved.describe(), "inproc:text");
     }
 

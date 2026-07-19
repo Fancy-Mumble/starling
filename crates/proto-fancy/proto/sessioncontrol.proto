@@ -3,13 +3,13 @@ syntax = "proto3";
 // Moderating a *connected* session: move it, mute it, deafen it, suppress it.
 //
 // murmur's `setState` (`MumbleServer.ice`), and the one thing an external
-// moderation bot cannot do by holding a client connection of its own — a bot
+// moderation bot cannot do by holding a client connection of its own, a bot
 // that joins as a user can only act where that user's ACLs let it, and cannot
 // act at all while it is disconnected.
 //
 // Why this is `session-lifecycle` and not `moderation`: the fields below are
 // connection state, and `session-lifecycle` is the service that owns a
-// connection's existence. `moderation` owns what outlives a session — bans —
+// connection's existence. `moderation` owns what outlives a session (bans)
 // which is why `Kick` lives there and `SetState` does not.
 package starling.sessioncontrol.v1;
 
@@ -31,7 +31,7 @@ message SetStateRequest {
   uint32 session = 3;
 
   // Move the session to this channel. Enforced as murmur enforces a move rather
-  // than applied blindly — see `SetStateResult.refused`.
+  // than applied blindly, see `SetStateResult.refused`.
   optional uint32 channel = 4;
 
   // Administrative mute and deafen, which are the server's statement about the

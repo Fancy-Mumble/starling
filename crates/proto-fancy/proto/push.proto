@@ -42,7 +42,7 @@ message Notification {
   //
   // Without this the mute preference was unusable and the whole feature a
   // no-op: registrations stored a channel list, the read path returned it, and
-  // delivery had nothing to compare it against — so a user who muted a room
+  // delivery had nothing to compare it against, so a user who muted a room
   // was notified from it anyway.
   uint32 channel = 7;
 }

@@ -3,14 +3,14 @@
 | File | Shows |
 |---|---|
 | `services.puml` | **Start here.** Every service, the four planes, and how they talk |
-| `scaling.puml` | The shard key per service — what scales out, what cannot, and why |
+| `scaling.puml` | The shard key per service, what scales out, what cannot, and why |
 | `gateway-internals.puml` | The gateway's parts, and what it deliberately does not know |
 | `deployment.puml` | Container topology, and the four exposure problems |
 
-Each answers one question, and none repeats another's rationale — shard keys live
+Each answers one question, and none repeats another's rationale, shard keys live
 only in `scaling.puml`, gateway mechanics only in `gateway-internals.puml`.
 
-Rendered PNGs are build output and are not committed — `*.png` here is ignored.
+Rendered PNGs are build output and are not committed, `*.png` here is ignored.
 
 Prose lives in `../ARCHITECTURE.md`, `../PROTOCOL-COMPATIBILITY.md` and
 `../CONFIGURATION.md`. Diagrams carry structure; rationale goes in the docs, so
@@ -19,7 +19,7 @@ neither has to repeat the other.
 ## What of this is built
 
 These started as the plan. Much of it now exists, so the diagrams mark the
-difference rather than claiming either extreme — a picture that overstates is
+difference rather than claiming either extreme, a picture that overstates is
 worse than one that admits a gap, because the gap is what a reader needs to know
 before trusting the rest.
 
@@ -27,7 +27,7 @@ before trusting the rest.
 routing table, the per-route limiter, the circuit breaker, the resume ring. All
 twenty services exist and serve gRPC. The handshake carries a real client from
 `Version` to `SuggestConfig`, and the `starling` binary's own e2e test drives it
-over a real TCP+TLS socket. Storage is real — `sqlx` over SQLite, MySQL or
+over a real TCP+TLS socket. Storage is real, `sqlx` over SQLite, MySQL or
 PostgreSQL, one schema per service. Permissions evaluates ACLs. Voice binds its
 own UDP socket, mints the ciphers and answers the server-browser ping. `directory`
 announces to the public server list. The operator log and `operator-api` are
@@ -53,8 +53,8 @@ plantuml -Playout=smetana -tpng *.puml
 ```
 
 `-Playout=smetana` uses PlantUML's built-in layout engine, so **GraphViz is not
-required** — which is the case on most machines. Note the flag order: `java -jar
-plantuml.jar -Playout=smetana`, since `-P…` before `-jar` is read as a JVM option
+required**, which is the case on most machines. Note the flag order: `java -jar
+plantuml.jar -Playout=smetana`, since `-P...` before `-jar` is read as a JVM option
 and fails.
 
 Verified with PlantUML 1.2024.7 under both smetana and bundled `dot`.
@@ -83,16 +83,16 @@ also works but only tells you *that* something leaked, not where.
   fix, not shrinking the fonts.
 * **No markup may span a line break.** `<b>` opened on one line of a note and
   closed on the next prints a literal `</b>`; creole `**bold**` split the same
-  way prints a literal `**`. This has now cost four separate fixes — use the SVG
+  way prints a literal `**`. This has now cost four separate fixes, use the SVG
   grep above rather than trusting a read of the PNG. Relatedly, a note line
   *starting* with `*` parses as a bullet.
 * **Prefer a labelled edge to an interface node.** Lollipop `interface` glyphs
   pile onto one rank with their labels overlapping. `A --> B : «Trait»` carries
-  the same information — caller, implementor, contract — and lays out.
+  the same information (caller, implementor, contract) and lays out.
 * **No `skinparam linetype ortho`.** Right-angle routing makes crossings worse
   once there are more than a handful of edges.
 * **Stick to ASCII arrows in labels.** `->`, not `→`; the default font renders
   tofu. `·` and `«»` are fine.
 * **Encode the hard-won constraints in the picture.** The ICE-lite rule, the
-  1 msg/s bucket, the two queue policies — each cost a debugging session, and a
+  1 msg/s bucket, the two queue policies, each cost a debugging session, and a
   note on the edge is where the next person will actually look.

@@ -5,7 +5,7 @@
 //! building three binaries. sqlx's `Any` driver resolves it from the URL scheme
 //! at connect time, which is the same shape murmur has.
 //!
-//! What `Any` unifies is the *protocol*. It does not unify the SQL — that is
+//! What `Any` unifies is the *protocol*. It does not unify the SQL; that is
 //! [`crate::dialect`]'s job, and the reason a pool alone is not enough.
 //!
 //! # Two things a pool gets wrong unless told
@@ -28,7 +28,7 @@
 //! Compile-time query checking: `sqlx::query!` cannot verify a statement it will
 //! not know the dialect of until run time. Every query in this crate is
 //! therefore an unchecked `sqlx::query`, and the schema is exercised against a
-//! real database in the tests instead — SQLite in memory, which is a genuine SQL
+//! real database in the tests instead, SQLite in memory, which is a genuine SQL
 //! engine rather than a mock.
 
 use std::time::Duration;
@@ -81,7 +81,7 @@ impl Backend {
             .acquire_timeout(CONNECT_TIMEOUT)
             // Every connection, not just the first. A pragma run once arms one
             // pooled connection and leaves the others ignoring the schema's
-            // foreign keys — so whether a delete cascades would depend on which
+            // foreign keys, so whether a delete cascades would depend on which
             // connection the pool handed out.
             .after_connect(move |connection, _meta| {
                 Box::pin(async move {
@@ -114,7 +114,7 @@ impl Backend {
 /// How many connections this URL can safely support.
 ///
 /// One for a private in-memory SQLite database, because a second connection
-/// would be a second, empty database — the schema would be created on one and
+/// would be a second, empty database, the schema would be created on one and
 /// queried on another, and every read would come back missing its tables.
 ///
 /// A *shared-cache* in-memory URL (`file::memory:?cache=shared`) does not have

@@ -60,7 +60,7 @@ impl VoiceSocket {
 
     /// Remember which address a session's audio arrives from.
     ///
-    /// Recorded only after a datagram has decrypted under that session's key —
+    /// Recorded only after a datagram has decrypted under that session's key,
     /// otherwise anyone could redirect a session's audio by spoofing a source
     /// address, which is the whole reason identity is earned here.
     pub fn bind_peer(&self, session: SessionId, address: SocketAddr) {
@@ -130,7 +130,7 @@ impl Datagrams for UdpSender {
 
 /// The write half of a deployment that has no UDP socket.
 ///
-/// Not a degenerate case to be tolerated — it is a supported configuration. A
+/// Not a degenerate case to be tolerated; it is a supported configuration. A
 /// voice service with no `udp_listen` serves every client over the tunnel, and
 /// the router needs *a* transport at construction time either way. Handing it
 /// this rather than leaving the router unbuilt is what keeps tunnelled audio

@@ -1,14 +1,14 @@
 //! The live event channel: what changed, as it changes.
 //!
 //! Every other route here answers what the server *is*. This one reports what
-//! happened to it, so an external system — a channel viewer, a user manager, a
-//! bot — follows the server instead of polling it.
+//! happened to it, so an external system, a channel viewer, a user manager, a
+//! bot, follows the server instead of polling it.
 //!
 //! # Why the events are named the way they are
 //!
 //! `userConnected`, `channelStateChanged` and the rest are the method names of
 //! the C++ server's `ServerCallback` (`vendor/server`'s `MumbleServer.ice`).
-//! Nothing here speaks Ice — `docs/GAP-ANALYSIS.md` S6 — but the systems being
+//! Nothing here speaks Ice (`docs/GAP-ANALYSIS.md` S6) but the systems being
 //! pointed at this channel were written against those names, and a
 //! gratuitously different vocabulary would make every one of them rewrite a
 //! `switch` to gain nothing.
@@ -18,7 +18,7 @@
 //! The services already publish changes, but in a shape built for state
 //! reconciliation: `session-view` and `metadata` both report an **upsert**,
 //! which is a create and an update collapsed into one. That is right for a
-//! subscriber rebuilding a view and wrong for one reacting to arrivals — "a
+//! subscriber rebuilding a view and wrong for one reacting to arrivals, "a
 //! user appeared" and "a user moved" call for different behaviour, and a
 //! consumer cannot recover the distinction from an upsert alone.
 //!
@@ -136,7 +136,7 @@ pub enum Event {
     /// A user disconnected.
     UserDisconnected {
         /// Their last known state. They are already gone, so nothing can look
-        /// this up afterwards — which is why it is carried here.
+        /// this up afterwards, which is why it is carried here.
         user: UserJson,
     },
     /// A user moved, was renamed, muted, deafened or suppressed.
@@ -174,7 +174,7 @@ pub enum Event {
     /// The server's state became readable, and this channel is live.
     ///
     /// Virtual servers are configuration here; there is nothing to boot at
-    /// runtime. So this fires when the bridge attaches — which is what a
+    /// runtime. So this fires when the bridge attaches, which is what a
     /// consumer wants it for either way: the moment it is worth asking.
     Started {
         /// Which virtual server.
@@ -184,7 +184,7 @@ pub enum Event {
     ///
     /// A shutdown and a dropped subscription are reported the same way: from a
     /// consumer's side they are indistinguishable, and both mean the same
-    /// thing — what you are holding is now stale.
+    /// thing, what you are holding is now stale.
     Stopped {
         /// Which virtual server.
         server_id: u32,
@@ -216,13 +216,13 @@ pub struct EventHub {
     /// Whether the state below the bridges is currently readable.
     ///
     /// Kept because `started` is published once, when the bridges attach, and
-    /// this channel is deliberately not a replay — so a subscriber connecting
+    /// this channel is deliberately not a replay, so a subscriber connecting
     /// afterwards would otherwise never learn the channel is live, which is the
     /// one thing `started` exists to tell it.
     live: Arc<AtomicBool>,
     /// How many bridges currently hold a subscription.
     ///
-    /// The channel is live only at [`BRIDGES`] — every one of them — and that
+    /// The channel is live only at [`BRIDGES`] (every one of them) and that
     /// is the whole point of counting. `live` used to be set by the session
     /// bridge alone, so `started` went out while the channel bridge was still
     /// attaching: a channel created in that window produced no event at all,
@@ -269,7 +269,7 @@ impl EventHub {
     /// One bridge has its subscription; `started` goes out when the last does.
     ///
     /// Called after the stream is open rather than before, because the promise
-    /// being made is that events from here on are observed — a bridge that has
+    /// being made is that events from here on are observed, a bridge that has
     /// asked for a stream and not yet received one is still dropping them.
     fn bridge_attached(&self, scope: Scope) {
         if self.attached.fetch_add(1, Ordering::Relaxed) + 1 == BRIDGES {
@@ -342,7 +342,7 @@ const REATTACH: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long one attempt to attach a subscription may take.
 ///
 /// Without this a bridge can wait forever inside the call that opens the
-/// stream — a dial that hangs rather than refusing never returns, so the retry
+/// stream, a dial that hangs rather than refusing never returns, so the retry
 /// below is never reached and the live channel silently never starts. That
 /// failure logs nothing at all, which makes it the worst of the ones available.
 const ATTACH: std::time::Duration = std::time::Duration::from_secs(5);
@@ -373,7 +373,7 @@ async fn bridge_sessions(
 
     loop {
         // Reset per attach. A new subscription opens with a snapshot, and the
-        // set has to be rebuilt from it — carrying the old one across a
+        // set has to be rebuilt from it, carrying the old one across a
         // reconnect would report everybody who joined while it was down as
         // already known, which is exactly the arrival a consumer wanted.
         let mut known: HashSet<u32> = HashSet::new();
@@ -709,8 +709,8 @@ fn channel_json(c: &starling_proto_fancy::metadata::Channel) -> ChannelJson {
 #[must_use]
 pub fn encode(event: &Event) -> String {
     serde_json::to_string(event).unwrap_or_else(|error| {
-        // Serialising these types cannot fail — they are plain data with no
-        // maps, non-string keys or custom impls — but a panic on the event path
+        // Serialising these types cannot fail; they are plain data with no
+        // maps, non-string keys or custom impls, but a panic on the event path
         // would take the whole channel down for every subscriber.
         tracing::error!(%error, "an event could not be serialised");
         String::from(r#"{"event":"error","reason":"unserialisable"}"#)

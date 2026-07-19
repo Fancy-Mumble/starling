@@ -1,7 +1,7 @@
 syntax = "proto3";
 
-// The channel tree and who is in it. One actor per virtual server — the
-// guild-process pattern of docs/ARCHITECTURE.md §6 — so the order it applies
+// The channel tree and who is in it. One actor per virtual server, the
+// guild-process pattern of docs/ARCHITECTURE.md §6, so the order it applies
 // mutations is a total order.
 package starling.metadata.v1;
 
@@ -139,12 +139,12 @@ message ListenRequest {
   repeated uint32 listen = 3;
   repeated uint32 unlisten = 4;
   // Gains to set, keyed by channel. Applied after `listen` and `unlisten`, and
-  // accepted for a channel in neither — murmur stores an adjustment for a
+  // accepted for a channel in neither, murmur stores an adjustment for a
   // listener that does not exist yet, so a client may set the volume before it
   // starts listening.
   map<uint32, float> volume = 5;
   // The account to persist this under. Absent for a guest, whose listeners live
-  // and die with the session — murmur stores nothing for an unregistered user
+  // and die with the session, murmur stores nothing for an unregistered user
   // (`Server.cpp:3224` guards on `iId >= 0`), because there is no identity for a
   // later visit to be matched against.
   optional uint64 account = 6;
@@ -163,7 +163,7 @@ message ListenResult {
   repeated uint32 added = 1;
   // Channels it stopped listening to.
   repeated uint32 removed = 2;
-  // Requests refused, and by which limit — so the caller can tell the client
+  // Requests refused, and by which limit, so the caller can tell the client
   // which ceiling it met rather than letting the request quietly do nothing.
   repeated ListenRefusal refused = 3;
   // Gains that changed, keyed by channel.

@@ -2,14 +2,14 @@
 //!
 //! murmur's `obfuscate` (`Server.cpp:2545`). `obfuscate_ips` existed in
 //! `server-config` and was read by nothing, so addresses were written out in
-//! full whatever an operator had set (`docs/GAP-ANALYSIS.md` §5) — and an
+//! full whatever an operator had set (`docs/GAP-ANALYSIS.md` §5), and an
 //! operator log is exactly the artefact that gets copied into a ticket, kept
 //! for a month, and read by more people than the person who runs the server.
 //!
 //! # Why it is a pseudonym and not a redaction
 //!
 //! `<<hash>>:port` rather than `<<hidden>>`, because the question an operator
-//! asks of an address is almost never "what is it" — it is "is this the same
+//! asks of an address is almost never "what is it"; it is "is this the same
 //! one as that". Two records from one address still match; the address itself
 //! is not recoverable from the record. Blanking the field would take the answer
 //! away along with the address.
@@ -42,7 +42,7 @@ const ADDRESS_FIELDS: &[&str] = &["address", "peer", "remote", "ip"];
 /// This process's salt.
 ///
 /// Derived once from the system clock and the process id. Not a cryptographic
-/// secret — it is a nonce that makes the mapping unpredictable and
+/// secret; it is a nonce that makes the mapping unpredictable and
 /// process-local, which is the whole of what it is for.
 static SALT: LazyLock<[u8; 16]> = LazyLock::new(|| {
     let mut hasher = Sha256::new();
@@ -57,7 +57,7 @@ static SALT: LazyLock<[u8; 16]> = LazyLock::new(|| {
 /// The pseudonym for `address`, keeping any port it carries.
 ///
 /// The port survives because it distinguishes two connections from one host and
-/// discloses nothing about who they are — which is murmur's reasoning, and why
+/// discloses nothing about who they are, which is murmur's reasoning, and why
 /// its own form is `<<hash>>:port`.
 #[must_use]
 pub fn obfuscate(address: &str) -> String {

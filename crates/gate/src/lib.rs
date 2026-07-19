@@ -1,4 +1,4 @@
-//! `starling-gate` — what a peer is allowed to be given.
+//! `starling-gate`: what a peer is allowed to be given.
 //!
 //! One table maps each capability to the Fancy Mumble version that introduced
 //! it. Everything that varies by client version asks this crate; nothing decides
@@ -6,7 +6,7 @@
 //!
 //! # The bug this exists to stop
 //!
-//! Negotiation used to branch on `peer.is_fancy()` — *does this client announce
+//! Negotiation used to branch on `peer.is_fancy()`, *does this client announce
 //! any Fancy version at all*. That handed a Fancy 0.1.0 client the modern cipher
 //! suite, because the check could not tell 0.1.0 from 0.4.0. Announcing the
 //! extension is not the same as implementing a capability added later.

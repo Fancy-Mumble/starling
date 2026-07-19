@@ -12,7 +12,7 @@ pub enum FieldValue {
     Text(String),
     /// Signed integer.
     Int(i64),
-    /// Unsigned integer — session and channel ids.
+    /// Unsigned integer, session and channel ids.
     Uint(u64),
     /// Flag.
     Bool(bool),

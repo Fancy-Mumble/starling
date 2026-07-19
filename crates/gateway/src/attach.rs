@@ -2,11 +2,11 @@
 //!
 //! Each attachment is a long-lived bidirectional gRPC stream. Frames go out
 //! verbatim; actions come back and are applied to the connection registry. The
-//! payload is never re-encoded — it is already protobuf, and the gateway has no
+//! payload is never re-encoded; it is already protobuf, and the gateway has no
 //! stubs to decode it with anyway.
 //!
 //! Reconnection is automatic and quiet: a service pod being replaced is a
-//! rolling deploy, not an incident. What is *not* quiet is the breaker — after
+//! rolling deploy, not an incident. What is *not* quiet is the breaker, after
 //! a threshold of consecutive failures the route sheds at the door rather than
 //! making every client wait a full deadline to be told the same thing.
 
@@ -242,8 +242,8 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
                 );
                 // Close the socket rather than only forgetting the entry. This
                 // used to be a bare `registry.remove`, which left the client
-                // connected and still sending, and — because `finish` never
-                // ran — never told any service the session had ended, so a
+                // connected and still sending, and, because `finish` never
+                // ran, never told any service the session had ended, so a
                 // kicked or banned user went on being rendered by everyone
                 // else. The close makes the read loop break, and the ordinary
                 // disconnect path does the removal and the broadcast.
@@ -278,7 +278,7 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
 /// The frames go out through the same queue as anything else, so the ordinary
 /// backpressure applies: a client that asks to resume and then stops reading is
 /// disconnected for control overflow exactly as it would be otherwise. They are
-/// **not** re-stamped — a replayed frame keeps the sequence it was written
+/// **not** re-stamped, a replayed frame keeps the sequence it was written
 /// under, which is what lets a client that disconnects again mid-replay resume
 /// from the right place rather than from a number that has since moved.
 fn replay_to(replay: &starling_proto_fancy::control::Replay, ctx: &AttachContext) {
@@ -292,7 +292,7 @@ fn replay_to(replay: &starling_proto_fancy::control::Replay, ctx: &AttachContext
         // receives carries a number well past the one it asked from, and a jump
         // means re-sync. That covers every cause of a gap rather than just this
         // one, and it keeps the gateway from having to encode a service's
-        // message to explain itself — which is the coupling §1 exists to avoid.
+        // message to explain itself, which is the coupling §1 exists to avoid.
         outcome => {
             tracing::debug!(
                 conn = replay.conn,
@@ -353,7 +353,7 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
     };
 
     // Encoded once and shared by every recipient. This is murmur's
-    // `QByteArray &cache` parameter, made structural — and it is why the
+    // `QByteArray &cache` parameter, made structural, and it is why the
     // header is built separately below rather than concatenated here: the
     // sequence number in it differs per connection, and joining them would
     // copy the payload once per client to carry eight bytes of difference.

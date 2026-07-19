@@ -10,7 +10,7 @@
 //! `assert_voice_cipher_contract` (in this module, test-only) is the
 //! specification. An implementation that
 //! passes it round-trips, detects tampering, rejects replays and refuses short
-//! packets — the properties that make a voice cipher a voice cipher rather than
+//! packets, the properties that make a voice cipher a voice cipher rather than
 //! an obfuscator. OCB2 has to pass exactly the same function, which is the
 //! cheapest way to keep two ciphers honest about the same rules.
 //!
@@ -32,8 +32,8 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
 
     /// Bytes added to a frame: counter or nonce, plus the tag.
     ///
-    /// Reported rather than assumed, because the two ciphers differ — 18 bytes
-    /// for `XChaCha` here against OCB2's 7 — and the UDP path needs it to size
+    /// Reported rather than assumed, because the two ciphers differ, 18 bytes
+    /// for `XChaCha` here against OCB2's 7, and the UDP path needs it to size
     /// buffers without knowing which cipher it holds.
     fn overhead(&self) -> usize;
 
@@ -61,7 +61,7 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
     ///
     /// Deliberately not a defaulted method. A cipher added later must *decide*
     /// which of the two it is, and a default would let it inherit the wrong
-    /// answer silently — which is a peer that asks to resynchronise and is told
+    /// answer silently, which is a peer that asks to resynchronise and is told
     /// something it cannot use.
     fn send_nonce(&self) -> Option<Vec<u8>>;
 
@@ -69,7 +69,7 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
     /// taken.
     ///
     /// `false` for a cipher that cannot resynchronise this way, and for a nonce
-    /// of the wrong width — which is the implementation's own judgement to make,
+    /// of the wrong width, which is the implementation's own judgement to make,
     /// because only it knows what width it expects. A refusal is not an error:
     /// the caller's fallback is to re-key, which recovers the peer either way.
     ///
@@ -81,8 +81,8 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
 
 /// The properties every [`VoiceCipher`] must have.
 ///
-/// Takes two freshly derived sessions for the same key and direction — a sender
-/// and a receiver — because half the contract is about what the receiver refuses.
+/// Takes two freshly derived sessions for the same key and direction, a sender
+/// and a receiver, because half the contract is about what the receiver refuses.
 ///
 /// # Panics
 ///
@@ -155,7 +155,7 @@ pub(crate) fn assert_voice_cipher_contract(
     //
     // Last, because it mutates the receiver. A cipher that offers a nonce must
     // accept one of that width back, and one that offers nothing must accept
-    // nothing — the mixed answers are the ones that strand a peer: offering a
+    // nothing, the mixed answers are the ones that strand a peer: offering a
     // nonce the peer cannot give back, or refusing to say what to send while
     // accepting what arrives.
     match sender.send_nonce() {

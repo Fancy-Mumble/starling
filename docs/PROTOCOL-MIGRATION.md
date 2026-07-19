@@ -8,40 +8,40 @@ window where they cannot talk.
 Split out of `PROTOCOL-REDESIGN.md` §9, which it is still numbered against:
 references to §1 through §8 and §10 mean sections of that document.
 
-Ordered so every intermediate state is safe to ship — **which the re-analysis
+Ordered so every intermediate state is safe to ship, **which the re-analysis
 showed the starting state was not**: both ends already claim epoch 1 and
 corrupt each other (D1), so the order now begins with the step that makes the
 present honest. The L2 tags stay movable until M2c because no shipped peer
-speaks the canon — the one client that claims epoch 1 speaks a dead dialect of
-it — and after M4 they are frozen like everything else.
+speaks the canon, the one client that claims epoch 1 speaks a dead dialect of
+it, and after M4 they are frozen like everything else.
 
 Remaining work runs in this order: **M2b → M2c → M3 → M4 → M5 → M6.** M2h and
 M2p are done; M2c is the one that reverts M2h's degradation, and must not land
 before M2b has given the client something worth encoding.
 
-* **M1 — canon markers. Done.** Tombstone the proto2 envelope block in
+* **M1, canon markers. Done.** Tombstone the proto2 envelope block in
   `Mumble.proto`; land `fancy/wire.proto` and `SyncDelta`; this document.
   Nothing on any wire changed.
-* **M2a — the canon settles its own shape. Done.** The last window where L2
+* **M2a, the canon settles its own shape. Done.** The last window where L2
   tags may move freely, so everything that moves them happened at once:
   pchat's `Reaction` and `Receipt` arms removed and their tags `reserved`
   (D2); `Cursor`/`PageInfo` adopted by pchat, text and audit; `Emoji` by
   social; `Refusal` by moderation and files; `MessageRef` by text's `Edit` and
   `Delete`. `Cursor::page_size` fixes a bug all three paginated services
-  shared — an unset `limit` is proto3-indistinguishable from 0, which every
+  shared, an unset `limit` is proto3-indistinguishable from 0, which every
   caller clamped up to 1, so a client that never set the field paged one entry
   at a time. **onboarding moved off the dead proto2 envelope** (the D1 instance
   inside Starling) and onto a canon that can carry what its answers grant.
   `Step.Choice` names the channels and ACL groups a choice confers, `Flow`
   carries `enabled` / `default_channels` / attribution, and `Response` batches
-  a whole submission with the `flow_version` it answered — where the canon had
+  a whole submission with the `flow_version` it answered, where the canon had
   a generic four-field wizard that could express none of it. Applying the
   grants is the remaining half, listed under M2b.
-* **M2h — make the break honest. Done.** Three changes in `vendor/client`:
+* **M2h, make the break honest. Done.** Three changes in `vendor/client`:
   the handshake stops announcing `fancy_protocol` (extracted to
   `client::version_announcement`, so the claim has one home a test can read),
-  `select_codec` returns `LegacyCodec` for an epoch-1 peer, and — the part that
-  outlives the hotfix — **an undecodable service frame is skipped instead of
+  `select_codec` returns `LegacyCodec` for an epoch-1 peer, and, the part that
+  outlives the hotfix, **an undecodable service frame is skipped instead of
   propagating**. That last one was a latent connection-killer: `codec::decode`
   used `?` on the envelope decode, so one frame from a peer whose envelope
   shapes differ tore down a working connection and turned a protocol skew into
@@ -52,11 +52,11 @@ before M2b has given the client something worth encoding.
   makes the ordering non-negotiable: today the
   client announces `fancy_protocol = 1`, selects `NativeCodec` against
   Starling, and the two ends corrupt each other in both directions. Until its
-  codec encodes the canon, the client must be what it actually is — a peer
+  codec encodes the canon, the client must be what it actually is, a peer
   that does not speak epoch 1: stop announcing `fancy_protocol`, and
   `select_codec` returns `LegacyCodec` unconditionally (one site,
   `fancy_codec.rs`, with the constant left at 1 for M2c). Starling then treats
-  it as a plain-Mumble peer and relays `PluginData` — so every feature with
+  it as a plain-Mumble peer and relays `PluginData`, so every feature with
   that fallback (typing, watch-sync, WebRTC signalling, pchat key
   distribution) starts *working* again, and `ServerOnly` features go visibly
   off instead of silently wrong. This is strictly better than the present on
@@ -67,7 +67,7 @@ before M2b has given the client something worth encoding.
   epoch-1 speaker, and have to be un-shipped in lockstep with M2c across two
   trees. The client is the peer whose claim is false; the correction belongs
   where the falsehood lives.
-* **M2p — the unset-limit rule, on every plane. Done.** `page::page_size` now
+* **M2p, the unset-limit rule, on every plane. Done.** `page::page_size` now
   states it once for a bare `u32`, `Cursor::page_size` delegates to it, and the
   three surviving `clamp(1, max)` sites (audit's L3 query, text's history,
   userdata's account list) call it. No `clamp(1,` remains in any service or in
@@ -77,13 +77,13 @@ before M2b has given the client something worth encoding.
   `clamp(1, max)` bug fixed for L2 in M2a alive on the mesh and REST planes:
   audit's L3 `query` clamps at `lib.rs:226`, text's L3 `History` RPC feeds the
   same clamp, and operator-api's new `GET /v1/log` passes a serde-default 0
-  straight into it — **an operator querying the log without a limit gets
+  straight into it, **an operator querying the log without a limit gets
   exactly one entry.** The rule, stated once: *an unset limit means the
   default page, never one entry.* One shared helper (the semantics of
   `Cursor::page_size`, callable from a bare `u32` for L3 requests), applied at
-  the service — not at operator-api, so every caller of the RPC is covered —
+  the service (not at operator-api, so every caller of the RPC is covered)
   plus a sweep for remaining `clamp(1,` sites in services.
-* **M2b — complete the canon for the shipped features.** The D4 finding: the
+* **M2b, complete the canon for the shipped features.** The D4 finding: the
   proto3 sets are a minimal green-field design, and several are smaller than
   what has shipped. Each of these must carry its feature's information before
   a client can move onto it, and none of it is a framing question:
@@ -91,20 +91,20 @@ before M2b has given the client something worth encoding.
   **First, a correction to how this list was drawn.** It originally measured
   each canon message against its epoch-0 counterpart and called every
   difference a gap. That is the wrong test twice over. A field is only missing
-  if *this* plane still owes it — and for two of the six the service does not
+  if *this* plane still owes it, and for two of the six the service does not
   implement the feature at all, where designing a wire ahead of the code is
   how the minimal sets became wrong in the first place. Re-checked against
   what each service actually does:
 
   | Service | Status | Finding |
   |---|---|---|
-  | server-config | **done** | Real, and blocking. `ConfigValues` now carries `repeated Setting` — key, kind, group, label, value, secret, help — plus the snapshot `version` a client drops stale replies by. The schema lives in one table in `snapshot.rs` where each row holds both its metadata *and* the accessor that reads it, because the value map and the `redacted` name list were two lists keyed by the same strings, and two such lists drift into a password on a settings screen. Keys from `Snapshot.extra` are offered as untyped strings rather than dropped, so the add-a-knob-without-a-proto-release mechanism keeps working |
-  | audit | **done**, and it was worse than a missing field | `Query` gained `target_account`; `AuditRecord` gained `target_account` and `target_channel`, which the store had held all along while the record dropped them — so "banned" arrived without saying whom, and a reader had to parse the human-readable `detail` to find out. **The real bug was underneath:** `QueryRequest` already carried `until_ms`, `category`, `target_account` and `before`, and the statement bound *none* of them. An operator narrowing the log got the whole log back, looking narrowed. A filter that is accepted and ignored is worse than one that is refused, because whoever reads the result believes it. Now built with a `QueryBuilder` so each clause sits beside its own bind |
+  | server-config | **done** | Real, and blocking. `ConfigValues` now carries `repeated Setting` (key, kind, group, label, value, secret, help) plus the snapshot `version` a client drops stale replies by. The schema lives in one table in `snapshot.rs` where each row holds both its metadata *and* the accessor that reads it, because the value map and the `redacted` name list were two lists keyed by the same strings, and two such lists drift into a password on a settings screen. Keys from `Snapshot.extra` are offered as untyped strings rather than dropped, so the add-a-knob-without-a-proto-release mechanism keeps working |
+  | audit | **done**, and it was worse than a missing field | `Query` gained `target_account`; `AuditRecord` gained `target_account` and `target_channel`, which the store had held all along while the record dropped them, so "banned" arrived without saying whom, and a reader had to parse the human-readable `detail` to find out. **The real bug was underneath:** `QueryRequest` already carried `until_ms`, `category`, `target_account` and `before`, and the statement bound *none* of them. An operator narrowing the log got the whole log back, looking narrowed. A filter that is accepted and ignored is worse than one that is refused, because whoever reads the result believes it. Now built with a `QueryBuilder` so each clause sits beside its own bind |
   | ~~onboarding~~ | done at M2a | the canon carries the grants; *applying* them is service work, below |
-  | ~~plugins~~ | **not a gap on this plane** | The client-facing `Admin` arm is *refused by design* — "plugin administration is an operator action and takes an operator identity, which the client plane does not carry". `marketplace_id`, `installed_at`, `builtin` and `path` are an operator-surface concern, so they belong to operator-api's REST routes, not here. Epoch 0 put plugin admin on the client wire; Starling deliberately moved it |
-  | ~~push~~ | **closed** | The canon had the semantics backwards — `Subscribe` was an *inclusion* list, and a user mutes two rooms out of forty rather than enumerating the other thirty-eight (and any channel created later would silently stop notifying). Now an exclusion list, which is the thing a person actually does. Closing it exposed that the feature was a **complete no-op**: `Subscribe` was never handled (it fell to `ok: false`), `Register` stored `channels: Vec::new()` and discarded the preference, every registration was filed under `account: 0` while every lookup asked for a real account, and `Notification` carried no channel — so delivery had nothing to compare a mute against. All four fixed; a muted channel no longer buzzes the phone, and there is a test saying so |
-  | ~~link-preview~~ | **deferred, feature not built** | The service vets a URL and returns an empty `Preview`; it has no HTTP client at all. The rich embed — and the `preview_data`-versus-`image_key` question, which is a real design choice about whether thumbnails ride the control plane or the files service — gets decided with the fetcher that has to produce it |
-  | ~~userdata~~ | **deferred, feature not built** | Worse than first measured, and in a way that reframes it: nothing decodes `UserdataEnvelope` at all. The account self-service surface (password, email, rename, TOTP enrol/verify/disable, unregister) does not exist in Starling. Its canon is also unsafe as drawn — `AccountAction.Kind` has no QUERY verb, so the proto3 default action is `SET_PASSWORD`, and a default-constructed message is a password change. Both get fixed with the implementation |
+  | ~~plugins~~ | **not a gap on this plane** | The client-facing `Admin` arm is *refused by design*, "plugin administration is an operator action and takes an operator identity, which the client plane does not carry". `marketplace_id`, `installed_at`, `builtin` and `path` are an operator-surface concern, so they belong to operator-api's REST routes, not here. Epoch 0 put plugin admin on the client wire; Starling deliberately moved it |
+  | ~~push~~ | **closed** | The canon had the semantics backwards, `Subscribe` was an *inclusion* list, and a user mutes two rooms out of forty rather than enumerating the other thirty-eight (and any channel created later would silently stop notifying). Now an exclusion list, which is the thing a person actually does. Closing it exposed that the feature was a **complete no-op**: `Subscribe` was never handled (it fell to `ok: false`), `Register` stored `channels: Vec::new()` and discarded the preference, every registration was filed under `account: 0` while every lookup asked for a real account, and `Notification` carried no channel, so delivery had nothing to compare a mute against. All four fixed; a muted channel no longer buzzes the phone, and there is a test saying so |
+  | ~~link-preview~~ | **deferred, feature not built** | The service vets a URL and returns an empty `Preview`; it has no HTTP client at all. The rich embed, and the `preview_data`-versus-`image_key` question, which is a real design choice about whether thumbnails ride the control plane or the files service, gets decided with the fetcher that has to produce it |
+  | ~~userdata~~ | **deferred, feature not built** | Worse than first measured, and in a way that reframes it: nothing decodes `UserdataEnvelope` at all. The account self-service surface (password, email, rename, TOTP enrol/verify/disable, unregister) does not exist in Starling. Its canon is also unsafe as drawn, `AccountAction.Kind` has no QUERY verb, so the proto3 default action is `SET_PASSWORD`, and a default-constructed message is a password change. Both get fixed with the implementation |
 
   The rule for closing a real gap is the one that produced the minimal sets in
   the first place: add what carries information the receiver cannot derive,
@@ -115,19 +115,19 @@ before M2b has given the client something worth encoding.
 
   Also outstanding here, and service work rather than protocol work: onboarding
   **applies** none of the grants its `Step.Choice` now carries.
-* **M2c — the client moves to the canon. Vendoring done; the codec is the
+* **M2c, the client moves to the canon. Vendoring done; the codec is the
   rest.** `vendor/client` now carries `proto/fancy/*.proto` mirrored from here
   and compiles all eight into `proto::fancy::*`, under the same two-pass
   `extern_path` dance `wire.proto` needs on this side. `check-proto-drift.sh`
-  covers them in both directions — a file whose wire meaning differs, and a
+  covers them in both directions, a file whose wire meaning differs, and a
   file the client has that Starling does not, which a loop over our own files
   would never look for. Nothing encodes them yet, and that is the point of
   doing it first: the canon is now *verified identical* on both ends before
   anything depends on it being so.
 
   **The pchat identity question is settled, and the canon was wrong.** The
-  client's key ladder is keyed on TLS certificate hash throughout — peer keys,
-  channel originators, key holders, even the consensus tie-break — while the
+  client's key ladder is keyed on TLS certificate hash throughout, peer keys,
+  channel originators, key holders, even the consensus tie-break, while the
   canon modelled pchat identity as a session id alone. That is not a mismatch
   the client should adapt to: a session id is handed out per connection and
   reused, so an archive keyed on one attributes last week's messages to
@@ -141,7 +141,7 @@ before M2b has given the client something worth encoding.
   claim; connection-stamped is an identity, and no client can write into
   somebody else's name. `Roster::cert_of` is the source, a nullable column
   holds it, and rows written before it existed read back empty rather than
-  guessed at — a wrong attribution in an archive is worse than an absent one.
+  guessed at, a wrong attribution in an archive is worse than an absent one.
 
   The same treatment is still owed to the key-ladder arms (`KeyAnnounce`,
   `KeyRequest`, `KeyDeliver`, `HolderReport`), which address by session and so
@@ -155,21 +155,21 @@ before M2b has given the client something worth encoding.
   The client's internal `ControlMessage` vocabulary stays its own: the codec is
   the boundary, and translating there is what keeps the app above it out of the
   migration. Starling's services already decode the canon; no server change.
-  **The M2h degradation is reverted in this same change** — the epoch-1
+  **The M2h degradation is reverted in this same change**, the epoch-1
   announcement and the codec that earns it ship in one commit, so the claim
   and the capability can never again be separated, which is precisely how D1
   happened.
-* **M3 — the dead block is deleted. Done.** Gone from all three `Mumble.proto`
+* **M3, the dead block is deleted. Done.** Gone from all three `Mumble.proto`
   copies, which are thereafter exactly: upstream surface + Fancy 1000+ fields +
   the epoch-0 legacy messages `vendor/server` still speaks. Deletion is also the
-  guard — the onboarding service bound itself to the dead block and nobody
+  guard, the onboarding service bound itself to the dead block and nobody
   noticed, because a tombstone comment stops readers and not compilers. The
   types no longer exist, so nothing can quietly speak them.
 
   It removed a live defect as well as dead text. The client's codec fell back to
   the proto2 envelopes whenever the canon did not recognise a payload, which
-  meant **a canon frame at a service the canon does not cover** — server-config
-  at 1013, say — was decoded as proto2, and where the wire types coincided it
+  meant **a canon frame at a service the canon does not cover**, server-config
+  at 1013, say, was decoded as proto2, and where the wire types coincided it
   produced a message that looked valid and was not. That is D1 inbound, and the
   fallback was the only thing keeping it reachable. Now an unreadable
   service-typed frame is skipped, which is what the envelope design says may
@@ -180,14 +180,14 @@ before M2b has given the client something worth encoding.
   in the burned 100–999 range, which routes nowhere on any peer. Those travel by
   relay, arranged a layer up; a raw one reaching the wire codec means somebody
   skipped that layer, and now they find out instead of the frame vanishing.
-* **M4 — freeze, per set rather than per date. Mechanism done.** A blanket
+* **M4, freeze, per set rather than per date. Mechanism done.** A blanket
   freeze would lock in whatever state the canon happened to be in on the day,
   and five services are still on the relay *because* their canon is incomplete
-  — freezing those buys nothing (nothing encodes them) and makes finishing them
+ freezing those buys nothing (nothing encodes them) and makes finishing them
   expensive. So a set is frozen when both ends encode it and a build carrying it
   could ship, and `check-proto-hygiene.py` enforces that against a recorded
   manifest (`scripts/frozen-tags.json`): a frozen field that moves or vanishes
-  fails the check by name. Frozen today: `pchat`, `social`, `wire` — the sets
+  fails the check by name. Frozen today: `pchat`, `social`, `wire`, the sets
   M2c's codec actually encodes. Everything else may still be renumbered, and
   should be, before it joins them.
 
@@ -198,7 +198,7 @@ before M2b has given the client something worth encoding.
   The epoch stays `1`: the
   layout a peer finds at `fancy_protocol` is already the discriminator, and no
   epoch-1 peer shipped before this point.
-* **M5 — scale features behind capability bits. S1 landed; two features left.**
+* **M5, scale features behind capability bits. S1 landed; two features left.**
   The step reads like wiring and is not: none of the three existed.
   `SyncDelta` was defined and never constructed, `Resume` is a stub that always
   answers `full_resync_required`, and zstd and the framing sequence have no
@@ -208,7 +208,7 @@ before M2b has given the client something worth encoding.
   looking at (`LazySubscribe`), and a `UserState` change splits its audience:
   peers that did not subscribe get exactly what murmur sends, peers that did and
   are looking at that channel get a `SyncDelta`, and **peers that did and are
-  looking elsewhere get nothing at all**. That omission is the whole saving —
+  looking elsewhere get nothing at all**. That omission is the whole saving,
   the win is not a smaller message, it is no message, which is what turns
   Θ(events × clients) into Θ(events × subscribers of the changed entity).
 
@@ -216,7 +216,7 @@ before M2b has given the client something worth encoding.
   still gets everything (a stock client must not be quietly cut out of state it
   renders); a subscription from a peer that never announced `lazy_subscribe` is
   **ignored**, because honouring it would stop the flood for a client that
-  cannot read what replaces it — a roster that silently stops updating; and
+  cannot read what replaces it, a roster that silently stops updating; and
   `everything: true` is the flood *by choice*, which is distinct from a client
   that failed to subscribe.
 
@@ -234,11 +234,11 @@ before M2b has given the client something worth encoding.
   traded away.** The apparent conflict was that a broadcast shares one
   refcounted frame across every recipient while a sequence number is per
   connection. It only conflicts if the header and the payload have to be *one
-  buffer* — and they do not. The send queue now carries
+  buffer*, and they do not. The send queue now carries
   `Outbound { prefix, payload }`: the prefix is six bytes, or fourteen for a
   peer that negotiated resume, and is never shared; the payload is the same
   refcounted buffer for everyone. The writer emits the two in sequence rather
-  than joining them, so nothing is copied per recipient. Z4 is not weakened —
+  than joining them, so nothing is copied per recipient. Z4 is not weakened;
   it is stronger, because the old path concatenated a header onto the payload
   and this one stops doing even that.
 
@@ -249,7 +249,7 @@ before M2b has given the client something worth encoding.
 
   The rest of the wiring, and one rule each:
 
-  * **The gateway cannot see a `ResumeRequest`** — it is inside a payload, and
+  * **The gateway cannot see a `ResumeRequest`**; it is inside a payload, and
     the gateway never parses one (§1). So session-lifecycle reads it and
     *instructs* the gateway through two new `ServerAction` arms, `Sequence` and
     `Replay`. The gateway acts on a control-plane instruction rather than on
@@ -260,7 +260,7 @@ before M2b has given the client something worth encoding.
     again mid-replay resumes from the right place rather than from a number
     that has since moved.
   * **A failed replay is not announced.** The gap in the numbers is the
-    announcement — it covers every cause rather than the one the server
+    announcement, it covers every cause rather than the one the server
     happened to know about, and it spares the gateway from having to encode a
     service's message to explain itself. The client watches for a skip and
     re-syncs; a *repeat* is not a skip, because that is what a successful
@@ -273,7 +273,7 @@ before M2b has given the client something worth encoding.
   made the shape obvious:
 
   * `ResumeStore::resume` is never called. The gateway owns the ring but must
-    not parse payloads (Z1), so it cannot see a `ResumeRequest` — which arrives
+    not parse payloads (Z1), so it cannot see a `ResumeRequest`, which arrives
     at outer type 1000 and routes to session-lifecycle, where the handler
     unconditionally answers `full_resync_required`. The fix is a new
     `ServerAction` arm (`Replay { conn, from_seq }`): the service reads the
@@ -282,13 +282,13 @@ before M2b has given the client something worth encoding.
   * **The sequence has to reach the client, and putting it in the framing
     conflicts with encode-once fan-out.** §5's S2 says the seq sits between
     `len` and `payload`. But a broadcast builds *one* frame and shares it by
-    refcount across every recipient (Z4), and a sequence is per recipient — so
+    refcount across every recipient (Z4), and a sequence is per recipient, so
     prefixing it means a distinct buffer per client, which is precisely the
     "1000 buffer writes for one logical event" the session-store note warns
     about. The two rules were written apart and have not been reconciled.
 
     The shape that keeps both: only connections that negotiated `resume` get a
-    prefixed frame, so the shared path stays shared for everyone else — the
+    prefixed frame, so the shared path stays shared for everyone else, the
     same per-capability split S1 uses. That bounds the cost to the clients that
     asked for it, and is worth measuring before it is built rather than after.
 
@@ -297,7 +297,7 @@ before M2b has given the client something worth encoding.
   of whole frames, zstd'd, unwrapped before anything is routed.
 
   Stream-level compression was the alternative and is rejected because both
-  ends must then switch at *exactly* the same byte — one frame written before
+  ends must then switch at *exactly* the same byte, one frame written before
   the switch and read after it desynchronises the connection permanently, and
   the symptom appears at a layer with no idea compression exists. A frame type
   is self-describing, bounded by the framing that already exists, costs one
@@ -316,7 +316,7 @@ before M2b has given the client something worth encoding.
     connection, and a stock Mumble client announces nothing.
   * **A batch that does not shrink is not sent.** Sealed pchat ciphertext and
     avatars are effectively random, and zstd makes random data slightly larger
-    — compressing them would cost bandwidth to save none. Nor is a single frame
+ compressing them would cost bandwidth to save none. Nor is a single frame
     batched, or anything under 256 bytes.
   * **Expansion is bounded on the way in.** The expanded size is chosen by
     whoever sent the batch, so a few kilobytes can claim to be gigabytes. The
@@ -325,7 +325,7 @@ before M2b has given the client something worth encoding.
 
   Level 1 rather than the default 3: this runs on the socket write path, where
   the budget is a 10 ms audio frame, and the alternative to compressing quickly
-  is not compressing better — it is stalling the writer. Batching happens in
+  is not compressing better; it is stalling the writer. Batching happens in
   the writer, which drains what is already queued, so a burst compresses and a
   quiet connection is untouched.
 
@@ -340,49 +340,49 @@ before M2b has given the client something worth encoding.
   connection.
 
   Its default is the load-bearing part. Every capability is something the
-  server does *to* a client — compress its stream, replay a gap, send deltas
-  instead of the flood — so a peer that never announced one must not receive
+  server does *to* a client, compress its stream, replay a gap, send deltas
+  instead of the flood, so a peer that never announced one must not receive
   it, or it cannot read its own connection. All-false is therefore both the
   default and what an unknown connection reads as, and a stock client lands
   there correctly by sending no `Hello` at all.
-* **M6 — enforcement. Partly done; taken early because it guards the rest.**
+* **M6, enforcement. Partly done; taken early because it guards the rest.**
   The three checks of `PROTOCOL-COMPATIBILITY.md` §5:
 
-  * **consistency** — `check-proto-drift.sh`, which already compared L0's wire
+  * **consistency**, `check-proto-drift.sh`, which already compared L0's wire
     meaning across the three trees and passes. Its header called
     `vendor/server` "upstream's source of truth", which is the belief that let
     §1's numbering drift through, and its failure advice said to re-sync from
-    that tree — so a deliberate change would be reverted by whoever ran the
+    that tree, so a deliberate change would be reverted by whoever ran the
     check next. Both corrected: no tree is the authority, and the diff has to
     be adjudicated rather than copied over. Extends to L2 when the client
     vendors those files at M2c.
-  * **hygiene** — `check-proto-hygiene.py`, new. Two rules no compiler
+  * **hygiene**, `check-proto-hygiene.py`, new. Two rules no compiler
     enforces and that the drift check is blind to *by construction*, because
     all three trees break them identically: **no field number in the burned
     100–999 range** (with `Version.fancy_version = 6` as the one pinned
     exception), and **no source outside the frozen crate may name a dead-block
-    envelope type** — the canon shares those names, so the import *path* is
+    envelope type**, the canon shares those names, so the import *path* is
     what distinguishes them. Both were verified by reintroducing the original
     bug and watching the check fail with file and line: a Fancy field taking
     upstream's next number, and onboarding's dead-block import.
-  * **compatibility** — upstream surface vs `mumble-voip/mumble`, still
+  * **compatibility**, upstream surface vs `mumble-voip/mumble`, still
     outstanding. It needs a remote, and none is configured here; a failure
     there is a released-client break, so it is the one that most wants doing.
 
   A fourth check landed with M4/M5: **outer-type agreement.** The client names
   outer types as its own constants because it does not link `proto-fancy`, so
   the table exists twice with nothing comparing the copies. A wrong one is not
-  a compile error — the frame is well-formed and simply arrives at the wrong
+  a compile error, the frame is well-formed and simply arrives at the wrong
   service, which does not recognise the envelope and skips it. A feature that
   silently does nothing, with plausible-looking numbers in both files. Verified
   by pointing the client's `PUSH` at the plugins service and watching the check
   name both values.
 
-  Still outstanding: an **honesty check** on the epoch — the tree announcing
+  Still outstanding: an **honesty check** on the epoch, the tree announcing
   `fancy_protocol = 1` must be the tree whose codec encodes the canon,
   asserted by the e2e suite round-tripping one Fancy message per service
   rather than by anyone's claim in a document. Both docs claimed states the
   code contradicted; only the round-trip is evidence. M2c has now made it
   writable, and the three structural checks above narrow what it has to cover:
   the protos are identical, the frozen tags cannot move, and the outer types
-  agree — so what remains for it is the codecs themselves.
+  agree, so what remains for it is the codecs themselves.

@@ -4,7 +4,7 @@
 # below bind: a dependency needing a newer compiler is not selected.
 resolver = "3"
 members = [
-    # Wire and security primitives — no I/O, no state.
+    # Wire and security primitives, no I/O, no state.
     "crates/proto",
     "crates/proto-fancy",
     "crates/gate",

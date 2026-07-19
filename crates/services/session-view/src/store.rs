@@ -1,7 +1,7 @@
 //! The composed view itself: sessions by virtual server.
 //!
 //! Sharded by session id in the deployment model (`docs/diagrams/scaling.puml`)
-//! — unsharded, one actor performs every domain read, which is Discord's
+//! unsharded, one actor performs every domain read, which is Discord's
 //! guild-process bottleneck relocated. The shard key is designed in now because
 //! it cannot be retrofitted: every service in the domain calls this one.
 

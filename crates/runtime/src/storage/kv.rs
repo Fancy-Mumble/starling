@@ -1,9 +1,9 @@
 //! Ordered, namespaced key/value with atomic batches.
 //!
 //! This is what a plugin gets instead of SQL, and the reasoning is in
-//! `docs/STORAGE.md` §5.3. SQL passthrough is the tempting alternative —
+//! `docs/STORAGE.md` §5.3. SQL passthrough is the tempting alternative,
 //! executing opaque SQL is philosophically identical to shuttling opaque
-//! messages — and it loses on two practical points: every plugin author would
+//! messages, and it loses on two practical points: every plugin author would
 //! have to write SQL portable across three dialects, and the host would have to
 //! *parse* SQL to enforce namespace isolation. Both taxes are permanent.
 //!
@@ -86,7 +86,7 @@ impl KvStore {
     /// A half-open key range, forwards or backwards.
     ///
     /// This is an index range scan on the clustered primary key with no
-    /// dialect-specific syntax — the access path the whole design is chosen
+    /// dialect-specific syntax, the access path the whole design is chosen
     /// for.
     ///
     /// # Errors

@@ -3,7 +3,7 @@
 # The multi-process shape of docs/ARCHITECTURE.md: a gateway in front,
 # independent gRPC services behind it, and the media planes bypassing the
 # gateway entirely. This differs from starling.example.toml in exactly one
-# respect — endpoints are `http://<name>:50051` rather than Unix sockets,
+# respect, endpoints are `http://<name>:50051` rather than Unix sockets,
 # because "co-located, and file permissions are the auth" stops being true the
 # moment each service is its own container.
 #
@@ -23,7 +23,7 @@
 # the command line rather than needing a second file.
 all_in_one = false
 # A named volume, because the gateway generates its certificate here on first
-# boot and Mumble clients identify a server by certificate fingerprint — a
+# boot and Mumble clients identify a server by certificate fingerprint, a
 # fresh pair on every restart is a security warning for every connected client.
 # The per-service SQLite files live here too, one per service.
 data_dir = "/var/lib/starling"
@@ -98,7 +98,7 @@ ttl = "120s"
 # `docker compose logs` is a terminal, not a log collector. Switch to "json"
 # when something downstream is parsing it.
 log_format = "text"
-# Neither key below binds a listener in this build — the runtime records that
+# Neither key below binds a listener in this build, the runtime records that
 # OTLP is configured and keeps spans local, and nothing serves the metrics
 # registry over HTTP yet. Left commented so enabling them is a deliberate act
 # rather than a setting that appears to work.
@@ -108,8 +108,8 @@ log_format = "text"
 # -- Services ---------------------------------------------------------------
 #
 # One block per container. `endpoint` is both where the service binds and where
-# every other service dials it — the runtime has one address per service, not a
-# bind/advertise pair — so the host part must be the compose service name.
+# every other service dials it, the runtime has one address per service, not a
+# bind/advertise pair, so the host part must be the compose service name.
 # Docker's embedded resolver answers a container's own network alias, so
 # binding `text:50051` inside the `text` container binds that container's own
 # address, and one line stays the single source of truth for both directions.
@@ -119,7 +119,7 @@ log_format = "text"
 # give that one container STARLING_SERVICES_TEXT_ENDPOINT=http://0.0.0.0:50051,
 # which overrides only its own entry, only where it binds.
 #
-# `types` is the outer message type from docs/PROTOCOL-COMPATIBILITY.md §3 —
+# `types` is the outer message type from docs/PROTOCOL-COMPATIBILITY.md §3,
 # one number per service, because a service's own message types live in its
 # nested envelope and the gateway never looks inside.
 
@@ -158,7 +158,7 @@ types = [24, 25, 1013]
 endpoint = "http://voice:50051"
 tier = "core"
 types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
-# Voice's OWN socket — audio skips the gateway. A legacy client sends UDP to
+# Voice's OWN socket, audio skips the gateway. A legacy client sends UDP to
 # the host:port it made TCP to, which is why compose publishes this container's
 # UDP 64738 on the same host port the gateway publishes TCP 64738 on.
 udp_listen = "0.0.0.0:64738"
@@ -195,7 +195,7 @@ tier = "optional"
 types = [1009]
 listen = "0.0.0.0:8080"      # its own HTTP listener, published by compose
 # What the signed URLs handed out over the control channel point at, which is
-# what a *client* must be able to reach — not what the container binds. Change
+# what a *client* must be able to reach, not what the container binds. Change
 # this to your public name the moment the stack is not on localhost.
 public_url = "http://localhost:8080"
 url_ttl = "15m"
@@ -239,7 +239,7 @@ types = [16, 17, 1017]
 
 # The gateway's own block.
 #
-# It owns no wire types — it is the process that *routes* them — and nothing
+# It owns no wire types (it is the process that *routes* them) and nothing
 # dials it to do work. It needs an endpoint anyway, because the `health`
 # collector below dials every service to ask how it is, and without one the
 # gateway is the single component missing from the health dashboard: the
@@ -249,11 +249,11 @@ enabled = true
 endpoint = "http://gateway:50051"
 # `core`, the default. The tier says what the *gateway* does while a service is
 # unhealthy, so the gateway's own tier is a value it would only ever consult
-# about itself — there is no answer for it to act on.
+# about itself; there is no answer for it to act on.
 tier = "core"
 types = []
 
-# The one service with no `endpoint`, because nothing dials it — it dials the
+# The one service with no `endpoint`, because nothing dials it, it dials the
 # public Mumble server list, hourly, and has no gRPC surface to reach. It does
 # nothing at all until `registry_name`, `registry_password` and `registry_url`
 # are set in `server-config`, which is where murmur keeps them too.
@@ -265,7 +265,7 @@ types = []
 # Where the public list's own certificate is verified. Debian's path, which is
 # what this image is; change it for an image that keeps its trust store
 # elsewhere. A missing bundle is a startup error for the announcement rather
-# than a silent unverified POST — the document carries a shared secret.
+# than a silent unverified POST, the document carries a shared secret.
 trust_store = "/etc/ssl/certs/ca-certificates.crt"
 
 # Asks every other service how it is, once every few seconds, and holds the
@@ -273,8 +273,8 @@ trust_store = "/etc/ssl/certs/ca-certificates.crt"
 # fanning out across twenty endpoints per page load.
 #
 # Unlike the announcer above this one *is* dialled, so it needs a real
-# endpoint. Without this block the collector is simply absent — `--config`
-# replaces `Config::with_defaults` rather than merging with it — and
+# endpoint. Without this block the collector is simply absent, `--config`
+# replaces `Config::with_defaults` rather than merging with it, and
 # `/v1/health` answers 502 "health is unreachable": the admin plane up,
 # reachable, and with nothing behind the one route a dashboard opens on.
 [services.health]
@@ -286,7 +286,7 @@ types = []
 # -- Storage, per service ---------------------------------------------------
 #
 # Each service owns its own schema; no service reads another's tables. With no
-# block, a SQLite file under `data_dir` named after the service is used — which
+# block, a SQLite file under `data_dir` named after the service is used, which
 # is what every service above does, so twenty separate files in one volume.
 #
 # Point a service at a real database when it outgrows that:

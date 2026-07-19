@@ -1,6 +1,6 @@
 # Starling
 
-A pure-Rust Mumble server — the replacement for `vendor/server` (C++/Qt murmur,
+A pure-Rust Mumble server, the replacement for `vendor/server` (C++/Qt murmur,
 Fancy fork).
 
 > Starlings fly in *murmurations*. The name stays in the Mumble/Murmur family,
@@ -34,11 +34,11 @@ cargo run --bin starling -- migrate-config /path/to/mumble-server.ini > starling
 ```
 
 With no `--config`, built-in defaults are used and a self-signed certificate is
-generated in `starling-data/` on first boot — Mumble clients identify a server by
+generated in `starling-data/` on first boot, Mumble clients identify a server by
 certificate fingerprint, so the pair is then stable across restarts.
 
 **Linux, macOS and Windows.** Services on one host reach each other over the
-platform's own local IPC — a Unix domain socket, or a named pipe on Windows — and
+platform's own local IPC (a Unix domain socket, or a named pipe on Windows) and
 the built-in defaults pick whichever this build can serve, so the quick start
 above needs no configuration file on any of the three. A hand-written `unix:`
 endpoint is a startup error on Windows rather than a substitution, because the
@@ -58,12 +58,12 @@ docker compose up -d --wait --build starling         # instead: one container, i
 ```
 
 Keep the `--build`. Compose builds only when the image is *missing*, so a stale
-`starling:local` is reused however far the source has moved — and since every
+`starling:local` is reused however far the source has moved, and since every
 container runs the same binary picked by `command`, that surfaces as a service
-exiting with `no service named "…"` rather than as anything about the image.
+exiting with `no service named "..."` rather than as anything about the image.
 
 Then connect a Mumble client to `localhost:64738`. `--wait` returns once every
-container is healthy, which is a TCP connect — this build has no HTTP `/healthz`
+container is healthy, which is a TCP connect, this build has no HTTP `/healthz`
 to probe, so it means the listener is up rather than the caches are warm.
 
 ## The shape of it
@@ -84,7 +84,7 @@ Two facts give the gateway everything else for free: it is the **single writer t
 each client socket**, so per-client ordering is preserved by construction; and
 the wire type is in the **framing, not the protobuf**, so routing is two bytes
 and a lookup. It parses no payload, links no service's stubs, and never
-recompiles when a service is added — a new service is a TOML block.
+recompiles when a service is added, a new service is a TOML block.
 
 ## Crates
 
@@ -104,7 +104,7 @@ recompiles when a service is added — a new service is a TOML block.
 
 ## Services and tiers
 
-`tier` is not documentation — the gateway reads it and behaves accordingly.
+`tier` is not documentation, the gateway reads it and behaves accordingly.
 
 | Tier | Services | Down means |
 |---|---|---|

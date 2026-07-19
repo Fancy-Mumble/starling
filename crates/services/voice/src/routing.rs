@@ -2,7 +2,7 @@
 //!
 //! A pure function of a snapshot: given who is speaking and what they aimed at,
 //! produce the sessions that should receive the frame. No I/O, no locks, no
-//! state service — which is the point, because this runs once per packet at 50
+//! state service, which is the point, because this runs once per packet at 50
 //! packets a second per speaker.
 //!
 //! # Why a snapshot rather than asking the authority
@@ -34,7 +34,7 @@ pub enum Target {
 
     /// Target 31: the server echoes the frame to the speaker alone.
     ///
-    /// A connectivity test — the client uses it to prove its UDP path works
+    /// A connectivity test, the client uses it to prove its UDP path works
     /// before trusting it with real audio.
     Loopback,
 
@@ -52,7 +52,7 @@ pub const SERVER_LOOPBACK: u8 = 31;
 impl Target {
     /// Decode the target field of an audio packet.
     ///
-    /// Anything above 31 cannot appear — the field is five bits — but a hostile
+    /// Anything above 31 cannot appear (the field is five bits) but a hostile
     /// peer can put whatever it likes on the wire, so out-of-range values are
     /// mapped to [`Self::Normal`] rather than trusted or panicked on.
     #[must_use]
@@ -88,7 +88,7 @@ pub struct Reception {
     /// Who receives it.
     pub session: SessionId,
 
-    /// The `context` value to put on the wire for this recipient — see
+    /// The `context` value to put on the wire for this recipient, see
     /// [`context`]. Per recipient and not per frame, because one registered
     /// target can whisper to a person and shout into a room at once, and one
     /// channel can be both stood in and listened to.
@@ -133,7 +133,7 @@ pub struct RoutingSnapshot {
 }
 
 impl RoutingSnapshot {
-    /// An empty snapshot — nobody connected.
+    /// An empty snapshot, nobody connected.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -354,7 +354,7 @@ impl RoutingSnapshot {
     ///
     /// Bounded by the number of channels: a cycle in `parent_of` would otherwise
     /// hang the voice task, and the authority is not the only thing that can put
-    /// one there — a corrupt database can too.
+    /// one there, a corrupt database can too.
     fn is_below(&self, channel: ChannelId, ancestor: ChannelId) -> bool {
         let mut at = channel;
         for _ in 0..self.parent_of.len() {
@@ -371,7 +371,7 @@ impl RoutingSnapshot {
 
     /// Members of a channel plus anyone listening to it.
     ///
-    /// `standing` is the context for people actually in the channel — normal
+    /// `standing` is the context for people actually in the channel, normal
     /// speech or a shout, depending on how the channel was reached. Listeners
     /// always get [`context::LISTEN`] and their own gain, whichever way the
     /// audio arrived at the channel they are listening to.
@@ -393,7 +393,7 @@ impl RoutingSnapshot {
 /// a second one. Two copies of a frame is not a wasted packet, it is an audible
 /// echo.
 struct Audience<'a> {
-    /// Excluded from their own fan-out — normal speech echoed back would double
+    /// Excluded from their own fan-out, normal speech echoed back would double
     /// every speaker's own audio.
     speaker: SessionId,
     /// Excluded because they receive nothing at all.
@@ -417,10 +417,10 @@ impl<'a> Audience<'a> {
     /// Both folds are murmur's (`AudioReceiverBuffer.cpp:87-90`) and neither is
     /// arbitrary:
     ///
-    /// * **context takes the minimum** — the most direct way of being reached
+    /// * **context takes the minimum**, the most direct way of being reached
     ///   wins, so somebody standing in the channel they also listen to is told
     ///   they are hearing their own room rather than a remote one.
-    /// * **gain takes the maximum** — a listener gain must never quieten audio
+    /// * **gain takes the maximum**, a listener gain must never quieten audio
     ///   the session was going to receive anyway at full volume. Being in the
     ///   channel is unity, so a listener who turned that channel down to 0.2 and
     ///   then walked into it hears it at 1.0.
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_target_is_not_trusted() {
-        // The field is five bits, so this cannot occur honestly — but a hostile
+        // The field is five bits, so this cannot occur honestly, but a hostile
         // peer writes whatever it likes.
         for raw in [32, 100, 255] {
             assert_eq!(Target::decode(raw), Target::Normal, "raw {raw}");
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn a_listener_gain_never_quietens_audio_that_was_already_unity() {
         // Bob turned the lobby down to a fifth and then walked into it. Being in
-        // the channel is unity, and murmur takes the louder of the two — the
+        // the channel is unity, and murmur takes the louder of the two, the
         // slider is for a room you are listening to from elsewhere.
         let snapshot = lobby_with_three()
             .with_listener(BOB, LOBBY)
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn a_listener_hears_a_shout_into_the_channel_it_listens_to() {
         // The shout reaches the channel; the listener is attached to the
-        // channel, so it reaches them too — but as a listener, with their gain.
+        // channel, so it reaches them too, but as a listener, with their gain.
         let listener = SessionId(9);
         let snapshot = lobby_with_three()
             .with_member(SessionId(4), ANNEX)

@@ -1,8 +1,8 @@
 //! Deployment configuration: read once at startup and injected at construction.
 //!
 //! There are two configuration layers and only one of them is this file.
-//! Anything that needs a restart anyway lives here — endpoints, ports, TLS
-//! paths, storage URLs, tiers and routes — so there is no late-subscriber
+//! Anything that needs a restart anyway lives here, endpoints, ports, TLS
+//! paths, storage URLs, tiers and routes, so there is no late-subscriber
 //! problem and no service to be down. Anything an operator expects to change
 //! live belongs to the `server-config` service (`docs/CONFIGURATION.md`).
 //!
@@ -60,7 +60,7 @@ pub struct RuntimeConfig {
     /// Every service in one process, over in-memory transports.
     ///
     /// Same binary, same config file, and `endpoint` values are ignored. It is
-    /// the mode for a single VPS — and it exercises the same boundaries, which
+    /// the mode for a single VPS, and it exercises the same boundaries, which
     /// is why it is not a second code path.
     pub all_in_one: bool,
     /// Where generated certificates and default databases live.
@@ -187,8 +187,8 @@ impl Config {
     ///
     /// This is what a first boot with no file gets, and what `--all-in-one`
     /// starts from. Which local mechanism that is belongs to
-    /// [`crate::transport::local_endpoint`] — a Unix socket, or a named pipe on
-    /// Windows — so that a first boot works on the platform it happens on
+    /// [`crate::transport::local_endpoint`]: a Unix socket, or a named pipe on
+    /// Windows, so that a first boot works on the platform it happens on
     /// without an operator having to allocate a port per service.
     #[must_use]
     pub fn with_defaults(run_dir: &Path) -> Self {
@@ -211,7 +211,7 @@ impl Config {
         // Not a `ServiceKind`: it owns no wire type and the gateway never
         // routes to it directly (`docs/ARCHITECTURE.md` §4). It still needs a
         // real endpoint, because every other service subscribes to it over
-        // gRPC — the same self-discovery gap that a bare `ServiceKind` loop
+        // gRPC, the same self-discovery gap that a bare `ServiceKind` loop
         // cannot fill.
         let _ = config.services.insert(
             "session-view".to_owned(),
@@ -222,8 +222,8 @@ impl Config {
             ),
         );
         // Also not a `ServiceKind`, and for the opposite reason to session-view:
-        // it needs no endpoint at all. Nothing dials the announcer — it dials the
-        // public server list — so this entry exists only so that an operator can
+        // it needs no endpoint at all. Nothing dials the announcer, it dials the
+        // public server list, so this entry exists only so that an operator can
         // switch it off or point it at a different trust store.
         let _ = config.services.insert(
             "directory".to_owned(),
@@ -232,7 +232,7 @@ impl Config {
                 ..ServiceConfig::default()
             },
         );
-        // Not a `ServiceKind` either — no client talks to it — but unlike the
+        // Not a `ServiceKind` either (no client talks to it) but unlike the
         // announcer it *is* dialled, by `operator-api` reading the aggregate,
         // so it needs a real endpoint. Optional: a server with no health
         // collector is a server nobody can see the state of, which is a poorer
@@ -304,7 +304,7 @@ fn default_tier(kind: ServiceKind) -> Tier {
 fn default_types(kind: ServiceKind) -> Vec<u16> {
     let upstream: &[u16] = match kind {
         // UserState (9) and UserStats (22) are connection state, and both were
-        // routed to userdata — which has no arm for either and returned
+        // routed to userdata, which has no arm for either and returned
         // nothing. A frame with no handler is dropped silently, because an
         // unroutable frame is normally harmless, so both simply did nothing:
         // right-click → Information never opened a window, and self-mute and
@@ -314,7 +314,7 @@ fn default_types(kind: ServiceKind) -> Vec<u16> {
         ServiceKind::Permissions => &[12, 13, 20],
         ServiceKind::Metadata => &[6, 7],
         // 18 is `UserList`, the registered-account list, which is genuinely
-        // userdata's — it is simply not implemented yet, unlike the two above,
+        // userdata's; it is simply not implemented yet, unlike the two above,
         // which were implemented and merely unreachable.
         ServiceKind::Userdata => &[14, 18, 23],
         ServiceKind::Voice => &[1, 19],
@@ -336,8 +336,8 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
     match kind {
         ServiceKind::Screenshare => Some("signalling"),
         ServiceKind::Plugins => Some("plugin"),
-        // Tunnelled audio is fifty frames a second, so the control bucket —
-        // murmur's 1/s — throttles a talking client off the air within one
+        // Tunnelled audio is fifty frames a second, so the control bucket,
+        // murmur's 1/s, throttles a talking client off the air within one
         // second of speech. Upstream does not charge it at all: `UDPTunnel` is
         // handled and returned from at the top of `Server::message`
         // (`Server.cpp:1905`), before the message-rate check further down.
@@ -345,7 +345,7 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
         // The ACL editor emits one query per channel when it opens the tree,
         // and chat is a person typing. Both are *interactive bursts* by a human
         // rather than a flood, and both were being silently decimated by the
-        // shared 1/s bucket — the same failure that moved screen-share
+        // shared 1/s bucket, the same failure that moved screen-share
         // signalling and tunnelled audio off it.
         ServiceKind::Permissions => Some("acl"),
         ServiceKind::Text => Some("chat"),
@@ -363,7 +363,7 @@ mod tests {
         // frame is accepted, dropped, and never answered, so the feature just
         // does nothing. It happened to `UserState` and `UserStats`, which sat
         // on userdata while their handlers sat unreachable on
-        // session-lifecycle — self-mute did nothing and right-click →
+        // session-lifecycle, self-mute did nothing and right-click →
         // Information opened no window.
         let config = Config::with_defaults(Path::new("/run/starling"));
         for (type_id, expected, what) in [
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn every_bucket_a_service_names_actually_exists() {
         // A service naming a bucket the operator did not define is allowed
-        // through unlimited by `Limiter::check` — deliberately, because
+        // through unlimited by `Limiter::check`, deliberately, because
         // starving a route over a typo is the worse failure. That makes the
         // typo *invisible*, so it is caught here instead: the defaults must
         // name only buckets the defaults define.

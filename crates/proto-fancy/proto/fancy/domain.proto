@@ -3,7 +3,7 @@ syntax = "proto3";
 // Fancy extensions for the four essential domain services, in the file each
 // one owns a message set in.
 //
-// They share a file because they share a shape — every one of them is a small
+// They share a file because they share a shape, every one of them is a small
 // addition to an upstream message that already exists, unlike pchat or social
 // which are whole features. The outer types stay one per service:
 //
@@ -58,7 +58,7 @@ message MetadataEnvelope {
 
 // Fancy channel properties that upstream's ChannelState has no field for.
 // Upstream owns 1–99 in every upstream message; these live out here instead of
-// squatting on upstream's next field number — docs/PROTOCOL-COMPATIBILITY.md §1.
+// squatting on upstream's next field number, docs/PROTOCOL-COMPATIBILITY.md §1.
 message ChannelExtras {
   uint32 channel = 1;
   uint32 expiry_mode = 2;
@@ -83,7 +83,7 @@ message Subscribe {
   bool everything = 2;
 }
 
-// A coalesced batch of state changes for a lazy subscriber — the delivery
+// A coalesced batch of state changes for a lazy subscriber, the delivery
 // half of Subscribe, and the mechanism that takes presence fan-out from
 // Θ(events × clients) to Θ(events × subscribers of the changed entity).
 //
@@ -96,7 +96,7 @@ message Subscribe {
 // The frames inside are *encoded upstream messages*, embedded as bytes. A
 // protobuf submessage and a bytes field share one wire shape (tag ‖ len ‖
 // payload), so the buffer encoded once for the legacy flood is placed here
-// verbatim — never re-encoded per recipient, and decoded by the parsers a
+// verbatim, never re-encoded per recipient, and decoded by the parsers a
 // client already has (docs/PROTOCOL-REDESIGN.md §4, rule Z3).
 message SyncDelta {
   // Encoded MumbleProto.UserState frames, verbatim.
@@ -104,7 +104,7 @@ message SyncDelta {
   // Encoded MumbleProto.ChannelState frames, verbatim.
   repeated bytes channel_states = 2;
   // Sessions gone from the subscribed view. Deliberately one list: left the
-  // server, or moved somewhere unsubscribed — the render outcome is the same,
+  // server, or moved somewhere unsubscribed, the render outcome is the same,
   // and distinguishing them would leak movement the subscriber cannot see.
   repeated uint32 users_gone = 3;
   // Channels removed from the subscribed view.
@@ -176,7 +176,7 @@ message ConfigQuery {}
 // knows it. A client that hard-codes "max_users is an integer labelled Maximum
 // users" has to ship a release whenever an operator-facing knob is added, and
 // `Snapshot.extra` exists precisely so a service can add one without a proto
-// change — those would arrive as untyped, unlabelled keys and render as raw
+// change; those would arrive as untyped, unlabelled keys and render as raw
 // strings, which is how a settings screen rots.
 message Setting {
   string key = 1;
@@ -189,7 +189,7 @@ message Setting {
   // The permitted values. Meaningful for CHOICE, empty otherwise.
   repeated string options = 6;
   // Never carries a value outward, and only ever received. Named rather than
-  // omitted, so a client can tell "no password set" from "password withheld" —
+  // omitted, so a client can tell "no password set" from "password withheld",
   // they mean very different things to whoever is looking at the screen.
   bool secret = 7;
   string help = 8;

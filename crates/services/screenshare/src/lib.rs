@@ -1,4 +1,4 @@
-//! `screenshare` — signalling only; media goes client↔SFU directly.
+//! `screenshare`: signalling only; media goes client↔SFU directly.
 //!
 //! Two contract constraints, each of which cost a debugging session
 //! (`docs/ARCHITECTURE.md` §3):
@@ -104,7 +104,7 @@ impl ClientService for ScreenshareService {
             Some(screenshare_envelope::Body::Viewers(request)) => {
                 // Joining is implicit in asking: a client that wants the viewer
                 // list is watching, and the presenter's own request is not a
-                // join — which is why the presenter is compared out here rather
+                // join, which is why the presenter is compared out here rather
                 // than filtered on the way to the SFU.
                 let viewers = self
                     .shares

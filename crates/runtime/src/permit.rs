@@ -18,7 +18,7 @@
 //! mistake.
 //!
 //! **Anything that is not an explicit grant is a denial.** An unreachable
-//! `permissions`, a refused call, a malformed reply, a session that has gone —
+//! `permissions`, a refused call, a malformed reply, a session that has gone,
 //! every one of them denies. That is the direction the architecture already
 //! commits to: *a stale deny is safe; a stale grant is a security bug*
 //! (`docs/ARCHITECTURE.md` §4). It also means a service cannot be talked into
@@ -166,7 +166,7 @@ pub fn permission_denied(inbound: &Inbound, missing: Perm, channel: u32) -> Serv
 }
 
 /// Tell the client its action was refused for a reason that is **not** a
-/// missing permission — a limit it met, a name it may not use.
+/// missing permission, a limit it met, a name it may not use.
 ///
 /// murmur's `PERM_DENIED_TYPE`, and the distinction matters at the other end: a
 /// client told `Permission` renders "you lack the X permission", which is a

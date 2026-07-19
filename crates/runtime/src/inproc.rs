@@ -1,6 +1,6 @@
 //! `--all-in-one`: every service in one process, over in-memory pipes.
 //!
-//! One image, two deployment modes — one process for a VPS, twenty-four for
+//! One image, two deployment modes, one process for a VPS, twenty-four for
 //! isolation or per-service scaling. The point is that it is the *same* code:
 //! the services still speak gRPC to each other, still serialise, still see
 //! deadlines and streaming semantics. Only the socket is gone.

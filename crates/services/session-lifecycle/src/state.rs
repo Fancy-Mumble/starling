@@ -24,7 +24,7 @@ use crate::session::{SessionAllocator, SessionSource as _};
 pub struct Identity {
     /// The account it holds, or `None` for a guest.
     pub account: Option<u64>,
-    /// The name to use — the account's own spelling when there is an account,
+    /// The name to use, the account's own spelling when there is an account,
     /// so a login as "alice" shows up as the registered "Alice".
     pub name: String,
     /// The account's stored comment, as a content hash. Empty for a guest, who
@@ -76,7 +76,7 @@ pub struct PendingConnection {
     ///
     /// **Secret, and treated as one.** They are announced to `session-view`
     /// because that is the only thing `permissions` reads a session through,
-    /// and they go nowhere else — no `UserState`, no log line, no operator
+    /// and they go nowhere else, no `UserState`, no log line, no operator
     /// response. A password in a log is a password that has leaked.
     ///
     /// Replaceable after the handshake: a client that is told it may not enter
@@ -93,7 +93,7 @@ pub struct PendingConnection {
     /// What the peer last reported about its own link, from its `Ping`.
     ///
     /// The client measures these, not the server
-    /// (`vendor/server/src/murmur/Messages.cpp:2918`) — round trips it timed,
+    /// (`vendor/server/src/murmur/Messages.cpp:2918`), round trips it timed,
     /// packets it received, packets it found late or missing. The server's part
     /// is to remember the last set so that *other* clients can be shown them.
     pub reported: ReportedStats,
@@ -104,8 +104,8 @@ pub struct PendingConnection {
     /// Separate from `fancy_version` for the reason the epoch is separate from
     /// it: a version says which features *exist* in a build, and these say
     /// which of them this connection will accept. Every one is a thing the
-    /// server may do *to* a client — compress its stream, replay a gap, send
-    /// deltas instead of the full flood — and doing any of them to a peer that
+    /// server may do *to* a client, compress its stream, replay a gap, send
+    /// deltas instead of the full flood, and doing any of them to a peer that
     /// did not ask is a peer that cannot read its own connection.
     ///
     /// So the default is all-false, and silence means the murmur behaviour:
@@ -147,7 +147,7 @@ pub struct PendingConnection {
     /// Held here rather than read from `metadata` when a `Session` is composed,
     /// because that composition happens on every self-mute and every avatar
     /// change: a gRPC round trip there would put the tree actor's lock on the
-    /// path of every push-to-mute keypress. `metadata` remains the authority —
+    /// path of every push-to-mute keypress. `metadata` remains the authority;
     /// this is the copy it last agreed to.
     pub listening: Vec<u32>,
     /// The gain it set on each listened channel, keyed by channel.
@@ -189,7 +189,7 @@ pub struct PendingConnection {
 /// Recorded rather than acted on: the three features these gate are not built
 /// (`PROTOCOL-MIGRATION.md` M5). The gate exists first so that each lands behind
 /// a flag that is already true or false per connection, instead of arriving
-/// with its own ad-hoc way of asking — which is how one of them ends up sent to
+/// with its own ad-hoc way of asking, which is how one of them ends up sent to
 /// a peer that never agreed to it.
 ///
 /// Before this, a `Hello` was received and thrown away, so a client announcing
@@ -234,7 +234,7 @@ impl Subscription {
 /// Every field here is the *client's* measurement. The server cannot compute
 /// them: only the client knows when it sent a ping and when the reply came
 /// back, and only the client can count what it did not receive. Reporting them
-/// is therefore repeating a claim, not making one — which is exactly what
+/// is therefore repeating a claim, not making one, which is exactly what
 /// murmur does with the same numbers.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ReportedStats {
@@ -328,7 +328,7 @@ impl Connections {
     ///
     /// **Replace, never merge**, as upstream does (`Messages.cpp:378`): the
     /// client sends the whole set it is holding, so merging would make a token
-    /// impossible to withdraw — a channel password would keep working for
+    /// impossible to withdraw, a channel password would keep working for
     /// everyone who had ever typed it, for as long as they stayed connected.
     ///
     /// Answers whether anything actually changed, so the caller can skip
@@ -370,7 +370,7 @@ impl Connections {
     /// Allocate a session id for a connection that has authenticated.
     ///
     /// Returns `None` when the pool is exhausted, which refuses the connection
-    /// rather than growing — murmur does the same (`Server.cpp:1625`), and an
+    /// rather than growing; murmur does the same (`Server.cpp:1625`), and an
     /// unbounded pool would mean an unbounded server.
     ///
     /// Takes the whole [`Identity`] rather than its parts: everything the login
@@ -403,7 +403,7 @@ impl Connections {
 
     /// An authenticated connection that collides with `account`/`name`.
     ///
-    /// murmur's predicate, from `Messages.cpp:418` — the same registered
+    /// murmur's predicate, from `Messages.cpp:418`, the same registered
     /// account, *or* the same name compared case-insensitively. Case matters:
     /// without folding, "Alice" and "alice" are two users whom every client
     /// renders as the same person.
@@ -482,7 +482,7 @@ impl Connections {
     /// Returns `(flood, subscribed)`: the sessions that get the message the way
     /// murmur sends it, and the sessions that asked for deltas and are looking
     /// at the channel it happened in. **A subscriber not looking at `channel`
-    /// appears in neither** — that omission is the entire point, and the reason
+    /// appears in neither**, that omission is the entire point, and the reason
     /// the fan-out stops growing with the population.
     ///
     /// Sessions with no id yet (mid-handshake) are in neither list: they cannot
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_connection_that_announced_nothing_accepts_nothing() {
-        // Every capability is something the server does *to* a connection —
+        // Every capability is something the server does *to* a connection,
         // compress its stream, replay a gap, send deltas instead of the flood.
         // Doing one to a peer that never asked leaves it unable to read its own
         // connection, so silence must mean the murmur behaviour and not a
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn a_subscription_without_the_capability_is_not_honoured() {
         // Announcing a subscription without announcing that deltas are readable
-        // would stop the flood for a client that cannot read what replaces it —
+        // would stop the flood for a client that cannot read what replaces it,
         // a roster that silently stops updating. It falls back to the flood.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn session_zero_never_resolves_to_a_connection() {
         // Zero means "not authenticated yet", and every mid-handshake entry
-        // carries it — so looking it up must not return an arbitrary one.
+        // carries it, so looking it up must not return an arbitrary one.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         assert!(connections.by_session(0).is_none());
@@ -1098,8 +1098,8 @@ mod tests {
     #[test]
     fn registering_a_guest_gives_the_live_connection_its_account() {
         // The connection has to carry the account immediately, not after a
-        // reconnect: everything downstream — the ACL evaluation that puts them
-        // in `@auth`, the announcement to session-view — reads it from here.
+        // reconnect: everything downstream, the ACL evaluation that puts them
+        // in `@auth`, the announcement to session-view, reads it from here.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         let session = connections.allocate(1, &guest("guest")).expect("a session");
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn a_channel_move_is_recorded_so_the_rest_of_the_server_agrees() {
         // `set_channel` existed and nothing ever called it, so every session
-        // read as being in the root however many times it moved — which is
+        // read as being in the root however many times it moved, which is
         // what `UserStats` and the same-channel disclosure rule key off.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");

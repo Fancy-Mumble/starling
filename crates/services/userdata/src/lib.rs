@@ -1,4 +1,4 @@
-//! `userdata` — registered accounts, profiles, settings and blobs.
+//! `userdata`: registered accounts, profiles, settings and blobs.
 //!
 //! **Account settings are userdata, not settings**: they are per-user profile
 //! data and belong with the profile, while `server-config` owns what an
@@ -62,7 +62,7 @@ pub struct UserdataService {
     /// server, so it is not public.
     permit: Permit,
     /// To reach `session-view`, which is the only place that knows which
-    /// account a session belongs to — see [`UserdataService::sessions`].
+    /// account a session belongs to, see [`UserdataService::sessions`].
     resolver: Resolver,
     /// The operator-facing record of account changes.
     trail: Trail,
@@ -93,7 +93,7 @@ impl UserData for UserdataRpc {
     ///
     /// # Why this hops to the blocking pool
     ///
-    /// Verifying a password is 210 000 rounds of PBKDF2-HMAC-SHA256 — the
+    /// Verifying a password is 210 000 rounds of PBKDF2-HMAC-SHA256, the
     /// OWASP figure, and deliberately expensive, because the whole point is to
     /// cost an attacker something. Measured here: **30 ms in release, 1.45 s in
     /// a debug build**.
@@ -102,7 +102,7 @@ impl UserData for UserdataRpc {
     /// nobody: other clients' pings, text and channel joins queue behind a
     /// stranger's failed login. It is also a lever anyone can pull *without
     /// credentials*, since the cost is paid before the password is known to be
-    /// wrong — so a handful of connections can hold every worker busy.
+    /// wrong, so a handful of connections can hold every worker busy.
     ///
     /// `spawn_blocking` puts it on the pool that exists for exactly this, where
     /// blocking is expected and the async workers stay free. The cost itself is
@@ -291,8 +291,8 @@ impl UserdataService {
     ///
     /// The request names **sessions**, and blobs hang off **accounts**. This
     /// used to pass the session id straight to `by_id` as though the two were
-    /// the same number. They are not related at all — sessions are handed out
-    /// per connection and reused after a disconnect — so the answer was
+    /// the same number. They are not related at all, sessions are handed out
+    /// per connection and reused after a disconnect, so the answer was
     /// whichever account happened to share the integer: usually none, and
     /// occasionally somebody else's avatar.
     async fn on_request_blob(&self, inbound: &Inbound) -> Actions {
@@ -350,7 +350,7 @@ impl UserdataService {
 
         // Named by **account**, not by session: this is how a client redeems the
         // `comment_hash` in a `UserList` entry, whose subject may well not be
-        // connected — that is the whole point of a directory. Answered as a
+        // connected; that is the whole point of a directory. Answered as a
         // `UserList` of one for the same reason: there is no session to hang a
         // `UserState` on.
         let mut listed = Vec::new();
@@ -415,7 +415,7 @@ impl Serve for UserdataService {
 
         // Every virtual server gets an administrator on its first boot, because
         // a server with no way in is a server that has to be rebuilt. The
-        // password is generated and announced exactly once, at creation — a
+        // password is generated and announced exactly once, at creation, a
         // restart never repeats it, so this is safe to run unconditionally.
         for scope in ctx.virtual_servers() {
             if let Some(password) = accounts.ensure_superuser(scope).await {
@@ -450,7 +450,7 @@ impl Serve for UserdataService {
 ///
 /// Sent to both records for the same reason. `tracing` is what is on the console
 /// of whoever just ran the server, and the operator log is what survives to be
-/// read afterwards — an operator who scrolled past it needs the second one, and
+/// read afterwards, an operator who scrolled past it needs the second one, and
 /// one who is following `docker compose up` needs the first.
 ///
 /// It is announced once, at creation. Re-announcing on every boot would leave a
@@ -458,7 +458,7 @@ impl Serve for UserdataService {
 fn announce_superuser(ctx: &ServiceContext, scope: u32, password: &str) {
     // The operator log only, and deliberately not `tracing` as well. This is
     // the one line in the system that prints a live administrator password, so
-    // printing it twice doubles the number of places it can be scraped from —
+    // printing it twice doubles the number of places it can be scraped from,
     // and the two went to the same console anyway. The operator log is the
     // right home: it is what an operator is reading at first boot, and it is
     // the stream a deployment can point at a file with restricted permissions.
@@ -497,7 +497,7 @@ mod tests {
 
     /// The runtime must keep serving other clients while a password is checked.
     ///
-    /// Verifying a password is 210 000 rounds of PBKDF2 — 30 ms in release,
+    /// Verifying a password is 210 000 rounds of PBKDF2, 30 ms in release,
     /// 1.45 s in a debug build like the one this test runs in. Done inline on
     /// an async worker, that is time no other client is served, and it is
     /// reachable *without credentials*: the cost is paid before the password
@@ -520,7 +520,7 @@ mod tests {
             }
         });
 
-        // Not the service's RPC surface, which would need a whole deployment —
+        // Not the service's RPC surface, which would need a whole deployment,
         // the same `spawn_blocking` hop it makes, around the same work.
         let secret = Secret::new("correct horse");
         let checked = tokio::task::spawn_blocking(move || secret.verify("wrong"))

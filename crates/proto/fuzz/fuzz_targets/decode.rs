@@ -2,7 +2,7 @@
 //!
 //! `codec::decode` is the very first code an unauthenticated peer reaches, so
 //! its contract is absolute: for *any* byte sequence it returns
-//! `Ok(Some(msg))`, `Ok(None)` or `Err(_)` — and never panics, never aborts on
+//! `Ok(Some(msg))`, `Ok(None)` or `Err(_)`, and never panics, never aborts on
 //! an allocation it was told to make, and never loops forever.
 //!
 //! Run locally:

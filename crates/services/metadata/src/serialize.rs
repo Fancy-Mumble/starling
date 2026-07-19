@@ -42,9 +42,9 @@ fn set_legacy_temporary(state: &mut tcp::ChannelState, temporary: bool) {
 /// A `ChannelState` announcing only a change of links.
 ///
 /// A **delta**, not the whole record, and that is not an optimisation. A stock
-/// client reads a non-empty `links` as the complete set — it unlinks
+/// client reads a non-empty `links` as the complete set, it unlinks
 /// everything and re-links what is listed (`vendor/server/src/mumble/Messages.cpp:935`)
-/// — so an *unlink* announced as full state arrives as an empty repeated field,
+/// so an *unlink* announced as full state arrives as an empty repeated field,
 /// which the client skips entirely and the removed edge stays on its screen
 /// forever. `links_remove` is the only thing that takes a link away.
 #[must_use]
@@ -88,7 +88,7 @@ impl ChannelEdit {
 /// Read an inbound `ChannelState` into a channel and the fields it names.
 ///
 /// Returning the field list rather than a whole channel is what lets an update
-/// touch only what the client sent — the same rule server-config follows, and
+/// touch only what the client sent, the same rule server-config follows, and
 /// for the same reason.
 #[must_use]
 pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
@@ -119,7 +119,7 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
     }
     // `links` is not applied here. A client sends it as a *complete* set and
     // the server's answer to that is a pair of deltas, so it is turned into one
-    // below rather than written over `channel.links` — which the field-wise
+    // below rather than written over `channel.links`, which the field-wise
     // update would then have had to special-case anyway.
 
     // `hidden` was read by nothing, so a client asking for a private room got an
@@ -133,8 +133,8 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
     // tree loads them, but nothing ever took them off the wire, so a client
     // asking for a room that expires got one that never does.
     //
-    // Mode and duration travel together — a mode with no duration has no
-    // deadline to compute, and a duration with no mode is never consulted — so
+    // Mode and duration travel together, a mode with no duration has no
+    // deadline to compute, and a duration with no mode is never consulted, so
     // a client that sends only one of them is asking for something incoherent
     // and neither is applied.
     if let (Some(mode), Some(duration)) = (state.expiry_mode, state.expiry_duration_secs) {

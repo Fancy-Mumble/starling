@@ -27,8 +27,8 @@
 
 /// The built-in administrator's account id.
 ///
-/// Zero, as murmur has it. It bypasses ACL evaluation entirely — an ACL table
-/// that has locked its own administrator out is a server nobody can repair — so
+/// Zero, as murmur has it. It bypasses ACL evaluation entirely, an ACL table
+/// that has locked its own administrator out is a server nobody can repair, so
 /// **every check against it must also require registration**, or every
 /// unregistered guest becomes an administrator. Use [`is_superuser`] rather than
 /// comparing to this directly.
@@ -74,7 +74,7 @@ pub const fn is_superuser(registered: bool, id: u64) -> bool {
 
 /// Whether this subject is in murmur's `@auth` group.
 ///
-/// `iId >= 0` upstream, which is exactly "registered" — **not** "has a session".
+/// `iId >= 0` upstream, which is exactly "registered", **not** "has a session".
 /// Every connected client has a session, so reading it that way puts anonymous
 /// guests in `@auth` and hands them whatever an operator granted to registered
 /// users.

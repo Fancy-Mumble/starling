@@ -7,7 +7,7 @@
 //! reaches everybody, and "the payload is encrypted" does not cover who sent it,
 //! when, or in which channel.
 //!
-//! `session-view` is the only thing that knows the whole server's membership —
+//! `session-view` is the only thing that knows the whole server's membership,
 //! with more than one gateway attached, the connections any single process sees
 //! are a fraction of it. So a service subscribes there and folds every event
 //! into this table, which is then a local lookup.
@@ -57,8 +57,8 @@ pub struct Roster {
     /// Session id to the account behind it, absent for an unregistered guest.
     ///
     /// Session ids are per connection and get recycled; an account is the
-    /// person. Anything that has to outlive a connection — what a user
-    /// answered, what they were sent — must be keyed on this and never on the
+    /// person. Anything that has to outlive a connection, what a user
+    /// answered, what they were sent, must be keyed on this and never on the
     /// session, or a reconnect looks like a stranger and a recycled id looks
     /// like the wrong one.
     accounts: Mutex<HashMap<u32, Option<u64>>>,
@@ -68,7 +68,7 @@ pub struct Roster {
     /// The other durable identity, and the one end-to-end crypto needs: an
     /// account says *who* a person is to this server, a certificate says which
     /// keypair they hold. A guest has no account but may still hold a
-    /// certificate, and pchat's key ladder is keyed on exactly this — peer
+    /// certificate, and pchat's key ladder is keyed on exactly this, peer
     /// keys, channel originators and key holders are all `cert_hash`.
     certs: Mutex<HashMap<u32, Vec<u8>>>,
     warm: AtomicBool,
@@ -247,7 +247,7 @@ impl Roster {
     /// Re-subscribes on failure: a `session-view` restart is a rolling deploy,
     /// not an incident. The stream is also dropped deliberately when a
     /// subscriber falls behind, because a missed delta cannot be repaired from
-    /// the next one — reconnecting replaces the whole table, which is the only
+    /// the next one, reconnecting replaces the whole table, which is the only
     /// way back to agreement.
     ///
     /// `gate` is opened after the first event rather than before, because a

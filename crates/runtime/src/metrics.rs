@@ -6,7 +6,7 @@
 //! not a measurement.
 //!
 //! One further lesson, carried over from the bus experiments: **the failure
-//! mode was refusal, not latency** — 392 of 400 slow publications were refused
+//! mode was refusal, not latency**, 392 of 400 slow publications were refused
 //! outright rather than delayed. So watch refusals, not percentiles, and make
 //! refusals the easiest thing in here to find.
 
@@ -52,7 +52,7 @@ impl Metrics {
     /// The counter called `name`, creating it if this is the first mention.
     ///
     /// Counters are created on demand rather than declared up front so a metric
-    /// cannot exist in the code and be missing from the registry — the failure
+    /// cannot exist in the code and be missing from the registry, the failure
     /// where a drop is counted into a counter nobody exports.
     #[must_use]
     pub fn counter(&self, name: &str) -> Counter {

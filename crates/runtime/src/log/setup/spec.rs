@@ -2,8 +2,8 @@
 //!
 //! Deliberately plain data with no `serde`: this is the *vocabulary* an operator's
 //! intent is expressed in, not a file format. A binary maps its own configuration
-//! onto this — which section names it uses, which defaults it applies, whether it
-//! reads TOML or an `.ini` — and this crate never learns any of that.
+//! onto this, which section names it uses, which defaults it applies, whether it
+//! reads TOML or an `.ini`, and this crate never learns any of that.
 
 use crate::log::{Category, Severity};
 

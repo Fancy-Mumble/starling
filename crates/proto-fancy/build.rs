@@ -29,7 +29,7 @@ const SERVICES: &[&str] = &[
 
 /// Contracts that carry only shared primitives, imported by the files below.
 ///
-/// These compile in their own pass and are then declared external — see the
+/// These compile in their own pass and are then declared external, see the
 /// note in `main`. One per plane: `common` for the mesh, `fancy/wire` for the
 /// client wire (docs/PROTOCOL-REDESIGN.md §7).
 const PRIMITIVES: &[(&str, &str, &str)] = &[

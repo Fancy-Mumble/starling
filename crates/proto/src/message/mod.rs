@@ -14,7 +14,7 @@ use crate::proto::tcp;
 ///
 /// The Fancy fork defines ~70 extension messages (ids 100–171, 200–201). A
 /// staged port cannot implement them all at once, but the *framing* layer must
-/// be complete and correct from day one — otherwise an unimplemented message
+/// be complete and correct from day one, otherwise an unimplemented message
 /// desynchronises the stream and takes the whole connection down.
 ///
 /// [`ControlMessage::Opaque`] keeps the frame intact and the stream in sync
@@ -27,7 +27,7 @@ pub enum ControlMessage {
     /// Tunnelled UDP audio: the raw UDP packet, *not* a protobuf message.
     ///
     /// `Mumble.proto` does define a `UDPTunnel` message, but its own comment
-    /// says it is "Not used. Not even for tunneling UDP through TCP" — the
+    /// says it is "Not used. Not even for tunneling UDP through TCP", the
     /// payload is the UDP packet verbatim. Both murmur and the FancyMumble
     /// client treat it that way.
     UdpTunnel(Bytes),

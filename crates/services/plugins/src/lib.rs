@@ -1,7 +1,7 @@
-//! `plugins` — the host, and the storage capability plugins persist through.
+//! `plugins`: the host, and the storage capability plugins persist through.
 //!
 //! **Plugins are opaque to the server.** It shuttles opaque data and offers
-//! generic callbacks — permissions, sessions, config, storage — and never
+//! generic callbacks (permissions, sessions, config, storage) and never
 //! learns a plugin's name, message schema or feature semantics. That principle
 //! was applied to the wire protocol; it applies equally to storage, which is
 //! why the core schema contains no plugin-specific tables and a plugin gets a
@@ -9,7 +9,7 @@
 //!
 //! Storage is **ordered, namespaced key/value with atomic batches** (§5.4). The
 //! namespace is implicit: the host knows which plugin is calling and scopes
-//! every operation to it, so a plugin cannot name — or reach — another's data.
+//! every operation to it, so a plugin cannot name (or reach) another's data.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -265,7 +265,7 @@ const MAX_PLUGIN_DATA_ID: usize = 256;
 impl PluginsService {
     /// Relay one `PluginDataTransmission` to the receivers it names.
     ///
-    /// The payload stays opaque — the server never parses what a plugin sent —
+    /// The payload stays opaque (the server never parses what a plugin sent)
     /// but the *envelope* is not opaque, and treating it as such was a bug in
     /// two directions (`vendor/server/src/murmur/Messages.cpp:3384`):
     ///

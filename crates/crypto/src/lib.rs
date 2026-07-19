@@ -16,7 +16,7 @@
 //!
 //! # The design
 //!
-//! Security choices come in coherent *families* — a TLS floor and a voice cipher
+//! Security choices come in coherent *families*, a TLS floor and a voice cipher
 //! that make sense together. That is an Abstract Factory:
 //!
 //! ```text
@@ -32,7 +32,7 @@
 //! A stock client announces no Fancy version, gets [`LegacySuite`], and behaves
 //! exactly as it does against murmur. A Fancy client announces one, gets
 //! [`FancySuite`], and is held to modern primitives. Neither branch is a special
-//! case in a handler — the negotiation happens once and the result is carried on
+//! case in a handler, the negotiation happens once and the result is carried on
 //! the connection.
 //!
 //! Note that rustls does not implement TLS 1.0 or 1.1 **at all**, so Starling's

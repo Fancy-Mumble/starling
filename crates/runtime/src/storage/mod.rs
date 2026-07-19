@@ -2,8 +2,8 @@
 //! table.
 //!
 //! **Each service owns its own schema. No service reads another's tables.** A
-//! shared database *service* would keep the schema coupling and add a hop — the
-//! anti-pattern this architecture exists to avoid — so what is shared is this
+//! shared database *service* would keep the schema coupling and add a hop, the
+//! anti-pattern this architecture exists to avoid, so what is shared is this
 //! code, not the data (`docs/ARCHITECTURE.md` §4).
 //!
 //! Two rules from `docs/STORAGE.md` are enforced by the shape of this module
@@ -56,7 +56,7 @@ impl Store {
     /// Open `url` and apply nothing yet.
     ///
     /// Migrations are applied by the owning service, because the schema belongs
-    /// to it — this type deliberately does not know what tables exist.
+    /// to it, this type deliberately does not know what tables exist.
     ///
     /// # Errors
     ///
@@ -111,7 +111,7 @@ impl Store {
         // `AssertSqlSafe` because sqlx 0.9 will only take a `&'static str`
         // otherwise, and this is schema work: every caller passes a `Migration`
         // constant compiled into the binary. No value from a client reaches
-        // here — a migration is not somewhere user data is interpolated — which
+        // here (a migration is not somewhere user data is interpolated) which
         // is exactly the audit the assertion is asking for.
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(self.pool())
@@ -129,7 +129,7 @@ pub(crate) async fn memory_store() -> Store {
     // A shared-cache in-memory database: a private one would be a different,
     // empty database per pooled connection. Named uniquely per call, because
     // `cache=shared` makes same-named databases visible to every connection
-    // that names them — sharing one name across tests would let them race on
+    // that names them, sharing one name across tests would let them race on
     // the same tables.
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);

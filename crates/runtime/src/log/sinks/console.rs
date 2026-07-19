@@ -9,7 +9,7 @@ use crate::log::timestamp;
 /// Writes one line per record.
 ///
 /// Generic over the destination so tests can capture the output, but defaults to
-/// stderr — stdout belongs to the program's actual output (`migrate-config`
+/// stderr, stdout belongs to the program's actual output (`migrate-config`
 /// prints a config there, and a log line in the middle of it would corrupt the
 /// result).
 pub struct ConsoleSink {
@@ -46,7 +46,7 @@ impl ConsoleSink {
 
     /// Render a record as one line.
     ///
-    /// `<timestamp> <SEVERITY> <category> <message> key=value …`
+    /// `<timestamp> <SEVERITY> <category> <message> key=value ...`
     #[must_use]
     pub fn format(event: &LogEvent) -> String {
         let mut line = format!(

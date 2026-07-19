@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 // Operational configuration: everything murmur lets an operator change while
-// the server runs. Deployment configuration is the TOML and is not here —
+// the server runs. Deployment configuration is the TOML and is not here,
 // docs/CONFIGURATION.md.
 package starling.serverconfig.v1;
 
@@ -62,7 +62,7 @@ message Snapshot {
   // Whether this server answers an unauthenticated UDP ping with its version
   // and user counts. murmur's `allowping`, default true, and it gates two
   // things rather than one: the ping a server browser sends, and public-list
-  // registration — which refuses to run without it, because a listing nobody
+  // registration, which refuses to run without it, because a listing nobody
   // can measure is a dead entry.
   bool allow_ping = 30;
   // The rest of murmur's `register*` block. Operational rather than deployment

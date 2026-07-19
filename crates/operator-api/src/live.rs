@@ -6,8 +6,8 @@
 //! two.
 //!
 //! **WebSocket is the one that works everywhere.** WebTransport needs the
-//! deployment to terminate QUIC — reverse proxies do not generally forward
-//! Extended CONNECT over HTTP/3 — so it is off unless configured, and the
+//! deployment to terminate QUIC, reverse proxies do not generally forward
+//! Extended CONNECT over HTTP/3, so it is off unless configured, and the
 //! WebSocket is what a proxied deployment uses.
 //!
 //! # Why the channel is bidirectional
@@ -86,7 +86,7 @@ async fn serve(socket: WebSocket, api: Arc<OperatorApi>, subject: String) {
     // Told on arrival, not only at the moment the bridge attaches. `started` is
     // published once and this channel is not a replay, so without this a
     // subscriber that connects to an already-running server is never told the
-    // state below it is readable — which is the only thing `started` says.
+    // state below it is readable, which is the only thing `started` says.
     if api.events().is_live()
         && sink
             .send(Message::Text(

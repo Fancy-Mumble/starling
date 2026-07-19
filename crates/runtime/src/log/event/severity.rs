@@ -9,7 +9,7 @@ pub enum Severity {
     Debug,
     /// Normal operation worth recording.
     Info,
-    /// Normal, but notable — an administrator changed something.
+    /// Normal, but notable, an administrator changed something.
     Notice,
     /// Something was refused or degraded, but the server carried on.
     Warning,

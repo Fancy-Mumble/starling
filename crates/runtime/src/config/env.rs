@@ -2,7 +2,7 @@
 //! and `docker compose` works without a mount.
 //!
 //! The rule is one line: `[services.text] endpoint` becomes
-//! `STARLING_SERVICES_TEXT_ENDPOINT` — uppercase, dots and dashes to
+//! `STARLING_SERVICES_TEXT_ENDPOINT`: uppercase, dots and dashes to
 //! underscores, `STARLING_` prefix.
 //!
 //! # Why the walk goes outwards from the config rather than inwards from the
@@ -33,7 +33,7 @@ pub fn env_key(path: &[&str]) -> String {
 /// # Errors
 ///
 /// [`ConfigError::Environment`] when a value does not fit the key it overrides
-/// — a port that is not a number is a startup failure, not a default.
+/// a port that is not a number is a startup failure, not a default.
 pub fn apply_environment(
     config: &mut Config,
     vars: &[(String, String)],

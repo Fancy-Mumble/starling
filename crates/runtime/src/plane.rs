@@ -5,8 +5,8 @@
 //! server actions out. Writing that stream plumbing nineteen times would be
 //! nineteen chances to get backpressure, fan-out or drain subtly different.
 //!
-//! So a service implements [`ClientService`] — three async methods over
-//! *decoded* events — and [`Plane`] turns that into the gRPC surface. A service
+//! So a service implements [`ClientService`], three async methods over
+//! *decoded* events, and [`Plane`] turns that into the gRPC surface. A service
 //! that wants to push without being asked (a fan-out, a broadcast) sends into
 //! its [`Fanout`], which every attached gateway is subscribed to.
 //!
@@ -151,7 +151,7 @@ impl Fanout {
     /// Receive everything pushed from now on.
     ///
     /// Public because a service that pushes from somewhere other than a
-    /// [`ClientService`] method — voice's packet path is the one that does —
+    /// [`ClientService`] method (voice's packet path is the one that does)
     /// has no returned `Actions` for a test to inspect, and asserting on what
     /// reached the gateway is the only way to test it end to end.
     #[must_use]
@@ -201,7 +201,7 @@ impl<S: ClientService> Plane<S> {
     ///
     /// `name` is what this service is called in the log. It is passed in rather
     /// than derived because [`ClientService`] deliberately knows nothing about
-    /// deployment — but a frame log that cannot say *which* of nineteen
+    /// deployment, but a frame log that cannot say *which* of nineteen
     /// services handled the frame is not worth writing.
     #[must_use]
     pub fn new(service: Arc<S>, fanout: Fanout, name: &'static str) -> Self {

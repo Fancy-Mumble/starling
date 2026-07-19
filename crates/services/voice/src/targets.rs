@@ -8,7 +8,7 @@
 //! # Why the registration is per session and not global
 //!
 //! Target 3 means something different for every speaker. Two clients both using
-//! slot 3 for unrelated groups is the normal case, not a collision — which is
+//! slot 3 for unrelated groups is the normal case, not a collision, which is
 //! why this is a map from session to slots rather than a table of routes.
 //!
 //! # What the words mean
@@ -27,7 +27,7 @@ use crate::ports::{ChannelId, SessionId};
 /// The highest slot a client may register.
 ///
 /// Slots run 1..=30: 0 is normal speech and 31 is the loopback, and neither can
-/// be reassigned. A client asking for either is refused rather than clamped —
+/// be reassigned. A client asking for either is refused rather than clamped,
 /// silently rewriting slot 31 would break the client's connectivity probe.
 pub const MAX_TARGET: u8 = 30;
 
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_slot_beyond_five_bits_is_refused() {
-        // Cannot arrive honestly — the field is five bits — but a hostile peer
+        // Cannot arrive honestly (the field is five bits) but a hostile peer
         // writes what it likes into a TCP message.
         let mut registry = TargetRegistry::new();
         for slot in [32, 100, 255] {

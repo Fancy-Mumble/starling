@@ -1,4 +1,4 @@
-//! `starling-runtime` — the one common standalone crate.
+//! `starling-runtime`: the one common standalone crate.
 //!
 //! Every service is a library crate plus a one-line binary:
 //!
@@ -11,7 +11,7 @@
 //!
 //! * TOML config with environment override, so a `ConfigMap` works untemplated
 //! * a tonic bootstrap over TCP or a Unix socket
-//! * `/healthz` and `/readyz`, **distinct** — readiness fails while caches warm
+//! * `/healthz` and `/readyz`, **distinct**, readiness fails while caches warm
 //! * `SIGTERM` → graceful drain, because Kubernetes kills you 30 s later anyway
 //! * tracing with a request id threaded through every hop, and a metrics endpoint
 //! * endpoint discovery, which Kubernetes DNS fills in for free

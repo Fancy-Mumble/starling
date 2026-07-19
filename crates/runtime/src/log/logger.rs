@@ -22,7 +22,7 @@ enum Message {
 /// bounded queue drained by a dedicated OS thread. A slow disk cannot stall the
 /// voice path.
 ///
-/// Cheap to clone — every clone feeds the same writer.
+/// Cheap to clone, every clone feeds the same writer.
 #[derive(Debug, Clone)]
 pub struct Logger {
     tx: SyncSender<Message>,
@@ -30,7 +30,7 @@ pub struct Logger {
     /// murmur's `obfuscate`: whether addresses are written as pseudonyms.
     ///
     /// Shared with the writer thread, and with every clone of this logger. An
-    /// operator turning it on means the *next* record, not the next restart —
+    /// operator turning it on means the *next* record, not the next restart,
     /// which is the whole reason it is an atomic here rather than an argument
     /// to `spawn`.
     obfuscate: Arc<AtomicBool>,
@@ -85,7 +85,7 @@ impl Logger {
     /// put one: a [`ServiceContext`](crate::serve::ServiceContext) built in a
     /// test, and a unit started by something that never configured logging.
     /// Dropping that handle would stop the writer and turn every later `log`
-    /// into a silent increment of the dropped counter — a logger that looks
+    /// into a silent increment of the dropped counter, a logger that looks
     /// alive and is not.
     ///
     /// So the pair is parked in a `LazyLock` and lives for the process: one
@@ -100,7 +100,7 @@ impl Logger {
 
     /// Queue a record. Never blocks; never fails.
     ///
-    /// If the queue is full the record is dropped and counted — see
+    /// If the queue is full the record is dropped and counted, see
     /// [`Self::dropped`]. Blocking here would let a slow sink apply
     /// backpressure to the server, which is exactly what a log must never do.
     pub fn log(&self, event: LogEvent) {
@@ -115,7 +115,7 @@ impl Logger {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Whether addresses are written as pseudonyms — murmur's `obfuscate`.
+    /// Whether addresses are written as pseudonyms, murmur's `obfuscate`.
     ///
     /// Set from `server-config`'s `obfuscate_ips` by whichever service watches
     /// it; every clone of this logger, in this process, follows.
@@ -161,14 +161,14 @@ impl Drop for LoggerShutdown {
 
 /// How long a record may sit in a sink's buffer before being made durable.
 ///
-/// A graceful shutdown flushes, but `SIGKILL` and the OOM killer do not — and
+/// A graceful shutdown flushes, but `SIGKILL` and the OOM killer do not, and
 /// those are exactly the deaths whose last records matter. This bounds the loss
 /// window instead of leaving it open until the buffer happens to fill.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The writer thread: the only thing that touches the sink.
 ///
-/// A struct because it has state that must survive between messages — the sink,
+/// A struct because it has state that must survive between messages, the sink,
 /// how many drops have already been reported, and whether anything is waiting to
 /// be flushed. That state used to live as locals in a `run` function which passed
 /// `&mut reported` down to a helper; an accumulator threaded through a call is a
@@ -313,7 +313,7 @@ mod tests {
     fn obfuscate_ips_decides_whether_an_address_reaches_the_sink() {
         // §5's `obfuscate_ips`: it existed, it was settable, and addresses were
         // written out in full regardless. The same record, logged twice, with
-        // only the setting different — an assertion that it round-trips through
+        // only the setting different, an assertion that it round-trips through
         // the API would have passed before any of this existed.
         let (logger, shutdown, handle) = logger_with_memory(64);
         let record = || {
@@ -324,7 +324,7 @@ mod tests {
 
         logger.log(record());
         // The writer is a separate thread, so the first record has to have been
-        // *written* before the setting changes — otherwise the test is racing
+        // *written* before the setting changes, otherwise the test is racing
         // the queue and would occasionally obfuscate both. A flush is ordered
         // behind the record in the same channel, so observing the flush
         // observes the write.
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn turning_obfuscation_off_again_restores_the_address() {
         // An operator investigating an incident turns it off, and the next
-        // record has to be the readable one — not the next restart's.
+        // record has to be the readable one, not the next restart's.
         let (logger, shutdown, handle) = logger_with_memory(64);
         logger.set_obfuscate_addresses(true);
         logger.set_obfuscate_addresses(false);

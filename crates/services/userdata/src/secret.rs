@@ -1,7 +1,7 @@
 //! Password hashing and TOTP.
 //!
 //! PBKDF2-HMAC-SHA256 with a per-account salt and a recorded iteration count,
-//! so raising the count later does not invalidate existing passwords — the
+//! so raising the count later does not invalidate existing passwords, the
 //! stored value carries the count it was made with.
 //!
 //! Comparison is constant-time. A timing side channel on a password check is
@@ -28,7 +28,7 @@ pub const DEFAULT_ITERATIONS: u32 = 210_000;
 /// rather than a behaviour: this is precisely the knob somebody reaches for
 /// when logins feel slow, and it should not be possible to turn it down and
 /// still get a build. If logins are slow the answer is a **release build** and
-/// the blocking pool — the derivation costs 1.45 s compiled without
+/// the blocking pool, the derivation costs 1.45 s compiled without
 /// optimisation and 30 ms with, and only one of those is what ships.
 const _: () = assert!(
     DEFAULT_ITERATIONS >= 210_000,

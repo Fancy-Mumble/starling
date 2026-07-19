@@ -7,7 +7,7 @@
 //! one, and a client that presents the right certificate is admitted without a
 //! password (`vendor/server/src/murmur/Messages.cpp:418`). None of that is
 //! reachable unless the server requests a certificate during the TLS handshake
-//! — and a server built with rustls's `with_no_client_auth()` never does, so
+//! and a server built with rustls's `with_no_client_auth()` never does, so
 //! every peer arrives anonymous and none of those mechanisms can ever fire.
 //!
 //! # Why it accepts a certificate that chains to nothing
@@ -29,7 +29,7 @@
 //!
 //! Accepting any *issuer* is not accepting anything at all. The handshake
 //! signature is still verified against the presented key, by rustls, using the
-//! provider's own algorithms — so a peer must actually hold the private key for
+//! provider's own algorithms, so a peer must actually hold the private key for
 //! the certificate it offers. Without that a client could claim any hash it
 //! liked by copying somebody else's public certificate, and certificate
 //! identity would be worse than none.
@@ -57,7 +57,7 @@ pub struct PeerCertificate {
     /// SHA-1 and not something stronger because this value is a **compatibility
     /// key**: it has to equal what every existing Mumble client, murmur
     /// database and ban list already computed. Its collision resistance is not
-    /// what protects the account — holding the private key is, and that is
+    /// what protects the account, holding the private key is, and that is
     /// checked during the handshake.
     pub hash: Vec<u8>,
     /// The chain as presented, leaf first, DER-encoded.
@@ -143,7 +143,7 @@ impl ClientCertVerifier for AcceptAnyClientCertificate {
     ///
     /// The certificate is still parsed by rustls before this is reached, and
     /// the peer must still prove possession of the private key in the two
-    /// signature checks below — so "accepted" means "identified", not
+    /// signature checks below, so "accepted" means "identified", not
     /// "unauthenticated".
     fn verify_client_cert(
         &self,

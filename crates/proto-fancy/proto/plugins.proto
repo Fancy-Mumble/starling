@@ -17,7 +17,7 @@ service Plugins {
   // Opaque plugin traffic, in both directions.
   rpc Deliver(PluginMessage) returns (starling.common.v1.Ack);
 
-  // Ordered, namespaced key/value with atomic batches — docs/STORAGE.md §5.4.
+  // Ordered, namespaced key/value with atomic batches, docs/STORAGE.md §5.4.
   // The namespace is implicit: the host knows which plugin is calling.
   rpc KvGet(KvGetRequest) returns (KvValue);
   rpc KvScan(KvScanRequest) returns (KvPage);
@@ -48,7 +48,7 @@ message InstallRequest {
   starling.common.v1.Scope scope = 1;
   starling.common.v1.Actor actor = 2;
   string id = 3;
-  // Where the binary is fetched from — a files-service key, never inline bytes
+  // Where the binary is fetched from, a files-service key, never inline bytes
   // on the control plane.
   string source_key = 4;
   bytes sha256 = 5;

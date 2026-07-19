@@ -1,4 +1,4 @@
-//! `pchat` — persistent chat: a relay and a store, never a decryptor.
+//! `pchat`: persistent chat: a relay and a store, never a decryptor.
 //!
 //! The end-to-end crypto lives in the client
 //! (`vendor/client/crates/mumble-protocol/src/persistent/`), so this service
@@ -7,7 +7,7 @@
 //! chat).
 //!
 //! The key is `channel_id ‖ uuidv7`, so the table is physically ordered
-//! tenant → channel → time. Both fetch shapes — newest page and scroll-back —
+//! tenant → channel → time. Both fetch shapes (newest page and scroll-back)
 //! are then one backwards range scan, which is what turns murmur's full scan of
 //! an unindexed `TEXT` UUID into an index seek (`docs/STORAGE.md` L3).
 
@@ -64,7 +64,7 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
     ],
 ),
     // The archive recorded its author as a session id, which is handed out per
-    // connection and reused — so a message written last week is attributed to
+    // connection and reused, so a message written last week is attributed to
     // whoever holds that number now. Sessions are the wrong key for anything
     // that outlives a connection (`Roster::accounts` says so in as many words);
     // an archive is the longest-lived thing this server keeps.
@@ -80,7 +80,7 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
     // What a reader needs to decrypt what it fetches back. The archive stored
     // the ciphertext and the epoch *number* but not which key that was, so a
     // channel that forked during a membership change had two epoch 4s and the
-    // page came back undecryptable — with nothing to distinguish "wrong key"
+    // page came back undecryptable, with nothing to distinguish "wrong key"
     // from "corrupt". Opaque to this service, like the ciphertext beside them.
     Migration::new(
         "0003_pchat_decryption_context",
@@ -254,8 +254,8 @@ struct Relay {
     /// The certificate this body claims for its own sender, when it names one.
     ///
     /// Read so the relay can refuse a body claiming somebody else's identity.
-    /// The bodies are re-sent verbatim — they carry signatures over their own
-    /// encoding — so this cannot be stamped the way `Message.sender_cert` is;
+    /// The bodies are re-sent verbatim, they carry signatures over their own
+    /// encoding, so this cannot be stamped the way `Message.sender_cert` is;
     /// it is checked instead. Absent for bodies that claim no identity.
     claims: Option<Vec<u8>>,
 }
@@ -506,7 +506,7 @@ impl PchatService {
 
         // A body that names its own sender must name the connection's own
         // certificate. Without this, anyone in the channel could announce a
-        // public key under somebody else's identity and be relayed as them —
+        // public key under somebody else's identity and be relayed as them,
         // and key distribution is exactly the place where being believed about
         // who you are is the whole game.
         //
@@ -621,7 +621,7 @@ mod tests {
 
     /// The same service with a warm roster, so a relay has somewhere to go.
     ///
-    /// Sessions 7, 8 are in channel 4 and session 9 is in channel 9 — enough to
+    /// Sessions 7, 8 are in channel 4 and session 9 is in channel 9, enough to
     /// tell "the channel" from "everyone".
     /// The certificate behind session 7, as the TLS connection presented it.
     const SPEAKER_CERT: &[u8] = b"\x01\x02speaker-cert";
@@ -696,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn the_archive_keeps_an_identity_that_outlives_the_session() {
         // The archive recorded its author as a session id, which is handed out
-        // per connection and reused — so a message written last week is
+        // per connection and reused, so a message written last week is
         // attributed to whoever holds that number today. An archive is the
         // longest-lived thing this server keeps, and a session is the shortest
         // lived name in it.
@@ -745,7 +745,7 @@ mod tests {
         // every member who trusts it seals their next epoch key to you.
         //
         // The body is relayed verbatim because it is signed over its own bytes,
-        // so there is nothing to correct — it is refused instead. Session 7's
+        // so there is nothing to correct; it is refused instead. Session 7's
         // certificate is `SPEAKER_CERT`; this claims a different one.
         let service = service_with_members().await;
         let forged = pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
@@ -760,7 +760,7 @@ mod tests {
         );
 
         // The same body under its own identity gets as far as the permission
-        // check, which the test resolver denies — so this asserts it was *not*
+        // check, which the test resolver denies, so this asserts it was *not*
         // stopped by the identity check, which is the distinction that matters.
         let honest = pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
             channel: 4,
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(roster.cert_of(8), None, "no certificate is not an identity");
         assert_eq!(roster.cert_of(99), None, "an unknown session has none either");
 
-        // The snapshot path, which is how a subscription actually opens — and
+        // The snapshot path, which is how a subscription actually opens, and
         // which this test caught missing the certificates entirely. Getting it
         // only in `upsert` fails closed rather than open (an unknown identity
         // matches nothing, so every announcement is refused), but the feature
@@ -950,7 +950,7 @@ mod tests {
         // every member a copy of a message addressed to one of them.
         //
         // Asserted against `Relay::of` rather than through `frame`, because the
-        // test resolver denies every permission — a frame test would pass on
+        // test resolver denies every permission, a frame test would pass on
         // the refusal and prove nothing about the addressing.
         let relay = Relay::of(&pchat_envelope::Body::KeyDeliver(KeyDeliver {
             channel: 4,

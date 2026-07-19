@@ -1,7 +1,7 @@
 //! The account store: typed columns, the indexes its queries need, and the
 //! in-memory cache authentication reads from.
 //!
-//! `docs/STORAGE.md` L1 and L2 in one table — no entity-attribute-value rows,
+//! `docs/STORAGE.md` L1 and L2 in one table, no entity-attribute-value rows,
 //! a unique index on the name and one on the certificate hash, because those
 //! are exactly the two lookups authentication performs.
 
@@ -20,7 +20,7 @@ use crate::secret::{Secret, verify_totp};
 /// How many characters a generated SuperUser password has.
 ///
 /// Twenty from a 56-character alphabet is about 116 bits, which is far past
-/// anything that matters — the length is chosen for what it *cannot* be, namely
+/// anything that matters, the length is chosen for what it *cannot* be, namely
 /// short enough for somebody to decide it is fine to leave as it is.
 const GENERATED_PASSWORD_LEN: usize = 20;
 
@@ -81,7 +81,7 @@ struct Record {
 /// What the peer has already proved by the time the password is considered.
 ///
 /// The distinction matters only in one case, and that case is a security hole:
-/// an account with no stored password. Reached by certificate that is fine — the
+/// an account with no stored password. Reached by certificate that is fine, the
 /// certificate *was* the proof. Reached by name it is not, and the two paths are
 /// otherwise identical enough to be confused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,7 @@ impl Accounts {
 
         match by_cert {
             // A certificate that matches an account is the strongest signal
-            // murmur has — but it authenticates **that account and no other**.
+            // murmur has, but it authenticates **that account and no other**.
             //
             // This arm used to be `(Some(record), _)`, matching on the
             // certificate alone and ignoring the name the peer asked for. The
@@ -206,7 +206,7 @@ impl Accounts {
             }
             // The certificate belongs to a different account than the one being
             // claimed, so it proves nothing about this login and is set aside.
-            // Resolution falls to the name, which carries its own proof — and
+            // Resolution falls to the name, which carries its own proof, and
             // the impersonation guard below still applies, so a peer cannot use
             // one account's certificate to take another's name.
             _ => match by_name {
@@ -224,8 +224,8 @@ impl Accounts {
                 // server-config's question, not this one's.
                 //
                 // Reached by a peer holding a valid certificate for another
-                // account too. That is a *downgrade* — they take no privileges
-                // with them — so it is allowed, and it is the only way for
+                // account too. That is a *downgrade*, they take no privileges
+                // with them, so it is allowed, and it is the only way for
                 // somebody to connect under a second, unregistered name from a
                 // machine they have already registered from.
                 None => AuthResult {
@@ -245,7 +245,7 @@ impl Accounts {
             }
             // A registered account with no stored password, claimed by name
             // alone. There is nothing here to check, so accepting would hand
-            // the account — and every permission it holds — to whoever typed
+            // the account (and every permission it holds) to whoever typed
             // the name. It is refused rather than downgraded to a guest,
             // because a guest wearing a registered name is the impersonation
             // the name-taken branch above exists to prevent.
@@ -306,10 +306,10 @@ impl Accounts {
     /// a registered `Alice` who was offline could be worn by a guest calling
     /// themselves `alice`, because `NameTaken` is reachable only through here.
     /// A registration that protects a name only while its owner is connected
-    /// protects nothing — being connected is what already protects it.
+    /// protects nothing, being connected is what already protects it.
     ///
     /// It also made `identity.rs`'s claim untrue, that the SuperUser name is
-    /// "matched case-insensitively … because every Mumble client offers it as
+    /// "matched case-insensitively ... because every Mumble client offers it as
     /// the administrator login". Now it is.
     ///
     /// # Why an exact match still wins
@@ -318,12 +318,12 @@ impl Accounts {
     /// `alice` as two accounts. Collapsing them would take one person's login
     /// away, so an exact match is preferred and returned immediately: both
     /// legacy accounts keep working, and only a *third* spelling resolves by
-    /// fold. New collisions cannot be created — `register` and `rename` gate on
+    /// fold. New collisions cannot be created, `register` and `rename` gate on
     /// this same lookup, so `alice` is now refused while `Alice` exists.
     ///
     /// Ties are broken by the lowest account id rather than by iteration order.
     /// The cache is a `HashMap`, so "whichever came first" is a different
-    /// answer in every process — and an authentication that depends on hash
+    /// answer in every process, and an authentication that depends on hash
     /// seeding is not one anybody can reason about.
     fn record_by_name(&self, scope: u32, name: &str) -> Option<Record> {
         let cache = self.cache.lock().ok()?;
@@ -425,7 +425,7 @@ impl Accounts {
     /// evidence. `update` treats a name change as sensitive and demands the
     /// account's current password, which is right when a user is editing their
     /// own profile: a hijacked session must not be able to rename the account
-    /// out from under its owner. It is *impossible* for the other caller — an
+    /// out from under its owner. It is *impossible* for the other caller, an
     /// administrator holding `Register` renaming somebody through the
     /// registered-user dialog, who does not know that person's password and
     /// must not need to. Folding the two together would mean either weakening
@@ -435,7 +435,7 @@ impl Accounts {
     ///
     /// The name, if it is empty or already registered. Uniqueness is checked
     /// here rather than left to the `ux_account_name` index: a violated index
-    /// fails inside [`Self::write`], which only logs — so the cache would keep
+    /// fails inside [`Self::write`], which only logs, so the cache would keep
     /// the new name while the table kept the old one, and the two would disagree
     /// until the next restart.
     pub async fn rename(&self, scope: u32, id: u64, name: &str) -> Result<Account, String> {
@@ -473,7 +473,7 @@ impl Accounts {
     /// `None` means the account was already there, which is what makes this safe
     /// to call on every boot: the credential is announced exactly once, at
     /// creation, and a restart never prints it again. murmur does the same thing
-    /// for the same reason — an operator who missed the line uses
+    /// for the same reason, an operator who missed the line uses
     /// `set-superuser-password` rather than expecting it to reappear.
     pub async fn ensure_superuser(&self, scope: u32) -> Option<String> {
         if self.by_id(scope, identity::SUPERUSER).is_some() {
@@ -528,7 +528,7 @@ impl Accounts {
     ///
     /// # Errors
     ///
-    /// A message when the current password is required and wrong — a hijacked
+    /// A message when the current password is required and wrong, a hijacked
     /// session must not be able to lock the owner out of their own account.
     pub async fn update(&self, scope: u32, request: UpdateRequest) -> Result<Account, String> {
         let Some(mut record) = self
@@ -745,7 +745,7 @@ mod tests {
     async fn a_registered_name_cannot_be_worn_by_changing_its_case() {
         // The impersonation guard was reachable only through a case-sensitive
         // lookup, so it protected a registered name **only while its owner was
-        // connected** — the live-session check beside it has always folded case.
+        // connected**, the live-session check beside it has always folded case.
         // Being connected is what already protects a name; the registration is
         // supposed to protect it when they are not.
         let accounts = accounts().await;
@@ -882,8 +882,8 @@ mod tests {
         // whose certificate belonged to one account, connecting under another
         // name, was resolved to the certificate's account.
         //
-        // It surfaced as "wrong password" — the typed administrator password
-        // checked against somebody else's secret — which is the safe direction
+        // It surfaced as "wrong password", the typed administrator password
+        // checked against somebody else's secret, which is the safe direction
         // of a wrong answer. The unsafe direction is the same code path: had
         // the certificate's account carried no password, the peer would have
         // been *admitted* as an identity they never claimed.
@@ -1026,7 +1026,7 @@ mod tests {
     async fn a_registered_account_with_no_password_cannot_be_claimed_by_name() {
         // Reachable through data, not code: an account row written before
         // passwords were stored carries a NULL, and the check used to be
-        // skipped entirely when there was nothing to check — so the name alone
+        // skipped entirely when there was nothing to check, so the name alone
         // was enough. For a SuperUser in that state it hands over the server.
         let accounts = accounts().await;
         let _ = accounts
@@ -1060,7 +1060,7 @@ mod tests {
     async fn a_certificate_still_authenticates_an_account_that_has_no_password() {
         // The other half of the rule above: a certificate *is* the proof, so
         // requiring a password on top of it would lock out every account that
-        // registered by certificate — which is how Mumble expects it to work.
+        // registered by certificate, which is how Mumble expects it to work.
         let accounts = accounts().await;
         let hash = vec![9_u8, 9, 9, 9];
         let _ = accounts
@@ -1257,7 +1257,7 @@ mod tests {
     async fn an_administrator_renames_an_account_without_its_password() {
         // The whole reason `rename` exists next to `update`. Renaming somebody
         // through the registered-user dialog is authorised by `Register` on the
-        // caller, and the caller does not know — and must not need — the
+        // caller, and the caller does not know (and must not need) the
         // password of the account they are renaming.
         let accounts = accounts().await;
         let account = accounts
@@ -1287,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn renaming_onto_a_taken_name_is_refused_before_it_is_written() {
         // `ux_account_name` would refuse this in the table, and `write` only
-        // logs a failure — so without the check here the cache would hold two
+        // logs a failure, so without the check here the cache would hold two
         // accounts with one name while the table held the old one, and the two
         // would disagree until a restart resolved it in favour of the row
         // nobody asked for.

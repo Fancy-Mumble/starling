@@ -2,8 +2,8 @@
 //!
 //! The routing core is a pure function of a snapshot ([`crate::routing`]), and
 //! this is where the snapshot comes from. `session-view` is the only thing that
-//! knows the whole server's membership — with more than one gateway attached,
-//! the connections this process can see are a fraction of it — so voice
+//! knows the whole server's membership, with more than one gateway attached,
+//! the connections this process can see are a fraction of it, so voice
 //! subscribes there and folds every event into a table it can rebuild from.
 //!
 //! # Why a cache and not a lookup
@@ -20,7 +20,7 @@
 //! Exactly one thing, and it is worth naming because it has no log line: a
 //! session missing from here is a session nobody hears and who hears nobody.
 //! Voice's readiness therefore gates on this subscription being warm rather
-//! than on the process being alive — a voice service that is up with a cold
+//! than on the process being alive, a voice service that is up with a cold
 //! cache is a voice service that silently drops every frame.
 
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ pub struct SessionCache {
 }
 
 impl SessionCache {
-    /// An empty cache — nobody connected, and nobody audible.
+    /// An empty cache, nobody connected, and nobody audible.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -77,7 +77,7 @@ impl SessionCache {
     ///
     /// Asked when a client registers a whisper target, because the permission
     /// for whispering to somebody is held in *their* channel rather than the
-    /// speaker's. Off the packet path entirely — this runs once per
+    /// speaker's. Off the packet path entirely, this runs once per
     /// `VoiceTarget`, not once per frame.
     #[must_use]
     pub fn channel_of(&self, session: u32) -> Option<u32> {
@@ -164,7 +164,7 @@ const fn cannot_hear(session: &Session) -> bool {
 /// and `bSelfMute`, and separately guarantees that deafening yourself mutes you
 /// by forcing `bSelfMute` when `bSelfDeaf` arrives in a `UserState`. Folding
 /// `self_deaf` in here reproduces the second guarantee on the path that
-/// depends on it, rather than trusting another service to have enforced it —
+/// depends on it, rather than trusting another service to have enforced it,
 /// a user whose client shows a crossed-out headphone and who is still audible
 /// is a bug nobody reports, because the person it affects cannot hear it.
 const fn cannot_speak(session: &Session) -> bool {
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn a_session_that_moved_channel_is_routed_by_where_it_is_now() {
         // An upsert is how every channel change arrives, and the old membership
-        // has to go with it — otherwise a user hears their previous channel
+        // has to go with it, otherwise a user hears their previous channel
         // forever, which sounds like a leak of a private conversation.
         let cache = cache_of(vec![session(1, LOBBY), session(2, LOBBY)]);
         cache.upsert(session(2, ANNEX));

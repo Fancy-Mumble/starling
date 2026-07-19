@@ -1,7 +1,7 @@
 //! Collapsing identical in-flight questions into one answer.
 //!
 //! ACL evaluation walks the channel tree, and a busy channel produces many
-//! identical concurrent queries — everyone in it asks the same thing at the
+//! identical concurrent queries, everyone in it asks the same thing at the
 //! same moment. Discord's Rust data services collapse those into one query so a
 //! hot partition cannot be stampeded, and the analogue here is exact.
 //!
@@ -51,7 +51,7 @@ impl Coalescer {
 
         if let Some(mut waiting) = existing {
             // The leader may finish before this subscriber is polled, which
-            // closes the channel — falling back to evaluating is correct and
+            // closes the channel, falling back to evaluating is correct and
             // cheap, and never wrong.
             return match waiting.recv().await {
                 Ok(answer) => answer,
@@ -109,7 +109,7 @@ mod tests {
                 .await;
             assert_eq!(answer, 7);
         }
-        // Sequential callers each evaluate, because nothing is cached — that is
+        // Sequential callers each evaluate, because nothing is cached; that is
         // the point. What is collapsed is concurrency, not repetition.
         assert_eq!(calls.load(Ordering::Relaxed), 4);
     }

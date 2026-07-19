@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 // ACL evaluation. Stateless, and scaled out by coalescing identical in-flight
-// queries rather than by caching — docs/diagrams/scaling.puml.
+// queries rather than by caching, docs/diagrams/scaling.puml.
 package starling.permissions.v1;
 
 import "common.proto";
@@ -13,7 +13,7 @@ service Permissions {
   //
   // Names a *session* rather than carrying a `Subject`, and that is the whole
   // point: `Check` lets its caller state who the subject is, so a caller that
-  // built one carelessly — or was compromised — can assert
+  // built one carelessly (or was compromised) can assert
   // `account = 0, registered = true` and be told it is the SuperUser. Here the
   // caller supplies only the session id the frame arrived on, and this service
   // resolves the identity itself through `session-view`.
@@ -54,7 +54,7 @@ message EffectiveRequest {
 // a session and no account, and an operator edits an account with no session.
 message Subject {
   uint32 session = 1;
-  // The registered account id — meaningful ONLY when `registered` is set.
+  // The registered account id, meaningful ONLY when `registered` is set.
   //
   // An unregistered subject carries 0 here, and 0 is also the SuperUser's id, so
   // reading this field alone identifies every guest as the administrator. Use
@@ -65,14 +65,14 @@ message Subject {
   // `iId >= 0` (`vendor/server/src/Group.cpp:154`).
   //
   // Named `registered` and not `authenticated` on purpose. It was the latter,
-  // and it was populated as "has a session id" — true for every connected
-  // client — which put anonymous guests in `@auth` alongside registered users.
+  // and it was populated as "has a session id", true for every connected
+  // client, which put anonymous guests in `@auth` alongside registered users.
   // The field number is unchanged; only the name and its meaning are.
   bool registered = 4;
   // The access tokens the client presented, for `#token` group specifications.
   //
   // murmur's `ServerUser::qslAccessTokens`, matched **case-insensitively**
-  // (`vendor/server/src/Group.cpp:16`) — a channel password typed with the
+  // (`vendor/server/src/Group.cpp:16`), a channel password typed with the
   // wrong capitalisation still opens the channel, and an operator who cased
   // the ACL entry differently from the password has not locked anybody out.
   repeated string tokens = 5;
@@ -87,7 +87,7 @@ message Subject {
   // Whether the subject's certificate chained to a configured CA.
   //
   // murmur's `bVerified`, and the `strong` group. False for the self-signed
-  // certificate a stock Mumble client generates, which is the ordinary case —
+  // certificate a stock Mumble client generates, which is the ordinary case,
   // so `strong` is the one predicate here that means "an authority vouched for
   // this", and it must never be inferred from merely *having* a certificate.
   bool strong_cert = 8;
@@ -111,8 +111,8 @@ message CheckRequest {
 // The identity is deliberately absent: it is not the caller's to state.
 message SessionCheckRequest {
   starling.common.v1.Scope scope = 1;
-  // The session the frame arrived on. Zero — a client that has not finished
-  // its handshake — resolves to nothing and is therefore denied.
+  // The session the frame arrived on. Zero, a client that has not finished
+  // its handshake, resolves to nothing and is therefore denied.
   uint32 session = 2;
   uint32 channel = 3;
   // The bit being asked for. More than one bit means all of them are required.
@@ -178,7 +178,7 @@ message TemporaryGroupRequest {
   // The channel the group is declared on. The membership is scoped to it, and
   // reaches sub-channels only as far as the group's own `inheritable` allows.
   uint32 channel = 3;
-  // The group name, without any of the `!~#$` prefixes — this names a group,
+  // The group name, without any of the `!~#$` prefixes, this names a group;
   // it is not a specification to be parsed.
   string group = 4;
   // Who holds it.

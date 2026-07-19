@@ -1,6 +1,6 @@
 //! SQLite, including in-memory.
 //!
-//! The default, and the one every test runs against — a real SQL engine with no
+//! The default, and the one every test runs against, a real SQL engine with no
 //! server to start, which is why the schema is exercised rather than mocked.
 
 use super::SqlDialect;

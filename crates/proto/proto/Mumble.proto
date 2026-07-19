@@ -13,7 +13,7 @@ option optimize_for = SPEED;
 // Fancy field numbering: **every Fancy-added field starts at 1000.**
 //
 // This file is upstream Mumble's, extended. Upstream keeps adding fields to its
-// own messages, and it numbers them consecutively from where it left off — so a
+// own messages, and it numbers them consecutively from where it left off, so a
 // Fancy field sitting immediately above upstream's highest number is standing
 // where upstream will step next. When that happens the two definitions disagree
 // about what a number means and neither side errors: protobuf reads the wrong
@@ -22,7 +22,7 @@ option optimize_for = SPEED;
 //
 // So upstream owns 1–999 in every upstream message and Fancy takes 1000+. That
 // leaves ~975 free numbers even in the tightest case (`UserState`, whose
-// upstream max is 24), which is more room than upstream can plausibly consume —
+// upstream max is 24), which is more room than upstream can plausibly consume,
 // the point being that nobody should ever have to re-run this migration.
 // Numbering *within* the Fancy range restarts at 1000 per message, because these
 // are independent number spaces and a shared counter would only invite the same
@@ -41,7 +41,7 @@ option optimize_for = SPEED;
 // field every shipped Fancy peer reads to decide whether extensions exist at
 // all. Moving it would not break loudly, it would make this server look like
 // plain Mumble to every one of them. `Version.fancy_protocol` is what carries
-// the numbering forward from here — see docs/PROTOCOL-COMPATIBILITY.md §2a.
+// the numbering forward from here, see docs/PROTOCOL-COMPATIBILITY.md §2a.
 // ---------------------------------------------------------------------------
 
 message Version {
@@ -59,7 +59,7 @@ message Version {
     // version: it answers "which features exist", and a peer can infer from it
     // that some message was implemented. It cannot express "I renumbered the
     // wire", so a client that trusts it will happily send a type the peer can
-    // route nowhere — which is exactly what happened when Starling kept the
+    // route nowhere, which is exactly what happened when Starling kept the
     // upstream types and moved every Fancy message to a new range.
     //
     //   absent / 0  epoch 0: the historical interleaved 100-999 layout, which
@@ -70,7 +70,7 @@ message Version {
     //
     // A peer speaks exactly one epoch. When the other side does not know it,
     // the Fancy extensions are off and the connection degrades to plain Mumble
-    // — plus anything relayable through PluginDataTransmission, which works
+    // plus anything relayable through PluginDataTransmission, which works
     // through any Mumble server and is therefore epoch-independent.
     optional uint32 fancy_protocol = 1000;
 

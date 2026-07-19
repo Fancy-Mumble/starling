@@ -6,8 +6,8 @@
 //! | audio | drop the oldest, and count it |
 //!
 //! The asymmetry is the point. Dropping a control message desyncs that client
-//! permanently and silently — it renders the wrong world forever with nothing
-//! in any log — and unbounded queueing is a memory `DoS`. Disconnecting is the
+//! permanently and silently, it renders the wrong world forever with nothing
+//! in any log, and unbounded queueing is a memory `DoS`. Disconnecting is the
 //! only outcome both bounded and honest, and reconnect already re-syncs from
 //! scratch. A late audio frame, by contrast, is worthless.
 //!
@@ -46,7 +46,7 @@ pub enum QueueError {
 /// A broadcast encodes its payload **once** and hands the same refcounted
 /// buffer to every recipient (`PROTOCOL-REDESIGN.md` §4, Z4). The header cannot
 /// be shared the same way once resume exists, because the sequence number in it
-/// is per connection — so the two are carried separately and joined at the
+/// is per connection, so the two are carried separately and joined at the
 /// socket rather than concatenated per recipient.
 ///
 /// That is the whole reason this type exists. Building a combined buffer per
@@ -103,7 +103,7 @@ pub struct ClientHandle {
     ///
     /// Off until the peer announces `resume` in its `Hello` and
     /// session-lifecycle turns it on, because a client that is not expecting
-    /// eight extra bytes reads them as the start of its payload — and a stock
+    /// eight extra bytes reads them as the start of its payload, and a stock
     /// Mumble client never announces anything, so it never gets them.
     sequenced: Arc<std::sync::atomic::AtomicBool>,
     /// Whether this peer's control stream may be compressed.
@@ -128,8 +128,8 @@ pub struct ClientHandle {
     /// Shared deliberately: a per-client gauge would be a registry entry per
     /// connection, which on a server with a thousand clients is a thousand rows
     /// nobody reads. One gauge watching all of them answers the question an
-    /// operator actually has — "is anybody close to being disconnected for
-    /// this" — see `Gauge::observe`.
+    /// operator actually has, "is anybody close to being disconnected for
+    /// this", see `Gauge::observe`.
     pressure: Gauge,
     /// The ceiling those bytes may reach before the client is disconnected.
     control_budget: usize,
@@ -138,7 +138,7 @@ pub struct ClientHandle {
     ///
     /// Separate from [`Self::close`], which wakes the *read* loop. The two are
     /// the opposite halves of one shutdown: the reader must stop at once, and
-    /// the writer must not — a disconnect is nearly always preceded by the one
+    /// the writer must not, a disconnect is nearly always preceded by the one
     /// frame that explains it (`Reject` on a refused login, `UserRemove` on a
     /// kick), and tearing the socket down first delivers the disconnect and
     /// loses the reason.
@@ -214,7 +214,7 @@ impl ClientHandle {
                 // `image_message_length`, 128 KiB by default. Four thousand of
                 // those is half a gigabyte queued for one client that has
                 // stopped reading its socket, and it only takes a few such
-                // clients to take the gateway down — with image sharing being
+                // clients to take the gateway down, with image sharing being
                 // exactly the workload that produces them.
                 //
                 // Overflowing on bytes disconnects that client, which is the
@@ -234,7 +234,7 @@ impl ClientHandle {
                         // Observed rather than accumulated: the budget is *per
                         // client*, so the number worth watching is the client
                         // closest to its own bound, not the sum across clients
-                        // — which has no ceiling to be a fraction of.
+                        // which has no ceiling to be a fraction of.
                         self.pressure.observe(total as u64);
                         Ok(())
                     }
@@ -301,7 +301,7 @@ impl ClientHandle {
     /// Ask this connection to end.
     ///
     /// A service that kicks or bans somebody, and the handshake evicting a
-    /// ghost, both need the socket *closed* — forgetting the registry entry
+    /// ghost, both need the socket *closed*, forgetting the registry entry
     /// leaves the client connected, still able to send, and still rendered by
     /// everyone else because no service was ever told the session ended.
     ///
@@ -322,7 +322,7 @@ impl ClientHandle {
     /// Called as the connection is torn down, *before* the writer task is
     /// waited on. Without it the writer is simply aborted, and a client that
     /// was refused, kicked or banned is disconnected without ever receiving
-    /// the message that says why — murmur flushes for the same reason
+    /// the message that says why, murmur flushes for the same reason
     /// (`forceFlush()` before `disconnectSocket()`, `Messages.cpp:1424`).
     pub fn drain(&self) {
         self.drain.notify_one();
@@ -374,7 +374,7 @@ pub(crate) fn channel(
 ///
 /// 4 MiB is dozens of avatars plus far more ordinary control traffic than a
 /// healthy client is ever behind on, and a thousand clients simultaneously at
-/// the ceiling is 4 GiB — a number an operator can reason about, which the old
+/// the ceiling is 4 GiB, a number an operator can reason about, which the old
 /// bound never was.
 const CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
@@ -576,7 +576,7 @@ mod tests {
     fn a_client_cannot_queue_unbounded_memory_under_a_bounded_frame_count() {
         // The bound the frame count never provided. At the shipped 4096 frames
         // and a 128 KiB `image_message_length`, one client that has stopped
-        // reading holds half a gigabyte — and heavy image sharing is exactly
+        // reading holds half a gigabyte, and heavy image sharing is exactly
         // the workload that produces such clients.
         //
         // The frame count here is deliberately huge so that *only* the byte
@@ -607,7 +607,7 @@ mod tests {
     fn the_control_lane_reports_its_occupancy_and_its_refusals() {
         // The counter beside this one ("clients disconnected for control
         // overflow") only ever moves after somebody has been disconnected. The
-        // gauge is the interval before that — the client at 90% of its budget,
+        // gauge is the interval before that, the client at 90% of its budget,
         // still connected, about to not be.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn a_client_that_drains_stops_showing_as_pressure() {
         // The peak is per interval, so a client that filled up and recovered
-        // must not keep the gauge pinned for the rest of the server's life —
+        // must not keep the gauge pinned for the rest of the server's life,
         // a dashboard that never comes back down is one nobody believes.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());

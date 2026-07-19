@@ -26,7 +26,7 @@ use starling_runtime::over_limit;
 pub enum Verdict {
     /// Deliver it unchanged.
     Deliver,
-    /// Deliver this instead — the markup was stripped.
+    /// Deliver this instead, the markup was stripped.
     Rewritten(String),
     /// Refuse it: too long, and no rewrite would shorten it.
     TooLong,
@@ -35,7 +35,7 @@ pub enum Verdict {
 /// Whether `text` may be delivered, given the two settings.
 ///
 /// `image_message_length` bounds the whole body when HTML is allowed, because
-/// that is where a data-URI image lives: without it a single `<img src=…>` is
+/// that is where a data-URI image lives: without it a single `<img src=...>` is
 /// an unbounded upload wearing a chat message.
 #[must_use]
 pub fn check(text: &str, allow_html: bool, text_limit: u32, image_limit: u32) -> Verdict {
@@ -65,7 +65,7 @@ pub fn check(text: &str, allow_html: bool, text_limit: u32, image_limit: u32) ->
     }
     // Over the text limit but under the image one. murmur's rule: if it is not
     // markup at all it is simply too long, and if it is, the text limit is
-    // measured with image payloads discounted — the picture was already
+    // measured with image payloads discounted, the picture was already
     // bounded above.
     if !text.contains('<') {
         return Verdict::TooLong;
@@ -118,8 +118,8 @@ pub fn strip_html(html: &str) -> String {
 /// Whether a tag ends a line, as murmur's filter has it: `br` and `p`.
 ///
 /// murmur emits the break on the *end* element, which is why `<p>one</p>` is
-/// one newline and not two. `br` is void — a client may write it `<br>`,
-/// `<br/>` or `<br />` and mean the same thing — so it breaks however it is
+/// one newline and not two. `br` is void, a client may write it `<br>`,
+/// `<br/>` or `<br />` and mean the same thing, so it breaks however it is
 /// spelled, while `p` breaks only when it closes.
 fn breaks_line(tag: &str) -> bool {
     let closing = tag.starts_with('/');
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn an_image_is_bounded_by_the_image_limit_and_not_the_text_one() {
         // murmur's asymmetry: a long body made of markup is judged by its
-        // visible text, but the whole thing still has a ceiling — otherwise a
+        // visible text, but the whole thing still has a ceiling, otherwise a
         // data-URI image is an unbounded upload wearing a chat message.
         let image = format!("<img src=\"data:{}\" />ok", "A".repeat(200));
         assert_eq!(check(&image, true, 10, 1_000), Verdict::Deliver);

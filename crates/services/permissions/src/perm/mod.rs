@@ -1,12 +1,12 @@
 //! The permission bit set.
 //!
-//! [`Perm`] is wire-visible — it is sent in `ServerSync.permissions` and
-//! `PermissionQuery.permissions` — so the values are transcribed from
+//! [`Perm`] is wire-visible; it is sent in `ServerSync.permissions` and
+//! `PermissionQuery.permissions`, so the values are transcribed from
 //! `vendor/server/src/ACL.h:21` and must never be renumbered.
 //!
 //! The *policy* that evaluates it is [`crate::evaluate`]. It lives outside this
 //! module because evaluation needs the ancestor chain, the ACL entries and the
-//! group memberships, and a trait taking only ids would have to fetch them —
+//! group memberships, and a trait taking only ids would have to fetch them,
 //! which is how murmur's `ACLCache` ends up threaded through everything.
 
 // The bits themselves are the wire contract and live with it, so a
@@ -21,7 +21,7 @@ pub use starling_proto_fancy::perm::Perm;
 /// Implementations are **total and side-effect free**: this runs on the hot
 /// path of every check and must never block or fail. A check that could return
 /// "don't know" would force every caller to invent a fallback, and the safe
-/// fallback — deny — would be indistinguishable from a real denial in the logs.
+/// fallback (deny) would be indistinguishable from a real denial in the logs.
 pub trait Permissions: std::fmt::Debug + Send + Sync {
     /// The permissions granted in `channel`.
     fn effective(&self, channel: u32) -> Perm;
@@ -29,8 +29,8 @@ pub trait Permissions: std::fmt::Debug + Send + Sync {
 
 /// The Null Object: everything is permitted.
 ///
-/// Kept because it is what makes a deployment without ACLs — a single-room
-/// server, a test fixture — work without a special case anywhere else.
+/// Kept because it is what makes a deployment without ACLs, a single-room
+/// server, a test fixture, work without a special case anywhere else.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllowAll;
 

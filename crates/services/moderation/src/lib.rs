@@ -1,4 +1,4 @@
-//! `moderation` — bans and kicks.
+//! `moderation`: bans and kicks.
 //!
 //! A ban outlives the session it was issued against, which is why it is stored
 //! here and not in `session-view`: that view is of *connected* users, and a ban
@@ -67,7 +67,7 @@ pub struct ModerationService {
     /// Reaches `session-view` to find out who a session id refers to.
     ///
     /// A ban outlives the connection, so it has to be written against something
-    /// durable — the address and the certificate hash — and the session id
+    /// durable (the address and the certificate hash) and the session id
     /// alone carries neither.
     resolver: Resolver,
     /// The operator-facing record of moderation actions.
@@ -160,7 +160,7 @@ const PERMISSION_DENIED: u16 = 12;
 /// A stored address, as the ban table holds them.
 ///
 /// The v6-mapped sixteen bytes, matching what a `/128` prefix is compared
-/// against — see `covers` below, which walks the stored bytes directly.
+/// against, see `covers` below, which walks the stored bytes directly.
 fn address_bytes(peer: &str) -> Vec<u8> {
     let host = match peer.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or(rest),
@@ -278,7 +278,7 @@ impl Moderation for ModerationRpc {
         }
 
         // A ban outlives the session it was issued against, so it is the kind
-        // of thing that has to be answerable months later — who, why, and for
+        // of thing that has to be answerable months later, who, why, and for
         // how long.
         self.0.logger.log(
             LogEvent::notice(Category::Admin, "ban issued")
@@ -388,7 +388,7 @@ impl ClientService for ModerationService {
 impl ModerationService {
     /// A kick, or a kick that also leaves a ban behind.
     ///
-    /// This was `Actions::new()` — accepted, discarded, and answered with
+    /// This was `Actions::new()`, accepted, discarded, and answered with
     /// nothing, so the moderator's client showed the user still present and no
     /// log said why.
     ///
@@ -465,7 +465,7 @@ impl ModerationService {
         );
 
         // Everyone is told, with the actor filled in as murmur does
-        // (`Messages.cpp:1602`) — a client renders "X was kicked by Y" from it.
+        // (`Messages.cpp:1602`), a client renders "X was kicked by Y" from it.
         let announce = starling_proto::proto::tcp::UserRemove {
             session: request.session,
             actor: Some(inbound.session),
@@ -587,7 +587,7 @@ impl ModerationService {
 
         // Reading the ban list takes `Ban` at the root, as murmur asks. It is a
         // list of names, addresses and certificate hashes of people who were
-        // thrown off — handing it to any client who asks is a disclosure that
+        // thrown off, handing it to any client who asks is a disclosure that
         // has nothing to do with using the server.
         if !self
             .permit
@@ -692,8 +692,8 @@ mod tests {
     #[test]
     fn an_unparseable_address_is_stored_as_nothing_rather_than_as_everything() {
         // `covers` returns false for an empty stored address, so an address it
-        // could not read becomes a ban that matches nobody. The alternative —
-        // storing a partial or zeroed value — is a ban that matches everybody.
+        // could not read becomes a ban that matches nobody. The alternative,
+        // storing a partial or zeroed value, is a ban that matches everybody.
         assert!(address_bytes("not-an-address").is_empty());
         assert!(!covers(
             &Ban {

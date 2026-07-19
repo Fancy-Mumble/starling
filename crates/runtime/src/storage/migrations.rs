@@ -6,7 +6,7 @@
 //! §3).
 //!
 //! Recording by *name* rather than by number means two services can grow their
-//! own schemas independently — which they must, because each owns its own.
+//! own schemas independently, which they must, because each owns its own.
 
 use crate::storage::{Store, StoreError};
 

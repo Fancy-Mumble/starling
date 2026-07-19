@@ -1,8 +1,8 @@
-//! `session-view` — the composed live view of every connected session.
+//! `session-view`: the composed live view of every connected session.
 //!
 //! Every service in the control, core and realtime groups reads here and
 //! nowhere else. Without it each would depend on userdata, permissions,
-//! metadata and server-config — N×4 edges, and four caches each to keep warm
+//! metadata and server-config, N×4 edges, and four caches each to keep warm
 //! (`docs/ARCHITECTURE.md` §4).
 //!
 //! Two rules stop it becoming the god service:
@@ -17,7 +17,7 @@
 //!   snapshot stream and keep their own copy rather than calling per request,
 //!   so the rule that nothing on the audio path may make a request still holds.
 //!
-//! **A stale deny is safe; a stale grant is a security bug** — so a revocation
+//! **A stale deny is safe; a stale grant is a security bug**, so a revocation
 //! invalidates the composed view before it is acknowledged, while a grant may
 //! arrive lazily.
 //!
@@ -69,8 +69,8 @@ impl SessionViewService {
     ///
     /// This is the composition the whole service exists to do: an ACL query
     /// names a *session*, and the authority that answers it needs to know which
-    /// *account* that session holds. Permissions cannot look it up — that would
-    /// reverse the cold-query edge — so the answer is assembled here.
+    /// *account* that session holds. Permissions cannot look it up; that would
+    /// reverse the cold-query edge, so the answer is assembled here.
     ///
     /// `None` when the query is not about a subject, or names a session this view
     /// has never seen. A caller that gets `None` evaluates as an anonymous guest,
@@ -84,8 +84,8 @@ impl SessionViewService {
         // Written out field by field, with **no `..Subject::default()`**. That
         // fill-in is what made this wrong: it silently supplied `tokens: []`,
         // `channel: 0` and `strong_cert: false`, so a `#password` group matched
-        // nobody on this path — the surviving half of `GAP-ANALYSIS.md` G2,
-        // whose other call site was fixed — and every `in`/`out`/`sub` rule
+        // nobody on this path, the surviving half of `GAP-ANALYSIS.md` G2,
+        // whose other call site was fixed, and every `in`/`out`/`sub` rule
         // read the user as standing in the root.
         //
         // `out` is the one that does not merely fail closed. It is
@@ -220,7 +220,7 @@ impl SessionView for ViewRpc {
         // ACL engine.
         //
         // The *subject* is composed here, though, and that is not caching a
-        // decision — it is this service doing the one job it exists for. An ACL
+        // decision; it is this service doing the one job it exists for. An ACL
         // query names a session, and only the read model knows which account
         // that session holds.
         let query = request.into_inner();
@@ -352,7 +352,7 @@ mod tests {
     async fn the_subject_a_cold_query_is_about_carries_everything_the_acl_reads() {
         // `SECURITY-AUDIT-identity.md` I3. This was built with
         // `..Subject::default()`, which supplied `tokens: []`, `channel: 0` and
-        // `strong_cert: false` — so a channel password opened nothing on this
+        // `strong_cert: false`, so a channel password opened nothing on this
         // path, and `in`/`out`/`sub` read every user as standing in the root.
         //
         // The channel is the one that could fail *open* rather than closed:

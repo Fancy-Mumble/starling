@@ -4,7 +4,7 @@ syntax = "proto3";
 //
 // Every service in the control, core and realtime groups reads here and
 // nowhere else (docs/ARCHITECTURE.md §4). It forwards but never decides, and
-// it is a subscription hub rather than a proxy — so nothing on the audio path
+// it is a subscription hub rather than a proxy, so nothing on the audio path
 // makes a request.
 package starling.sessionview.v1;
 
@@ -57,7 +57,7 @@ message Session {
   // Whether `account` above names a real account.
   //
   // Mumble uses `-1` for "not registered" and a uint64 cannot carry it, so this
-  // is the presence bit and `account` means nothing without it — an anonymous
+  // is the presence bit and `account` means nothing without it, an anonymous
   // guest is written as `account = 0, registered = false`, and 0 is also the
   // SuperUser's id. Interpret the pair through
   // `starling_proto_fancy::identity`, never by comparing `account` directly.
@@ -70,7 +70,7 @@ message Session {
   // `userdata`'s blob store and are fetched with `RequestBlob`, so a session
   // costs the same 20 bytes whether the avatar is 1 KiB or 500.
   //
-  // Empty means the account has none — or that this is a guest, who has no
+  // Empty means the account has none, or that this is a guest, who has no
   // account to have stored one on.
   bytes comment_hash = 21;
   bytes texture_hash = 22;
@@ -87,7 +87,7 @@ message Session {
   // it, and `operator-api`'s user JSON names its fields one by one so that
   // adding one here cannot leak into an HTTP response by default.
   repeated string tokens = 23;
-  // Whether the peer's certificate chained to a configured CA — murmur's
+  // Whether the peer's certificate chained to a configured CA, murmur's
   // `bVerified`, and the `strong` ACL group. Carried separately from
   // `cert_hash` because the hash is an identifier and this is an assurance.
   bool strong_cert = 24;
@@ -95,7 +95,7 @@ message Session {
   //
   // Sparse: a listener that never moved the slider has no entry here, and
   // absent means unity. Separate from `listening` rather than a parallel array
-  // because the two are written by different messages — a client can adjust a
+  // because the two are written by different messages, a client can adjust a
   // volume without changing which channels it listens to, and a parallel array
   // that fell out of step would silence the wrong room.
   map<uint32, float> listening_volume = 25;

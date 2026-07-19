@@ -36,7 +36,7 @@ jobs:
         run: scripts/check-proto-drift.sh
 
       # Hygiene: the rules the drift check is blind to *by construction*,
-      # because all three trees can break them identically — a Fancy field in
+      # because all three trees can break them identically, a Fancy field in
       # the burned 100-999 range, and code bound to the dead proto2 envelopes.
       # Both of these shipped undetected; see docs/PROTOCOL-MIGRATION.md M6.
       # Through the interpreter rather than the shebang: the runner has it, and
@@ -47,7 +47,7 @@ jobs:
 
       # Compatibility: our upstream surface against *actual* upstream Mumble.
       # The only one of the three that can fail with a released client on the
-      # other end — the other two prove our trees agree, not that they are
+      # other end, the other two prove our trees agree, not that they are
       # right. Needs the upstream remote, and skips loudly without it.
       - name: Fetch upstream Mumble for the compatibility check
         run: git -C vendor/server fetch --no-tags --depth=1 upstream 1.6.x || true
@@ -172,17 +172,17 @@ jobs:
       - name: Miri setup
         run: cargo +nightly miri setup
 
-      - name: Miri (starling-proto — framing and version encoding)
+      - name: Miri (starling-proto, framing and version encoding)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p starling-proto --lib
 
-      - name: Miri (starling-model — pure logic, no I/O)
+      - name: Miri (starling-model, pure logic, no I/O)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p starling-model --lib
 
-      - name: Miri (starling-server — handlers only)
+      - name: Miri (starling-server, handlers only)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: >

@@ -6,14 +6,14 @@
 //!
 //! * in `--all-in-one` twenty services share one process and each holds its own
 //!   `Health`, so nineteen of them had no endpoint at all;
-//! * `/readyz` is a liveness contract for an orchestrator, not a read model —
+//! * `/readyz` is a liveness contract for an orchestrator, not a read model,
 //!   it answers about *one* process and returns prose;
 //! * nothing could ask a service how it was without being that service.
 //!
 //! So the runtime adds this to every service's routes in
 //! [`serve`](crate::serve), the same way it adds config, discovery and metrics.
 //! A service opts into nothing and cannot forget to implement it, which is the
-//! only way a health surface stays honest — the service most worth asking about
+//! only way a health surface stays honest, the service most worth asking about
 //! is the one nobody remembered to instrument.
 
 use starling_proto_fancy::health::health_server::{Health as HealthRpc, HealthServer};

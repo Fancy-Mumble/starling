@@ -16,17 +16,17 @@ Both ends of a Fancy conversation are ours.
 ## 1. Measured drift, fork against upstream
 
 Compared against upstream `91fe75d5a` (Mumble 1.6.x, 2026-07-19), recovered from
-the merge commit in `vendor/server` — there is no upstream remote configured.
+the merge commit in `vendor/server`; there is no upstream remote configured.
 
 **What is safe.** All 27 upstream messages are present; none removed. No upstream
 field retyped or renumbered. And no `required` field was added to any upstream
-message — all 15 new `required` fields live in new Fancy messages, where an
+message, all 15 new `required` fields live in new Fancy messages, where an
 upstream client never looks. So the fork is wire-compatible with upstream *today*.
 
 **What was not.** Seven of the nine extended upstream messages took upstream's
 *immediate next* field numbers. Upstream's next `TextMessage` field *will be* 6.
 When that happens two meanings share one number, and proto2 resolves by number
-and type — so if both are varint you get **silent misinterpretation**, not a
+and type, so if both are varint you get **silent misinterpretation**, not a
 parse error. That is the worst failure class available: no log line, wrong data.
 
 Fixed in this repo's copy (2026-07-29) by moving the Fancy fields clear of
@@ -49,12 +49,12 @@ Four things to know about that move:
 
 * **`Version.fancy_version = 6` stays where it is.** It is the field every
   shipped Fancy peer reads to decide whether extensions exist at all. Moving it
-  would not break loudly — it would make this server look like plain Mumble to
+  would not break loudly; it would make this server look like plain Mumble to
   all of them. It keeps its squat, and `fancy_protocol` (1000) is what carries
   the numbering forward.
 * **`Version.fancy_protocol` moved with everything else, and that is the one
   genuinely hard break here.** It is read *before* any epoch is known, so its
-  location cannot be negotiated — a peer built against the 100+ layout looks at
+  location cannot be negotiated, a peer built against the 100+ layout looks at
   field 100, finds nothing, and concludes it is talking to plain Mumble. That is
   the correct outcome (it would not have understood the rest either) but it is
   silent, so all three trees have to move in one release. They did.
@@ -72,13 +72,13 @@ Four things to know about that move:
 > **Upstream owns field numbers 1–999 in every upstream message. Fancy fields
 > start at 1000.**
 
-1–99 would have been enough for any plausible upstream — `UserState`, the
+1–99 would have been enough for any plausible upstream, `UserState`, the
 tightest message, was at 24 against a ceiling of 99. The larger margin is not
 about upstream running out; it is about never having to make this judgement
 again, and it is free: protobuf spends two tag bytes on everything from field
 16 to field 2047, so 100 and 1000 encode identically.
 
-All three trees — `starling`, `vendor/server` and `vendor/client` — implement
+All three trees (`starling`, `vendor/server` and `vendor/client`) implement
 this and hold identical numbers. `scripts/check-proto-drift.sh` is what keeps
 them that way.
 
@@ -86,7 +86,7 @@ them that way.
 
 The TCP frame is `type: u16 ‖ len: u32 ‖ payload`. The wire allows 65 536 types.
 Note that `vendor/server`'s `enum class TCPMessageType : byte`
-(`MumbleProtocol.h:135`) caps the C++ at 255 and is already at 201 — about 54
+(`MumbleProtocol.h:135`) caps the C++ at 255 and is already at 201, about 54
 left there, though Starling is Rust and unaffected.
 
 The real problem is that the existing Fancy range is **interleaved, not blocked**:
@@ -111,7 +111,7 @@ cannot be retrofitted onto this.
 ## 2a. Epochs: how a peer says *which* numbering it speaks
 
 The numbering above is not something a peer can infer. `Version.fancy_version`
-is a **product** version — it answers "which features exist" — and there is no
+is a **product** version (it answers "which features exist") and there is no
 way to express "I renumbered the wire" in it. A client that reads only that
 field will happily send a type the peer routes nowhere, and the message
 disappears with nothing in any log. That is precisely what happened here:
@@ -133,7 +133,7 @@ Three rules make it work:
 * **The epoch is read before the version.** A version only means something once
   both sides agree what the numbers on the wire are.
 * **No agreement means plain Mumble**, plus anything relayable through
-  `PluginDataTransmission` — that path is epoch-independent and works through
+  `PluginDataTransmission`: that path is epoch-independent and works through
   any Mumble server, so typing, watch-sync, WebRTC signalling and pchat key
   distribution survive a mismatch. Everything `ServerOnly` does not.
 
@@ -146,20 +146,20 @@ The client keeps the mirror of this in `mumble-protocol/src/fancy_codec.rs`
 (`FANCY_PROTOCOL_EPOCH`, `speaks_epoch`), and announces its own epoch in the
 `Version` it sends, so the judgement is symmetric.
 
-### What the client encodes at epoch 1 — a correction
+### What the client encodes at epoch 1, a correction
 
 An earlier version of this section claimed the client "can only encode epoch 0
 today, so against Starling it degrades to the `PluginData` path". **That is
 false, and dangerously so.** The client announces `fancy_protocol = 1`
 (`fancy_codec.rs`, `FANCY_PROTOCOL_EPOCH`), selects its `NativeCodec` the
 moment Starling's `Version` arrives, and frames every Fancy message under its
-service's outer type — `message.rs`, the `fancy_services!` mapping. There is
+service's outer type, `message.rs`, the `fancy_services!` mapping. There is
 no degradation and no honest split.
 
 What it frames is the problem: the *payloads* are the proto2 envelope shapes
 from this file's `Mumble.proto`, while Starling decodes the proto3 sets in
 `crates/proto-fancy/proto/fancy/`. Same epoch, same outer types, different
-inner schemas — the silent break documented as D1 in `PROTOCOL-REDESIGN.md`
+inner schemas, the silent break documented as D1 in `PROTOCOL-REDESIGN.md`
 §0, fixed by its migration step M2c (the client codec moves to the canon).
 Until M2c lands, Fancy traffic between the client and Starling corrupts or
 vanishes per message, with nothing above debug level in any log.
@@ -170,7 +170,7 @@ Upstream types stay flat and frozen. Every Fancy service gets **one** outer type
 and its payload is a service-owned envelope with its own `oneof`:
 
 ```protobuf
-// proto-fancy/pchat.proto — owned entirely by the pchat service
+// proto-fancy/pchat.proto, owned entirely by the pchat service
 message PchatEnvelope {
   oneof body {
     PchatMessage     message      = 1;
@@ -189,7 +189,7 @@ message PchatEnvelope {
 
 ### Why nesting rather than blocks of 100
 
-* **unbounded types per service** — no block size to guess wrong
+* **unbounded types per service**, no block size to guess wrong
 * **one routing line per service**, so the gateway config stays trivial
 * **no central registry.** With a flat space every new message type edits a shared
   enum, which is coordination between teams. Here a service's types are private
@@ -204,10 +204,10 @@ the payload's first field, so tooling recovers the name with one nested read.
 | Type | Service |
 |---|---|
 | 1000 | session-lifecycle (Fancy extensions only; 0–26 stay flat) |
-| — | session-view has **no** client-facing type: internal by construction |
+| | session-view has **no** client-facing type: internal by construction |
 | 1001 | permissions |
 | 1002 | metadata |
-| 1003 | userdata — including account settings |
+| 1003 | userdata, including account settings |
 | 1004 | voice |
 | 1005 | text |
 | 1006 | pchat |
@@ -217,7 +217,7 @@ the payload's first field, so tooling recovers the name with one nested read.
 | 1010 | plugins |
 | 1011 | push |
 | 1012 | audit |
-| 1013 | server-config — runtime-mutable operational settings |
+| 1013 | server-config, runtime-mutable operational settings |
 | 1014 | onboarding |
 | 1015 | social |
 | 1016 | link-preview |
@@ -228,7 +228,7 @@ New service: take the next number, add a TOML block, ship. No gateway release.
 ### The message mapping
 
 All 61 epoch-0 types have exactly one epoch-1 home. The **inner message keeps its
-epoch-0 shape** — `FancyOnboardingConfig` at inner tag 1 of 1014 is byte-for-byte
+epoch-0 shape**, `FancyOnboardingConfig` at inner tag 1 of 1014 is byte-for-byte
 the `FancyOnboardingConfig` that used to be outer type 136. Epoch 1 changes the
 *framing* only, so no feature has to be redesigned to cross the epoch, and the
 three implementations share one set of definitions in `Mumble.proto`.
@@ -238,10 +238,10 @@ introduced natively and have no epoch-0 ancestor.
 
 | Outer | Service | Epoch-0 types folded in |
 |---|---|---|
-| 1006 | pchat | 100–116, 121, 128–130 — message/fetch/deliver, the key ladder, deletes, offline drain, pins |
+| 1006 | pchat | 100–116, 121, 128–130, message/fetch/deliver, the key ladder, deletes, offline drain, pins |
 | 1015 | social | 117–119 (reactions), 124 (custom reactions), 126–127 (read receipts), 131 (typing), 134 (watch sync), 135 (draw stroke), 144–145 (polls) |
 | 1011 | push | 122–123, 125 |
-| 1008 | screenshare | 120 (`WebRtcSignal` — screen and camera share both ride it) |
+| 1008 | screenshare | 120 (`WebRtcSignal`, screen and camera share both ride it) |
 | 1016 | link-preview | 132–133 |
 | 1014 | onboarding | 136–140 |
 | 1010 | plugins | 146–151, plus the generic plugin relay at 200–201 |
@@ -262,7 +262,7 @@ Two consequences worth stating, because both were live bugs before:
 
 Fancy-to-Fancy backwards compatibility only. Specifically: the per-message
 `min_version` gate, which existed so a new client could talk to an older Fancy
-server — in epoch 1 both ends ship together and a Fancy peer speaks all of it or
+server, in epoch 1 both ends ship together and a Fancy peer speaks all of it or
 none of it.
 
 **Compatibility with upstream Mumble is untouched.** `PluginDataTransmission`
@@ -270,7 +270,7 @@ relaying is epoch-independent, so a Fancy client keeps working against a vanilla
 server exactly as before, and every message keeps its `FallbackPolicy`. An
 epoch-0 Fancy server is simply not a peer any more: `speaks_epoch` already
 returns false for it, which selects that same plain-Mumble path. No compatibility
-code is written for it — the existing epoch check is the whole mechanism.
+code is written for it, the existing epoch check is the whole mechanism.
 
 ## 4. Enum and `oneof` hazards in proto2
 
@@ -289,14 +289,14 @@ proto3:
 
 `scripts/check-proto-drift.sh` currently asserts that Starling's proto matches
 `vendor/server`'s, describing the fork as "upstream's source of truth". It is not
-— it is the fork. That check has been verifying Fancy-consistency and saying
+ it is the fork. That check has been verifying Fancy-consistency and saying
 nothing about Mumble compatibility.
 
 It needs to become two checks with two meanings:
 
-1. **compatibility** — upstream messages, field numbers 1–99, against
+1. **compatibility**, upstream messages, field numbers 1–99, against
    `mumble-voip/mumble`. A failure here is a released-client break
-2. **consistency** — everything else, against `vendor/server` and
+2. **consistency**, everything else, against `vendor/server` and
    `vendor/client`. A failure here is a coordination bug between our own trees
 
 Plus a third that would have caught this class years earlier:

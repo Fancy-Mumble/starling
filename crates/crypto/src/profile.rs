@@ -1,6 +1,6 @@
 //! Building one peer's voice profile (Abstract Factory).
 //!
-//! A peer is not "modern" or "legacy" — it sits somewhere on two independent
+//! A peer is not "modern" or "legacy", it sits somewhere on two independent
 //! axes, and the products it needs must agree with each other:
 //!
 //! | Axis | Threshold | Product |
@@ -10,7 +10,7 @@
 //!
 //! [`VoiceProfile`] is the product family; [`ProfileFactory`] is the factory that
 //! chooses one. The factory is a trait so a deployment can refuse a combination
-//! it does not want to serve — [`ModernOnlyProfiles`] does exactly that — without
+//! it does not want to serve ([`ModernOnlyProfiles`] does exactly that) without
 //! the connection code learning a second way to decide.
 //!
 //! # Why a family rather than two independent lookups
@@ -41,8 +41,8 @@ pub fn spec_for(choice: CipherChoice) -> Box<dyn VoiceCipherSpec> {
 ///
 /// Framing and confidentiality were bundled while UDP was the only transport,
 /// because UDP answers both the same way: we frame it, we encrypt it. They are
-/// two questions, and a transport that provides its own encryption — QUIC, under
-/// TLS 1.3 — answers them differently.
+/// two questions, and a transport that provides its own encryption, QUIC, under
+/// TLS 1.3, answers them differently.
 ///
 /// Mumble voice is server-relayed, so the application cipher protects exactly the
 /// client-to-server hop that QUIC would. Running both would encrypt twice for no
@@ -131,7 +131,7 @@ impl VoiceProfile {
     /// Which cipher this peer's key material must be generated for.
     ///
     /// Derived from the negotiated spec rather than stored beside it, so the
-    /// two cannot disagree — a stored tag is a second source of truth about the
+    /// two cannot disagree, a stored tag is a second source of truth about the
     /// same decision.
     #[must_use]
     pub fn cipher_choice(&self) -> Option<CipherChoice> {

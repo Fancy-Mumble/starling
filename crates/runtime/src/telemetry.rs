@@ -6,7 +6,7 @@
 //! every span, so one grep follows a client's frame across the whole system.
 //!
 //! Note the deliberate separation from `crate::log`: that is the
-//! **operator-facing** record — who connected, what was refused — and it
+//! **operator-facing** record (who connected, what was refused) and it
 //! survives independently of whatever `RUST_LOG` happens to say.
 
 use tonic::metadata::{MetadataMap, MetadataValue};
@@ -27,9 +27,9 @@ pub fn install(config: &TelemetryConfig) {
     // `warn`, not `info`, when `RUST_LOG` says nothing.
     //
     // Both this and `crate::log` write to stderr, and at `info` they narrated
-    // the same events twice in two different shapes — the operator log's
-    // `INFO session client connected …` next to tracing's
-    // `INFO starling_gateway::listener: client connected …`. The operator log
+    // the same events twice in two different shapes, the operator log's
+    // `INFO session client connected ...` next to tracing's
+    // `INFO starling_gateway::listener: client connected ...`. The operator log
     // is the one meant to be *read*: it is curated, categorised, and covers
     // startup, connections and refusals. This one is a developer's dial.
     //
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn a_request_id_survives_a_hop() {
         // If it did not, a trace would restart at every service and the whole
-        // point — following one frame across processes — would be lost.
+        // point (following one frame across processes) would be lost.
         let mut metadata = MetadataMap::new();
         let id = new_request_id();
         set_request_id(&mut metadata, &id);

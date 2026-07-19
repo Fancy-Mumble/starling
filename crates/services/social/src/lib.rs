@@ -1,4 +1,4 @@
-//! `social` — reactions, receipts, typing, polls, watch-together, drawing.
+//! `social`: reactions, receipts, typing, polls, watch-together, drawing.
 //!
 //! One service rather than six, because each of these is a few hundred bytes of
 //! state and a fan-out. Six services with one message each would be six

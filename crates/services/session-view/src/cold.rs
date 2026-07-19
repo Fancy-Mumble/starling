@@ -1,6 +1,6 @@
 //! Cold queries: routed to the owning authority, never answered from here.
 //!
-//! The cost is one extra hop for the cold cases — an ACL question about a
+//! The cost is one extra hop for the cold cases, an ACL question about a
 //! channel the user is not in, or a lookup of an offline account. Neither is on
 //! a hot path: whisper setup is not per-packet and moderation is not per-frame
 //! (`docs/ARCHITECTURE.md` §4).
@@ -41,7 +41,7 @@ impl ColdRouter {
     /// Forward one query, on behalf of `asker`.
     ///
     /// `asker` is the identified subject the query is about, which only the
-    /// caller can supply — this router holds no view of its own. Passing `None`
+    /// caller can supply, this router holds no view of its own. Passing `None`
     /// evaluates the query as an anonymous guest, which is the safe direction but
     /// denies a registered user permissions they hold.
     ///

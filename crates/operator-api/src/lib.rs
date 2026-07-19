@@ -1,4 +1,4 @@
-//! `operator-api` — the admin plane, and the replacement for Ice.
+//! `operator-api`: the admin plane, and the replacement for Ice.
 //!
 //! It can create users, rewrite ACLs, ban and read the database: the
 //! highest-privilege surface in the system. Three decisions follow from that,
@@ -7,8 +7,8 @@
 //! **It is plain HTTP with an `OpenAPI` description.** An admin client becomes
 //! trivial to write in any language, including a browser panel and `curl`.
 //!
-//! **Authentication is whatever the operator already runs** — OIDC, a bare JWT,
-//! mTLS or a static token — so an existing Keycloak role becomes an
+//! **Authentication is whatever the operator already runs**, OIDC, a bare JWT,
+//! mTLS or a static token, so an existing Keycloak role becomes an
 //! authorisation without code. Against Ice, whose `icesecret` *is* the identity,
 //! has no scope, and rotates by editing a file and restarting, that is the whole
 //! point.
@@ -20,7 +20,7 @@
 //! offline bans and config.
 //!
 //! **Audit is fail-closed.** Every operator action is recorded, and a request is
-//! refused if it cannot be recorded — written by this process rather than
+//! refused if it cannot be recorded, written by this process rather than
 //! through the `audit` service, because audit is optional and the
 //! highest-privilege plane must not depend on a service the operator may not be
 //! running.

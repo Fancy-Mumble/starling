@@ -1,13 +1,13 @@
-//! `starling-proto-fancy` — everything on the wire that upstream Mumble does
+//! `starling-proto-fancy`: everything on the wire that upstream Mumble does
 //! not define.
 //!
 //! Two kinds of contract live here, and they are deliberately in one crate
 //! because they are both "ours to change":
 //!
-//! * **Fancy envelopes** — one outer message type per service, each carrying a
+//! * **Fancy envelopes**, one outer message type per service, each carrying a
 //!   service-owned `oneof`. Adding a message type touches one file and needs no
 //!   gateway release (`docs/PROTOCOL-COMPATIBILITY.md` §3).
-//! * **Inter-service gRPC** — the contracts services speak to each other. No
+//! * **Inter-service gRPC**, the contracts services speak to each other. No
 //!   client ever sees these.
 //!
 //! What is *not* here is upstream `Mumble.proto`: it is frozen, it lives in
@@ -95,7 +95,7 @@ generated!(
     "starling.userdata.v1"
 );
 generated!(
-    /// Voice's control surface — never audio.
+    /// Voice's control surface, never audio.
     voice,
     "starling.voice.v1"
 );

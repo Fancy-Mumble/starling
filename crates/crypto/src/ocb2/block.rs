@@ -10,7 +10,7 @@
 
 use aes::Aes128;
 // `BlockCipherEncrypt`/`BlockCipherDecrypt` in `cipher` 0.5; they were
-// `BlockEncrypt`/`BlockDecrypt` before it. A rename only — the block operations
+// `BlockEncrypt`/`BlockDecrypt` before it. A rename only, the block operations
 // below are the same primitive, which matters because OCB2's offsets are
 // derived from them and a substituted primitive would still compile.
 use aes::cipher::{BlockCipherDecrypt as _, BlockCipherEncrypt as _, KeyInit as _};
@@ -24,7 +24,7 @@ const REDUCTION: u8 = 0x87;
 /// One 128-bit block.
 ///
 /// A newtype rather than a bare `[u8; 16]` so that a checksum, an offset and a
-/// tag cannot be passed to each other's parameters — they are all sixteen bytes
+/// tag cannot be passed to each other's parameters; they are all sixteen bytes
 /// and the compiler would not object.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Block(pub [u8; BLOCK_LEN]);
@@ -56,7 +56,7 @@ impl Block {
         Self(out)
     }
 
-    /// Multiply by two in GF(2^128) — murmur's `S2`.
+    /// Multiply by two in GF(2^128), murmur's `S2`.
     ///
     /// A left shift of the whole block as a big-endian integer, then a XOR of
     /// the reduction polynomial when a one was shifted out of the top.
@@ -71,7 +71,7 @@ impl Block {
         Self(out)
     }
 
-    /// Multiply by three — murmur's `S3`, which is `x ^ times2(x)`.
+    /// Multiply by three, murmur's `S3`, which is `x ^ times2(x)`.
     #[must_use]
     pub fn times3(self) -> Self {
         self.xor(self.times2())
@@ -99,7 +99,7 @@ impl Block {
     ///
     /// The mitigation itself. Upstream applies it to the offset-masked block and
     /// to the checksum together, which is exactly equivalent to flipping the bit
-    /// in the plaintext — and it does change the audio, by one bit in one sample
+    /// in the plaintext, and it does change the audio, by one bit in one sample
     /// of what was digital silence.
     #[must_use]
     pub fn flip_low_bit(self) -> Self {
@@ -111,7 +111,7 @@ impl Block {
     /// A block encoding `len` bytes as a bit count, for the final-block pad.
     ///
     /// The length lives in the last eight bytes big-endian. A partial block is
-    /// at most sixteen bytes, so in practice only the final byte is nonzero —
+    /// at most sixteen bytes, so in practice only the final byte is nonzero,
     /// which is what makes [`Self::matches_but_last`] the right check.
     #[must_use]
     pub fn length_encoding(len: usize) -> Self {
@@ -130,7 +130,7 @@ impl Block {
 
 /// AES-128 in the raw single-block mode OCB2 needs.
 ///
-/// Not a mode of operation — OCB2 *is* the mode, and it calls the bare block
+/// Not a mode of operation, OCB2 *is* the mode, and it calls the bare block
 /// cipher. Wrapping it in a type keeps `aes`'s trait imports out of the OCB2
 /// logic, which is otherwise the only thing in that file that is not arithmetic.
 #[derive(Clone)]

@@ -2,7 +2,7 @@
 # Assert that Starling's copy of the Mumble protobuf contract has not drifted
 # from the C++ server's or the client's.
 #
-# **`vendor/server` is not upstream's source of truth** — it is the Fancy fork,
+# **`vendor/server` is not upstream's source of truth**; it is the Fancy fork,
 # whose proto is ~2100 lines against upstream's 639, and treating it as the
 # reference is how the field-numbering drift in PROTOCOL-COMPATIBILITY.md §1
 # went unnoticed. This check therefore proves *consistency between our trees*
@@ -39,13 +39,13 @@ client="$root/vendor/client/crates/mumble-protocol/proto"
 # comment styles, collapse whitespace, normalise spacing around punctuation, and
 # drop blank lines.
 #
-# Done in one perl pass because `/* … */` blocks span lines, which a line-based
-# sed cannot see — the server's MumbleUDP.proto uses them and the client's does
+# Done in one perl pass because `/* ... */` blocks span lines, which a line-based
+# sed cannot see, the server's MumbleUDP.proto uses them and the client's does
 # not.
 #
 # The punctuation pass matters too: the server writes `[deprecated = true]` and
 # the client `[deprecated=true]`. Both compile to identical descriptors, so a
-# check that flagged it would be crying wolf on day one — and a check people
+# check that flagged it would be crying wolf on day one, and a check people
 # learn to ignore protects nothing.
 normalise() {
     perl -0777 -pe '
@@ -87,7 +87,7 @@ check MumbleUDP.proto "$client/MumbleUDP.proto" "client"
 #
 # Starling owns `proto-fancy/proto/fancy/`; the client mirrors it so it can
 # encode the canon. Both ends decode the same bytes, so a copy that drifts is
-# the D1 failure exactly — two definitions of one outer type, resolving by
+# the D1 failure exactly, two definitions of one outer type, resolving by
 # field number into the wrong fields with nothing in any log.
 #
 # `vendor/server` is not checked: it speaks epoch 0 and has no L2 copy at all.

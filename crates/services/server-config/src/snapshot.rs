@@ -4,7 +4,7 @@
 //! [`starling_runtime::settings::defaults`] when the settings in `§5` of
 //! `docs/GAP-ANALYSIS.md` were made to take effect: every service that enforces
 //! a setting needs the same answer when this service cannot be reached, and a
-//! second copy of a default table is one copy that eventually disagrees — the
+//! second copy of a default table is one copy that eventually disagrees, the
 //! symptom being a limit that depends on which service restarted last. This
 //! module re-exports it so the name still reads as this service's own.
 
@@ -66,8 +66,8 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
 
 /// The readable settings, with the schema a client renders them from.
 ///
-/// Schema and value live in one table on purpose. They used to be two — a map
-/// of values and a separate list of withheld names — and two lists keyed by the
+/// Schema and value live in one table on purpose. They used to be two, a map
+/// of values and a separate list of withheld names, and two lists keyed by the
 /// same strings drift: a secret added to one and not the other is a password
 /// printed on a settings screen.
 ///
@@ -97,7 +97,7 @@ pub fn redact(snapshot: &Snapshot) -> Vec<Setting> {
 
     // Keys a service added without a proto change (`Snapshot.extra`). They have
     // no schema, so they are offered as plain strings under their own heading
-    // rather than dropped — an operator can still read and set them, and the
+    // rather than dropped, an operator can still read and set them, and the
     // absence of a label is visible instead of silent.
     settings.extend(snapshot.extra.iter().map(|(key, value)| Setting {
         key: key.clone(),
@@ -363,7 +363,7 @@ mod tests {
     fn every_setting_carries_enough_schema_to_render_itself() {
         // The point of the change: a client builds the form from this and
         // nothing else, so a row without a label or a group is a field that
-        // shows up blank or in the wrong section — and one whose kind defaults
+        // shows up blank or in the wrong section, and one whose kind defaults
         // to STRING renders a checkbox as a text box.
         for setting in redact(&defaults(1)) {
             assert!(!setting.key.is_empty());

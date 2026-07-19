@@ -1,8 +1,8 @@
-//! `push` — notifications for clients that are not connected.
+//! `push`: notifications for clients that are not connected.
 //!
 //! Optional, and it means it: nobody notices when this is down, because
 //! everyone who is connected got the real message over the control plane.
-//! Which is also the rule the fan-out follows — a recipient with a live session
+//! Which is also the rule the fan-out follows, a recipient with a live session
 //! is skipped, so nobody is notified twice about a message already on screen.
 
 use std::sync::Arc;
@@ -51,7 +51,7 @@ pub struct PushService {
     /// rather than under nobody.
     ///
     /// Every registration used to be stored with `account: 0`, and every lookup
-    /// asked for a real account — so nothing was ever found and no device was
+    /// asked for a real account, so nothing was ever found and no device was
     /// ever notified. A push token belongs to a person across reconnects, which
     /// is exactly what a session id is not.
     roster: Arc<Roster>,
@@ -170,7 +170,7 @@ impl Push for PushRpc {
             // Muted channels are honoured here, and this is the point the whole
             // preference exists for. Every layer below stored it and no layer
             // read it: registrations kept a channel list, the read path
-            // returned it, and delivery counted every device regardless — so a
+            // returned it, and delivery counted every device regardless, so a
             // user who muted a room was notified from it anyway.
             for registration in self.0.subscriptions(scope, *account).await {
                 if registration.muted.contains(&req.channel) {
@@ -378,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn a_muted_channel_does_not_buzz_the_phone() {
         // The preference was a complete no-op: stored on the registration,
-        // returned by the read path, and never compared against anything —
+        // returned by the read path, and never compared against anything,
         // because the notification did not say which channel it was about. A
         // user who muted a room was notified from it anyway.
         let service = service().await;

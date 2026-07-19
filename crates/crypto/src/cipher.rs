@@ -43,7 +43,7 @@ pub trait VoiceCipherSpec: std::fmt::Debug + Send + Sync {
     fn standing(&self) -> CipherStanding;
 }
 
-/// OCB2-AES128 — what stock Mumble uses.
+/// OCB2-AES128, what stock Mumble uses.
 ///
 /// Retained **only** for backwards compatibility. OCB2 has a practical forgery
 /// attack (Inoue–Iwata–Minematsu–Poettering, CRYPTO 2019); Mumble's fixed-length
@@ -76,12 +76,12 @@ impl VoiceCipherSpec for Ocb2Aes128Spec {
     }
 }
 
-/// `XChaCha20-Poly1305` with HKDF-SHA256 — the modern choice.
+/// `XChaCha20-Poly1305` with HKDF-SHA256, the modern choice.
 ///
 /// Matches the client's `fancy_v1` suite exactly (`XChaChaEncryptor`, suite
 /// version `0x01`, 32-byte key, 24-byte nonce, 16-byte tag), so voice and
 /// persistent chat share one cipher and one implementation to review. Chosen over
-/// AES-GCM because it is constant-time in software on every target — the client
+/// AES-GCM because it is constant-time in software on every target, the client
 /// runs on phones and on hardware without AES-NI.
 ///
 /// The 24-byte nonce is what makes it `XChaCha` rather than `ChaCha`: it is large
@@ -90,7 +90,7 @@ impl VoiceCipherSpec for Ocb2Aes128Spec {
 ///
 /// # The nonce must not be transmitted on the voice path
 ///
-/// Chat sends `[version:1][nonce:24][ciphertext+tag:16+]` — 41 bytes of overhead,
+/// Chat sends `[version:1][nonce:24][ciphertext+tag:16+]`, 41 bytes of overhead,
 /// which is fine for a chat message and unacceptable for a 20 ms voice frame,
 /// where an Opus payload at 32 kbit/s is roughly 80 bytes. Transmitting the nonce
 /// would add about 30% to every packet.

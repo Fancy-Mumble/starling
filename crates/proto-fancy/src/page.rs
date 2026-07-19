@@ -2,7 +2,7 @@
 //!
 //! pchat, text and audit each page a UUIDv7-ordered store, and each hand-rolled
 //! the same three fields before `wire.Cursor` existed. The rules they were
-//! duplicating live here instead — including the one they all got wrong.
+//! duplicating live here instead, including the one they all got wrong.
 
 use crate::fancy::wire::{Cursor, PageInfo};
 
@@ -10,8 +10,8 @@ use crate::fancy::wire::{Cursor, PageInfo};
 ///
 /// **An unset limit means `default`, never one entry.** Stated once here because
 /// every plane had its own copy of the mistake: the client wire, the gRPC mesh
-/// and the REST admin surface each wrote `limit.clamp(1, max)`, and proto3 —
-/// like `serde(default)` — cannot distinguish an unset `u32` from a zero. So a
+/// and the REST admin surface each wrote `limit.clamp(1, max)`, and proto3,
+/// like `serde(default)`, cannot distinguish an unset `u32` from a zero. So a
 /// caller that simply never set the field asked for 0, was clamped *up* to 1,
 /// and paged one entry at a time. Nothing errors; it just looks slow, and on
 /// `GET /v1/log` it looked like an audit log with one row in it.
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn the_rule_is_the_same_one_off_the_client_wire() {
         // The mesh and REST planes carry a flat `limit` rather than a `Cursor`,
-        // and each had its own `clamp(1, max)` — which is how `GET /v1/log`
+        // and each had its own `clamp(1, max)`, which is how `GET /v1/log`
         // with no limit came back holding a single audit entry. Same function,
         // so the planes cannot drift apart again.
         assert_eq!(page_size(0, 50, 500), 50, "unset must not mean one");

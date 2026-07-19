@@ -1,4 +1,4 @@
-//! `directory` — what this server tells the outside world about itself.
+//! `directory`: what this server tells the outside world about itself.
 //!
 //! The replacement for murmur's `Register.cpp`: an hourly announcement to the
 //! public Mumble server list, so a server that wants to be found can be.
@@ -9,7 +9,7 @@
 //!
 //! # Why this is its own service and not part of `server-config`
 //!
-//! `server-config` is **essential** — a cold start with it down rejects logins.
+//! `server-config` is **essential**, a cold start with it down rejects logins.
 //! This is a scheduled outbound HTTPS client with a TLS trust store and an XML
 //! payload, and none of that belongs in the process the handshake cannot proceed
 //! without. Being listed publicly is the definition of **optional**: nobody
@@ -259,7 +259,7 @@ impl Serve for DirectoryService {
         let service = ctx.service();
         let data_dir = &ctx.config.runtime.data_dir;
         // The gateway's certificate, by exactly the same rule the gateway uses
-        // to find it — the announced fingerprint has to be the one clients are
+        // to find it, the announced fingerprint has to be the one clients are
         // shown, so a second convention here would be a second answer.
         let cert = ctx
             .config
@@ -325,7 +325,7 @@ mod tests {
         // The bug worth a test: `to_xml_redacted` exists for logging, and using
         // it by mistake here produces a registration the list accepts once and
         // can never authenticate an update against again. Nothing on this side
-        // would show it — the POST succeeds.
+        // would show it, the POST succeeds.
         let listing = Listing {
             name: "Starling".to_owned(),
             password: "shared-secret".to_owned(),

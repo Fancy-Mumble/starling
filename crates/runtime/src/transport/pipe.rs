@@ -3,7 +3,7 @@
 //! The counterpart of [`super::unix`], and there for the same reason: a
 //! deployment whose services share a box should not be reachable from off it.
 //! A pipe's ACL is the boundary a Unix socket's file permissions are, and the
-//! default one — the creating account, and administrators — is what a service
+//! default one (the creating account, and administrators) is what a service
 //! gets here; nothing in this file widens it.
 //!
 //! # Why the name still looks like a path
@@ -54,7 +54,7 @@ pub struct Pipe {
 impl Pipe {
     /// The transport for the pipe called `name`.
     ///
-    /// `name` is normalised, so the bare name and the full `\\.\pipe\…` path
+    /// `name` is normalised, so the bare name and the full `\\.\pipe\...` path
     /// name the same pipe.
     #[must_use]
     pub fn new(name: impl AsRef<str>) -> Self {
@@ -80,8 +80,8 @@ pub(super) fn parse(text: &str) -> Option<Arc<dyn Transport>> {
 
 /// A pipe name in the one form that round-trips: no prefix, `/` for separators.
 ///
-/// Both forms get pasted into configuration — the bare name, and the full path
-/// that tools which list pipes print — and `\` is the one character a pipe name
+/// Both forms get pasted into configuration, the bare name, and the full path
+/// that tools which list pipes print, and `\` is the one character a pipe name
 /// may not contain. Folding them together here means [`Transport::describe`]
 /// has a single form to emit, so a description copied back out of a log parses
 /// to the pipe it came from.
@@ -149,8 +149,8 @@ impl Transport for Pipe {
 
 /// Hand each connected instance on, having created its replacement first.
 ///
-/// A named pipe server is one instance per connection — the instance a client
-/// connects to *is* the connection — so unlike a socket there is no listener
+/// A named pipe server is one instance per connection, the instance a client
+/// connects to *is* the connection, so unlike a socket there is no listener
 /// that outlives the accept. The replacement therefore has to exist before the
 /// connected one is handed over: a client that dials in the gap gets
 /// `ERROR_FILE_NOT_FOUND`, which reads as "the service is not running" and
@@ -178,7 +178,7 @@ async fn accept(
             .is_err()
         {
             // Nothing is serving these any more, so the pipe this task still
-            // holds is dropped with it — which is how the name is released.
+            // holds is dropped with it, which is how the name is released.
             return;
         }
     }

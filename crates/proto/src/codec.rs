@@ -145,7 +145,7 @@ pub fn frame(type_id: u16, payload: &[u8]) -> Bytes {
 /// every recipient of a broadcast while the header varies per connection
 /// (`PROTOCOL-REDESIGN.md` §4, Z4 and §5, S2). `seq` is `Some` only for a peer
 /// that negotiated resume, and `len` then covers the sequence as well as the
-/// payload — a reader takes `len` bytes after the header either way, and the
+/// payload, a reader takes `len` bytes after the header either way, and the
 /// eight it must skip first are the ones it asked for.
 #[must_use]
 pub fn header(type_id: u16, payload_len: usize, seq: Option<u64>) -> Bytes {
@@ -260,7 +260,7 @@ mod tests {
     fn a_sequenced_header_puts_the_sequence_inside_the_length() {
         // The layout the client's decoder strips. `len` covers the sequence as
         // well as the payload, so a reader takes `len` bytes after the header
-        // either way and the eight it skips first are the ones it asked for —
+        // either way and the eight it skips first are the ones it asked for,
         // which is what keeps an unsequenced peer's parsing untouched.
         let header = header(9, 100, Some(0x0102_0304_0506_0708));
         assert_eq!(header.len(), HEADER_SIZE + 8);

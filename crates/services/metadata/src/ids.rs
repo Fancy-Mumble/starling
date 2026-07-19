@@ -2,7 +2,7 @@
 //!
 //! Owned here because metadata is the channel-tree authority
 //! (`docs/ARCHITECTURE.md` §4); every other service that needs to name a
-//! channel — permissions, session-view, voice — depends on this crate for the
+//! channel (permissions, session-view, voice) depends on this crate for the
 //! type rather than inventing its own.
 
 /// The channel every server has and no one can delete.

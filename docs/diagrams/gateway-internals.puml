@@ -7,7 +7,7 @@ skinparam ranksep 48
 skinparam defaultTextAlignment center
 skinparam packageStyle rectangle
 
-title The gateway — five parts, and what it deliberately does not know
+title The gateway: five parts, and what it deliberately does not know
 
 header
 The gateway is the <b>only</b> component holding a client's TCP socket, and it never parses a payload.
@@ -19,8 +19,8 @@ component "**services**\ngRPC" as svc #E8F5E9
 
 package "starling-gateway" as GW #FFE9D6 {
   component "**event loop**  «reactor»\nthe one place that awaits socket readiness" as loop #FFFFFF
-  component "**listener**\nTCP accept · TLS handshake\nmints the connection id\n—\n**requests a client certificate**, accepts any\nissuer, hands the SHA-1 to the services" as listener #FFFFFF
-  component "**connection**  [0..*]\none TLS stream · control framing\n«type u16 + len u32»\n—\n**two bounded queues, two policies:**\ncontrol full -> **disconnect**\naudio full -> **drop oldest, count**" as conn #FFFFFF
+  component "**listener**\nTCP accept · TLS handshake\nmints the connection id\n--\n**requests a client certificate**, accepts any\nissuer, hands the SHA-1 to the services" as listener #FFFFFF
+  component "**connection**  [0..*]\none TLS stream · control framing\n«type u16 + len u32»\n--\n**two bounded queues, two policies:**\ncontrol full -> **disconnect**\naudio full -> **drop oldest, count**" as conn #FFFFFF
   component "**router**\nreads the u16 type, looks it up in TOML,\nforwards the payload **verbatim**.\n**No generated stubs. No schemas.**" as router #FFF9C4
   component "**limiter**\na bucket **per route**, never one shared" as lim #FFF9C4
   component "**breaker + shedder**\na circuit breaker per service, and\ninbound shed by `tier` when one is unhealthy" as brk #FFF9C4
@@ -51,7 +51,7 @@ end note
 note right of res #FFE0B2
   **Why a replay buffer and not just a reconnect.** Draining a
   pod with 10 000 clients means 10 000 simultaneous full floods
-  of every ChannelState and UserState — a self-inflicted DDoS on
+  of every ChannelState and UserState, a self-inflicted DDoS on
   the services behind. A client that resumes from its last
   sequence number replays only the gap.
   The buffer is therefore *meant* to live **outside** this
@@ -101,7 +101,7 @@ note right of listener #E3F2FD
   is bound to one, a ban can be issued against one, and a client
   presenting the right one is admitted without a password.
   None of that is reachable unless the server sends a
-  `CertificateRequest` — with `with_no_client_auth()` it never
+  `CertificateRequest`: with `with_no_client_auth()` it never
   does, so every peer arrives anonymous and all three mechanisms
   are silently unreachable.
   Clients are self-signed by design, so **any issuer is accepted**
@@ -121,9 +121,9 @@ end note
 
 note bottom of listener #FFF9C4
   **Every way a connection ends must reach one place.**
-  The read loop breaks on a clean close, on an I/O error — a
+  The read loop breaks on a clean close, on an I/O error, a
   crashed client, a reset, a dropped network, which is how *most*
-  disconnects actually arrive — and on a service asking for the
+  disconnects actually arrive, and on a service asking for the
   client to go. All three run the same teardown: forget the
   registry entry, tell the services, count it.
   Skipping it on any path leaves the connection in the registry

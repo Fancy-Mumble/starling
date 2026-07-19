@@ -1,8 +1,8 @@
 //! MySQL and MariaDB.
 //!
 //! The two are treated as one because they still agree on everything this crate
-//! asks. Where they diverge — and the upsert clause is the place they nearly do
-//! — the older spelling is used, because MariaDB has not adopted the newer one.
+//! asks. Where they diverge, and the upsert clause is the place they nearly do
+//! the older spelling is used, because MariaDB has not adopted the newer one.
 
 use super::SqlDialect;
 
@@ -32,7 +32,7 @@ impl SqlDialect for MySql {
 
     fn upsert_suffix(&self, _keys: &[&str], updates: &[&str]) -> String {
         // MySQL has no `ON CONFLICT`, and infers the conflict target from
-        // whichever unique constraint the insert violated — so `keys` is unused
+        // whichever unique constraint the insert violated, so `keys` is unused
         // here rather than ignored by mistake.
         //
         // `VALUES()` is deprecated in MySQL 8 in favour of a row alias, but

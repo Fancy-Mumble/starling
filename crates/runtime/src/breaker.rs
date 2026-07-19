@@ -1,7 +1,7 @@
 //! A circuit breaker per service, because deadlines alone fail slowly.
 //!
 //! A saturated service otherwise makes every caller wait its full deadline and
-//! *then* fail, burning gateway capacity throughout — the gateway spends five
+//! *then* fail, burning gateway capacity throughout, the gateway spends five
 //! seconds per request discovering something it learned five seconds ago. Trip
 //! the breaker and shed at the door instead (`docs/ARCHITECTURE.md` §5).
 //!

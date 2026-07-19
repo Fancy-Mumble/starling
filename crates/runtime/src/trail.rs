@@ -28,7 +28,7 @@
 //!
 //! [`Trail::record`] returns immediately and does the call on a spawned task.
 //! Awaiting it would put the latency of an optional service in front of every
-//! channel edit, mute and registration — the same reasoning that keeps the
+//! channel edit, mute and registration, the same reasoning that keeps the
 //! audio path off request/reply. Ordering between records is not preserved by
 //! the spawn, and does not need to be: each entry carries `at_ms`, and the
 //! hash chain is assigned by `audit` itself under its own lock, so it links
@@ -44,7 +44,7 @@ use crate::ids::now_ms;
 /// What kind of thing happened, in the vocabulary the Fancy audit UI filters
 /// on.
 ///
-/// These are the fork's own category strings — `AuditLogBridge` and the client's
+/// These are the fork's own category strings, `AuditLogBridge` and the client's
 /// audit tab both key off them, so a new name here is a row the existing UI
 /// cannot filter to.
 pub mod category {
@@ -151,7 +151,7 @@ impl Trail {
     ///
     /// Returns immediately. The call happens on a spawned task and its outcome
     /// reaches the caller only as a log line, because there is nothing a caller
-    /// could usefully do with the failure — the action it describes has already
+    /// could usefully do with the failure, the action it describes has already
     /// happened.
     pub fn record(&self, scope: u32, what: Record) {
         let resolver = self.resolver.clone();

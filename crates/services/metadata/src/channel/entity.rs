@@ -63,7 +63,7 @@ impl Channel {
 /// Whether a channel with cap `max_users` is full at `occupants`.
 ///
 /// A free function because the rule has **two** callers holding two different
-/// channel types — this entity and the proto record the live tree is made of —
+/// channel types (this entity and the proto record the live tree is made of)
 /// and it was previously written out in both. `GAP-ANALYSIS.md` C4 records what
 /// that cost: the rule was modelled here, covered by tests here, and the tree
 /// that clients actually enter had its own copy. A rule with two homes is a

@@ -1,8 +1,8 @@
 //! The permission bit set.
 //!
 //! Values are transcribed from `vendor/server/src/ACL.h:21`, including the Fancy
-//! fork's additions. They are **wire-visible** — sent in `ServerSync.permissions`
-//! and `PermissionQuery.permissions` — so they must never be renumbered.
+//! fork's additions. They are **wire-visible**, sent in `ServerSync.permissions`
+//! and `PermissionQuery.permissions`, so they must never be renumbered.
 //!
 //! It lives in the contract crate rather than in `starling-permissions` because
 //! it is not policy: every service that *enforces* a permission needs to name
@@ -16,8 +16,8 @@ bitflags! {
     /// A set of channel permissions.
     ///
     /// Declared with `bitflags` so that the set of flags has exactly one
-    /// definition. The hand-rolled version needed two parallel lists — a
-    /// `NAMED` table and an `ALL` union — that had to be updated whenever a
+    /// definition. The hand-rolled version needed two parallel lists, a
+    /// `NAMED` table and an `ALL` union; that had to be updated whenever a
     /// permission was added, and silently under-reported when they were not.
     /// [`Self::all`] and [`Self::iter_names`] are generated from the
     /// declaration below, so they cannot drift from it.
@@ -101,8 +101,8 @@ impl Perm {
     /// murmur's `ChanACL::effectivePermissions` seeds the walk with exactly
     /// these (`vendor/server/src/ACL.cpp:130`) rather than with nothing, and the
     /// difference is the whole behaviour of an unconfigured server: starting
-    /// from empty means a fresh server grants **nobody** anything — no talking,
-    /// no text, not even entering a channel — and every client shows every
+    /// from empty means a fresh server grants **nobody** anything, no talking,
+    /// no text, not even entering a channel, and every client shows every
     /// action greyed out with no ACL to point at as the cause.
     ///
     /// An operator takes permissions *away* from here with a deny entry. That

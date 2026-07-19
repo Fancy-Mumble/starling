@@ -37,7 +37,7 @@ impl std::error::Error for SinkError {}
 
 /// Somewhere log records can be written.
 ///
-/// Implement this to send the log anywhere — a file, a database, syslog, an
+/// Implement this to send the log anywhere, a file, a database, syslog, an
 /// HTTP endpoint. The server never learns which.
 ///
 /// # Contract
@@ -51,7 +51,7 @@ impl std::error::Error for SinkError {}
 ///    sinks and does not stop the server.
 /// 4. [`Self::flush`] must make everything written so far durable, and is
 ///    called on shutdown. A buffering sink that ignores it loses the records
-///    that matter most — the ones just before the process died.
+///    that matter most, the ones just before the process died.
 pub trait LogSink: Send + std::fmt::Debug {
     /// A short name, used in error messages and diagnostics.
     fn name(&self) -> &str;
@@ -70,8 +70,8 @@ pub trait LogSink: Send + std::fmt::Debug {
 /// Attach the failing sink's name to an error, so `?` can carry it.
 ///
 /// Ten call sites wrote `.map_err(|e| SinkError::new(name, e))` by hand. The
-/// wrapping is not optional — a `SinkError` without a sink name tells an operator
-/// nothing about which destination broke — but writing it out at every call was
+/// wrapping is not optional, a `SinkError` without a sink name tells an operator
+/// nothing about which destination broke, but writing it out at every call was
 /// noise around the one thing that mattered, the `?`.
 pub trait SinkContext<T> {
     /// Convert into a [`SinkError`] naming `sink`.

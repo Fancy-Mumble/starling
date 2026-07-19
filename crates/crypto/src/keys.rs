@@ -1,6 +1,6 @@
 //! The key material one peer's voice session is built from.
 //!
-//! `CryptSetup` (wire type 15) carries three fields — a key and two nonces — and
+//! `CryptSetup` (wire type 15) carries three fields (a key and two nonces) and
 //! the server generates all of them. This module holds them as a value that
 //! cannot accidentally be logged, and knows how a resync is meant to work.
 //!
@@ -26,7 +26,7 @@
 //! Swapping an IV mid-session is an OCB2 idea. `XChaCha20-Poly1305` folds its
 //! salt into a derived subkey and reconstructs the counter's high bits from the
 //! two bytes on the wire, so there is no value a peer could hand over that would
-//! mean anything — see [`VoiceCipher::send_nonce`](crate::VoiceCipher::send_nonce).
+//! mean anything, see [`VoiceCipher::send_nonce`](crate::VoiceCipher::send_nonce).
 //! A peer on that cipher resynchronises by being re-keyed instead, which is why
 //! the seam reports what it can do rather than assuming murmur's answer works
 //! everywhere.
@@ -179,7 +179,7 @@ pub enum ResyncRequest<'a> {
         /// means are the cipher's business: OCB2 wants the sixteen bytes of an
         /// AES block, and a cipher whose nonce is folded into a derived subkey
         /// has no use for it at all. Narrowing it to a number here is the bug
-        /// this field was reshaped to remove — an eight-byte counter matched
+        /// this field was reshaped to remove, an eight-byte counter matched
         /// neither cipher Starling ships, so every real resync fell through to
         /// [`Self::SendMine`].
         nonce: &'a [u8],
@@ -229,7 +229,7 @@ mod tests {
         // The failure this catches: a server that seals under the nonce it
         // should be opening with. Every packet then fails its tag, in both
         // directions, and the symptom is a handshake that looks perfect
-        // followed by total silence — which is indistinguishable from a
+        // followed by total silence, which is indistinguishable from a
         // microphone problem at the other end.
         //
         // Both ciphers, because the crossover is written out twice.
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_nonce_of_any_width_is_still_an_offer_to_adopt() {
-        // Presence decides, as it does in murmur — refusing a width belongs to
+        // Presence decides, as it does in murmur, refusing a width belongs to
         // the cipher, which knows what it expects. Classifying an unexpected
         // width as "send me yours" is what made every real resync take the
         // wrong branch: nothing here sends an eight-byte nonce.
@@ -486,8 +486,8 @@ impl VoiceSecrets {
     ///
     /// The counterpart to what the client builds from the same `CryptSetup`, and
     /// deliberately here rather than in the voice service: both halves of both
-    /// ciphers already live in this crate, and the one mistake that matters — a
-    /// server that sends under the nonce it should be receiving under — is only
+    /// ciphers already live in this crate, and the one mistake that matters, a
+    /// server that sends under the nonce it should be receiving under, is only
     /// visible when the two are written next to each other.
     ///
     /// Boxed because the two ciphers have different per-packet state and the
@@ -510,7 +510,7 @@ impl VoiceSecrets {
     /// The three fields `CryptSetup` carries, in wire order.
     ///
     /// One accessor rather than three, because all a caller ever does with them
-    /// is put them in that message — and because the middle two mean different
+    /// is put them in that message, and because the middle two mean different
     /// things per variant (IVs against salts) that no caller should have to know.
     #[must_use]
     pub fn to_wire(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

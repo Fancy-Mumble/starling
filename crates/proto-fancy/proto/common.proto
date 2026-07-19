@@ -11,7 +11,7 @@ package starling.common.v1;
 message Ack {}
 
 // Which virtual server an operation is scoped to. Every stored row and every
-// actor is keyed by this — docs/ARCHITECTURE.md §4.
+// actor is keyed by this, docs/ARCHITECTURE.md §4.
 message Scope {
   uint32 virtual_server = 1;
 }
@@ -19,7 +19,7 @@ message Scope {
 // Who is asking, for authorisation and for the audit record.
 //
 // A call carries exactly one of these. `operator` is how operator-api reaches
-// the same methods the gateway does without a session — ARCHITECTURE §3.
+// the same methods the gateway does without a session, ARCHITECTURE §3.
 message Actor {
   oneof who {
     uint32 session = 1;

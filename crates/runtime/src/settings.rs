@@ -5,7 +5,7 @@
 //! The same argument [`Permit`](crate::permit::Permit) makes. A setting read
 //! separately in each service is a setting that is read *differently* in each
 //! service, and the one that got it wrong is not visibly different from the
-//! others — which is exactly how §5 of `docs/GAP-ANALYSIS.md` happened: twelve
+//! others, which is exactly how §5 of `docs/GAP-ANALYSIS.md` happened: twelve
 //! settings an operator could change, accepted, persisted, and consulted by
 //! nothing.
 //!
@@ -16,7 +16,7 @@
 //!
 //! A permission check denies when it cannot reach `permissions`: a stale deny
 //! costs somebody one refused action, a stale grant is a security hole. A
-//! *setting* has no such asymmetry — refusing every message because
+//! *setting* has no such asymmetry, refusing every message because
 //! `server-config` restarted would take the server down over a dependency
 //! being briefly absent. So this falls back, in order:
 //!
@@ -111,7 +111,7 @@ pub fn defaults(virtual_server: u32) -> Snapshot {
 
 /// A service's live view of the settings an operator can change.
 ///
-/// Cheap to clone — every clone reads the same cache.
+/// Cheap to clone, every clone reads the same cache.
 #[derive(Debug, Clone)]
 pub struct Settings {
     resolver: Resolver,
@@ -120,7 +120,7 @@ pub struct Settings {
     ///
     /// Applied here rather than by each service because it is one setting with
     /// one effect, and a service that forgot the line would log addresses in
-    /// full while every other service in the deployment did not — which reads
+    /// full while every other service in the deployment did not, which reads
     /// like a bug in the obfuscation rather than a missing call.
     logger: Option<crate::log::Logger>,
 }
@@ -283,14 +283,14 @@ impl Settings {
 /// # Why this is here and not in the admin API
 ///
 /// It was in the admin API, and it understood **two** settings: `welcome_text`
-/// and `max_users`. Everything else in `§5` — the rate limit, the channel
-/// ceilings, `cert_required`, the retention, the obfuscation — could be
+/// and `max_users`. Everything else in `§5`, the rate limit, the channel
+/// ceilings, `cert_required`, the retention, the obfuscation, could be
 /// enforced by the server and still not be *reachable*, because the surface an
 /// operator actually uses had no way to write them. A setting nobody can set
 /// has not stopped being a lie; it has only moved which layer tells it.
 ///
 /// The list is the same one `server-config`'s own field-wise merge accepts, so
-/// a setting added there is settable here without a second edit — and the two
+/// a setting added there is settable here without a second edit, and the two
 /// cannot drift into disagreeing about a name.
 ///
 /// Unknown keys are returned in the field list too: `apply_fields` puts them in
@@ -404,7 +404,7 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
 
 /// Everything an operator may read back, as JSON.
 ///
-/// The two secrets — the server password and the registry password — are
+/// The two secrets (the server password and the registry password) are
 /// **not** here. A client must still be able to tell "not set" from "withheld",
 /// which is what `server-config`'s own `redact` does for the client-facing
 /// path; this is the admin one, and its callers already know both exist.
@@ -466,7 +466,7 @@ mod tests {
     fn a_cold_cache_reads_murmurs_defaults_and_not_a_zeroed_record() {
         // The property the whole type exists for. `Snapshot::default()` has
         // `message_limit = 0`, which the gateway would read as "no messages at
-        // all" — a dependency being slow to start would look like a server that
+        // all", a dependency being slow to start would look like a server that
         // accepts connections and answers nothing.
         let snapshot = settings().get(1);
         assert_eq!(snapshot.message_limit, 1);
@@ -507,8 +507,8 @@ mod tests {
 
     #[test]
     fn every_setting_in_the_gap_analysis_can_be_written_by_an_operator() {
-        // The admin API understood two settings — `welcome_text` and
-        // `max_users` — so the whole of §5 could be enforced by the server and
+        // The admin API understood two settings, `welcome_text` and
+        // `max_users`, so the whole of §5 could be enforced by the server and
         // still be unreachable from the surface an operator uses. A setting
         // nobody can set has not stopped being a lie.
         let (snapshot, fields) = from_json(&serde_json::json!({

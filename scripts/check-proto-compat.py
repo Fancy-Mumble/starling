@@ -3,7 +3,7 @@
 
 The third of the three checks in `PROTOCOL-COMPATIBILITY.md` §5, and the only
 one that can fail with a *released client* on the other end. The other two
-compare our trees against each other, which proves we agree — it does not prove
+compare our trees against each other, which proves we agree; it does not prove
 we are right. A field that all three trees moved identically is invisible to
 them and fatal here.
 
@@ -15,7 +15,7 @@ rather than passing: an unfetched remote must not read as agreement.
 What it asserts, for every message upstream defines:
 
 * **Every upstream field keeps upstream's number.** The failure this exists for
-  is a Fancy field taking the number upstream will use next — proto resolves by
+  is a Fancy field taking the number upstream will use next, proto resolves by
   number, so both ends decode happily and disagree about what they read.
 * **Every upstream field keeps upstream's type and label.** `optional uint32`
   becoming `optional uint64` is silently wrong for values above 2^32, and
@@ -55,7 +55,7 @@ FANCY_FIELD_MIN = 1000
 #
 # `Version.fancy_version = 6` cannot move: it is what every shipped Fancy peer
 # reads to decide whether extensions exist at all, so relocating it would not
-# break loudly — it would make this server look like plain Mumble to all of
+# break loudly; it would make this server look like plain Mumble to all of
 # them. But upstream's `Version` uses 1 to 5, which makes **6 the next number
 # upstream will take**, and this is exactly the collision the rest of the rule
 # exists to prevent.
@@ -147,7 +147,7 @@ def main() -> int:
             elif got[0] != number:
                 problems.append(
                     f"{message}.{name}: upstream numbers it {number}, we number it "
-                    f"{got[0]} — a released client would read the wrong field"
+                    f"{got[0]}, a released client would read the wrong field"
                 )
             elif got[1] != kind:
                 problems.append(
@@ -165,7 +165,7 @@ def main() -> int:
             if (message, name, number) in PINNED:
                 print(
                     f"note: {message}.{name} = {number} is the pinned exception, "
-                    f"and {number} is upstream's next free number in {message} — "
+                    f"and {number} is upstream's next free number in {message}, "
                     f"see PROTOCOL-COMPATIBILITY.md §1",
                     file=sys.stderr,
                 )

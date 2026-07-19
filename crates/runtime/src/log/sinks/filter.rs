@@ -8,7 +8,7 @@ use crate::log::sink::{LogSink, SinkError};
 /// Passes records to an inner sink only if they clear a threshold.
 ///
 /// Decorator: it *is* a [`LogSink`] wrapping a [`LogSink`], so it can gate
-/// anything — including a whole [`FanoutSink`](super::FanoutSink) — and the
+/// anything, including a whole [`FanoutSink`](super::FanoutSink), and the
 /// wrapped sink never learns it is being filtered.
 ///
 /// This is what lets one configuration say "everything to the file, but only

@@ -2,7 +2,7 @@
 //!
 //! A direct port of murmur's `ocb_encrypt` / `ocb_decrypt`, including the
 //! counter-cryptanalysis mitigation. Byte-for-byte compatibility is the whole
-//! requirement — a stock Mumble client will not negotiate anything else, so
+//! requirement, a stock Mumble client will not negotiate anything else, so
 //! "nearly OCB2" is the same as no voice at all.
 //!
 //! # The 2019 attack, and why the mitigation changes the audio
@@ -12,7 +12,7 @@
 //! its final byte. Mumble's fix is to detect that block and flip one bit of it
 //! before encrypting.
 //!
-//! That is a real change to the plaintext — the receiver decrypts to something
+//! That is a real change to the plaintext, the receiver decrypts to something
 //! one bit different from what was sent. Upstream accepts it because the block
 //! only arises from digital silence, where a single flipped bit in one sample is
 //! inaudible. The alternative upstream tried first, refusing to send the packet,
@@ -25,7 +25,7 @@ use super::block::{BLOCK_LEN, Block, BlockCipher};
 
 /// The three-byte authentication tag, truncated from a full block.
 ///
-/// Mumble sends three bytes, not sixteen. That is 24 bits of authentication —
+/// Mumble sends three bytes, not sixteen. That is 24 bits of authentication,
 /// weak by any modern standard, and one of the reasons `XChaCha20-Poly1305`
 /// exists as the upgrade path. It is not negotiable for a stock client.
 pub const TAG_LEN: usize = 3;
@@ -42,7 +42,7 @@ pub(super) fn encrypt(cipher: &BlockCipher, nonce: Block, plain: &[u8]) -> (Vec<
 
     // One block is always held back: the final block goes through the partial
     // path below even when it is full, because that path is what folds the
-    // length into the tag. Hence `len - 1` — a length that is an exact multiple
+    // length into the tag. Hence `len - 1`, a length that is an exact multiple
     // of BLOCK_LEN still leaves a full block as the tail, not an empty one.
     let (body, tail) = plain.split_at(plain.len().saturating_sub(1) / BLOCK_LEN * BLOCK_LEN);
     let (blocks, remainder) = body.as_chunks::<BLOCK_LEN>();
@@ -51,8 +51,8 @@ pub(super) fn encrypt(cipher: &BlockCipher, nonce: Block, plain: &[u8]) -> (Vec<
         "the split is a whole number of blocks"
     );
 
-    // The block that will be second-to-last overall — one block or less follows
-    // it — is the last one here, by construction of the split above.
+    // The block that will be second-to-last overall, one block or less follows
+    // it, is the last one here, by construction of the split above.
     let mitigated = blocks.len().wrapping_sub(1);
     for (index, chunk) in blocks.iter().enumerate() {
         let mut block = Block::from_padded(chunk);

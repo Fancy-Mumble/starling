@@ -1,7 +1,7 @@
 //! Authentication for the admin plane, which is a Strategy chosen in the TOML.
 //!
 //! The operator surface can create users, rewrite ACLs, ban and read the
-//! database — the highest-privilege plane in the system. So authentication is
+//! database, the highest-privilege plane in the system. So authentication is
 //! **whatever the operator already runs** rather than something we invent, and
 //! a new mode is a new implementation rather than a new arm in a `match`
 //! (`docs/ARCHITECTURE.md` §3).

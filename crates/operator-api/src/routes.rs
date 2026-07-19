@@ -2,7 +2,7 @@
 //!
 //! Every handler does the same three things in the same order: identify the
 //! caller, check the scope the operation needs, and record the action before
-//! answering. The order matters — a record written after the answer is a record
+//! answering. The order matters, a record written after the answer is a record
 //! that can be missing for an action that happened.
 
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
             put(update_account).delete(delete_account),
         )
         // Avatar and comment are content-addressed blobs behind an account
-        // rather than fields on it, so they are their own resources — and they
+        // rather than fields on it, so they are their own resources, and they
         // are bytes, which do not belong in a JSON field.
         .route(
             "/v1/accounts/{id}/texture",
@@ -61,7 +61,7 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         // The read side a channel viewer needs. Ice served this on the C++
         // server (`getChannels`, `getUsers`) and Starling has no Ice at all
         // (`docs/GAP-ANALYSIS.md` S6), so without these a viewer has no way to
-        // see the server — the whole surface it was built on is gone.
+        // see the server, the whole surface it was built on is gone.
         .route("/v1/channels", get(list_channels).post(create_channel))
         .route(
             "/v1/channels/{id}",
@@ -80,7 +80,7 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         .route("/v1/messages", post(send_message))
         .route("/v1/sessions", get(list_sessions))
         // Moderating a *connected* user. `PATCH` because these are a partial
-        // update to a live session and every field is optional — omitted means
+        // update to a live session and every field is optional, omitted means
         // "leave it alone", which a `PUT` could not express without the caller
         // having to restate the user's whole state and race whoever else is
         // changing it.
@@ -136,7 +136,7 @@ fn refuse(status: StatusCode, message: &str) -> (StatusCode, Json<ApiError>) {
     )
 }
 
-/// Identify, authorise and record — in that order.
+/// Identify, authorise and record, in that order.
 fn admit(
     api: &OperatorApi,
     headers: &HeaderMap,
@@ -180,7 +180,7 @@ fn admit(
 /// [`admit`], for a handler that cannot answer with this module's JSON body.
 ///
 /// The WebSocket upgrade returns a `Response` rather than a `Json<ApiError>`,
-/// and authorisation still has to happen before the upgrade — a socket that
+/// and authorisation still has to happen before the upgrade, a socket that
 /// opens and immediately closes is, to most clients, indistinguishable from a
 /// network fault.
 ///
@@ -211,8 +211,8 @@ fn dial(
 
 /// The identity a service should attribute this change to.
 ///
-/// Carried on every write, not for authorisation — the services trust this
-/// plane — but so a change has a name against it in the service's own log. An
+/// Carried on every write, not for authorisation, the services trust this
+/// plane, but so a change has a name against it in the service's own log. An
 /// operator action that appears in the audit file and nowhere else is only half
 /// recorded.
 fn operator_actor(subject: String, scope: &str) -> Option<Actor> {
@@ -421,7 +421,7 @@ async fn create_account(
         .await
         // A name already taken is a 409; a userdata that cannot be reached is
         // not. Reporting both as CONFLICT tells an operator to pick another
-        // name when the real answer is that the service is down — and the
+        // name when the real answer is that the service is down, and the
         // message it comes with ("dns error") does not read as either.
         .map_err(|status| match status.code() {
             tonic::Code::AlreadyExists | tonic::Code::InvalidArgument => {
@@ -441,19 +441,19 @@ async fn create_account(
 /// different settings must not silently overwrite each other, and userdata
 /// enforces that with an explicit field list rather than by diffing.
 ///
-/// **This is also how the SuperUser password is set** — the administrator is
+/// **This is also how the SuperUser password is set**, the administrator is
 /// simply account `0`:
 ///
 /// ```text
-/// PUT /v1/accounts/0  {"password":"…"}
+/// PUT /v1/accounts/0  {"password":"..."}
 /// ```
 ///
 /// There is deliberately no separate superuser route. One would be this endpoint
 /// with a hard-coded id, and it would drift: a change to how a password is
 /// written here would have to be remembered there.
 ///
-/// The account has to exist. For the administrator it always does — userdata
-/// creates it on first boot — but a userdata database restored from before that
+/// The account has to exist. For the administrator it always does, userdata
+/// creates it on first boot, but a userdata database restored from before that
 /// has no way back in over HTTP, which is what `starling
 /// set-superuser-password` is for.
 async fn update_account(
@@ -487,7 +487,7 @@ async fn update_account(
     }
 
     // Decoded before anything is written, so a malformed hash is a 400 naming
-    // the field rather than a certificate silently registered as empty — which
+    // the field rather than a certificate silently registered as empty, which
     // would read as "this account accepts no certificate" and lock the user out.
     let cert_hash = match change.cert_hash.as_deref() {
         None | Some("") => Vec::new(),
@@ -577,8 +577,8 @@ async fn delete_account(
 
 /// Which content-addressed field of an account a request is about.
 ///
-/// The two blobs behave identically — `userdata` stores bytes and the account
-/// holds the hash — so they share every step but the field name.
+/// The two blobs behave identically, `userdata` stores bytes and the account
+/// holds the hash, so they share every step but the field name.
 #[derive(Clone, Copy)]
 enum Blob {
     Texture,
@@ -779,7 +779,7 @@ async fn set_comment(
 /// A ban to place, as JSON.
 ///
 /// Everything except the reason is optional because murmur's ban table matches
-/// on any of three things — address, certificate hash, or name — and a ban that
+/// on any of three things (address, certificate hash, or name) and a ban that
 /// named all three would only catch somebody presenting all three.
 #[derive(Debug, Deserialize)]
 struct NewBan {
@@ -979,7 +979,7 @@ struct SessionPatch {
 
 /// murmur's `setState`: move, mute, deafen or suppress a connected user.
 ///
-/// The gap an operator meets first — an admin plane that can watch somebody
+/// The gap an operator meets first, an admin plane that can watch somebody
 /// misbehave and do nothing about them. Everything else here reads the server
 /// or changes what is stored; this is the only route that reaches a live
 /// connection.
@@ -1017,7 +1017,7 @@ async fn set_session_state(
 
     if !result.applied {
         // `NOT_FOUND` when the session is gone, `CONFLICT` when it is there and
-        // the change was refused — the caller's recourse differs: one is retry
+        // the change was refused, the caller's recourse differs: one is retry
         // with a different session, the other is fix the ACL.
         let status = if result.refused.starts_with("no session") {
             StatusCode::NOT_FOUND
@@ -1275,8 +1275,8 @@ async fn get_health(
         }
     }
 
-    // The recent past in the same round trip. A dashboard needs both — the
-    // detail of now and the shape of the last hour — and two polls would
+    // The recent past in the same round trip. A dashboard needs both, the
+    // detail of now and the shape of the last hour, and two polls would
     // double the traffic to show one page.
     //
     // Best effort: a collector that can answer `Get` and not `History` is odd
@@ -1310,7 +1310,7 @@ async fn get_health(
                 "unreachable": sample.unreachable,
                 // Microseconds. A dashboard divides for display; the API does
                 // not, because rounding at the source destroys the difference
-                // between "fast" and "not measured" — every in-process check
+                // between "fast" and "not measured", every in-process check
                 // truncated to 0ms before this.
                 "worst_latency_us": sample.worst_latency_us,
                 "slowest": sample.slowest,
@@ -1374,7 +1374,7 @@ async fn get_config(
         .into_inner();
 
     // Everything an operator may write, so the form they render next has the
-    // value they just set rather than a blank. Neither password is here — a
+    // value they just set rather than a blank. Neither password is here, a
     // credential read back is a credential in a log, a browser cache and
     // whatever proxy sits in between.
     Ok(Json(starling_runtime::settings::to_json(&snapshot)))
@@ -1382,7 +1382,7 @@ async fn get_config(
 
 /// The channel tree.
 ///
-/// **Not visibility-filtered, and that is deliberate** — it is the same
+/// **Not visibility-filtered, and that is deliberate**; it is the same
 /// property Ice's `getChannels` had, and the channel viewer relies on knowing
 /// it. This is the operator plane: it answers for the server, not for some
 /// session, so there is no viewer whose permissions could filter it. A caller
@@ -1496,7 +1496,7 @@ async fn list_sessions(
 struct NewChannel {
     name: String,
     /// The root channel is 0, and a channel created without a parent belongs
-    /// there — which is what murmur does and what makes `parent` omissible.
+    /// there, which is what murmur does and what makes `parent` omissible.
     #[serde(default)]
     parent: u32,
     #[serde(default)]
@@ -1524,7 +1524,7 @@ struct ChannelUpdate {
     max_users: Option<u32>,
 }
 
-/// One channel, as JSON — the same shape `GET /v1/channels` returns per entry.
+/// One channel, as JSON, the same shape `GET /v1/channels` returns per entry.
 fn channel_json(c: &starling_proto_fancy::metadata::Channel) -> serde_json::Value {
     serde_json::json!({
         "id": c.id,
@@ -1550,8 +1550,8 @@ fn applied(
     result: &starling_proto_fancy::metadata::ChannelResult,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     if !result.applied {
-        // The refusals are all statements about the request — an absent parent,
-        // a duplicate name, an empty name — so they are the caller's fault.
+        // The refusals are all statements about the request, an absent parent,
+        // a duplicate name, an empty name, so they are the caller's fault.
         return Err(refuse(StatusCode::CONFLICT, &result.refused));
     }
     Ok(Json(serde_json::json!({
@@ -1691,7 +1691,7 @@ async fn delete_channel(
 ///
 /// `grant` and `deny` are `Perm` bit sets. They stay numeric rather than
 /// becoming name arrays because the numbers are what murmur's own ACL editor,
-/// the wire protocol and the database all use — translating here would put a
+/// the wire protocol and the database all use, translating here would put a
 /// name table in three places and make a new permission bit a change to all of
 /// them.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1913,7 +1913,7 @@ impl TemporaryMember {
 /// murmur's `addUserToGroup` (`MumbleServer.ice:728`), which Starling reaches
 /// here because it has no Ice and never will (`GAP-ANALYSIS.md` S6).
 ///
-/// **Not durable, deliberately** — upstream says so of its own ("This state is
+/// **Not durable, deliberately**, upstream says so of its own ("This state is
 /// not saved"), and a session-scoped grant that survived a restart would be
 /// attached to a session id belonging to whoever connects next. It is an
 /// external authority's live decision, not configuration.
@@ -1939,7 +1939,7 @@ async fn remove_temporary_group(
 /// Both directions, which differ only in the call they end in.
 ///
 /// Written once because the two drifting apart is how a grant comes to be
-/// validated differently from the revocation meant to undo it — and of the two,
+/// validated differently from the revocation meant to undo it, and of the two,
 /// the revocation failing is the dangerous one.
 async fn temporary_group(
     api: Arc<OperatorApi>,
@@ -2052,7 +2052,7 @@ async fn set_config(
     // Every setting `server-config` accepts, not the two this used to know
     // about. An operator could not write `messagelimit`, `certrequired`,
     // `channelnestinglimit`, `logdays` or the obfuscation through the surface
-    // built for exactly that — so the whole of `GAP-ANALYSIS.md` §5 could be
+    // built for exactly that, so the whole of `GAP-ANALYSIS.md` §5 could be
     // enforced by the server and still be unreachable.
     //
     // The mapping lives in `starling_runtime::settings` beside the defaults and

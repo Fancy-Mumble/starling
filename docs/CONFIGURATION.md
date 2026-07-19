@@ -5,7 +5,7 @@
 murmur keeps deployment and operational settings together in one `Config` table.
 Starling splits them, because they have different lifetimes:
 
-| | **Deployment — this file** | **Operational — the `server-config` service** |
+| | **Deployment (this file** | **Operational) the `server-config` service** |
 |---|---|---|
 | Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `bandwidth`, `messagelimit`, `users`, `welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`, `certrequired`, `allow_ping`, `registry_*` |
 | Changed by | editing this file | an operator, at runtime, like murmur |
@@ -13,7 +13,7 @@ Starling splits them, because they have different lifetimes:
 | Scope | the process | per virtual server |
 
 Anything that needs a restart anyway belongs here, so it is read once at startup
-and injected at construction — no late-subscriber problem and no service to be
+and injected at construction, no late-subscriber problem and no service to be
 down. Anything an operator expects to change live belongs to `server-config`,
 which is an **essential** service for exactly that reason: the gateway cannot
 rate-limit without `messagelimit`, so a cold start without it rejects logins
@@ -21,7 +21,7 @@ rather than quietly serving on defaults nobody chose.
 
 Every key below is overridable by environment variable, so a Kubernetes ConfigMap
 works without templating and `docker compose` works without a mount. The rule:
-`[services.text] endpoint` becomes `STARLING_SERVICES_TEXT_ENDPOINT` — uppercase,
+`[services.text] endpoint` becomes `STARLING_SERVICES_TEXT_ENDPOINT`, uppercase,
 dots and dashes to underscores, `STARLING_` prefix.
 
 ---
@@ -67,7 +67,7 @@ tier    = "optional"
 mode = "oidc"                      # oidc | jwt | mtls | token
 ```
 
-**`oidc`** — for Keycloak, Authentik, Auth0, Entra. The JWKS is discovered from
+**`oidc`**, for Keycloak, Authentik, Auth0, Entra. The JWKS is discovered from
 the issuer and cached, so key rotation needs no restart.
 
 ```toml
@@ -83,7 +83,7 @@ scope_claim = "roles"              # which claim carries authorisation
 "backup-job"       = ["userdata:read", "metadata:read"]
 ```
 
-**`jwt`** — a bare token you sign yourself, for setups with no IdP.
+**`jwt`**, a bare token you sign yourself, for setups with no IdP.
 
 ```toml
 [services.operator-api.auth.jwt]
@@ -92,7 +92,7 @@ audience    = "starling-admin"
 scope_claim = "scopes"
 ```
 
-**`mtls`** — client certificates, when a PKI already exists. Scopes come from the
+**`mtls`**, client certificates, when a PKI already exists. Scopes come from the
 certificate subject.
 
 ```toml
@@ -102,7 +102,7 @@ client_ca = "/etc/starling/operator/ca.pem"
 "CN=admin-console" = ["*"]
 ```
 
-**`token`** — a static bearer token, for a script or a one-box install. The
+**`token`**, a static bearer token, for a script or a one-box install. The
 weakest option: no identity, no expiry. It exists so nobody reinvents `icesecret`
 badly, not because it is recommended.
 
@@ -113,13 +113,13 @@ tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
 
 ### The live channel
 
-`GET /v1/events` is a WebSocket carrying what changed as it changes — users
+`GET /v1/events` is a WebSocket carrying what changed as it changes, users
 connecting and moving, channels being created and edited, messages as they are
 delivered, and context-menu entries being chosen. It needs no configuration and
 works through any reverse proxy.
 
 The same channel is available over **WebTransport (HTTP/3)**, and that one does
-need configuring, because a reverse proxy generally *cannot* forward it —
+need configuring, because a reverse proxy generally *cannot* forward it,
 WebTransport is Extended CONNECT over HTTP/3, and terminating it means
 terminating QUIC.
 
@@ -134,7 +134,7 @@ key     = "/etc/starling/wt/key.pem"
 **The certificate is not optional in practice.** Every other surface here can
 sit behind a proxy holding the certificate; this listener is the one the proxy
 is not terminating, so it presents its own. A self-signed pair is generated on
-first boot if `cert` and `key` are absent, which a browser will refuse — that
+first boot if `cert` and `key` are absent, which a browser will refuse, that
 default exists so a first boot starts, not so a deployment ships on it.
 
 **One UDP port serves every endpoint, not every service.** A WebTransport
@@ -160,7 +160,7 @@ service the operator may not be running.
 ## A service
 
 Every service block takes the same keys. `types` is the outer message type from
-`PROTOCOL-COMPATIBILITY.md` §3 — one number per service, because the service's own
+`PROTOCOL-COMPATIBILITY.md` §3, one number per service, because the service's own
 message types live in its nested envelope and the gateway never looks inside.
 
 ```toml
@@ -213,7 +213,7 @@ make `unix` a typo away from silently opening a TCP socket on a host that
 expected a permission boundary.
 
 The co-located form is the platform's own, and **only one of the two exists in a
-given build** — a Unix socket cannot be served on Windows, and a named pipe
+given build**, a Unix socket cannot be served on Windows, and a named pipe
 cannot be served anywhere else. An endpoint naming the other one is a startup
 error rather than a substitution, so a configuration file carried between
 platforms says so instead of quietly binding a different kind of boundary than
@@ -221,7 +221,7 @@ it asked for. A deployment meant to run on both should use `http://` for the
 services it shares, or let `--all-in-one` and the built-in defaults pick.
 
 With no `--config` file at all, every service is given the local form for
-whichever platform it is running on, under the run directory — so a first boot
+whichever platform it is running on, under the run directory, so a first boot
 needs no port allocated for anything but the gateway.
 
 > On Windows, `\\.\pipe\` is one flat namespace for the whole machine with no
@@ -247,7 +247,7 @@ needs no generated stubs for the new service and no knowledge of its schema.
 ### The one service with no endpoint
 
 `directory` announces this server to the public Mumble list. Nothing dials it, so
-it has no `endpoint` and no gRPC surface — the only two lines it needs here are
+it has no `endpoint` and no gRPC surface, the only two lines it needs here are
 its tier and where to find a trust store:
 
 ```toml
@@ -257,7 +257,7 @@ types = []
 
 [services.directory.options]
 # The public list's certificate is verified against this bundle. A missing one
-# fails the announcement rather than posting unverified — the payload carries a
+# fails the announcement rather than posting unverified, the payload carries a
 # shared secret.
 trust_store = "/etc/ssl/certs/ca-certificates.crt"
 ```
@@ -277,13 +277,13 @@ because murmur lets an operator change it while the server runs. In
 
 Two of those rules surprise people, and both are murmur's rather than ours: a
 server with a `password` set is **never** listed, and `allow_ping = false` also
-prevents registration — a listing the list cannot measure is a dead entry. When a
+prevents registration, a listing the list cannot measure is a dead entry. When a
 server is not being announced, the reason is logged once per interval, naming the
 specific condition rather than "missing required fields".
 
 ## Storage, per service
 
-Each service owns its own schema — no service reads another's tables.
+Each service owns its own schema, no service reads another's tables.
 
 ```toml
 [services.pchat.storage]
@@ -314,7 +314,7 @@ all_in_one = true
 ```
 
 Every service runs in one process with in-process calls instead of gRPC. Same
-binary, same config file — `endpoint` values are ignored. This is the mode for a
+binary, same config file, `endpoint` values are ignored. This is the mode for a
 single VPS; the multi-process mode is for isolation or per-service scaling.
 
 ## Virtual servers
@@ -331,6 +331,6 @@ name = "Staging"
 port = 64739
 ```
 
-Metadata runs one actor per virtual server, sharded by id — the Discord
+Metadata runs one actor per virtual server, sharded by id, the Discord
 guild-process pattern. Port numbers follow murmur's convention of
 `base_port + server_id`.

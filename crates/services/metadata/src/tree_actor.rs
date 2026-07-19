@@ -53,7 +53,7 @@ impl TreeLimits {
     /// gRPC and `operator-api` are administrative surfaces: an operator
     /// building a tree through them is the person who set the limits, and
     /// refusing them their own ceiling turns a deliberate action into a
-    /// mystery. murmur draws the line in the same place — `canNest` and the
+    /// mystery. murmur draws the line in the same place, `canNest` and the
     /// count check live in `msgChannelState`, which is the *client* path.
     pub const UNLIMITED: Self = Self {
         nesting: 0,
@@ -312,7 +312,7 @@ impl Trees {
     /// silently renamed: murmur refuses too, and two channels with one name in
     /// one place is a UI nobody can use.
     ///
-    /// The two ceilings are murmur's, in murmur's order — nesting is checked
+    /// The two ceilings are murmur's, in murmur's order, nesting is checked
     /// against the parent before the count, so a client that is both too deep
     /// and on a full server is told the more specific of the two.
     pub fn create(
@@ -452,14 +452,14 @@ impl Trees {
             let mut unlistened = Vec::new();
             // An iterator chain rather than a `for`: the sessions are walked in
             // whatever order the map holds them, and the result is sorted below
-            // — so the shape says the order is not observed.
+            // so the shape says the order is not observed.
             state.members.values_mut().for_each(|membership| {
                 if doomed.contains(&membership.channel) {
                     membership.channel = 0;
                 }
                 // A listener on a channel that no longer exists would be a
                 // subscription to nothing that the owning client still shows in
-                // its tree, with no way to cancel it — murmur deletes them and
+                // its tree, with no way to cancel it, murmur deletes them and
                 // tells the client (`Server.cpp:2194`). The gains are kept: they
                 // are keyed by channel id, and the ids are gone with it.
                 let dropped: Vec<u32> = membership
@@ -502,7 +502,7 @@ impl Trees {
     /// **Symmetric**, as murmur's `Channel::link` is (`Channel.cpp:189`): it
     /// writes the edge into both channels. Audio crossing a link is a property
     /// of the pair, not of whichever channel the operator happened to edit, and
-    /// a one-sided edge is a link that works in one direction — which is not a
+    /// a one-sided edge is a link that works in one direction, which is not a
     /// thing Mumble has.
     ///
     /// A channel cannot be linked to itself: it would be an edge that says
@@ -548,7 +548,7 @@ impl Trees {
     /// Move a session into a channel.
     ///
     /// A structural channel is refused, and a temporary channel emptied by the
-    /// move is collected — both are reported rather than done silently, because
+    /// move is collected, both are reported rather than done silently, because
     /// a client that renders a channel the server has deleted is a client
     /// showing a world that does not exist.
     pub fn enter(&self, scope: u32, session: u32, channel: u32) -> EnterResult {
@@ -587,7 +587,7 @@ impl Trees {
             // Entered in place rather than replaced, so that a move keeps the
             // listeners and gains the session already had. Overwriting the
             // membership wholesale would make walking into another room silently
-            // cancel every channel that user was listening to — murmur touches
+            // cancel every channel that user was listening to, murmur touches
             // only the channel (`Server.cpp:1291`), and the two are unrelated
             // facts about a session.
             let member = state.members.entry(session).or_insert(Membership {
@@ -756,7 +756,7 @@ pub(crate) const FULL_REFUSED: &str = "that channel is full";
 /// Compared with a tolerance rather than `== 1.0` because the number arrives as
 /// a float from a client that computed it from a decibel slider, and a value
 /// that lands a millionth away from unity is a user who dragged the slider back
-/// to the middle — not a request for an imperceptible attenuation worth storing
+/// to the middle, not a request for an imperceptible attenuation worth storing
 /// a row for.
 fn is_unity(gain: f32) -> bool {
     (gain - 1.0).abs() < f32::EPSILON
@@ -769,7 +769,7 @@ fn is_unity(gain: f32) -> bool {
 /// to be taken before the caller's own membership is borrowed mutably anyway.
 fn listener_counts(state: &TreeState) -> HashMap<u32, usize> {
     let mut counts: HashMap<u32, usize> = HashMap::new();
-    // The order is not observable — this is a tally — which is what makes
+    // The order is not observable (this is a tally) which is what makes
     // walking a `HashMap` acceptable here.
     for channel in state.members.values().flat_map(|member| &member.listening) {
         *counts.entry(*channel).or_default() += 1;
@@ -835,7 +835,7 @@ fn remove_link(state: &mut TreeState, from: u32, to: u32) {
 ///
 /// Called wherever a channel is destroyed. A link is a pair, so removing one
 /// end without the other leaves the survivor advertising an edge to a channel
-/// no client can render — and `ChannelState.links` is a *complete* statement of
+/// no client can render, and `ChannelState.links` is a *complete* statement of
 /// the set, so the stale id would be re-sent on every announcement.
 fn forget_links_to(state: &mut TreeState, gone: &[u32]) {
     // An iterator chain rather than a `for`, as `remove` uses above: nothing
@@ -862,7 +862,7 @@ fn descendants(state: &TreeState, root: u32) -> Vec<u32> {
             .collect();
         // Sorted because the scan above walks a `HashMap`, whose order is
         // randomised per process. Every caller today treats the result as a set,
-        // so the order is not observable — but this is the list of channels a
+        // so the order is not observable, but this is the list of channels a
         // removal destroys, and the day one of them reports it to clients the
         // ordering would differ between two servers running the same code.
         children.sort_unstable();
@@ -886,7 +886,7 @@ pub const EXPIRY_SLIDING: u32 = 2;
 pub struct Relocated {
     /// The occupant that was moved.
     pub session: u32,
-    /// The channel they were moved into — the reaped channel's parent.
+    /// The channel they were moved into, the reaped channel's parent.
     pub to: u32,
 }
 
@@ -904,10 +904,10 @@ impl Trees {
     ///
     /// Two modes, both from the client's `ChannelState`:
     ///
-    /// * **absolute** — a deadline measured from creation. The channel goes at
+    /// * **absolute**, a deadline measured from creation. The channel goes at
     ///   the deadline whether or not it is in use, which is what a scheduled
     ///   room is for.
-    /// * **sliding** — an *idle* window. Every arrival and departure pushes the
+    /// * **sliding**, an *idle* window. Every arrival and departure pushes the
     ///   deadline out, so a room in use survives and only a quiet one is
     ///   reaped.
     ///
@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn the_channel_count_limit_refuses_the_one_past_it() {
-        // C3. The root counts, as it does in murmur — `qhChannels` holds it.
+        // C3. The root counts, as it does in murmur, `qhChannels` holds it.
         let trees = trees();
         let limits = depth_limit(0, 3);
         assert!(trees.create(1, named("A", 0), false, limits).applied);

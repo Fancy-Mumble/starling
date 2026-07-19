@@ -1,7 +1,7 @@
 //! Assembling the sink tree and running the writer (Abstract Factory).
 //!
 //! A [`LogSpec`] names *what* is wanted; this builds the composition and owns its
-//! lifetime. Adding a destination later — syslog, a database, an HTTP endpoint —
+//! lifetime. Adding a destination later (syslog, a database, an HTTP endpoint)
 //! means a new [`LogSink`] implementation and one arm in [`LogRuntime::start`],
 //! with nothing outside this crate changing.
 //!
@@ -18,7 +18,7 @@ use crate::log::{Category, LogEvent, LogSink, Logger, LoggerShutdown, MemoryHand
 /// # Lifetime
 ///
 /// [`Self::finish`] takes `self`, so the health report cannot be written after
-/// the writer has gone — records produced during shutdown still need somewhere
+/// the writer has gone, records produced during shutdown still need somewhere
 /// to go.
 #[derive(Debug)]
 pub struct LogRuntime {
@@ -79,8 +79,8 @@ impl LogRuntime {
     /// Start from an operator's `[logging]` section.
     ///
     /// [`Self::start`] takes a resolved [`LogSpec`]; this takes the unresolved
-    /// [`LogConfig`] and carries its fallback warnings — a misspelled level, an
-    /// unknown category — into the log itself. Resolving in the composition root
+    /// [`LogConfig`] and carries its fallback warnings, a misspelled level, an
+    /// unknown category, into the log itself. Resolving in the composition root
     /// instead would mean every entry point remembering to report them, and the
     /// one that forgot would log at the wrong level in silence.
     #[must_use]

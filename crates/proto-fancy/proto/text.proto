@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 // Chat that is not end-to-end encrypted: TextMessage (11) fan-out and the
-// history behind it. Rows are keyed by UUIDv7 — coordination-free and
+// history behind it. Rows are keyed by UUIDv7, coordination-free and
 // time-sortable, so a page is one index range scan (docs/STORAGE.md L3).
 package starling.text.v1;
 
@@ -11,14 +11,14 @@ service Text {
   rpc History(HistoryRequest) returns (HistoryPage);
   rpc Purge(PurgeRequest) returns (starling.common.v1.Ack);
   // A message from the server itself, with no client behind it: the only way
-  // an external system — operator-api, a bot, a user manager — reaches a
+  // an external system (operator-api, a bot, a user manager) reaches a
   // connected user without holding a client connection.
   rpc Announce(AnnounceRequest) returns (AnnounceResult);
 
   // Every message as it is delivered. History is what was said; a watcher
   // wants to be told as it happens rather than to poll for it.
   //
-  // Observation only — a subscriber cannot refuse or alter a message, because
+  // Observation only, a subscriber cannot refuse or alter a message, because
   // by the time it is published the message has already been fanned out.
   rpc Watch(WatchRequest) returns (stream MessageEvent);
 }
@@ -54,7 +54,7 @@ message PurgeRequest {
 
 // A server-originated message.
 //
-// Addressed to sessions, to channels, or to both — the same shape upstream's
+// Addressed to sessions, to channels, or to both, the same shape upstream's
 // TextMessage(11) carries, because that is the frame this becomes. Empty on
 // both counts is refused rather than treated as a broadcast: a typo in a
 // session id must not become a message to the whole server.
@@ -98,7 +98,7 @@ message MessageEvent {
   repeated uint32 tree = 7;
   string body = 8;
   uint64 sent_at_ms = 9;
-  // False when the server itself sent it — an Announce rather than a client's
+  // False when the server itself sent it, an Announce rather than a client's
   // message.
   bool from_client = 10;
 }

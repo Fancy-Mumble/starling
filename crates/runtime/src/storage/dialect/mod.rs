@@ -2,7 +2,7 @@
 //!
 //! sqlx's `Any` driver unifies the wire protocol. It does not unify the SQL, and
 //! the differences are not cosmetic: a placeholder written the wrong way, or a
-//! `CREATE TABLE` using the wrong auto-increment syntax, fails outright — but
+//! `CREATE TABLE` using the wrong auto-increment syntax, fails outright, but
 //! only on the backend nobody develops against.
 //!
 //! # Why this is a trait and not a `match` per question
@@ -10,12 +10,12 @@
 //! It was a `match` per question, and that is closed against exactly the change
 //! it should be open to. Seven methods each matching three ways means adding a
 //! fourth backend edits seven places, and the compiler only catches it because
-//! the matches are exhaustive — miss one `_ =>` arm and it does not catch it at
+//! the matches are exhaustive, miss one `_ =>` arm and it does not catch it at
 //! all.
 //!
 //! Here each backend is one type implementing [`SqlDialect`], and [`Dialect`]
 //! carries it. Adding one is a new file, a new variant, and one arm in
-//! [`Dialect::behaviour`] — nothing that already works is touched.
+//! [`Dialect::behaviour`]: nothing that already works is touched.
 //!
 //! # The differences, in one table
 //!
@@ -41,7 +41,7 @@ use crate::storage::StoreError;
 /// The SQL one backend speaks.
 ///
 /// Every method answers a question the three genuinely disagree about. A
-/// question they agree on does not belong here — it belongs in the query.
+/// question they agree on does not belong here, it belongs in the query.
 pub trait SqlDialect: std::fmt::Debug + Send + Sync {
     /// A short name, for logs and the admin surface.
     fn name(&self) -> &'static str;

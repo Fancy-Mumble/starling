@@ -17,7 +17,7 @@ use crate::ids::ChannelId;
 ///    can never be removed.
 /// 2. Every `Channel::parent` resolves to a channel in the store.
 /// 3. `Channel::children` is the exact inverse of `Channel::parent`.
-/// 4. Channel ids are never reused, even after removal — a reused id would
+/// 4. Channel ids are never reused, even after removal, a reused id would
 ///    alias a dead channel in client state and in the database.
 /// 5. [`Self::breadth_first`] yields every parent before any of its children.
 pub trait ChannelStore: std::fmt::Debug {
@@ -36,7 +36,7 @@ pub trait ChannelStore: std::fmt::Debug {
 
     /// Create a channel under `parent`, returning its new id.
     ///
-    /// Returns `None` if `parent` does not exist — an orphan would violate
+    /// Returns `None` if `parent` does not exist, an orphan would violate
     /// invariant 2.
     fn insert(&mut self, parent: ChannelId, name: &str) -> Option<ChannelId>;
 
@@ -54,7 +54,7 @@ pub trait ChannelStore: std::fmt::Debug {
         self.get(id).is_some()
     }
 
-    /// Always `false` — the root channel cannot be removed (invariant 1).
+    /// Always `false`, the root channel cannot be removed (invariant 1).
     ///
     /// Present because clippy requires `is_empty` alongside `len`, and stating
     /// the invariant is more useful than suppressing the lint.

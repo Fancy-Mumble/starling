@@ -1,4 +1,4 @@
-//! `starling-proto` — the Mumble wire protocol, server side.
+//! `starling-proto`: the Mumble wire protocol, server side.
 //!
 //! This crate is deliberately I/O-free and state-free. It knows how to turn
 //! bytes into messages and messages into bytes, and nothing else. Everything
@@ -6,18 +6,18 @@
 //!
 //! # Scope
 //!
-//! * [`proto`] — `prost`-generated types for `Mumble.proto` / `MumbleUDP.proto`.
-//! * [`message`] — the [`ControlMessage`] enum and the message-type-id table
+//! * [`proto`]: `prost`-generated types for `Mumble.proto` / `MumbleUDP.proto`.
+//! * [`message`]: the [`ControlMessage`] enum and the message-type-id table
 //!   shared by both directions of the TCP control channel.
-//! * [`codec`] — the `[type:u16][len:u32][payload]` TCP framing.
-//! * [`version`] — Mumble's two version encodings plus the Fancy extension
+//! * [`codec`]: the `[type:u16][len:u32][payload]` TCP framing.
+//! * [`version`]: Mumble's two version encodings plus the Fancy extension
 //!   version.
 //!
 //! # Hostile input
 //!
 //! Unlike the client's `mumble-protocol`, everything here decodes data from an
 //! *unauthenticated peer*. Decoders must bound allocations before making them
-//! and must never panic on malformed input — see [`codec::decode`].
+//! and must never panic on malformed input, see [`codec::decode`].
 
 /// `prost`-generated protobuf message types.
 pub mod proto {

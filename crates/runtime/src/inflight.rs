@@ -2,7 +2,7 @@
 //! without any service measuring anything.
 //!
 //! [`Pressure`](crate::pressure::Pressure) can describe any bounded thing, but
-//! a registry only holds what somebody remembered to put in it — and the
+//! a registry only holds what somebody remembered to put in it, and the
 //! service nobody instrumented is reliably the service that falls over. The
 //! gateway's control lane got a gauge because somebody had already been bitten
 //! by it; nineteen other services had none, and their queue depth was not zero,
@@ -18,7 +18,7 @@
 //! queues in a channel a depth could be read from. What backs up instead is the
 //! caller: requests arrive faster than they complete and the count of
 //! outstanding ones climbs. That count *is* the queue, and its peak over an
-//! interval is the backpressure signal — see `pressure`'s note on why the peak
+//! interval is the backpressure signal, see `pressure`'s note on why the peak
 //! matters more than the instant.
 
 use std::pin::Pin;
@@ -31,8 +31,8 @@ use crate::pressure::{Gauge, Pressure};
 
 /// What the per-service concurrency gauge is called.
 ///
-/// A constant because three places name it — the layer that fills it, the
-/// dashboard that draws it, and the test that asserts it exists — and a gauge
+/// A constant because three places name it, the layer that fills it, the
+/// dashboard that draws it, and the test that asserts it exists, and a gauge
 /// renamed in two of the three is a chart that silently goes flat.
 pub const IN_FLIGHT: &str = "requests in flight";
 
@@ -103,7 +103,7 @@ where
 /// A guard rather than a decrement at the end of the future, because a request
 /// can end without finishing: a cancelled call, a client that hung up, a
 /// panicking handler. Each of those drops the future, and none of them reaches
-/// a line at the bottom of it — which would leak occupancy upward forever and
+/// a line at the bottom of it, which would leak occupancy upward forever and
 /// make a healthy service look permanently saturated.
 #[derive(Debug)]
 struct Busy(Gauge);

@@ -1,10 +1,10 @@
-//! `UserList`(18) — the registered-users dialog, read and edited.
+//! `UserList`(18), the registered-users dialog, read and edited.
 //!
 //! The message is one type doing two jobs, and murmur decides which by whether
 //! it arrived carrying any users (`Messages.cpp:3155`):
 //!
-//! * **empty** — "tell me who is registered", answered with the whole directory;
-//! * **non-empty** — "rename these, and unregister the ones I sent no name for".
+//! * **empty**, "tell me who is registered", answered with the whole directory;
+//! * **non-empty**, "rename these, and unregister the ones I sent no name for".
 //!
 //! Both halves live here rather than in `lib.rs` because they are one feature
 //! and because the read half has to be careful about two things that have
@@ -47,8 +47,8 @@ const MAX_ENTRIES: usize = 10_000;
 
 /// How many bytes of avatar one directory answer will carry.
 ///
-/// Avatars are the only unbounded part of an entry — `image_message_length`
-/// defaults to 128 KiB each — so this is what actually decides whether the
+/// Avatars are the only unbounded part of an entry, `image_message_length`
+/// defaults to 128 KiB each, so this is what actually decides whether the
 /// answer fits. Past it the remaining entries are sent **without** their
 /// texture: a row with a name and no picture is a usable directory, and an
 /// oversized frame is no directory at all.
@@ -90,7 +90,7 @@ impl UserdataService {
     /// Two permissions, deliberately (`Messages.cpp:3153`). `Register` is an
     /// administrator's power over the directory and comes with the whole record.
     /// `ReadRegister` is held by every registered user by default
-    /// (`permissions/src/evaluate.rs:182`) and gets the reduced view — a name and
+    /// (`permissions/src/evaluate.rs:182`) and gets the reduced view, a name and
     /// an avatar, enough to find somebody who is offline and invite them, and
     /// not enough to tell when they were last here.
     async fn read_directory(&self, inbound: &Inbound, manage: bool) -> Actions {
@@ -205,7 +205,7 @@ impl UserdataService {
             }),
             // Absent because nothing records it: Starling has no last-channel
             // memory at all (`docs/GAP-ANALYSIS.md` A4), and a zero here is not
-            // "unknown" to a client — it is the root channel.
+            // "unknown" to a client; it is the root channel.
             last_channel: None,
             texture,
             comment_hash,
@@ -231,7 +231,7 @@ impl UserdataService {
         afforded
     }
 
-    /// This account's comment as `(inline, hash)` — never both.
+    /// This account's comment as `(inline, hash)`, never both.
     async fn comment_of(&self, scope: u32, account: &Account) -> (Option<String>, Option<Vec<u8>>) {
         if account.comment_hash.is_empty() {
             return (None, None);
@@ -297,7 +297,7 @@ impl UserdataService {
         // the change rests on. `update` demands the account's *current password*
         // for a name change, because there it is a user editing their own
         // profile and a hijacked session must not be able to lock the owner out.
-        // Here the authority is `Register`, checked above against the caller —
+        // Here the authority is `Register`, checked above against the caller,
         // and an administrator renaming somebody else does not know, and must
         // not need, that person's password.
         let renamed = match self.accounts.rename(inbound.scope, id, name).await {
@@ -345,7 +345,7 @@ impl UserdataService {
     /// Unregister an account: an entry the dialog sent back with no name.
     ///
     /// The connected session is deliberately **not** disturbed. Unregistering
-    /// takes the account away, not the connection — murmur leaves the user on
+    /// takes the account away, not the connection, murmur leaves the user on
     /// the server and lets the next login decide what they are.
     async fn unregister(&self, inbound: &Inbound, id: u32) {
         let id = u64::from(id);
@@ -383,7 +383,7 @@ impl UserdataService {
 /// Spend `budget` on `texture`, or leave both alone.
 ///
 /// A row that cannot afford its picture must not spend what the next row could
-/// still have used — and the check has to be a comparison rather than a
+/// still have used, and the check has to be a comparison rather than a
 /// subtraction, which on `usize` would wrap into an enormous budget and let
 /// every remaining avatar through.
 fn afford(budget: &mut usize, texture: Vec<u8>) -> Option<Vec<u8>> {
@@ -394,7 +394,7 @@ fn afford(budget: &mut usize, texture: Vec<u8>) -> Option<Vec<u8>> {
     Some(texture)
 }
 
-/// A stored comment as `(inline, hash)` — never both, and never neither.
+/// A stored comment as `(inline, hash)`, never both, and never neither.
 ///
 /// The protocol's own split: short comments travel with the entry, long ones
 /// travel as a hash the client redeems through `RequestBlob.user_id_comment`.
@@ -402,8 +402,8 @@ fn afford(budget: &mut usize, texture: Vec<u8>) -> Option<Vec<u8>> {
 /// again; sending neither leaves the dialog's comment column permanently blank.
 ///
 /// `body` is `None` when the hash is on the account and the blob is gone or is
-/// not text. The hash alone is still the honest answer there — the client asks
-/// for it and is told there is nothing — where an inlined empty string renders
+/// not text. The hash alone is still the honest answer there, the client asks
+/// for it and is told there is nothing, where an inlined empty string renders
 /// as somebody having deliberately cleared theirs.
 fn split_comment(hash: &[u8], body: Option<String>) -> (Option<String>, Option<Vec<u8>>) {
     match body {
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn the_answer_cannot_outgrow_the_frame_that_carries_it() {
         // The budget plus the worst case of the entry cap has to stay under the
-        // codec's limit, or the dialog is empty for the largest servers — which
+        // codec's limit, or the dialog is empty for the largest servers, which
         // is the bug this whole file exists to fix, arriving by another route.
         const NAME_AND_ID: usize = 200;
         assert!(

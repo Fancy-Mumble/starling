@@ -6,7 +6,7 @@
 //!
 //! murmur accepts TLS 1.0 and later (`Server.cpp:1660`). rustls implements only
 //! 1.2 and 1.3, so even the most permissive configuration here beats murmur for
-//! free — see `starling-crypto` for the per-peer suite negotiation this leaves
+//! free, see `starling-crypto` for the per-peer suite negotiation this leaves
 //! room for.
 
 use std::sync::Arc;
@@ -91,7 +91,7 @@ impl Gateway {
     ///
     /// # Errors
     ///
-    /// [`GatewayError::NoRoutes`] when nothing is routed — a gateway with an
+    /// [`GatewayError::NoRoutes`] when nothing is routed, a gateway with an
     /// empty table would accept clients and answer none of them, which looks
     /// like a hung server rather than a misconfiguration.
     pub fn new(
@@ -225,7 +225,7 @@ impl Gateway {
     ///
     /// The gateway is not a service and has no `ServiceContext`, so it does
     /// its own subscription rather than going through the same `build` hook
-    /// every service uses — but it reads the same
+    /// every service uses, but it reads the same
     /// [`Settings`](starling_runtime::Settings) the services do, so there is
     /// still one definition of what these numbers are and one fallback when
     /// `server-config` is down.
@@ -252,7 +252,7 @@ impl Gateway {
                 // **Only once an operator has configured this server.**
                 //
                 // `is_warm` was the wrong gate and this is the bug it hid: it
-                // asks whether a snapshot *arrived*, and one always does —
+                // asks whether a snapshot *arrived*, and one always does,
                 // carrying `server-config`'s own defaults. So a deployment that
                 // deliberately tuned `[gateway.limits.control]` had it silently
                 // reset to murmur's 1/s the moment `server-config` came up,
@@ -311,12 +311,12 @@ impl Gateway {
         // rustls 0.23 no longer picks a default crypto backend on its own; it
         // must be installed once per process before the first `ServerConfig`
         // is built. Ignored if another listener in this process already
-        // installed one — the workspace enables exactly one backend
+        // installed one, the workspace enables exactly one backend
         // (`ring`), so a second install would only ever be this same one.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Ask for a client certificate. `with_no_client_auth()` was here, and
-        // it does not merely skip validation — it means the server never sends
+        // it does not merely skip validation, it means the server never sends
         // a `CertificateRequest`, so no client ever offers one and every peer
         // arrives with an empty hash. Certificate identity is how Mumble binds
         // a registered account, admits a user without a password and enforces a
@@ -324,7 +324,7 @@ impl Gateway {
         // question was never asked.
         //
         // The verifier accepts any issuer, which is the correct policy for
-        // Mumble's self-signed clients rather than a relaxation — see
+        // Mumble's self-signed clients rather than a relaxation, see
         // `starling_crypto::peer_cert`. Possession of the private key is still
         // proved during the handshake.
         let provider = rustls::crypto::CryptoProvider::get_default().map_or_else(
@@ -355,7 +355,7 @@ impl Gateway {
             .with("connections", self.registry.len());
         // Only when there is one. A blank field on every guest trains an
         // operator to stop reading it, and the hash is the thing a ban or a
-        // registration is keyed by — it is worth seeing when present.
+        // registration is keyed by; it is worth seeing when present.
         if let Some(certificate) = certificate {
             connected = connected
                 .with("certificate", certificate.hex())
@@ -441,14 +441,14 @@ impl Gateway {
 
         let reason = loop {
             let read = tokio::select! {
-                // A service asked for this client to go — a kick, a ban, or the
+                // A service asked for this client to go, a kick, a ban, or the
                 // handshake evicting a ghost. Without this the read loop sits
                 // here until the peer happens to say something, so a kicked
                 // client stays connected and keeps talking.
                 () = handle.closed() => break "disconnected by the server",
                 read = reader.read(&mut scratch) => match read {
                     Ok(read) => read,
-                    // This used to be `?`, which returned before `finish` ran —
+                    // This used to be `?`, which returned before `finish` ran,
                     // and an I/O error is how *most* disconnects actually
                     // arrive: a client that crashed, a network that dropped, a
                     // reset. The clean `close_notify` below is the rare one.
@@ -469,7 +469,7 @@ impl Gateway {
 
             match self.drain_frames(&handle, &mut buffer, &mut limiter) {
                 Ok(()) => {}
-                // A protocol error closes *that* connection and nothing else —
+                // A protocol error closes *that* connection and nothing else,
                 // hostile input is per-peer by construction.
                 Err(error) => {
                     tracing::debug!(conn, %error, "malformed frame");
@@ -511,8 +511,8 @@ impl Gateway {
     ) -> bool {
         // Every inbound frame, at trace. The gateway is the only place that
         // sees a client's traffic as it arrives, so when a UI action appears to
-        // do nothing this answers the first question — did anything reach the
-        // server at all — without guessing from downstream silence.
+        // do nothing this answers the first question, did anything reach the
+        // server at all, without guessing from downstream silence.
         tracing::trace!(
             conn = handle.conn,
             session = handle.session(),
@@ -534,7 +534,7 @@ impl Gateway {
             return true;
         };
 
-        // Buckets are per *service*, so every type a service owns shares one —
+        // Buckets are per *service*, so every type a service owns shares one,
         // and `session-lifecycle` owns both `UserState`, which murmur does
         // rate-limit, and `Ping`, which it does not. Charging keepalives to the
         // same bucket as user actions means a client's own liveness traffic
@@ -551,7 +551,7 @@ impl Gateway {
                 Verdict::Throttle { retry_after_ms } => {
                     // On the operator's own record, not just `tracing`. This
                     // discards something a user sent and believes was
-                    // delivered, and nothing retries it — the same class of
+                    // delivered, and nothing retries it, the same class of
                     // event as a permission denial, which is also logged here.
                     // It was `tracing::debug!` alone, which on any normal
                     // deployment is invisible: a shed text message looked
@@ -727,8 +727,8 @@ async fn pump_writer(
                 // disconnect a client for the writer's own backlog.
                 handle.control_sent(frame.len());
                 // Drain whatever else is already queued before writing. A burst
-                // is where compression pays — a reconnect flood or a page of
-                // history — and a batch of one is exactly the case `batch`
+                // is where compression pays, a reconnect flood or a page of
+                // history, and a batch of one is exactly the case `batch`
                 // declines, so a quiet connection is unaffected.
                 let mut queued = vec![frame];
                 while let Ok(more) = outbound.try_recv() {
@@ -777,7 +777,7 @@ async fn pump_writer(
             // instead delivers the disconnect and drops the reason, which
             // leaves the user staring at a connection that closed itself.
             //
-            // Only what is already queued — `try_recv` rather than `recv` —
+            // Only what is already queued (`try_recv` rather than `recv`)
             // so a peer that has stopped reading cannot hold the teardown
             // open by never draining its socket. `finish` bounds it as well.
             () = handle.draining() => {
@@ -801,8 +801,8 @@ async fn pump_writer(
 /// murmur does not rate-limit a connection wholesale. It applies `RATELIMIT`
 /// inside named handlers (`vendor/server/src/murmur/Messages.cpp:47`), and this
 /// is that list: `Version`(0), `ChannelState`(7), `UserState`(9),
-/// `TextMessage`(11) and `ACL`(13). Fancy adds its own charged types — WebRTC
-/// signalling, typing and watch-sync — which reach their services on the outer
+/// `TextMessage`(11) and `ACL`(13). Fancy adds its own charged types, WebRTC
+/// signalling, typing and watch-sync, which reach their services on the outer
 /// types below rather than upstream numbers.
 ///
 /// **What is deliberately absent matters more than what is present.** `Ping`(3)
@@ -810,7 +810,7 @@ async fn pump_writer(
 /// never charges it, and because Starling's buckets are per *service* it shared
 /// one with `UserState`. A client's own liveness traffic therefore spent the
 /// allowance its text messages needed, and a shed frame is not retried or
-/// reported — so messages went missing with nothing in any log to say why.
+/// reported, so messages went missing with nothing in any log to say why.
 /// `Authenticate`(2), `CryptSetup`(15), `CodecVersion`(21) and `UserStats`(22)
 /// are absent for the same reason: handshake and diagnostics, unlimited
 /// upstream.
