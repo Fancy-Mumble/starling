@@ -29,10 +29,10 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::attach::{AttachContext, Attachments};
-use crate::connection::{self, ClientHandle, Lane, Registry};
-use crate::limiter::{Limiter, MessageLimit, Verdict};
 use crate::compress;
 use crate::connection::Outbound;
+use crate::connection::{self, ClientHandle, Lane, Registry};
+use crate::limiter::{Limiter, MessageLimit, Verdict};
 use crate::resume::ResumeStore;
 use crate::router::Router;
 
@@ -637,7 +637,10 @@ impl Gateway {
         };
         let payload = envelope.encode_to_vec();
         let outer = ServiceKind::SessionLifecycle.outer_type();
-        let _ = handle.send(Lane::Control, Outbound::whole(codec::frame(outer, &payload)));
+        let _ = handle.send(
+            Lane::Control,
+            Outbound::whole(codec::frame(outer, &payload)),
+        );
     }
 
     /// Tear one connection down, giving the writer a moment to say why.

@@ -274,7 +274,10 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
             match self.0.handshake.enter(scope, req.session, wanted).await {
                 None => return refused("metadata is unreachable; cannot move"),
                 Some(result) if !result.applied => {
-                    return refused(&format!("channel {wanted} refused the move: {}", result.refused));
+                    return refused(&format!(
+                        "channel {wanted} refused the move: {}",
+                        result.refused
+                    ));
                 }
                 Some(_) => {
                     self.0.connections.set_channel(target.conn, wanted);
@@ -304,14 +307,15 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
         // authoritative record, but this line is what an operator reads when
         // they are looking at the *server*, and "by operator" without a name
         // is unattributable in exactly the situation it gets read in.
-        let by = req.actor.as_ref().and_then(|actor| actor.who.as_ref()).map_or_else(
-            String::new,
-            |who| match who {
+        let by = req
+            .actor
+            .as_ref()
+            .and_then(|actor| actor.who.as_ref())
+            .map_or_else(String::new, |who| match who {
                 actor::Who::Operator(operator) => operator.subject.clone(),
                 actor::Who::Session(session) => format!("session {session}"),
                 actor::Who::Internal(internal) => internal.service.clone(),
-            },
-        );
+            });
         self.0.handshake.context().logger.log(
             LogEvent::notice(Category::Admin, "session state set by operator")
                 .with("by", by)
@@ -345,13 +349,11 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
             priority_speaker: Some(applied.priority_speaker),
             ..tcp::UserState::default()
         };
-        self.0
-            .fanout
-            .push_all(vec![to_sessions(
-                Vec::new(),
-                USER_STATE,
-                state.encode_to_vec(),
-            )]);
+        self.0.fanout.push_all(vec![to_sessions(
+            Vec::new(),
+            USER_STATE,
+            state.encode_to_vec(),
+        )]);
 
         Ok(tonic::Response::new(SetStateResult {
             applied: true,

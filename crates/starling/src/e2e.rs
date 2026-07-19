@@ -1573,7 +1573,10 @@ async fn an_operator_can_moderate_a_live_session_from_outside() {
     assert!(applied.applied, "refused: {}", applied.refused);
     assert_eq!(applied.channel, target, "the move was not applied");
     assert!(applied.deaf, "the deafen was not applied");
-    assert!(applied.mute, "deafening must imply muting, as it does in murmur");
+    assert!(
+        applied.mute,
+        "deafening must imply muting, as it does in murmur"
+    );
 
     // And everyone is told, the mover included. Asserted from bob as well
     // because a client builds its user list from these: a moderation action only
@@ -1583,7 +1586,11 @@ async fn an_operator_can_moderate_a_live_session_from_outside() {
         let moved = timeout(FRAME_TIMEOUT, client.next_move_of(alice_session))
             .await
             .unwrap_or_else(|_| panic!("{who} was never told alice was moved"));
-        assert_eq!(moved.channel_id, Some(target), "{who} saw the wrong channel");
+        assert_eq!(
+            moved.channel_id,
+            Some(target),
+            "{who} saw the wrong channel"
+        );
         assert_eq!(moved.deaf, Some(true), "{who} was not told alice is deaf");
     }
 

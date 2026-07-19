@@ -44,25 +44,26 @@ const VIEW_GATE: &str = "session-view";
 /// The schema. `expires_at_ms` and its index are here from day one, because
 /// retention on a table that grows without bound is a schema property rather
 /// than an afterthought (`docs/STORAGE.md` D4).
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
-    "0001_pchat_message",
-    &[
-        "CREATE TABLE IF NOT EXISTS pchat_message (\
+const SCHEMA: &[Migration<'static>] = &[
+    Migration::new(
+        "0001_pchat_message",
+        &[
+            "CREATE TABLE IF NOT EXISTS pchat_message (\
              server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, id BLOB NOT NULL, \
              sent_at_ms BIGINT NOT NULL, sender BIGINT NOT NULL, epoch INTEGER NOT NULL, \
              ciphertext BLOB NOT NULL, supersedes BLOB NULL, expires_at_ms BIGINT NULL, \
              PRIMARY KEY (server_id, channel_id, id))",
-        "CREATE INDEX IF NOT EXISTS ix_pchat_expiry ON pchat_message(server_id, expires_at_ms)",
-        // `holder` is the certificate hash, not a session: holding a key is
-        // what lets someone read the archive after reconnecting, so the one
-        // thing it cannot be keyed on is the connection. Nothing writes this
-        // table yet, which is why it is defined right rather than migrated.
-        "CREATE TABLE IF NOT EXISTS pchat_holder (\
+            "CREATE INDEX IF NOT EXISTS ix_pchat_expiry ON pchat_message(server_id, expires_at_ms)",
+            // `holder` is the certificate hash, not a session: holding a key is
+            // what lets someone read the archive after reconnecting, so the one
+            // thing it cannot be keyed on is the connection. Nothing writes this
+            // table yet, which is why it is defined right rather than migrated.
+            "CREATE TABLE IF NOT EXISTS pchat_holder (\
              server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, epoch INTEGER NOT NULL, \
              holder BLOB NOT NULL, \
              PRIMARY KEY (server_id, channel_id, epoch, holder))",
-    ],
-),
+        ],
+    ),
     // The archive recorded its author as a session id, which is handed out per
     // connection and reused, so a message written last week is attributed to
     // whoever holds that number now. Sessions are the wrong key for anything
@@ -797,7 +798,11 @@ mod tests {
 
         assert_eq!(roster.cert_of(7).as_deref(), Some(SPEAKER_CERT));
         assert_eq!(roster.cert_of(8), None, "no certificate is not an identity");
-        assert_eq!(roster.cert_of(99), None, "an unknown session has none either");
+        assert_eq!(
+            roster.cert_of(99),
+            None,
+            "an unknown session has none either"
+        );
 
         // The snapshot path, which is how a subscription actually opens, and
         // which this test caught missing the certificates entirely. Getting it

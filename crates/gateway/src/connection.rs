@@ -520,8 +520,16 @@ mod tests {
     fn a_full_control_queue_reports_overflow_rather_than_dropping() {
         // Dropping would desync that client permanently and silently.
         let (handle, _rx) = channel(1, "tok".to_owned(), 2, 4);
-        assert!(handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"a"))).is_ok());
-        assert!(handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"b"))).is_ok());
+        assert!(
+            handle
+                .send(Lane::Control, Outbound::whole(Bytes::from_static(b"a")))
+                .is_ok()
+        );
+        assert!(
+            handle
+                .send(Lane::Control, Outbound::whole(Bytes::from_static(b"b")))
+                .is_ok()
+        );
         assert_eq!(
             handle.send(Lane::Control, Outbound::whole(Bytes::from_static(b"c"))),
             Err(QueueError::ControlOverflow)
@@ -535,13 +543,22 @@ mod tests {
         for byte in [1_u8, 2, 3] {
             assert!(
                 handle
-                    .send(Lane::Audio, Outbound::whole(Bytes::copy_from_slice(&[byte])))
+                    .send(
+                        Lane::Audio,
+                        Outbound::whole(Bytes::copy_from_slice(&[byte]))
+                    )
                     .is_ok()
             );
         }
         assert_eq!(handle.dropped_audio(), 1);
-        assert_eq!(handle.pop_audio().map(|f| f.payload), Some(Bytes::copy_from_slice(&[2])));
-        assert_eq!(handle.pop_audio().map(|f| f.payload), Some(Bytes::copy_from_slice(&[3])));
+        assert_eq!(
+            handle.pop_audio().map(|f| f.payload),
+            Some(Bytes::copy_from_slice(&[2]))
+        );
+        assert_eq!(
+            handle.pop_audio().map(|f| f.payload),
+            Some(Bytes::copy_from_slice(&[3]))
+        );
     }
 
     #[test]
@@ -586,7 +603,10 @@ mod tests {
 
         let mut queued = 0_usize;
         for _ in 0..100_000 {
-            if handle.send(Lane::Control, Outbound::whole(blob.clone())).is_err() {
+            if handle
+                .send(Lane::Control, Outbound::whole(blob.clone()))
+                .is_err()
+            {
                 break;
             }
             queued += blob.len();
@@ -614,7 +634,10 @@ mod tests {
         let (handle, _rx) = super::channel(1, "tok".to_owned(), 100_000, 4, gauge);
         let blob = Bytes::from(vec![0_u8; 128 * 1024]);
 
-        while handle.send(Lane::Control, Outbound::whole(blob.clone())).is_ok() {}
+        while handle
+            .send(Lane::Control, Outbound::whole(blob.clone()))
+            .is_ok()
+        {}
 
         let load = pressure
             .sample()
@@ -644,7 +667,10 @@ mod tests {
         let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, gauge);
 
         handle
-            .send(Lane::Control, Outbound::whole(Bytes::from(vec![0_u8; 2048])))
+            .send(
+                Lane::Control,
+                Outbound::whole(Bytes::from(vec![0_u8; 2048])),
+            )
             .expect("queued");
         assert_eq!(pressure.sample()[0].peak, 2048);
 
@@ -660,7 +686,9 @@ mod tests {
         // is eventually disconnected for bytes it received hours ago.
         let (handle, mut rx) = channel(1, "tok".to_owned(), 16, 4);
         let frame = Bytes::from(vec![0_u8; 1024]);
-        handle.send(Lane::Control, Outbound::whole(frame.clone())).expect("queued");
+        handle
+            .send(Lane::Control, Outbound::whole(frame.clone()))
+            .expect("queued");
         assert_eq!(handle.queued_control_bytes(), 1024);
 
         let taken = rx.try_recv().expect("the writer takes it");
@@ -669,7 +697,9 @@ mod tests {
 
         // And the room is genuinely reusable, not merely reported as free.
         for _ in 0..8 {
-            handle.send(Lane::Control, Outbound::whole(frame.clone())).expect("reusable");
+            handle
+                .send(Lane::Control, Outbound::whole(frame.clone()))
+                .expect("reusable");
             let taken = rx.try_recv().expect("drained");
             handle.control_sent(taken.len());
         }

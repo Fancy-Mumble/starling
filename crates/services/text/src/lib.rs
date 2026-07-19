@@ -682,17 +682,19 @@ impl TextService {
         let messages: Vec<_> = page
             .messages
             .into_iter()
-            .map(|message| starling_proto_fancy::fancy::feature::StoredMessage {
-                message_id: Uuid7::from_slice(&message.id)
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                channel: message.channel,
-                sender: 0,
-                sender_name: message.sender_name,
-                body: message.body,
-                sent_at_ms: message.sent_at_ms,
-                edited: false,
-            })
+            .map(
+                |message| starling_proto_fancy::fancy::feature::StoredMessage {
+                    message_id: Uuid7::from_slice(&message.id)
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    channel: message.channel,
+                    sender: 0,
+                    sender_name: message.sender_name,
+                    body: message.body,
+                    sent_at_ms: message.sent_at_ms,
+                    edited: false,
+                },
+            )
             .collect();
         // `history` already trimmed to `limit`, so the cursor comes from the
         // page it returned rather than from an unconsumed extra row.

@@ -388,7 +388,10 @@ mod tests {
             .find(|s| s.key == "some_new_knob")
             .expect("an unschema'd key is still offered");
         assert_eq!(extra.value, "7");
-        assert!(!extra.secret, "an unknown key must not be treated as secret");
+        assert!(
+            !extra.secret,
+            "an unknown key must not be treated as secret"
+        );
     }
 
     #[test]

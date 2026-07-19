@@ -242,7 +242,9 @@ impl AuditService {
                     detail, entry_hash FROM server_audit WHERE server_id = ",
         );
         let _ = query.push_bind(i64::from(scope));
-        let _ = query.push(" AND at_ms >= ").push_bind(request.since_ms as i64);
+        let _ = query
+            .push(" AND at_ms >= ")
+            .push_bind(request.since_ms as i64);
         if request.until_ms > 0 {
             let _ = query
                 .push(" AND at_ms <= ")

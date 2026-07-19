@@ -41,7 +41,10 @@ struct Fixture {
 }
 
 fn fixtures() -> Vec<Fixture> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/canon-fixtures.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/canon-fixtures.json"
+    );
     let text = std::fs::read_to_string(path).expect("the fixture file is checked in");
     let mut out = Vec::new();
     let mut name = String::new();

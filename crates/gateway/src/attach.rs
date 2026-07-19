@@ -24,8 +24,8 @@ use starling_runtime::metrics::Metrics;
 use starling_runtime::tier::Tier;
 use tokio::sync::mpsc;
 
-use crate::connection::{Lane, Registry};
 use crate::connection::Outbound;
+use crate::connection::{Lane, Registry};
 use crate::resume::ResumeStore;
 
 /// One service's attachment.
