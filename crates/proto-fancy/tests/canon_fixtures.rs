@@ -1,0 +1,151 @@
+//! The epoch-honesty check: Starling reads what an epoch-1 client writes.
+//!
+//! `scripts/canon-fixtures.json` holds complete frames captured from the
+//! *client's* encoder, and this asserts Starling decodes them into the meaning
+//! the fixture names. The client has the mirror of this test, asserting it
+//! still produces the same bytes.
+//!
+//! # Why a checked-in fixture rather than a shared helper
+//!
+//! Because the thing being tested is that two independent implementations agree,
+//! and a helper both sides import would agree with itself while disagreeing with
+//! the wire. That is not hypothetical: it is precisely D1
+//! (`docs/PROTOCOL-REDESIGN.md` §0), where both ends were confident and wrong.
+//!
+//! The three structural checks in `scripts/` narrow what is left for this one.
+//! They prove the `.proto` files are identical, that frozen tags have not moved
+//! and that the outer types agree — none of which says the *codecs* agree.
+//! Bytes do.
+//!
+//! # When this fails
+//!
+//! Either the canon changed and the fixture is stale, or one end drifted. Do
+//! not regenerate the fixture to make it pass without establishing which: the
+//! whole value here is that a drifting codec cannot quietly re-baseline itself.
+
+use prost::Message as _;
+use starling_proto_fancy::fancy::social::{SocialEnvelope, social_envelope};
+
+/// Frame header: `type:u16 BE ‖ len:u32 BE`.
+const HEADER: usize = 6;
+
+/// One fixture, parsed out of the JSON without pulling in a JSON dependency.
+///
+/// The file is ours and its shape is fixed, so a scan for the three fields is
+/// enough — and a test dependency that exists only to read a test's own input
+/// is a dependency the server ships nothing for.
+struct Fixture {
+    name: String,
+    outer: u16,
+    frame: Vec<u8>,
+}
+
+fn fixtures() -> Vec<Fixture> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/canon-fixtures.json");
+    let text = std::fs::read_to_string(path).expect("the fixture file is checked in");
+    let mut out = Vec::new();
+    let mut name = String::new();
+    let mut outer = 0_u16;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = field(line, "\"name\":") {
+            name = value.trim_matches('"').to_owned();
+        } else if let Some(value) = field(line, "\"outer\":") {
+            outer = value.trim_end_matches(',').parse().unwrap_or(0);
+        } else if let Some(value) = field(line, "\"hex\":") {
+            let hex = value.trim_matches('"');
+            let frame = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect();
+            out.push(Fixture {
+                name: std::mem::take(&mut name),
+                outer,
+                frame,
+            });
+        }
+    }
+    assert!(!out.is_empty(), "the fixture file yielded nothing");
+    out
+}
+
+/// The value after `key` on a line, with the trailing comma removed.
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.strip_prefix(key)
+        .map(|rest| rest.trim().trim_end_matches(','))
+}
+
+#[test]
+fn starling_reads_every_frame_the_client_writes() {
+    for fixture in fixtures() {
+        let frame = &fixture.frame;
+        assert!(frame.len() > HEADER, "{}: truncated fixture", fixture.name);
+
+        // The framing first: a frame that arrives at the wrong outer type is
+        // routed to a service that will not recognise it and skip it silently,
+        // which is the failure the outer-type check in `check-proto-hygiene.py`
+        // exists for — asserted here too, because this is where it would bite.
+        let outer = u16::from_be_bytes([frame[0], frame[1]]);
+        assert_eq!(outer, fixture.outer, "{}: wrong outer type", fixture.name);
+        let len = u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]) as usize;
+        assert_eq!(
+            len,
+            frame.len() - HEADER,
+            "{}: the declared length does not match the frame",
+            fixture.name
+        );
+
+        let envelope = SocialEnvelope::decode(&frame[HEADER..])
+            .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name));
+        assert!(
+            envelope.body.is_some(),
+            "{}: decoded to an empty envelope — the shapes have diverged and \
+             protobuf did not notice, which is exactly D1",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn the_typing_indicator_means_what_the_fixture_says() {
+    // Decoding without erroring is not agreement: two incompatible schemas can
+    // both "succeed" and disagree about every field, which is how D1 stayed
+    // invisible. So the values are asserted, not just the parse.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("typing"))
+        .expect("the typing fixture");
+    let envelope = SocialEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(social_envelope::Body::Typing(typing)) = envelope.body else {
+        panic!("expected a typing indicator, got {:?}", envelope.body);
+    };
+    assert_eq!(typing.channel, 4);
+    assert!(typing.typing);
+}
+
+#[test]
+fn the_reaction_keeps_its_emoji_and_its_target() {
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("reaction"))
+        .expect("the reaction fixture");
+    let envelope = SocialEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(social_envelope::Body::Reaction(reaction)) = envelope.body else {
+        panic!("expected a reaction, got {:?}", envelope.body);
+    };
+    assert_eq!(reaction.channel, 4);
+    assert_eq!(reaction.message_id, "m-1");
+    assert!(!reaction.remove);
+
+    // The distinction `wire.Emoji` exists for: a shortcode resolves against the
+    // server's custom set and a grapheme is rendered as-is, and a bare string
+    // could not say which.
+    let kind = reaction
+        .emoji
+        .and_then(|emoji| emoji.kind)
+        .expect("the emoji survived");
+    assert_eq!(
+        kind,
+        starling_proto_fancy::fancy::wire::emoji::Kind::Unicode("\u{1f44d}".to_owned())
+    );
+}
