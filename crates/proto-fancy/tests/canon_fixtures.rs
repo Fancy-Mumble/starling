@@ -26,6 +26,14 @@
 use prost::Message as _;
 use starling_proto_fancy::fancy::social::{SocialEnvelope, social_envelope};
 
+// A test target inherits the crate's dependencies and `unused_crate_dependencies`
+// judges it on its own imports, so the three this test does not touch have to be
+// named. The workspace convention, rather than an `#[allow]` that would also hide
+// a genuinely unused dependency later.
+use bitflags as _;
+use tonic as _;
+use tonic_prost as _;
+
 /// Frame header: `type:u16 BE ‖ len:u32 BE`.
 const HEADER: usize = 6;
 
@@ -45,7 +53,9 @@ fn fixtures() -> Vec<Fixture> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../scripts/canon-fixtures.json"
     );
-    let text = std::fs::read_to_string(path).expect("the fixture file is checked in");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        panic!("the fixture file is checked in, and this test is the reason: {path}")
+    };
     let mut out = Vec::new();
     let mut name = String::new();
     let mut outer = 0_u16;
@@ -57,10 +67,16 @@ fn fixtures() -> Vec<Fixture> {
             outer = value.trim_end_matches(',').parse().unwrap_or(0);
         } else if let Some(value) = field(line, "\"hex\":") {
             let hex = value.trim_matches('"');
-            let frame = (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
-                .collect();
+            // Over bytes rather than `&hex[i..i + 2]`: slicing a `str` by index
+            // is a panic if the fixture ever picks up a multi-byte character,
+            // and the panic would name a UTF-8 boundary rather than the fixture.
+            let mut frame = Vec::with_capacity(hex.len() / 2);
+            for pair in hex.as_bytes().chunks_exact(2) {
+                let (Some(hi), Some(lo)) = (pair.first(), pair.last()) else {
+                    continue;
+                };
+                frame.push((nibble(*hi) << 4) | nibble(*lo));
+            }
             out.push(Fixture {
                 name: std::mem::take(&mut name),
                 outer,
@@ -70,6 +86,20 @@ fn fixtures() -> Vec<Fixture> {
     }
     assert!(!out.is_empty(), "the fixture file yielded nothing");
     out
+}
+
+/// One hex digit's value.
+///
+/// Panics rather than returning an error: a malformed fixture is a broken test
+/// input, not a condition the test could carry on from, and the message has to
+/// name the offending character or the failure reads as a decode bug.
+fn nibble(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        b'a'..=b'f' => digit - b'a' + 10,
+        b'A'..=b'F' => digit - b'A' + 10,
+        other => panic!("the fixture hex holds a non-hex digit: {:?}", other as char),
+    }
 }
 
 /// The value after `key` on a line, with the trailing comma removed.
