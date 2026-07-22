@@ -17,3 +17,7 @@ Thumbs.db
 # this repo has no JavaScript at all, but a stray `pnpm` invocation leaves one
 # in whatever directory it ran from, and it should never be staged.
 .pnpm-store/
+
+# Run logs from `starling --all-in-one` in this directory. Two of these were
+# committed once; the server writes them wherever it is started from.
+/starling-local*.log
