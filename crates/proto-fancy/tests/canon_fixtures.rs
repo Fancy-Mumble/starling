@@ -14,7 +14,7 @@
 //!
 //! The three structural checks in `scripts/` narrow what is left for this one.
 //! They prove the `.proto` files are identical, that frozen tags have not moved
-//! and that the outer types agree — none of which says the *codecs* agree.
+//! and that the outer types agree, none of which says the *codecs* agree.
 //! Bytes do.
 //!
 //! # When this fails
@@ -40,7 +40,7 @@ const HEADER: usize = 6;
 /// One fixture, parsed out of the JSON without pulling in a JSON dependency.
 ///
 /// The file is ours and its shape is fixed, so a scan for the three fields is
-/// enough — and a test dependency that exists only to read a test's own input
+/// enough, and a test dependency that exists only to read a test's own input
 /// is a dependency the server ships nothing for.
 struct Fixture {
     name: String,
@@ -117,7 +117,7 @@ fn starling_reads_every_frame_the_client_writes() {
         // The framing first: a frame that arrives at the wrong outer type is
         // routed to a service that will not recognise it and skip it silently,
         // which is the failure the outer-type check in `check-proto-hygiene.py`
-        // exists for — asserted here too, because this is where it would bite.
+        // exists for, asserted here too, because this is where it would bite.
         let outer = u16::from_be_bytes([frame[0], frame[1]]);
         assert_eq!(outer, fixture.outer, "{}: wrong outer type", fixture.name);
         let len = u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]) as usize;
@@ -132,7 +132,7 @@ fn starling_reads_every_frame_the_client_writes() {
             .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name));
         assert!(
             envelope.body.is_some(),
-            "{}: decoded to an empty envelope — the shapes have diverged and \
+            "{}: decoded to an empty envelope, the shapes have diverged and \
              protobuf did not notice, which is exactly D1",
             fixture.name
         );
