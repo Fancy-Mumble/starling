@@ -75,8 +75,8 @@ const FLAG_HIDDEN: u32 = 1;
 
 /// The Fancy wire epoch Starling speaks (`Mumble.proto`, `Version.fancy_protocol`).
 ///
-/// Epoch 1: upstream 0–99 flat and frozen, every Fancy service behind one outer
-/// type ≥ 1000. Starling has never spoken epoch 0's interleaved 100–999 layout,
+/// Epoch 1: upstream 0-99 flat and frozen, every Fancy service behind one outer
+/// type ≥ 1000. Starling has never spoken epoch 0's interleaved 100-999 layout,
 /// and cannot, `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
 /// unroutable, and §3 is the scheme this number names.
 const FANCY_PROTOCOL: u32 = 1;

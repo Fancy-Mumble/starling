@@ -5,7 +5,7 @@
 //! and knows none of their schemas; what it knows is that type 1006 goes to
 //! whatever the operator called `pchat`.
 //!
-//! Types 100–999 are burned (`docs/PROTOCOL-COMPATIBILITY.md` §2): they shipped
+//! Types 100-999 are burned (`docs/PROTOCOL-COMPATIBILITY.md` §2): they shipped
 //! in released Fancy clients under an interleaved layout, so a message with one
 //! of those numbers is from a stale client and must never land on a new
 //! service, which would read it as something else entirely.

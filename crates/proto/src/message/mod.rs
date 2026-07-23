@@ -12,7 +12,7 @@ use crate::proto::tcp;
 ///
 /// # Why `Opaque` exists
 ///
-/// The Fancy fork defines ~70 extension messages (ids 100–171, 200–201). A
+/// The Fancy fork defines ~70 extension messages (ids 100-171, 200-201). A
 /// staged port cannot implement them all at once, but the *framing* layer must
 /// be complete and correct from day one, otherwise an unimplemented message
 /// desynchronises the stream and takes the whole connection down.

@@ -2,17 +2,17 @@
 //!
 //! | Range | Use |
 //! |---|---|
-//! | 0–99 | upstream Mumble, flat, **frozen** (0–26 in use) |
-//! | 100–999 | **burned**, the interleaved Fancy layout shipped in released clients |
+//! | 0-99 | upstream Mumble, flat, **frozen** (0-26 in use) |
+//! | 100-999 | **burned**, the interleaved Fancy layout shipped in released clients |
 //! | 1000+ | one outer type per service, nested envelope |
 //!
-//! 100–999 is burned rather than reclaimed because today's numbering is
+//! 100-999 is burned rather than reclaimed because today's numbering is
 //! interleaved rather than blocked: `WebRtcSignal` is 120, sitting between
-//! pchat's 100–119 and 121. Reusing those numbers risks a deployed client's
+//! pchat's 100-119 and 121. Reusing those numbers risks a deployed client's
 //! message landing on a service that would read it as something else, silent
 //! misinterpretation, the worst failure class available.
 //!
-//! See `docs/PROTOCOL-COMPATIBILITY.md` §2–3.
+//! See `docs/PROTOCOL-COMPATIBILITY.md` §2-3.
 
 /// Highest type upstream Mumble may ever use.
 pub const UPSTREAM_MAX: u16 = 99;
@@ -186,9 +186,9 @@ impl ServiceKind {
 /// What a wire type number means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OuterType {
-    /// 0–99: an upstream Mumble message. Flat, frozen, routed by number.
+    /// 0-99: an upstream Mumble message. Flat, frozen, routed by number.
     Upstream(u16),
-    /// 100–999: shipped in released clients under the interleaved layout.
+    /// 100-999: shipped in released clients under the interleaved layout.
     ///
     /// A message arriving with one of these is from a stale client. It is never
     /// routed to a new service, because a new service would read it as

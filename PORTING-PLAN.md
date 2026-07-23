@@ -26,7 +26,7 @@ against upstream Mumble: every scope number below was measured in this tree.
 | Shared model/protocol | `src/{ACL,Channel,Group,User,Ban,MumbleProtocol,Version}.cpp`, `PacketDataStream.h` | ~3 100 | Medium, pure logic, very testable |
 | Crypto | `src/crypto/` | 688 | Low, OCB2 already exists in Rust (§2.2) |
 
-**~55 000 lines of C++ in scope.** Expected Rust equivalent: **18–25 kLOC**, because
+**~55 000 lines of C++ in scope.** Expected Rust equivalent: **18-25 kLOC**, because
 `sqlx` deletes most of the 14 kLOC DB layer, prost deletes the serialisation
 boilerplate, and the Ice subsystem is replaced rather than translated.
 
@@ -120,7 +120,7 @@ Mumble's transport security is dated in two specific ways, and the port is the
 opportunity to fix both **without** costing backwards compatibility:
 
 * **OCB2-AES128** (the UDP voice cipher) has a practical forgery attack
-  (Inoue–Iwata–Minematsu–Poettering, CRYPTO 2019). Mumble's framing limits the
+  (Inoue-Iwata-Minematsu-Poettering, CRYPTO 2019). Mumble's framing limits the
   exposure, but nobody would choose it today.
 * murmur accepts **TLS 1.0 and later** (`Server.cpp:1660`).
 

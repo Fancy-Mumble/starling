@@ -20,7 +20,7 @@ option optimize_for = SPEED;
 // field as the right one, or silently skips it on a type mismatch. There is no
 // symptom to notice.
 //
-// So upstream owns 1–999 in every upstream message and Fancy takes 1000+. That
+// So upstream owns 1-999 in every upstream message and Fancy takes 1000+. That
 // leaves ~975 free numbers even in the tightest case (`UserState`, whose
 // upstream max is 24), which is more room than upstream can plausibly consume,
 // the point being that nobody should ever have to re-run this migration.

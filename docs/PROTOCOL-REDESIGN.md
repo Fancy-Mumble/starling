@@ -127,7 +127,7 @@ The compatibility obligations are exactly two, and neither is here:
 * **`Mumble.proto` upstream messages**, a released Mumble client reads them.
   Field numbers there are upstream's, and the vacated ones are deliberately *not*
   reserved so upstream can grow into them (`PROTOCOL-COMPATIBILITY.md` §1).
-* **Outer types 100–999**, burned, because released *Fancy* clients shipped
+* **Outer types 100-999**, burned, because released *Fancy* clients shipped
   messages under them. That is a range never reused, not a set of reservations.
 
 After M4 the L2 tags join the first category and the reflex becomes correct.
@@ -139,11 +139,11 @@ only window in which the wire can be made right rather than merely extended.
 The hard rule stays the only hard rule: **never break a native Mumble
 client.** What this design guarantees, mechanically:
 
-* **Types 0–26 are flat and frozen.** Every upstream message, field number and
+* **Types 0-26 are flat and frozen.** Every upstream message, field number and
   wire type is exactly upstream's. No upstream message ever gains a `required`
   field or a Fancy field below 1000 (`Version.fancy_version = 6` is the single
   pinned exception, for discovery by already-shipped Fancy peers).
-* **Upstream owns 1–999 in every upstream message; Fancy fields start at
+* **Upstream owns 1-999 in every upstream message; Fancy fields start at
   1000.** Tag encoding is two bytes either way; the margin costs nothing.
 * **A stock 1.5 client negotiates nothing.** It never sends
   `Version.fancy_protocol`, so the gateway treats it as epoch-absent: it
@@ -295,7 +295,7 @@ alone; the discipline that got it to 12 (server-known facts like `sender_hash`
 dropped, request/response pairs collapsed, challenge sub-protocol replaced by
 the key ladder) is the discipline that keeps these numbers from regrowing.
 
-On the mesh (L3), minimal means RPC count: each service exposes 3–7 methods
+On the mesh (L3), minimal means RPC count: each service exposes 3-7 methods
 (metadata is the widest at 8, because it owns membership as well as the tree),
 plus the uniform `ClientPlane.Attach` every client-facing service implements.
 A contract and a process are not one-to-one: `sessioncontrol.v1` (the operator
@@ -368,8 +368,8 @@ change.
 
 | Requirement | Where it is met |
 |---|---|
-| zero-copy between services | §4 Z1–Z5; `Frame`/`Send` as `Bytes`; Z3 embed-verbatim |
-| tens of thousands of clients | §5 S1–S6; `SyncDelta`; framing seq; shard keys |
+| zero-copy between services | §4 Z1-Z5; `Frame`/`Send` as `Bytes`; Z3 embed-verbatim |
+| tens of thousands of clients | §5 S1-S6; `SyncDelta`; framing seq; shard keys |
 | minimal message set per service | §6 table; one envelope per service; D2 fix |
 | shared common primitives | §7; `starling.common.v1` + `starling.fancy.wire.v1` |
 | 100 % Mumble 1.5 compatibility | §3; L0 frozen; import law §1; checks `PROTOCOL-MIGRATION.md` M6 |

@@ -1,6 +1,6 @@
 //! Between the service's `Channel` and upstream's `ChannelState`.
 //!
-//! Upstream owns field numbers 1–99 in every upstream message and Fancy fields
+//! Upstream owns field numbers 1-99 in every upstream message and Fancy fields
 //! start at 100 (`docs/PROTOCOL-COMPATIBILITY.md` §1). This module therefore
 //! writes only upstream fields into `ChannelState`; the Fancy channel
 //! properties travel in metadata's own envelope, where they cannot collide with

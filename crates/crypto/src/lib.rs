@@ -5,7 +5,7 @@
 //! Mumble's transport security is showing its age. Two specifics:
 //!
 //! * **OCB2-AES128**, the UDP voice cipher, has a practical forgery attack
-//!   (Inoue–Iwata–Minematsu–Poettering, CRYPTO 2019). Mumble's framing limits
+//!   (Inoue-Iwata-Minematsu-Poettering, CRYPTO 2019). Mumble's framing limits
 //!   the exposure, but it is not a cipher anyone would choose today.
 //! * murmur accepts **TLS 1.0 and later** (`Server.cpp:1660`).
 //!

@@ -38,7 +38,7 @@ pub enum Target {
     /// before trusting it with real audio.
     Loopback,
 
-    /// Targets 1–30: a whisper or shout to a set the speaker registered earlier
+    /// Targets 1-30: a whisper or shout to a set the speaker registered earlier
     /// with `VoiceTarget`.
     Whisper(u8),
 }

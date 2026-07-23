@@ -16,8 +16,8 @@ a file grows past that, look for the seam before adding to it.
 ### Open/closed
 New behaviour arrives as a **new implementation of an existing trait**, not as a
 new arm in an existing `match`. The message dispatcher is the canonical example:
-Phases 3–5 add ~70 Fancy handlers, and each must be a `register` call, not an
-edit to a growing `match`.
+The plugin, chat and remaining-surface work adds ~70 Fancy handlers between
+them, and each must be a `register` call, not an edit to a growing `match`.
 
 ### Liskov
 Every implementation of a trait must satisfy the contract written in the trait's

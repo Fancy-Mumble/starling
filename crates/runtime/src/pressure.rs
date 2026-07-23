@@ -54,7 +54,7 @@ pub struct Load {
 }
 
 impl Load {
-    /// How full it is, 0–100, or `None` when nothing declares a limit.
+    /// How full it is, 0-100, or `None` when nothing declares a limit.
     ///
     /// Uses [`Self::peak`], not [`Self::used`]: the question a dashboard asks
     /// is "did this run out", and the instant of the poll is the least likely

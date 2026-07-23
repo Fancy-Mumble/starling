@@ -29,7 +29,7 @@ stubs, and never recompiles when a service is added.
 
 ### One outer type per service, nested envelope inside
 
-Upstream types (0–26) are flat and frozen forever. Every Fancy service instead
+Upstream types (0-26) are flat and frozen forever. Every Fancy service instead
 gets **one** outer type, and its payload is a service-owned envelope carrying its
 own `oneof`:
 
@@ -63,13 +63,13 @@ the name from one nested read.
 
 | Range | Use |
 |---|---|
-| **0–99** | upstream Mumble, flat, **frozen** (0–26 in use) |
-| **100–999** | **burned.** The old interleaved Fancy flat types shipped in released clients; never reused, so a stale client's message can never be misread as a new service's |
+| **0-99** | upstream Mumble, flat, **frozen** (0-26 in use) |
+| **100-999** | **burned.** The old interleaved Fancy flat types shipped in released clients; never reused, so a stale client's message can never be misread as a new service's |
 | **1000+** | one outer type per service, nested envelope. 64 500 services available |
 
-Why 100–999 is burned rather than reclaimed: today's Fancy numbering is
+Why 100-999 is burned rather than reclaimed: today's Fancy numbering is
 *interleaved*, not blocked, `WebRtcSignal` is 120, sitting between pchat's
-100–119 and 121, and pchat's pins are at 128–130. Range routing cannot work on
+100-119 and 121, and pchat's pins are at 128-130. Range routing cannot work on
 it, and reusing those numbers risks a deployed client's message landing on the
 wrong service. See `PROTOCOL-COMPATIBILITY.md`.
 

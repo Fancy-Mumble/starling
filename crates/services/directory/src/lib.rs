@@ -47,7 +47,7 @@ pub use registrar::{DEFAULT_TRUST_STORE, PublicList, RegisterError, Registrar};
 
 /// The earliest a first announcement is sent, after start-up.
 ///
-/// murmur waits 60–180 seconds. The delay is not politeness: a server that
+/// murmur waits 60-180 seconds. The delay is not politeness: a server that
 /// announces the instant it boots announces a user count of zero and a channel
 /// tree that has not loaded, and the jitter stops a thousand servers restarting
 /// after a package upgrade from arriving at the list together.

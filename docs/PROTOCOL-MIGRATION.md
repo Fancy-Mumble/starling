@@ -177,7 +177,7 @@ before M2b has given the client something worth encoding.
 
   Outbound gained the matching rule: `encode` **refuses** a Fancy message with
   no canon form rather than framing it flat, because flat means its epoch-0 id
-  in the burned 100–999 range, which routes nowhere on any peer. Those travel by
+  in the burned 100-999 range, which routes nowhere on any peer. Those travel by
   relay, arranged a layer up; a raw one reaching the wire codec means somebody
   skipped that layer, and now they find out instead of the frame vanishing.
 * **M4, freeze, per set rather than per date. Mechanism done.** A blanket
@@ -359,7 +359,7 @@ before M2b has given the client something worth encoding.
   * **hygiene**, `check-proto-hygiene.py`, new. Two rules no compiler
     enforces and that the drift check is blind to *by construction*, because
     all three trees break them identically: **no field number in the burned
-    100–999 range** (with `Version.fancy_version = 6` as the one pinned
+    100-999 range** (with `Version.fancy_version = 6` as the one pinned
     exception), and **no source outside the frozen crate may name a dead-block
     envelope type**, the canon shares those names, so the import *path* is
     what distinguishes them. Both were verified by reintroducing the original

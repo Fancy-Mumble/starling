@@ -2,7 +2,7 @@
 //!
 //! Ids are transcribed from `vendor/server/src/MumbleProtocol.h` and
 //! cross-checked against the client's `mumble-protocol/src/message.rs`. Ids
-//! 0–26 are stock Mumble; 100+ are Fancy Mumble extensions; 200+ are the plugin
+//! 0-26 are stock Mumble; 100+ are Fancy Mumble extensions; 200+ are the plugin
 //! channel.
 
 /// The 16-bit message type ids carried in the TCP frame header.

@@ -35,15 +35,15 @@ nobody has to re-check. All three trees hold the same numbers:
 
 | message | upstream's max | originally | now |
 |---|---|---|---|
-| `TextMessage` | 5 | 6, 7, 8, 9, 10 | 1000–1004 |
-| `ACL.ChanGroup` | 7 | 8, 9, 10, 11 | 1000–1003 |
-| `UserList.User` | 4 | 5, 6, 7 | 1000–1002 |
+| `TextMessage` | 5 | 6, 7, 8, 9, 10 | 1000-1004 |
+| `ACL.ChanGroup` | 7 | 8, 9, 10, 11 | 1000-1003 |
+| `UserList.User` | 4 | 5, 6, 7 | 1000-1002 |
 | `ServerConfig` | 7 | 8, 9 | 1000, 1001 |
 | `UserState` | 23 | 24 | 1000 |
 | `RequestBlob` | 3 | 4 | 1000 |
 | `Version` | 5 | 6 (+7) | 6 **pinned**, epoch at 1000 |
 | `Authenticate` | 6 | 100 | 1000 |
-| `ChannelState` | 13 | 100–111 | 1000–1011 |
+| `ChannelState` | 13 | 100-111 | 1000-1011 |
 
 Four things to know about that move:
 
@@ -69,10 +69,10 @@ Four things to know about that move:
 
 ### The rule going forward
 
-> **Upstream owns field numbers 1–999 in every upstream message. Fancy fields
+> **Upstream owns field numbers 1-999 in every upstream message. Fancy fields
 > start at 1000.**
 
-1–99 would have been enough for any plausible upstream, `UserState`, the
+1-99 would have been enough for any plausible upstream, `UserState`, the
 tightest message, was at 24 against a ceiling of 99. The larger margin is not
 about upstream running out; it is about never having to make this judgement
 again, and it is free: protobuf spends two tag bytes on everything from field
@@ -122,8 +122,8 @@ So `Version.fancy_protocol` (field 7, `uint32`) names the numbering itself:
 
 | Epoch | Numbering |
 |---|---|
-| absent / `0` | The interleaved 100–999 layout in §2. Every Fancy build shipped to date, including `vendor/server`. |
-| `1` | §3: upstream 0–99 flat and frozen, every Fancy service behind one outer type ≥ 1000. What Starling speaks. |
+| absent / `0` | The interleaved 100-999 layout in §2. Every Fancy build shipped to date, including `vendor/server`. |
+| `1` | §3: upstream 0-99 flat and frozen, every Fancy service behind one outer type ≥ 1000. What Starling speaks. |
 
 Three rules make it work:
 
@@ -183,8 +183,8 @@ message PchatEnvelope {
 
 | Range | Use |
 |---|---|
-| **0–99** | upstream Mumble, flat, **frozen** (0–26 in use) |
-| **100–999** | **burned.** Shipped in released Fancy clients with the interleaved layout above. Never reused, so a stale client's message can never land on a new service |
+| **0-99** | upstream Mumble, flat, **frozen** (0-26 in use) |
+| **100-999** | **burned.** Shipped in released Fancy clients with the interleaved layout above. Never reused, so a stale client's message can never land on a new service |
 | **1000+** | one outer type per service, nested envelope |
 
 ### Why nesting rather than blocks of 100
@@ -203,7 +203,7 @@ the payload's first field, so tooling recovers the name with one nested read.
 
 | Type | Service |
 |---|---|
-| 1000 | session-lifecycle (Fancy extensions only; 0–26 stay flat) |
+| 1000 | session-lifecycle (Fancy extensions only; 0-26 stay flat) |
 | | session-view has **no** client-facing type: internal by construction |
 | 1001 | permissions |
 | 1002 | metadata |
@@ -238,16 +238,16 @@ introduced natively and have no epoch-0 ancestor.
 
 | Outer | Service | Epoch-0 types folded in |
 |---|---|---|
-| 1006 | pchat | 100–116, 121, 128–130, message/fetch/deliver, the key ladder, deletes, offline drain, pins |
-| 1015 | social | 117–119 (reactions), 124 (custom reactions), 126–127 (read receipts), 131 (typing), 134 (watch sync), 135 (draw stroke), 144–145 (polls) |
-| 1011 | push | 122–123, 125 |
+| 1006 | pchat | 100-116, 121, 128-130, message/fetch/deliver, the key ladder, deletes, offline drain, pins |
+| 1015 | social | 117-119 (reactions), 124 (custom reactions), 126-127 (read receipts), 131 (typing), 134 (watch sync), 135 (draw stroke), 144-145 (polls) |
+| 1011 | push | 122-123, 125 |
 | 1008 | screenshare | 120 (`WebRtcSignal`, screen and camera share both ride it) |
-| 1016 | link-preview | 132–133 |
-| 1014 | onboarding | 136–140 |
-| 1010 | plugins | 146–151, plus the generic plugin relay at 200–201 |
-| 1013 | server-config | 152–153 |
-| 1003 | userdata | 154–156 (account settings + ack) |
-| 1012 | audit | 166–168, 170–171 |
+| 1016 | link-preview | 132-133 |
+| 1014 | onboarding | 136-140 |
+| 1010 | plugins | 146-151, plus the generic plugin relay at 200-201 |
+| 1013 | server-config | 152-153 |
+| 1003 | userdata | 154-156 (account settings + ack) |
+| 1012 | audit | 166-168, 170-171 |
 
 Two consequences worth stating, because both were live bugs before:
 
@@ -294,7 +294,7 @@ nothing about Mumble compatibility.
 
 It needs to become two checks with two meanings:
 
-1. **compatibility**, upstream messages, field numbers 1–99, against
+1. **compatibility**, upstream messages, field numbers 1-99, against
    `mumble-voip/mumble`. A failure here is a released-client break
 2. **consistency**, everything else, against `vendor/server` and
    `vendor/client`. A failure here is a coordination bug between our own trees

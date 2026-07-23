@@ -46,7 +46,7 @@ pub trait VoiceCipherSpec: std::fmt::Debug + Send + Sync {
 /// OCB2-AES128, what stock Mumble uses.
 ///
 /// Retained **only** for backwards compatibility. OCB2 has a practical forgery
-/// attack (Inoue–Iwata–Minematsu–Poettering, CRYPTO 2019); Mumble's fixed-length
+/// attack (Inoue-Iwata-Minematsu-Poettering, CRYPTO 2019); Mumble's fixed-length
 /// framing limits the practical exposure, but it is not a cipher anyone would
 /// choose today. Every client that can do better is given
 /// [`XChaCha20Poly1305Spec`] instead.

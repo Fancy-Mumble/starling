@@ -57,7 +57,7 @@ message MetadataEnvelope {
 }
 
 // Fancy channel properties that upstream's ChannelState has no field for.
-// Upstream owns 1–99 in every upstream message; these live out here instead of
+// Upstream owns 1-99 in every upstream message; these live out here instead of
 // squatting on upstream's next field number, docs/PROTOCOL-COMPATIBILITY.md §1.
 message ChannelExtras {
   uint32 channel = 1;
