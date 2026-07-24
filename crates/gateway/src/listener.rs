@@ -4,7 +4,7 @@
 //! readiness and pump gRPC" and "speak Mumble's framing" are two jobs, and
 //! fused they become one file nobody can review.
 //!
-//! murmur accepts TLS 1.0 and later (`Server.cpp:1660`). rustls implements only
+//! murmur accepts TLS 1.0 and later (`Server.cpp:1671`). rustls implements only
 //! 1.2 and 1.3, so even the most permissive configuration here beats murmur for
 //! free, see `starling-crypto` for the per-peer suite negotiation this leaves
 //! room for.

@@ -371,7 +371,7 @@ impl SessionLifecycleService {
     /// The client's `Version`.
     ///
     /// Starling already sent its own `Version` first, on TLS establishment
-    /// (`opened`, matching `Server.cpp:1668`), so the client's copy is recorded
+    /// (`opened`, matching `Server.cpp:1679`), so the client's copy is recorded
     /// rather than answered, the next thing the client sends is `Authenticate`,
     /// and answering twice confuses a stock client.
     fn on_version(&self, inbound: &Inbound) -> Actions {

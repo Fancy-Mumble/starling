@@ -55,6 +55,14 @@ jobs:
       - name: Check upstream compatibility
         run: python3 scripts/check-proto-compat.py
 
+      # Citations: the comments point at murmur by line number, and line
+      # numbers rot. When vendor/server moved on 2026-08-02 it took three of
+      # them with it, and each then pointed at real, plausible, unrelated
+      # code, which is worse than a dangling reference because a reader who
+      # follows it believes what they land on.
+      - name: Check C++ citations
+        run: python3 scripts/check-cpp-citations.py
+
   # ----------------------------------------------------------------
   # The microkernel rule: the kernel must never depend on a feature.
   # A build failure enforces what a design document could not.

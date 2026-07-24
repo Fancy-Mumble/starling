@@ -4,7 +4,7 @@
 ///
 /// rustls implements **only** TLS 1.2 and 1.3, so even
 /// [`TlsFloor::Tls12`] is stricter than murmur, which accepts
-/// `TlsV1_0OrLater` (`Server.cpp:1660`). There is deliberately no variant for
+/// `TlsV1_0OrLater` (`Server.cpp:1671`). There is deliberately no variant for
 /// TLS 1.0 or 1.1: they are broken, and offering the option would invite
 /// somebody to select it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

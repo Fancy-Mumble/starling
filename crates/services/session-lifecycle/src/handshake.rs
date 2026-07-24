@@ -3,7 +3,7 @@
 //! Verified against `vendor/server/src/murmur/Messages.cpp` and `Server.cpp`:
 //!
 //! ```text
-//! Version (server-first, on TLS established, Server.cpp:1668)
+//! Version (server-first, on TLS established, Server.cpp:1679)
 //!   → client Version → client Authenticate
 //!   → CryptSetup → CodecVersion
 //!   → ChannelState × N (BFS from root)
@@ -11,7 +11,7 @@
 //!   → ServerSync → ServerConfig → SuggestConfig
 //! ```
 //!
-//! The ordering is not cosmetic. `Messages.cpp:775` is explicit that listeners
+//! The ordering is not cosmetic. `Messages.cpp:843` is explicit that listeners
 //! must come *after* `ServerSync`, and a client that tolerates a different
 //! order in development can hang against it in the wild (`PORTING-PLAN.md` R4).
 //!

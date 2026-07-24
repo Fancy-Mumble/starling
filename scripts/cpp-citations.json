@@ -1,0 +1,7 @@
+{
+  "_comment": "Each key is a File.cpp:LINE citation used somewhere in this tree; each value is a symbol that must appear within a few lines of it. Verified by hand against vendor/server @ 3e41938f0 on 2026-08-06. Add an entry when you add a citation: an unpinned one is reported by check-cpp-citations.py but does not fail it.",
+  "Server.cpp:1671": "TlsV1_0OrLater",
+  "Server.cpp:1679": "Server::encrypted",
+  "Messages.cpp:843": "server-sync",
+  "ACL.h:21": "enum Perm"
+}

@@ -122,7 +122,7 @@ opportunity to fix both **without** costing backwards compatibility:
 * **OCB2-AES128** (the UDP voice cipher) has a practical forgery attack
   (Inoue-Iwata-Minematsu-Poettering, CRYPTO 2019). Mumble's framing limits the
   exposure, but nobody would choose it today.
-* murmur accepts **TLS 1.0 and later** (`Server.cpp:1660`).
+* murmur accepts **TLS 1.0 and later** (`Server.cpp:1671`).
 
 Starling cannot simply raise the floor, the acceptance rule below requires the
 shipped stock client to keep working. So security choices are negotiated
@@ -215,7 +215,7 @@ last three overlap to this day.
 
 - TLS listener; self-signed cert auto-generated on first boot (`rcgen`).
 - Handshake, in murmur's exact order (verified against `Messages.cpp`):
-  `Version` (server-first, on TLS-established, `Server.cpp:1668`) → client
+  `Version` (server-first, on TLS-established, `Server.cpp:1679`) → client
   `Version` → client `Authenticate` → `CryptSetup` → `CodecVersion` →
   `ChannelState`×N (BFS from root) → own `UserState` → other `UserState`s →
   `ServerSync` → `ServerConfig` → `SuggestConfig`.
@@ -282,7 +282,7 @@ WebRTC SFU: keep dlopen'ing the existing `libwebrtc_sfu.so` first; port to
 | R1 | **Ice has no viable Rust implementation.** `MumbleServerIce.cpp` is 2 568 lines and `vendor/channelviewer` consumes it (`getDefaultConf`). | **High** | Do not port. Replace per §6 and ship a shim. Needs explicit sign-off before any of it is persisted; this is the one deliberate compatibility break. |
 | R2 | Schema drift between Starling's migrations and murmur's. | High | Starling reads murmur's existing schema; migrations are additive only. CI runs a murmur-written DB through Starling and asserts data equality. |
 | R3 | Hostile input. A client library trusts the peer; a server cannot. The ported framing must survive fuzzing. | High | `cargo-fuzz` target on the frame decoder from the first commit. `MAX_PAYLOAD_SIZE` and per-field limits enforced before allocation. |
-| R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners, `Messages.cpp:775` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
+| R4 | Subtle handshake ordering differences that the client tolerates in dev but not in the wild (e.g. `ServerSync` before listeners, `Messages.cpp:843` is explicit that listeners must come *after*). | Medium | Ordering is transcribed from source with line references and asserted by a raw-TCP harness (`SERVER-COVERAGE.md` fixture layer 2). |
 | R5 | The `messagelimit`/`messageburst` leaky bucket **silently drops** messages (see `fixtures/mumble-server.ini`). Getting this subtly wrong breaks WebRTC signalling in ways that look like client bugs. | Medium | Port the token bucket first (`TokenBucketRateLimiter.cpp` is already isolated), unit-test it against the C++ behaviour, and log drops at `debug` rather than dropping silently. |
 | R6 | Two servers to maintain during the transition. | Medium | Phases are gated on the *same* e2e suite, so both stay honest. Fixture picks the implementation via one env var. |
 | R8 | **The gRPC hop cost has never been measured on the target platform.** The bus experiments it replaces were Windows-only on 24 unconstrained cores; the target is Linux containers, plausibly CPU-limited. A hop that is free on a workstation is not automatically free under a cgroup quota. | **High** | Measure gateway-to-service round-trip on Linux under quota, over both a Unix socket and TCP, before the first service ships. |
