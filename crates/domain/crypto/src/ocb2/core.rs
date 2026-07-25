@@ -21,7 +21,7 @@
 //! The decrypting side detects the same shape and refuses, which is what makes
 //! the pair a mitigation rather than an obfuscation.
 
-use super::block::{Block, BlockCipher, BLOCK_LEN};
+use super::block::{BLOCK_LEN, Block, BlockCipher};
 
 /// The three-byte authentication tag, truncated from a full block.
 ///
@@ -219,9 +219,11 @@ mod tests {
         let cipher = cipher();
         let plain = b"the quick brown fox jumps over the lazy dog".to_vec();
         let (encrypted, _) = encrypt(&cipher, nonce(), &plain);
-        assert!(!encrypted
-            .windows(8)
-            .any(|w| plain.windows(8).any(|p| w == p)));
+        assert!(
+            !encrypted
+                .windows(8)
+                .any(|w| plain.windows(8).any(|p| w == p))
+        );
     }
 
     #[test]

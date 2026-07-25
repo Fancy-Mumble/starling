@@ -106,7 +106,7 @@ pub fn reportable() -> Perm {
 mod tests {
     use super::*;
     use starling_api::{Effect, ServerConfig, Sessions, World};
-    use starling_model::{Permissions, UserId, ROOT_CHANNEL};
+    use starling_model::{Permissions, ROOT_CHANNEL, UserId};
     use starling_server::ServerState;
 
     /// A state with one authenticated user, as the dispatcher would have it.
@@ -199,9 +199,11 @@ mod tests {
     #[test]
     fn a_query_without_a_channel_is_ignored() {
         let (mut state, conn) = state_with_user();
-        assert!(PermissionQueryHandler
-            .handle(&mut state, conn, query(None))
-            .is_empty());
+        assert!(
+            PermissionQueryHandler
+                .handle(&mut state, conn, query(None))
+                .is_empty()
+        );
     }
 
     #[test]

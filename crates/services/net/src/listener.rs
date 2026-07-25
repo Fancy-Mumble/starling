@@ -43,12 +43,12 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use starling_crypto::TlsFloor;
-use starling_proto::{codec, ControlMessage};
+use starling_proto::{ControlMessage, codec};
 use starling_tls::TlsIdentity;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_rustls::{rustls, TlsAcceptor};
+use tokio_rustls::{TlsAcceptor, rustls};
 use tracing::{debug, info, warn};
 
 use crate::sink::ConnectionSink;
@@ -411,8 +411,8 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starling_proto::proto::tcp;
     use starling_proto::ControlMessage;
+    use starling_proto::proto::tcp;
 
     use starling_api::ServerConfig;
 
@@ -485,9 +485,11 @@ mod tests {
         // layer's job, and this one only knows which transport carried it.
         let payload: Vec<u8> = (0..=255_u8).collect();
         let audio = Arc::new(RecordedAudio::default());
-        assert!(read_with(tunnelled(&payload).to_vec(), Arc::clone(&audio))
-            .await
-            .is_ok());
+        assert!(
+            read_with(tunnelled(&payload).to_vec(), Arc::clone(&audio))
+                .await
+                .is_ok()
+        );
         assert_eq!(audio.all()[0], Bytes::from(payload));
     }
 
@@ -495,9 +497,11 @@ mod tests {
     async fn control_messages_do_not_go_to_the_audio_sink() {
         // The other half of the split, and the one a careless `match` breaks.
         let audio = Arc::new(RecordedAudio::default());
-        assert!(read_with(ping(1).to_vec(), Arc::clone(&audio))
-            .await
-            .is_ok());
+        assert!(
+            read_with(ping(1).to_vec(), Arc::clone(&audio))
+                .await
+                .is_ok()
+        );
         assert!(audio.all().is_empty());
     }
 
@@ -525,9 +529,11 @@ mod tests {
         // The voice service decides what is too short. Filtering here would be
         // a protocol decision this layer cannot see enough to make.
         let audio = Arc::new(RecordedAudio::default());
-        assert!(read_with(tunnelled(b"").to_vec(), Arc::clone(&audio))
-            .await
-            .is_ok());
+        assert!(
+            read_with(tunnelled(b"").to_vec(), Arc::clone(&audio))
+                .await
+                .is_ok()
+        );
         assert_eq!(audio.all().len(), 1);
     }
 

@@ -144,7 +144,7 @@ mod tests {
     use starling_api::Limits;
     use starling_api::ServerConfig;
     use starling_api::{Sessions, World};
-    use starling_model::{User, ROOT_CHANNEL};
+    use starling_model::{ROOT_CHANNEL, User};
     use std::net::SocketAddr;
 
     fn addr() -> SocketAddr {
@@ -244,9 +244,11 @@ mod tests {
         let sends = relayed(&fx);
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].0, Recipients::Session(bob));
-        assert!(!sends
-            .iter()
-            .any(|(to, _)| *to == Recipients::Session(carol)));
+        assert!(
+            !sends
+                .iter()
+                .any(|(to, _)| *to == Recipients::Session(carol))
+        );
     }
 
     #[test]

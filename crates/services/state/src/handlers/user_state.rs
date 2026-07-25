@@ -102,10 +102,10 @@ fn apply(state: &mut dyn Authority, actor: SessionId, msg: &tcp::UserState) -> E
         return Effects::none();
     }
 
-    if let Some(channel) = target_channel {
-        if state.users_mut().move_to(actor, channel).is_some() {
-            announcement.moved_to(channel);
-        }
+    if let Some(channel) = target_channel
+        && state.users_mut().move_to(actor, channel).is_some()
+    {
+        announcement.moved_to(channel);
     }
 
     let Some(changed) = announcement.finish() else {
@@ -246,7 +246,7 @@ mod tests {
     use starling_api::Limits;
     use starling_api::ServerConfig;
     use starling_api::{Sessions, World};
-    use starling_model::{User, ROOT_CHANNEL};
+    use starling_model::{ROOT_CHANNEL, User};
     use std::net::SocketAddr;
 
     fn addr() -> SocketAddr {

@@ -4,8 +4,8 @@ use tracing::debug;
 
 use starling_gate::{Capability, Gate};
 
-use crate::suite::{FancySuite, LegacySuite, SecuritySuite};
 use crate::PeerCapabilities;
+use crate::suite::{FancySuite, LegacySuite, SecuritySuite};
 
 /// Decides which [`SecuritySuite`] a peer gets.
 ///
@@ -149,15 +149,15 @@ mod tests {
                 policy.name()
             );
             // 2. A non-Fancy peer must never be handed the Fancy suite.
-            if let Some(suite) = policy.negotiate(&peer) {
-                if !peer.is_fancy() {
-                    assert!(
-                        suite.is_baseline(),
-                        "{} gave a stock peer the {} suite",
-                        policy.name(),
-                        suite.name()
-                    );
-                }
+            if let Some(suite) = policy.negotiate(&peer)
+                && !peer.is_fancy()
+            {
+                assert!(
+                    suite.is_baseline(),
+                    "{} gave a stock peer the {} suite",
+                    policy.name(),
+                    suite.name()
+                );
             }
         }
     }

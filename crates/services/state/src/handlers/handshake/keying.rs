@@ -33,8 +33,8 @@
 
 use starling_api::{Authority, ConnId, Effects, Recipients, VoiceKeying, VoiceUpdate};
 use starling_crypto::VoiceSecrets;
-use starling_proto::proto::tcp;
 use starling_proto::ControlMessage;
+use starling_proto::proto::tcp;
 use tracing::{info, warn};
 
 /// Send a peer its voice keys, and give the voice service the same material.

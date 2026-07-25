@@ -297,7 +297,7 @@ mod tests {
     use super::*;
     use starling_api::Limits;
     use starling_api::{Sessions, World};
-    use starling_model::{User, ROOT_CHANNEL};
+    use starling_model::{ROOT_CHANNEL, User};
 
     fn addr() -> SocketAddr {
         "127.0.0.1:1234".parse().expect("valid test address")
@@ -362,9 +362,10 @@ mod tests {
         }
 
         let s = state().with_permissions(Box::new(DenyAll));
-        assert!(!s
-            .permissions()
-            .allows(None, ROOT_CHANNEL, starling_model::Perm::SPEAK));
+        assert!(
+            !s.permissions()
+                .allows(None, ROOT_CHANNEL, starling_model::Perm::SPEAK)
+        );
     }
 
     #[test]

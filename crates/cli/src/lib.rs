@@ -26,7 +26,7 @@ pub mod native;
 pub mod overrides;
 
 pub use args::{Command as Invocation, ServeArgs, USAGE};
-pub use command::{registered, Command, CommandError};
+pub use command::{Command, CommandError, registered};
 pub use formats::ConfigFormat;
 pub use native::NativeConfig;
 pub use overrides::CliOverrides;

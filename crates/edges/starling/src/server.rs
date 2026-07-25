@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use starling_log::LogRuntime;
 use starling_net::{ConnectionRegistry, Listener, ListenerConfig, VoiceSocket};
-use starling_server::{handlers, ServerCore, ServerHandle, ServerState, TlsFloor};
+use starling_server::{ServerCore, ServerHandle, ServerState, TlsFloor, handlers};
 use starling_voice::{ServerDetails, VoiceBridge, VoiceService};
 use tracing::info;
 

@@ -8,8 +8,8 @@
 //! murmur writes the same arithmetic as a macro over native-endian `quint64`
 //! pairs wrapped in `SWAP64`, which is this with the endianness handled by hand.
 
-use aes::cipher::{BlockDecrypt as _, BlockEncrypt as _, KeyInit as _};
 use aes::Aes128;
+use aes::cipher::{BlockDecrypt as _, BlockEncrypt as _, KeyInit as _};
 
 /// AES's block size, and OCB2's.
 pub const BLOCK_LEN: usize = 16;

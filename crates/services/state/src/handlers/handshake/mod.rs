@@ -31,4 +31,4 @@ mod sync;
 mod version;
 
 pub use authenticate::AuthenticateHandler;
-pub use version::{server_version, VersionHandler};
+pub use version::{VersionHandler, server_version};

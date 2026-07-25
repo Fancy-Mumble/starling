@@ -30,7 +30,7 @@ pub mod session;
 pub mod user;
 
 pub use channel::{Channel, ChannelStore, ChannelTree};
-pub use ids::{ChannelId, SessionId, UserId, ROOT_CHANNEL};
+pub use ids::{ChannelId, ROOT_CHANNEL, SessionId, UserId};
 pub use perm::{AllowAll, Perm, Permissions};
 pub use session::{SessionAllocator, SessionSource};
 pub use user::{User, UserRegistry, Users};

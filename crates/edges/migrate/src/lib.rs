@@ -19,7 +19,7 @@ pub use ini::Ini;
 
 use std::path::PathBuf;
 
-use starling_cli::{resolve, Command, CommandError, ConfigFormat, ConfigSource, NativeConfig};
+use starling_cli::{Command, CommandError, ConfigFormat, ConfigSource, NativeConfig, resolve};
 
 /// `migrate-config <FILE>` — print a murmur `.ini` as `starling.toml`.
 #[derive(Debug, Default)]

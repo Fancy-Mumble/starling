@@ -22,7 +22,7 @@ pub mod version;
 pub mod voice;
 
 pub use version::FancyVersion;
-pub use voice::{AudioCodec, CipherChoice, MumbleVersion, UdpFormat, PROTOBUF_UDP_SINCE};
+pub use voice::{AudioCodec, CipherChoice, MumbleVersion, PROTOBUF_UDP_SINCE, UdpFormat};
 
 /// Declare capabilities and the version that introduced each.
 ///

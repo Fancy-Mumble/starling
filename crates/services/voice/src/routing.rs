@@ -352,17 +352,21 @@ mod tests {
     #[test]
     fn a_speaker_does_not_hear_themselves() {
         // Echoing normal speech back would double every speaker's own audio.
-        assert!(!lobby_with_three()
-            .recipients(ALICE, Target::Normal)
-            .contains(&ALICE));
+        assert!(
+            !lobby_with_three()
+                .recipients(ALICE, Target::Normal)
+                .contains(&ALICE)
+        );
     }
 
     #[test]
     fn another_channel_hears_nothing() {
         let snapshot = lobby_with_three().with_member(SessionId(4), ANNEX);
-        assert!(!snapshot
-            .recipients(ALICE, Target::Normal)
-            .contains(&SessionId(4)));
+        assert!(
+            !snapshot
+                .recipients(ALICE, Target::Normal)
+                .contains(&SessionId(4))
+        );
     }
 
     #[test]
@@ -383,9 +387,11 @@ mod tests {
     #[test]
     fn a_listener_hears_a_channel_without_joining_it() {
         let snapshot = lobby_with_three().with_listener(SessionId(9), LOBBY);
-        assert!(snapshot
-            .recipients(ALICE, Target::Normal)
-            .contains(&SessionId(9)));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Normal)
+                .contains(&SessionId(9))
+        );
     }
 
     #[test]
@@ -429,9 +435,11 @@ mod tests {
         // a frame Alice aimed only at Bob.
         let snapshot =
             lobby_with_three().with_target(ALICE, 3, VoiceTarget::new().whispering_to(BOB));
-        assert!(!snapshot
-            .recipients(ALICE, Target::Whisper(3))
-            .contains(&CAROL));
+        assert!(
+            !snapshot
+                .recipients(ALICE, Target::Whisper(3))
+                .contains(&CAROL)
+        );
     }
 
     #[test]
@@ -481,9 +489,11 @@ mod tests {
                     include_children: false,
                 }),
             );
-        assert!(snapshot
-            .recipients(ALICE, Target::Whisper(5))
-            .contains(&SessionId(4)));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Whisper(5))
+                .contains(&SessionId(4))
+        );
     }
 
     #[test]
@@ -492,9 +502,11 @@ mod tests {
             .with_member(SessionId(4), ANNEX)
             .with_link(LOBBY, ANNEX)
             .with_target(ALICE, 5, VoiceTarget::new().shouting_to(shout(LOBBY)));
-        assert!(!snapshot
-            .recipients(ALICE, Target::Whisper(5))
-            .contains(&SessionId(4)));
+        assert!(
+            !snapshot
+                .recipients(ALICE, Target::Whisper(5))
+                .contains(&SessionId(4))
+        );
     }
 
     #[test]
@@ -511,9 +523,11 @@ mod tests {
                     include_children: true,
                 }),
             );
-        assert!(snapshot
-            .recipients(ALICE, Target::Whisper(6))
-            .contains(&SessionId(4)));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Whisper(6))
+                .contains(&SessionId(4))
+        );
     }
 
     #[test]
@@ -532,9 +546,11 @@ mod tests {
                     include_children: true,
                 }),
             );
-        assert!(snapshot
-            .recipients(ALICE, Target::Whisper(6))
-            .contains(&SessionId(4)));
+        assert!(
+            snapshot
+                .recipients(ALICE, Target::Whisper(6))
+                .contains(&SessionId(4))
+        );
     }
 
     #[test]
@@ -580,9 +596,11 @@ mod tests {
                 .whispering_to(ALICE)
                 .shouting_to(shout(LOBBY)),
         );
-        assert!(!snapshot
-            .recipients(ALICE, Target::Whisper(7))
-            .contains(&ALICE));
+        assert!(
+            !snapshot
+                .recipients(ALICE, Target::Whisper(7))
+                .contains(&ALICE)
+        );
     }
 
     #[test]

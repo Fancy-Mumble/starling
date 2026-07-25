@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::state::ServerState;
     use starling_api::{Effect, ServerConfig, Sessions, World};
-    use starling_model::{User, ROOT_CHANNEL};
+    use starling_model::{ROOT_CHANNEL, User};
 
     fn state_with_user() -> (ServerState, ConnId) {
         let mut state = ServerState::new(ServerConfig::default());

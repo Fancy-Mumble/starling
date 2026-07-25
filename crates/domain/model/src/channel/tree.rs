@@ -84,10 +84,10 @@ impl ChannelStore for ChannelTree {
         }
 
         // Detach from the parent first so the subtree walk cannot revisit it.
-        if let Some(parent) = self.channels.get(&id).and_then(|c| c.parent) {
-            if let Some(p) = self.channels.get_mut(&parent) {
-                p.children.retain(|&c| c != id);
-            }
+        if let Some(parent) = self.channels.get(&id).and_then(|c| c.parent)
+            && let Some(p) = self.channels.get_mut(&parent)
+        {
+            p.children.retain(|&c| c != id);
         }
 
         let mut removed = Vec::new();

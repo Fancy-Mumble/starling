@@ -313,11 +313,10 @@ impl Router {
             AudioSource::Datagram(addr) => {
                 // The bound address first: one trial decryption for essentially
                 // every packet on a settled connection.
-                if let Some(conn) = self.by_addr.get(&addr).copied() {
-                    if let Some(plain) = self.peers.get_mut(&conn).and_then(|p| p.open(frame).ok())
-                    {
-                        return Some((Attributed::Datagram(conn, addr), plain));
-                    }
+                if let Some(conn) = self.by_addr.get(&addr).copied()
+                    && let Some(plain) = self.peers.get_mut(&conn).and_then(|p| p.open(frame).ok())
+                {
+                    return Some((Attributed::Datagram(conn, addr), plain));
                 }
 
                 // Otherwise the peers known at that host, most likely first. A

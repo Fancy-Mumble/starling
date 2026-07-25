@@ -54,7 +54,7 @@ mod tests {
     use starling_api::Effect;
     use starling_api::ServerConfig;
     use starling_api::{Sessions, World};
-    use starling_model::{SessionId, User, ROOT_CHANNEL};
+    use starling_model::{ROOT_CHANNEL, SessionId, User};
     use std::net::SocketAddr;
 
     fn addr() -> SocketAddr {

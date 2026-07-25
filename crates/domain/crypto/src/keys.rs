@@ -21,8 +21,8 @@
 //! silence, which is why [`ResyncRequest`] names the two cases instead of leaving
 //! callers to test an `Option`.
 
-use rand::rngs::SysRng;
 use rand::TryRng;
+use rand::rngs::SysRng;
 use starling_gate::CipherChoice;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 

@@ -61,17 +61,17 @@ pub mod voice;
 
 pub use cipher::{Ocb2Aes128Spec, VoiceCipherSpec, XChaCha20Poly1305Spec};
 pub use keys::{
-    KeyGenerationFailed, LegacyKeys, MalformedKeys, ResyncRequest, VoiceKeys, VoiceSecrets,
-    OCB2_KEY_LEN,
+    KeyGenerationFailed, LegacyKeys, MalformedKeys, OCB2_KEY_LEN, ResyncRequest, VoiceKeys,
+    VoiceSecrets,
 };
 pub use modern::XChaCha20Voice;
 pub use ocb2::Ocb2;
 pub use policy::{CompatibilityFirst, ModernOnly, SecurityPolicy};
 pub use profile::{
-    spec_for, CompatibilityFirstProfiles, ModernOnlyProfiles, ProfileError, ProfileFactory,
-    VoiceProfile,
+    CompatibilityFirstProfiles, ModernOnlyProfiles, ProfileError, ProfileFactory, VoiceProfile,
+    spec_for,
 };
-pub use session::{VoiceError, VoiceSession, MASTER_KEY_LEN, SALT_LEN};
+pub use session::{MASTER_KEY_LEN, SALT_LEN, VoiceError, VoiceSession};
 pub use stream::VoiceCipher;
 pub use suite::{FancySuite, LegacySuite, SecuritySuite};
 pub use tls::TlsFloor;

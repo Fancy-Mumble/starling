@@ -13,12 +13,12 @@
 mod broadcast;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use starling_log::{Category, LogEvent, Logger};
-use starling_proto::proto::tcp;
 use starling_proto::ControlMessage;
+use starling_proto::proto::tcp;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -325,7 +325,7 @@ mod tests {
     use crate::testing::{RecordingVoice, SharedVoice, TestRegistry, TestSink};
     use bytes::{Bytes, BytesMut};
     use starling_api::Sessions;
-    use starling_proto::{codec, Version};
+    use starling_proto::{Version, codec};
 
     fn addr() -> SocketAddr {
         "127.0.0.1:1234".parse().expect("valid test address")
@@ -635,9 +635,11 @@ mod tests {
             })),
         });
 
-        assert!(drain(&mut rx)
-            .iter()
-            .any(|m| matches!(m, ControlMessage::Reject(_))));
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ControlMessage::Reject(_)))
+        );
         assert!(
             !core.outbound.is_connected(ConnId(1)),
             "the connection should have been dropped after the Reject"

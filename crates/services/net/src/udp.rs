@@ -198,7 +198,7 @@ fn is_transient(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// How long a loopback datagram may take before the test gives up.
     ///
