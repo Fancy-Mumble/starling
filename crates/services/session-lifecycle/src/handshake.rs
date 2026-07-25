@@ -54,7 +54,7 @@ use crate::state::{Connections, Identity, PendingConnection};
 /// 1.6.0: the protobuf UDP format is available from 1.5.0, and announcing less
 /// would pin every client to the legacy audio framing.
 ///
-/// Encoded rather than written out. The literal this replaced was
+/// Encoded, not written out. The literal this replaced was
 /// `0x0001_0006_0000`, which is missing the sixteen-bit patch shift and decodes
 /// to **0.1.6**, below every feature gate the number exists to pass, and
 /// invisible because the handshake completes either way.
@@ -68,9 +68,9 @@ const ROOT_CHANNEL: u32 = 0;
 
 /// `Channel.flags` bit for a hidden channel, from `metadata`'s `tree_actor.rs`.
 ///
-/// Written out rather than imported: a service depending on another service's
-/// crate is the coupling the gRPC boundary exists to prevent, and the layout is
-/// documented on `Channel.flags` in `metadata.proto`.
+/// Written out here. Importing it would make one service depend on another
+/// service's crate, which is the coupling the gRPC boundary exists to prevent,
+/// and the layout is documented on `Channel.flags` in `metadata.proto`.
 const FLAG_HIDDEN: u32 = 1;
 
 /// The Fancy wire epoch Starling speaks (`Mumble.proto`, `Version.fancy_protocol`).
@@ -127,7 +127,7 @@ pub fn server_version() -> tcp::Version {
 ///
 /// Written out field by field with no `..Session::default()`, which is what hid
 /// the omission: a new field on the message should fail to compile here and
-/// make somebody choose, rather than silently defaulting on every announcement.
+/// make somebody choose, instead of silently defaulting on every announcement.
 fn session_record(pending: &PendingConnection) -> Session {
     let (account, registered) = identity::wire(pending.account);
     Session {
@@ -381,7 +381,7 @@ impl Handshake {
     /// so a client can re-render which channels it may now enter
     /// (`Messages.cpp:385`). That tree belongs to `metadata`, and the entry
     /// itself works without it; the client simply learns the door is open by
-    /// walking through it rather than by seeing it un-greyed.
+    /// walking through it, not by seeing it un-greyed.
     async fn retoken(
         &self,
         connections: &Connections,
@@ -412,7 +412,7 @@ impl Handshake {
 
     /// Disconnect the older session a reconnecting user left behind.
     ///
-    /// Pushed through the fan-out rather than returned with this connection's
+    /// Pushed through the fan-out, not returned with this connection's
     /// actions, because the ghost may be held by a different gateway pod
     /// entirely, the pod that does not have it ignores the frame, which is
     /// exactly the broadcast contract the plane already relies on.
@@ -1003,8 +1003,8 @@ impl Handshake {
     /// **After `ServerSync`**, which is not incidental: murmur is explicit that
     /// the client may need its own session id before it can process listeners
     /// (`Messages.cpp:843`), and `ServerSync` is the message that carries it.
-    /// Called from [`Self::authenticate`] rather than [`Self::welcome`] for that
-    /// reason, everything `welcome` builds precedes the sync.
+    /// Called from [`Self::authenticate`] for that reason, not from
+    /// [`Self::welcome`]: everything `welcome` builds precedes the sync.
     pub async fn restore_and_announce(
         &self,
         connections: &Connections,
@@ -1071,7 +1071,7 @@ impl Handshake {
 
     /// Tell session-view a session exists.
     ///
-    /// Built from the connection record rather than from the arguments to hand,
+    /// Built from the connection record, not from the arguments to hand,
     /// so that "up" and "changed" cannot describe the same session differently
     /// the address, certificate and client version are on the record and were
     /// being dropped here.
@@ -1483,7 +1483,7 @@ fn refusal(conn: u64, kind: tcp::reject::RejectType, reason: &str) -> Actions {
 /// Whether `cert_required` refuses this peer.
 ///
 /// A free function so the carve-out can be tested without a deployment, and it
-/// is worth testing rather than reasoning about: the failure it prevents has no
+/// is worth testing, because the failure it prevents has no
 /// recovery from inside the server. The administrator account is deliberately
 /// certificate-less, so refusing it would mean an operator ticking a checkbox
 /// and losing the only login that could untick it.
@@ -1540,7 +1540,7 @@ fn address_of(peer: &str) -> &str {
 
 /// The `Reject` type and the sentence that go with an unsuccessful outcome.
 ///
-/// A table rather than eight arms inline, because what this is *is* a mapping:
+/// A table, because what this is *is* a mapping and eight inline arms hide it:
 /// userdata decides the outcome, and the wire needs the murmur reject code and
 /// something a human can read. `Ok` is absent on purpose; it is not a refusal,
 /// and giving it a row here would mean inventing a reason for a success.
@@ -1587,7 +1587,7 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
 
 /// A certificate hash as the wire carries it: lower-case hex, or absent.
 ///
-/// Absent rather than empty for a peer with no certificate, because the client
+/// Absent, not empty, for a peer with no certificate, because the client
 /// tests emptiness to decide whether registration is even possible and an empty
 /// string would answer that question the same way at more cost.
 fn hex_hash(cert_hash: &[u8]) -> Option<String> {
@@ -1596,7 +1596,7 @@ fn hex_hash(cert_hash: &[u8]) -> Option<String> {
 
 /// A content hash as `UserState` carries it: the raw bytes, or absent.
 ///
-/// Absent rather than empty, and the distinction is load-bearing in the client:
+/// Absent, never empty, and the distinction is load-bearing in the client:
 /// a *present but empty* `texture_hash` is how a picture is **cleared**
 /// (`vendor/server/src/murmur/Messages.cpp:1517` sends one to do exactly that),
 /// so sending an empty hash for a user who never had an avatar would order

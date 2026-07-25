@@ -77,8 +77,8 @@ const PERMISSION_DENIED: u16 = 12;
 /// `subject` is the session the change is *about*, not the one that caused it.
 /// A moderator muting somebody in another channel is a change in the *target's*
 /// channel, and choosing the audience by the actor would send it to the wrong
-/// set of people. Looked up here rather than at each call site, because that
-/// distinction is exactly the kind a caller gets subtly wrong.
+/// set of people. Looked up here, not at each call site: that distinction is
+/// exactly the kind a caller gets subtly wrong.
 fn announce_user_state(connections: &Connections, subject: u32, state: &tcp::UserState) -> Actions {
     let payload = state.encode_to_vec();
     let channel = connections
@@ -123,8 +123,8 @@ const ROOT_CHANNEL: u32 = 0;
 
 /// `ChanACL::Ban` (`vendor/server/src/ACL.h:21`).
 ///
-/// Written out rather than taken from `starling-permissions`, because a service
-/// depending on another service's crate is exactly the coupling the gRPC
+/// Written out here. Taking it from `starling-permissions` would make one
+/// service depend on another service's crate, which is the coupling the gRPC
 /// boundary exists to prevent. The permission *set* is protocol, not
 /// implementation: it is the same 24-bit layout every Mumble client knows.
 const BAN: u32 = 0x0002_0000;
@@ -372,8 +372,8 @@ impl SessionLifecycleService {
     ///
     /// Starling already sent its own `Version` first, on TLS establishment
     /// (`opened`, matching `Server.cpp:1679`), so the client's copy is recorded
-    /// rather than answered, the next thing the client sends is `Authenticate`,
-    /// and answering twice confuses a stock client.
+    /// and not answered. The next thing the client sends is `Authenticate`, and
+    /// answering twice confuses a stock client.
     fn on_version(&self, inbound: &Inbound) -> Actions {
         let Ok(version) = tcp::Version::decode(inbound.payload.as_slice()) else {
             tracing::debug!(conn = inbound.conn, "undecodable Version");
@@ -575,9 +575,9 @@ impl SessionLifecycleService {
     /// Whether the asker is an administrator, by murmur's test for it.
     ///
     /// Ban on the root channel (`Messages.cpp:3206`). Asked of the permissions
-    /// service rather than decided here, so that "who is an admin" has one
-    /// answer in this system rather than one per service, and the superuser
-    /// short-circuit already lives there.
+    /// service, not decided here. "Who is an admin" then has one answer across
+    /// the system instead of one per service, and the superuser short-circuit
+    /// already lives there.
     ///
     /// Any failure is a `false`: the consequence is a sparser dialog, whereas
     /// guessing `true` because permissions is unreachable would hand out
@@ -920,15 +920,11 @@ impl SessionLifecycleService {
     /// `Enter`, which is the permission an operator revokes to make a channel
     /// private.
     ///
-    /// A refusal is *told to the client*. Silence is what made this look like a
-    /// broken server rather than a locked channel: the user clicks, nothing
-    /// moves, and no message says why.
+    /// A refusal is *told to the client*. Silence made this look like a broken
+    /// server, not a locked channel: the user clicks, nothing moves, and no
+    /// message says why.
     ///
-    /// A refusal is *told to the client*. Silence is what made this look like a
-    /// broken server rather than a locked channel: the user clicks, nothing
-    /// moves, and no message says why.
-    ///
-    /// `tokens` are the channel's password, sent with the request rather than
+    /// `tokens` are the channel's password, sent with the request and never
     /// stored on the session. They apply to the `Enter` check below and to
     /// nothing else, which is what makes a password a key to one door: the
     /// person moved may enter because they knew it, and the moment the request
@@ -1584,9 +1580,8 @@ impl SessionLifecycleService {
 ///
 /// The two travel identically (a blob plus a hash on the account) and differ
 /// only in which account field the hash lands in and which limit bounds them.
-/// One enum rather than two near-identical methods, because the pair that got
-/// out of step was exactly this: comments were handled and avatars were decoded
-/// and dropped.
+/// One enum, because two near-identical methods is precisely what got out of
+/// step here: comments were handled, and avatars were decoded and dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UserContent {
     /// `UserState.comment`, bounded by `text_message_length`.
@@ -1695,7 +1690,7 @@ impl Serve for SessionLifecycleService {
 /// How often to look for connections that have gone quiet.
 ///
 /// Well below the timeout itself, so the worst case is a ghost outliving its
-/// deadline by one tick rather than by a whole timeout.
+/// deadline by one tick, not by a whole timeout.
 const SWEEP_INTERVAL_MS: u64 = 5_000;
 
 /// The `UserStats` reply for `target` under murmur's two disclosure gates.
@@ -1976,10 +1971,9 @@ fn deny(inbound: &Inbound, kind: tcp::permission_denied::DenyType) -> ServerActi
 
 /// Whole seconds between `then` and `now`, saturating.
 ///
-/// Saturating rather than wrapping because the two timestamps come from
-/// different moments of `now_ms()`, and a clock that steps backwards would
-/// otherwise report a connection that has been online for half the age of the
-/// universe.
+/// Saturating, because the two timestamps come from different moments of
+/// `now_ms()`. Wrapping would let a clock that steps backwards report a
+/// connection online for half the age of the universe.
 fn seconds_since(then_ms: u64, now_ms: u64) -> u32 {
     u32::try_from(now_ms.saturating_sub(then_ms) / 1000).unwrap_or(u32::MAX)
 }
@@ -1989,7 +1983,7 @@ fn seconds_since(then_ms: u64, now_ms: u64) -> u32 {
 /// Not the `host:port` string it is stored as. Mumble's `HostAddress` is always
 /// an IPv6 address, an IPv4 peer is carried as the v4-mapped `::ffff:a.b.c.d`
 /// and a client that is handed anything else renders the address field as
-/// nonsense rather than failing visibly.
+/// nonsense, and does not fail visibly.
 fn address_bytes(peer: &str) -> Vec<u8> {
     let host = match peer.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or(rest),
