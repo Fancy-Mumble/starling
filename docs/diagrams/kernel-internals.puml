@@ -1,0 +1,58 @@
+@startuml kernel-internals
+!theme plain
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 30
+skinparam ranksep 40
+
+title What a feature may touch — everything goes through the bus
+
+header
+<b>DESIGN TARGET — Phase 2.</b> The bus has send() and take() today; call() is not built. It will **await**,
+not block — priority inheritance needs CAP_SYS_NICE, which deployment forbids.
+Nothing is wired to the bus yet. See ARCHITECTURE.md 6.1.
+endheader
+
+rectangle "**pchat**  «feature»\nholds a PortId and\na &dyn MessageBus —\n**nothing else**" as p #EAF7EA
+
+rectangle "**StateQuery** · **Capabilities**\n«client-side facades»\nassemble envelopes so a feature\nneed not — **not** a way around" as fac #F5E6F5
+
+rectangle "**starling-bus**  «the microkernel»\nports · lanes · **the only path**\ncall() **awaits** · send() pulse\npriority lives in the lanes,\nnot in the OS scheduler" as bus #FFE9D6
+
+rectangle "**state service**  «single writer»\nserialises mutation; owns\n**no domain data of its own**" as core #E6F0FA
+rectangle "**ServerState**\nconfig · Connections" as st #E6F0FA
+
+rectangle "dyn **ChannelStore**" as cs #EAF0F7
+rectangle "dyn **UserRegistry**" as ur #EAF0F7
+rectangle "dyn **Permissions**" as pm #EAF0F7
+rectangle "dyn **SecurityPolicy**" as sp #EAF0F7
+
+p --> fac : reads · uses
+fac --> bus : call(env) — blocks for a reply
+bus --> core : delivered on the caller's lane
+core --> bus : reply — Effects travel back
+bus --> p : reply
+
+core --> st : holds
+st --> cs
+st --> ur
+st --> pm
+st --> sp
+
+note right of bus
+  **No component addresses another directly.**
+  A feature cannot name the state service, and
+  the bus cannot read the payload it carries
+  (""Bytes"", opaque). Neither side can bypass
+  the other — that is the whole point.
+end note
+
+note bottom of st
+  **Single writer is not a single owner.** Each box below
+  owns its own slice behind a trait; ""ServerState"" cannot
+  read a channel tree except by asking ""dyn ChannelStore"".
+  What the service guarantees is *ordering* — one mutation
+  at a time — not omniscience.
+end note
+
+@enduml

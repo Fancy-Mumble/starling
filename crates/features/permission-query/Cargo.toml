@@ -1,0 +1,20 @@
+[package]
+name = "starling-feature-permission-query"
+description = "PermissionQuery (wire type 20): answer a client asking what it may do in a channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-api.workspace = true
+starling-model.workspace = true
+starling-proto.workspace = true
+tracing.workspace = true
+
+# Only the tests need a concrete `Authority`; the feature itself never does.
+[dev-dependencies]
+starling-server.workspace = true
+
+[lints]
+workspace = true
