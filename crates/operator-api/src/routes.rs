@@ -38,7 +38,7 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
             put(update_account).delete(delete_account),
         )
         // Avatar and comment are content-addressed blobs behind an account
-        // rather than fields on it, so they are their own resources, and they
+        // and not fields on it, so they are their own resources, and they
         // are bytes, which do not belong in a JSON field.
         .route(
             "/v1/accounts/{id}/texture",
@@ -114,7 +114,7 @@ async fn openapi() -> impl IntoResponse {
 
 /// `Channel.flags` bits, from `metadata`'s `tree_actor.rs`.
 ///
-/// Written out rather than imported: `operator-api` depending on a service's
+/// Written out, not imported: `operator-api` depending on a service's
 /// crate is the coupling the gRPC boundary exists to prevent, and these two
 /// bits are part of the published shape of `Tree`, not an implementation
 /// detail. The proto documents the layout at `Channel.flags`.
@@ -179,7 +179,7 @@ fn admit(
 
 /// [`admit`], for a handler that cannot answer with this module's JSON body.
 ///
-/// The WebSocket upgrade returns a `Response` rather than a `Json<ApiError>`,
+/// The WebSocket upgrade returns a `Response` and not a `Json<ApiError>`,
 /// and authorisation still has to happen before the upgrade, a socket that
 /// opens and immediately closes is, to most clients, indistinguishable from a
 /// network fault.
@@ -226,7 +226,7 @@ fn operator_actor(subject: String, scope: &str) -> Option<Actor> {
 
 /// The virtual server every route addresses.
 ///
-/// One constant rather than a parameter on each handler: multi-tenancy is a
+/// One constant, not a parameter on each handler: multi-tenancy is a
 /// deployment shape Starling supports but this API has never exposed, and a
 /// half-threaded `scope` would read as though it did.
 fn scope() -> Option<Scope> {
@@ -242,7 +242,7 @@ struct AccountJson {
     /// SHA-1 of the user's certificate as lowercase hex, empty when none is
     /// registered.
     ///
-    /// Hex rather than base64 because that is the form murmur prints it in,
+    /// Hex, not base64, because that is the form murmur prints it in,
     /// the form a Mumble client shows in its certificate dialog, and therefore
     /// the form an operator has in hand when comparing the two.
     cert_hash: String,
@@ -294,7 +294,7 @@ struct NewAccount {
 
 /// A change to one account. Absent fields are left alone.
 ///
-/// `Option` per field rather than `String`: "not mentioned" and "set to empty"
+/// `Option` per field, not `String`: "not mentioned" and "set to empty"
 /// are different requests, and collapsing them would make omitting a name a
 /// silent way to erase it.
 #[derive(Debug, Deserialize)]
@@ -437,9 +437,9 @@ async fn create_account(
 /// Change named fields of one account.
 ///
 /// Only the fields present in the body are written, which is what makes this a
-/// general edit rather than a whole-object replace: two operators changing
+/// general edit, not a whole-object replace: two operators changing
 /// different settings must not silently overwrite each other, and userdata
-/// enforces that with an explicit field list rather than by diffing.
+/// enforces that with an explicit field list, not by diffing.
 ///
 /// **This is also how the SuperUser password is set**, the administrator is
 /// simply account `0`:
@@ -471,7 +471,7 @@ async fn update_account(
 
     // Absent means "leave it alone"; present-but-empty is a request to store an
     // empty password, which would leave a login that any password opens. The two
-    // are different, so they are distinguished rather than both defaulted.
+    // are different, so they are distinguished and not both defaulted.
     if change.password.as_deref().is_some_and(str::is_empty) {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
@@ -508,7 +508,7 @@ async fn update_account(
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
     let mut userdata = UserDataClient::new(channel);
 
-    // Asked about before it is changed, so a missing id is a 404 rather than the
+    // Asked about before it is changed, so a missing id is a 404 and not the
     // 403 a refused change is. userdata reports both as `permission_denied`, and
     // an operator cannot act on "denied" when the truth is "no such account".
     let _ = userdata
@@ -598,7 +598,7 @@ impl Blob {
 /// The hash an account currently holds for one blob, or `None` when unset.
 ///
 /// A missing account and an account with no avatar are different answers, so
-/// this distinguishes them rather than collapsing both to "nothing there".
+/// this distinguishes them instead of collapsing both to "nothing there".
 async fn blob_hash(
     api: &OperatorApi,
     id: u64,
@@ -807,7 +807,7 @@ struct NewBan {
 impl NewBan {
     /// The wire form, or why it could not be built.
     ///
-    /// A ban matching nothing is refused rather than stored: it would sit in the
+    /// A ban matching nothing is refused, never stored: it would sit in the
     /// list looking like protection and catch nobody.
     fn resolve(self) -> Result<(starling_proto_fancy::moderation::Ban, u32), String> {
         let address = match self.address.as_deref().filter(|a| !a.is_empty()) {
@@ -1128,7 +1128,7 @@ async fn session_permissions(
         "groups": granted.groups,
     });
     if let Some(permission) = query.permission {
-        // The mask test done here rather than by a second RPC: one evaluation,
+        // The mask test done here, not by a second RPC: one evaluation,
         // so the boolean cannot disagree with the bitset beside it.
         let allowed = permission != 0 && granted.granted & permission == permission;
         answer["permission"] = serde_json::json!(permission);
@@ -1264,7 +1264,7 @@ async fn get_health(
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
         .into_inner();
 
-    /// The wire enum as the name a dashboard renders, rather than its number.
+    /// The wire enum as the name a dashboard renders, not its number.
     fn state_name(state: i32) -> &'static str {
         match HealthState::try_from(state) {
             Ok(HealthState::Ready) => "ready",
@@ -1338,7 +1338,7 @@ async fn get_health(
                     .collect::<Vec<_>>(),
                 // What this service has queued. `capacity: 0` means nothing
                 // declares a limit, and a viewer must then show `used`/`peak`
-                // as counts rather than inventing a percentage.
+                // as counts, without inventing a percentage.
                 "load": service
                     .load
                     .iter()
@@ -1374,7 +1374,7 @@ async fn get_config(
         .into_inner();
 
     // Everything an operator may write, so the form they render next has the
-    // value they just set rather than a blank. Neither password is here, a
+    // value they just set and not a blank. Neither password is here, a
     // credential read back is a credential in a log, a browser cache and
     // whatever proxy sits in between.
     Ok(Json(starling_runtime::settings::to_json(&snapshot)))
@@ -2024,7 +2024,7 @@ async fn send_message(
         .await
         .map_err(|status| match status.code() {
             // `text` refuses an empty body or an unaddressed message, and both
-            // are the caller's mistake rather than a server fault.
+            // are the caller's mistake, not a server fault.
             tonic::Code::InvalidArgument => refuse(StatusCode::BAD_REQUEST, status.message()),
             _ => refuse(StatusCode::BAD_GATEWAY, status.message()),
         })?

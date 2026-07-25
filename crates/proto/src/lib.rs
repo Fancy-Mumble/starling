@@ -20,11 +20,13 @@
 //! and must never panic on malformed input, see [`codec::decode`].
 
 /// `prost`-generated protobuf message types.
+///
+/// Both modules below carry the same `allow` list, and it is `allow` and not
+/// `expect` for both: which doc lints fire depends on how upstream wrapped the
+/// `.proto` comments, so an unfulfilled `expect` would break the build on an
+/// unrelated upstream rewrap. Each list is the measured minimum.
 pub mod proto {
     /// Generated types for the Mumble TCP control protocol (`Mumble.proto`).
-    // `allow`, not `expect`: which doc lints fire depends on how upstream
-    // wrapped the .proto comments, so an unfulfilled `expect` would break the
-    // build on an unrelated upstream rewrap. The list is the measured minimum.
     #[allow(
         missing_docs,
         missing_debug_implementations,
@@ -41,9 +43,6 @@ pub mod proto {
     }
 
     /// Generated types for the Mumble UDP audio protocol (`MumbleUDP.proto`).
-    // `allow`, not `expect`: which doc lints fire depends on how upstream
-    // wrapped the .proto comments, so an unfulfilled `expect` would break the
-    // build on an unrelated upstream rewrap. The list is the measured minimum.
     #[allow(
         missing_docs,
         missing_debug_implementations,

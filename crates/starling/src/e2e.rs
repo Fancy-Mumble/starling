@@ -5,7 +5,7 @@
 //! place that proves the composition in `compose::all_in_one` actually wires
 //! a client through the real handshake
 //! (`crates/services/session-lifecycle/src/handshake.rs`) end to end, over a
-//! real TCP+TLS socket rather than an in-memory `Inbound`.
+//! real TCP+TLS socket, not an in-memory `Inbound`.
 //!
 //! TLS verification is disabled on the client, matching how every Mumble
 //! client actually trusts a server: by fingerprint on first use, not by CA
@@ -42,7 +42,7 @@ use tokio_rustls::client::TlsStream;
 
 /// The Mumble version Starling's own client half announces.
 ///
-/// Encoded rather than written out, for the reason `handshake.rs` records about
+/// Encoded, not written out, for the reason `handshake.rs` records about
 /// the identical literal on the server side: `0x0001_0006_0000` is missing the
 /// sixteen-bit patch shift and decodes to **0.1.6**, which is below every
 /// feature gate the number exists to pass.
@@ -137,7 +137,7 @@ impl Deployment {
         // the loser reports `Address already in use` and never starts. Ephemeral
         // and loopback-only, for the same reason the gateway's port above is.
         //
-        // Reserved here rather than left as `:0` because a test that sends
+        // Reserved here, not left as `:0`, because a test that sends
         // audio has to know where to send it, and nothing reports the port a
         // service picked for itself.
         let voice_port = free_udp_port();
@@ -149,7 +149,7 @@ impl Deployment {
         let shutdown = Shutdown::new();
         let broker = Broker::new();
 
-        // A real log runtime rather than `Logger::null()`, so a deployment
+        // A real log runtime, not `Logger::null()`, so a deployment
         // under test exercises the same path a deployed one does, and so a
         // failing test can be read with the records that led to it. It keeps
         // the ring the admin surface reads, and stays off the console, where it
@@ -222,7 +222,7 @@ impl Deployment {
 
     /// Create a channel, as an operator would.
     ///
-    /// Through metadata's own gRPC rather than the client plane, because
+    /// Through metadata's own gRPC, not the client plane, because
     /// creating a channel takes `MakeChannel` and the default ACL deliberately
     /// withholds it; this is deployment set-up, not the behaviour under test.
     async fn create_channel(&self, name: &str) -> u32 {
@@ -234,7 +234,7 @@ impl Deployment {
         // it waits on a `unix:` socket file appearing, and this platform serves
         // over named pipes, so it skips every service and returns at once. A
         // pipe that is not accepting yet reports "all pipe instances are busy",
-        // which is a race to wait out rather than a failure to report.
+        // which is a race to wait out, not a failure to report.
         let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
         let result = loop {
             let attempt = async {
@@ -324,8 +324,8 @@ impl Deployment {
 
     /// The same, in either direction and without asserting the outcome.
     ///
-    /// Returned rather than asserted because a *refusal* is the point of two of
-    /// the tests below: naming a session that has gone must not be recorded.
+    /// Returned, not asserted: a *refusal* is the point of two of the tests
+    /// below, since naming a session that has gone must not be recorded.
     async fn temporary_group(
         &self,
         channel: u32,
@@ -381,8 +381,8 @@ impl Deployment {
 /// named pipe, it matched nothing, skipped every service, and returned
 /// immediately. The wait was a no-op on that platform, so a client connected to
 /// a deployment whose services had not finished binding and the handshake timed
-/// out. It presented as intermittent, and as a transport fault rather than as
-/// the missing wait it was.
+/// out. It presented as intermittent, and looked like a transport fault
+/// instead of the missing wait it was.
 ///
 /// A service reached over `http://` is left alone: it has no local artefact to
 /// watch, and the deadline below is what catches a genuine hang.
@@ -425,7 +425,7 @@ fn is_bound(endpoint: &str) -> bool {
 
 /// Whether a named pipe has been created.
 ///
-/// Opened and dropped rather than enumerated. The pipe namespace *can* be
+/// Opened and dropped, not enumerated. The pipe namespace *can* be
 /// listed as a directory, but `local_endpoint` derives a pipe's name from a
 /// filesystem path and so produces one containing `/`, which does not survive
 /// being read back as a directory entry. Opening it is the question actually
@@ -523,7 +523,7 @@ impl Drop for TempDir {
 
 /// Accepts any server certificate. Standing in for trust-on-first-use, which
 /// a real Mumble client implements by pinning the fingerprint after this
-/// point rather than by chain validation.
+/// point, not by chain validation.
 #[derive(Debug)]
 struct TrustAnyCertificate;
 
@@ -577,8 +577,8 @@ impl ServerCertVerifier for TrustAnyCertificate {
 /// Every service, including the gateway, is spawned concurrently and binds
 /// its listener asynchronously, so a connect attempt immediately after
 /// `Deployment::start` returns is a startup-ordering race, not a real
-/// failure, retry until the deadline rather than requiring the caller to
-/// know how long that takes.
+/// failure, so retry until the deadline. The caller has no way to know how
+/// long that takes.
 async fn connect_with_retry(port: u16) -> TcpStream {
     let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
     loop {
@@ -599,7 +599,7 @@ struct Client {
     buffer: BytesMut,
     /// The `CryptSetup` the server minted for this connection.
     ///
-    /// Kept as it goes past rather than fished out afterwards: it arrives in the
+    /// Kept as it goes past, not fished out afterwards: it arrives in the
     /// middle of the handshake flood, and it is the only thing that makes a
     /// datagram from this client decryptable by the server.
     crypt_setup: Option<tcp::CryptSetup>,
@@ -657,7 +657,7 @@ impl Client {
     /// The next complete frame, or `None` if `within` elapses first.
     ///
     /// The fallible half of [`Self::recv`], for the callers that are *waiting*
-    /// for something rather than asserting on what comes next: a client that
+    /// for something instead of asserting on what comes next: a client that
     /// keeps talking has to be able to try again, and a panic is not a retry.
     async fn next_frame(&mut self, within: Duration) -> Option<(u16, Vec<u8>)> {
         let deadline = tokio::time::Instant::now() + within;
@@ -1441,7 +1441,7 @@ async fn a_whisper_reaches_the_person_it_names_and_not_the_room() {
 /// of step.
 ///
 /// Deliberately short: a negative assertion should not cost fifteen seconds, and
-/// a client whose nonce has drifted fails on the first packet rather than the
+/// a client whose nonce has drifted fails on the first packet, not the
 /// fiftieth.
 async fn try_loop_back(
     socket: &UdpSocket,
@@ -2269,7 +2269,7 @@ mod example_config {
         // the fix worked under `--all-in-one` and did nothing whatsoever in the
         // Docker deployment, where a file is what is actually loaded.
         //
-        // Compared by *type* rather than by whole service block, because a file
+        // Compared by *type*, not by whole service block, because a file
         // is entitled to differ on endpoints, tiers and limits. Where a client's
         // frame is delivered is not that kind of choice.
         let defaults = Config::with_defaults(std::path::Path::new("/run/starling"));
@@ -2359,7 +2359,7 @@ mod example_config {
 // ── The live channel ────────────────────────────────────────────────────────
 //
 // Every test below runs on a **multi-threaded** runtime, and that is load
-// bearing rather than tidiness.
+// bearing, not tidiness.
 //
 // `#[tokio::test]` gives a current-thread runtime, and these tests start a whole
 // deployment (twenty-one services plus the gateway) on it. A real Starling
@@ -2375,7 +2375,7 @@ mod example_config {
 
 /// The token the live-channel tests authenticate with.
 ///
-/// Named rather than inlined because the configuration holds the *variable's
+/// Named, not inlined, because the configuration holds the *variable's
 /// name* and never the secret, so the test has to set the same variable the
 /// deployment reads.
 const LIVE_TOKEN_VAR: &str = "STARLING_E2E_LIVE_TOKEN";
@@ -2478,9 +2478,10 @@ async fn open_live_channel(port: u16) -> LiveSocket {
 
 /// Read events until one satisfies `wanted`.
 ///
-/// Reads rather than inspecting only the next frame: the channel carries
-/// everything that happens on the server, so a test asserting on one event has
-/// to skip the others rather than demand its own arrive first.
+/// Reads until it finds one, instead of inspecting only the next frame: the
+/// channel carries everything that happens on the server, so a test asserting
+/// on one event has to skip the others and cannot demand its own arrive
+/// first.
 async fn next_event(
     socket: &mut LiveSocket,
     wanted: impl Fn(&serde_json::Value) -> bool,
@@ -2701,7 +2702,7 @@ async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
 
 /// Register an account the way an operator does, over userdata's own gRPC.
 ///
-/// Deployment set-up rather than the behaviour under test, on the same grounds
+/// Deployment set-up, not the behaviour under test, on the same grounds
 /// as [`Deployment::create_channel`], and for one more: registering *from a
 /// client* requires the target to have presented a certificate, and this
 /// harness dials with `with_no_client_auth`. What the tests below assert is
@@ -3113,7 +3114,7 @@ async fn an_operator_clears_another_users_comment_but_cannot_write_one() {
 
 #[tokio::test]
 async fn a_peer_that_never_authenticated_reaches_nobody() {
-    // Defence in depth, asserted rather than assumed.
+    // Defence in depth: asserted, not assumed.
     //
     // The gateway has **no authentication gate**: `dispatch` routes any frame
     // whose type has a route, and an unauthenticated connection simply carries
