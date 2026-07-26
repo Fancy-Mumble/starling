@@ -1,24 +1,28 @@
 [package]
 name = "starling-voice"
-description = "Audio: the packet format on both wire versions, and who hears whom"
+description = "audio routing: its own UDP socket, the ciphers, and no gateway hop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# No transport. It is handed decoded audio and says where it goes, which is what
-# lets one implementation serve both the UDP socket and the UDPTunnel path.
 [dependencies]
-bytes.workspace = true
-prost.workspace = true
-starling-api.workspace = true
+starling-proto.workspace = true
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
 starling-crypto.workspace = true
 starling-gate.workspace = true
-starling-model.workspace = true
-starling-proto.workspace = true
+bytes.workspace = true
+
+async-trait.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

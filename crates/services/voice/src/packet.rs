@@ -28,7 +28,7 @@
 use bytes::Bytes;
 use prost::Message as _;
 use starling_gate::UdpFormat;
-use starling_model::SessionId;
+use crate::ports::SessionId;
 use starling_proto::proto::udp as mumble_udp;
 
 use crate::varint::{Reader, VarintError, Writer};

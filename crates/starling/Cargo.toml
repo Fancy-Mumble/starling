@@ -1,0 +1,52 @@
+[package]
+name = "starling"
+description = "One image, one entrypoint: a service name, or --all-in-one"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "starling"
+path = "src/main.rs"
+
+[dependencies]
+starling-runtime.workspace = true
+starling-proto-fancy.workspace = true
+starling-gateway.workspace = true
+starling-migrate.workspace = true
+starling-operator-api.workspace = true
+
+starling-session-lifecycle.workspace = true
+starling-session-view.workspace = true
+starling-permissions.workspace = true
+starling-metadata.workspace = true
+starling-userdata.workspace = true
+starling-server-config.workspace = true
+starling-voice.workspace = true
+starling-text.workspace = true
+starling-pchat.workspace = true
+starling-moderation.workspace = true
+starling-screenshare.workspace = true
+starling-files.workspace = true
+starling-plugins.workspace = true
+starling-push.workspace = true
+starling-audit.workspace = true
+starling-onboarding.workspace = true
+starling-social.workspace = true
+starling-link-preview.workspace = true
+starling-context-actions.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+starling-proto.workspace = true
+bytes.workspace = true
+prost.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

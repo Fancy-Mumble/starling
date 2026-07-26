@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+// Voice's control surface. Audio never appears here: clients send UDP straight
+// to voice's own socket, and only UDPTunnel reaches it through the gateway —
+// docs/ARCHITECTURE.md §3.
+package starling.voice.v1;
+
+import "common.proto";
+
+service Voice {
+  // CryptSetup (15) is a control message, so session-lifecycle delivers it —
+  // but the key seals UDP, so voice mints it. Key material never crosses a
+  // service boundary in the clear: what comes back is the encoded CryptSetup
+  // payload, ready to forward verbatim.
+  rpc Mint(MintRequest) returns (CryptMaterial);
+  rpc Resync(ResyncRequest) returns (CryptMaterial);
+  rpc Forget(ForgetRequest) returns (starling.common.v1.Ack);
+  rpc Stats(StatsRequest) returns (PeerStats);
+  // What a Fancy client is told to send audio to, when voice is not reachable
+  // at the gateway's own address (docs/ARCHITECTURE.md §9).
+  rpc Endpoint(EndpointRequest) returns (VoiceEndpoint);
+}
+
+message MintRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+  // The Fancy version the client announced. It, not the Mumble version,
+  // decides the cipher — the two axes are independent (starling-gate).
+  uint64 fancy_version = 3;
+  // The Mumble protocol version, which decides the UDP wire format.
+  uint64 mumble_version = 4;
+  string address = 5;
+}
+
+message ResyncRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message ForgetRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message CryptMaterial {
+  // An encoded Mumble CryptSetup message, forwarded to the client as-is.
+  bytes crypt_setup = 1;
+  string cipher = 2;
+}
+
+message StatsRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message PeerStats {
+  uint32 good = 1;
+  uint32 late = 2;
+  uint32 lost = 3;
+  uint32 resync = 4;
+  uint64 packets_sent = 5;
+  uint64 packets_received = 6;
+  uint64 bytes_sent = 7;
+  uint64 bytes_received = 8;
+  bool udp = 9;
+}
+
+message EndpointRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 session = 2;
+}
+
+message VoiceEndpoint {
+  string host = 1;
+  uint32 port = 2;
+}

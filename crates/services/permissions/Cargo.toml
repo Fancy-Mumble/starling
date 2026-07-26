@@ -1,0 +1,25 @@
+[package]
+name = "starling-permissions"
+description = "ACL evaluation, with request coalescing rather than a cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto.workspace = true
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+bitflags.workspace = true
+
+async-trait.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

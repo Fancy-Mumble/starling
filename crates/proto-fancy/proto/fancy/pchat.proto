@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+// Outer type 1006 — persistent chat.
+//
+// The server is a relay and a store. The end-to-end crypto lives in the
+// client, so nothing here decrypts anything: payloads are opaque ciphertext,
+// and the service's job is storage, fan-out, offline queues, key-holder
+// bookkeeping and rate limiting (PORTING-PLAN.md §4, Phase 4).
+package starling.fancy.pchat.v1;
+
+message PchatEnvelope {
+  oneof body {
+    Message message = 1;
+    Fetch fetch = 2;
+    FetchResponse fetch_response = 3;
+    Ack ack = 4;
+    KeyAnnounce key_announce = 5;
+    KeyRequest key_request = 6;
+    KeyDeliver key_deliver = 7;
+    HolderReport holder_report = 8;
+    HolderQuery holder_query = 9;
+    Reaction reaction = 10;
+    Pin pin = 11;
+    PinList pin_list = 12;
+    Delete delete = 13;
+    Receipt receipt = 14;
+  }
+}
+
+message Message {
+  // UUIDv7 as a string on the wire, kept as 16 bytes in storage — the wire
+  // type does not change (docs/STORAGE.md L3).
+  string message_id = 1;
+  uint32 channel = 2;
+  uint32 sender = 3;
+  bytes ciphertext = 4;
+  uint64 sent_at_ms = 5;
+  string supersedes = 6;
+  uint32 epoch = 7;
+}
+
+message Fetch {
+  uint32 channel = 1;
+  uint32 limit = 2;
+  string before_id = 3;
+  string after_id = 4;
+}
+
+message FetchResponse {
+  uint32 channel = 1;
+  repeated Message messages = 2;
+  bool more = 3;
+  uint64 total_stored = 4;
+}
+
+message Ack {
+  string message_id = 1;
+  enum Status {
+    STORED = 0;
+    DUPLICATE = 1;
+    REFUSED = 2;
+    RATE_LIMITED = 3;
+  }
+  Status status = 2;
+  string detail = 3;
+}
+
+message KeyAnnounce {
+  uint32 channel = 1;
+  uint32 epoch = 2;
+  bytes public_key = 3;
+  uint32 holder = 4;
+}
+
+message KeyRequest {
+  uint32 channel = 1;
+  uint32 epoch = 2;
+  bytes requester_key = 3;
+}
+
+message KeyDeliver {
+  uint32 channel = 1;
+  uint32 epoch = 2;
+  uint32 recipient = 3;
+  bytes sealed_key = 4;
+  bytes countersignature = 5;
+}
+
+message HolderReport {
+  uint32 channel = 1;
+  uint32 epoch = 2;
+  repeated uint32 holders = 3;
+}
+
+message HolderQuery {
+  uint32 channel = 1;
+}
+
+message Reaction {
+  string message_id = 1;
+  uint32 channel = 2;
+  string emoji = 3;
+  bool remove = 4;
+}
+
+message Pin {
+  string message_id = 1;
+  uint32 channel = 2;
+  bool unpin = 3;
+}
+
+message PinList {
+  uint32 channel = 1;
+  repeated Message pinned = 2;
+}
+
+message Delete {
+  uint32 channel = 1;
+  repeated string message_ids = 2;
+}
+
+message Receipt {
+  uint32 channel = 1;
+  string message_id = 2;
+  uint32 reader = 3;
+  uint64 at_ms = 4;
+}

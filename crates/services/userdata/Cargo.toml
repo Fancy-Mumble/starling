@@ -1,0 +1,30 @@
+[package]
+name = "starling-userdata"
+description = "registered accounts, profiles, account settings and content-addressed blobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto.workspace = true
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+serde.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+rand.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+
+async-trait.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

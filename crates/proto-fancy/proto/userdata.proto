@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+// Registered accounts, profiles, account settings and content-addressed blobs.
+//
+// Account settings live here rather than in server-config: they are per-user
+// profile data, and belong with the profile — docs/ARCHITECTURE.md §4.
+package starling.userdata.v1;
+
+import "common.proto";
+
+service UserData {
+  // The one read that cannot be deferred (docs/STORAGE.md D1), so accounts are
+  // held in memory and maintained write-through.
+  rpc Authenticate(AuthRequest) returns (AuthResult);
+
+  rpc Lookup(LookupRequest) returns (Account);
+  rpc List(ListRequest) returns (AccountPage);
+  rpc Register(RegisterRequest) returns (Account);
+  rpc Update(UpdateRequest) returns (Account);
+  rpc Delete(DeleteRequest) returns (starling.common.v1.Ack);
+
+  // Blobs are deduplicated by hash with a refcount (docs/STORAGE.md L4), so
+  // RequestBlob is a primary-key lookup and two identical avatars cost one row.
+  rpc GetBlob(BlobRequest) returns (Blob);
+  rpc PutBlob(Blob) returns (BlobRef);
+}
+
+message AuthRequest {
+  starling.common.v1.Scope scope = 1;
+  string name = 2;
+  string password = 3;
+  bytes cert_hash = 4;
+  bool strong_cert = 5;
+  string totp = 6;
+}
+
+message AuthResult {
+  enum Outcome {
+    OK = 0;
+    WRONG_PASSWORD = 1;
+    UNKNOWN_ACCOUNT = 2;
+    // The name is registered to another certificate: murmur's impersonation
+    // guard, and the reason a name alone is never an identity.
+    NAME_TAKEN = 3;
+    TOTP_REQUIRED = 4;
+    TOTP_INVALID = 5;
+    CERT_REQUIRED = 6;
+    INVALID_NAME = 7;
+  }
+  Outcome outcome = 1;
+  Account account = 2;
+  // Present when the name was accepted unregistered: a guest keeps its name
+  // but gets no account id.
+  bool guest = 3;
+}
+
+message Account {
+  uint64 id = 1;
+  string name = 2;
+  string email = 3;
+  bytes cert_hash = 4;
+  bytes texture_hash = 5;
+  bytes comment_hash = 6;
+  uint64 created_at_ms = 7;
+  uint64 last_active_ms = 8;
+  bool totp_enabled = 9;
+  map<string, string> settings = 10;
+}
+
+message LookupRequest {
+  starling.common.v1.Scope scope = 1;
+  oneof by {
+    uint64 id = 2;
+    string name = 3;
+    bytes cert_hash = 4;
+  }
+}
+
+message ListRequest {
+  starling.common.v1.Scope scope = 1;
+  string name_prefix = 2;
+  uint32 limit = 3;
+  uint64 after_id = 4;
+}
+
+message AccountPage {
+  repeated Account accounts = 1;
+  bool more = 2;
+}
+
+message RegisterRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  Account account = 3;
+  string password = 4;
+}
+
+message UpdateRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint64 id = 3;
+  repeated string fields = 4;
+  Account values = 5;
+  string password = 6;
+  // Required to change a password, an email or the TOTP secret from a session;
+  // an operator context does not need it.
+  string current_password = 7;
+}
+
+message DeleteRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint64 id = 3;
+}
+
+message BlobRequest {
+  starling.common.v1.Scope scope = 1;
+  bytes hash = 2;
+}
+
+message Blob {
+  starling.common.v1.Scope scope = 1;
+  bytes hash = 2;
+  bytes bytes = 3;
+}
+
+message BlobRef {
+  bytes hash = 1;
+  uint64 size = 2;
+}

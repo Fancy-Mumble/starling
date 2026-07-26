@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+// Fancy extensions for the four essential domain services, in the file each
+// one owns a message set in.
+//
+// They share a file because they share a shape — every one of them is a small
+// addition to an upstream message that already exists, unlike pchat or social
+// which are whole features. The outer types stay one per service:
+//
+//   1001 permissions   1002 metadata   1003 userdata   1013 server-config
+package starling.fancy.domain.v1;
+
+// -- 1001 permissions -------------------------------------------------------
+
+message PermissionsEnvelope {
+  oneof body {
+    TokenSet tokens = 1;
+    Invalidated invalidated = 2;
+    GroupQuery group_query = 3;
+    GroupList group_list = 4;
+  }
+}
+
+// Access tokens are secrets a client presents to unlock ACL entries. Replacing
+// the whole set is deliberate: an incremental API would leave a client unable
+// to say "I have forgotten that one".
+message TokenSet {
+  repeated string tokens = 1;
+}
+
+// The client's cached PermissionQuery answers are stale. Sent rather than left
+// implicit, because a stale grant in a UI is how a user learns about a
+// permission they no longer have by being refused mid-action.
+message Invalidated {
+  repeated uint32 channels = 1;
+  bool everything = 2;
+}
+
+message GroupQuery {
+  uint32 channel = 1;
+}
+
+message GroupList {
+  uint32 channel = 1;
+  repeated string groups = 2;
+}
+
+// -- 1002 metadata ----------------------------------------------------------
+
+message MetadataEnvelope {
+  oneof body {
+    ChannelExtras extras = 1;
+    StructuralHint structural = 2;
+    Subscribe subscribe = 3;
+  }
+}
+
+// Fancy channel properties that upstream's ChannelState has no field for.
+// Upstream owns 1–99 in every upstream message; these live out here instead of
+// squatting on upstream's next field number — docs/PROTOCOL-COMPATIBILITY.md §1.
+message ChannelExtras {
+  uint32 channel = 1;
+  uint32 expiry_mode = 2;
+  uint32 expiry_duration_s = 3;
+  uint64 created_at_ms = 4;
+  uint64 last_active_ms = 5;
+  bool hidden = 6;
+  bool structural = 7;
+  uint32 pchat_protocol = 8;
+  uint32 pchat_max_history = 9;
+  uint32 pchat_retention_days = 10;
+}
+
+// A structural channel is a grouping node no one can enter. Stock clients have
+// no idea, so they are told nothing and simply never see anyone in it.
+message StructuralHint {
+  repeated uint32 channels = 1;
+}
+
+message Subscribe {
+  repeated uint32 channels = 1;
+  bool everything = 2;
+}
+
+// -- 1003 userdata ----------------------------------------------------------
+
+message UserdataEnvelope {
+  oneof body {
+    AccountAction action = 1;
+    AccountAck ack = 2;
+    Settings settings = 3;
+    SettingsUpdate settings_update = 4;
+  }
+}
+
+// The account self-service surface: everything a user may change about their
+// own account. Each carries the current password, because a hijacked session
+// must not be able to lock the owner out.
+message AccountAction {
+  enum Kind {
+    SET_PASSWORD = 0;
+    SET_EMAIL = 1;
+    RENAME = 2;
+    ENABLE_TOTP = 3;
+    DISABLE_TOTP = 4;
+    UNREGISTER = 5;
+  }
+  Kind kind = 1;
+  string current_password = 2;
+  string value = 3;
+  string totp = 4;
+}
+
+message AccountAck {
+  AccountAction.Kind kind = 1;
+  bool ok = 2;
+  string detail = 3;
+  // Set on ENABLE_TOTP only, and only once.
+  string totp_secret = 4;
+}
+
+message Settings {
+  map<string, string> values = 1;
+}
+
+message SettingsUpdate {
+  map<string, string> set = 1;
+  repeated string unset = 2;
+}
+
+// -- 1013 server-config -----------------------------------------------------
+
+message ServerConfigEnvelope {
+  oneof body {
+    ConfigQuery query = 1;
+    ConfigValues values = 2;
+    ConfigUpdate update = 3;
+  }
+}
+
+message ConfigQuery {}
+
+// Secrets are redacted on the way out. The server password is a value an
+// operator sets and nobody reads back.
+message ConfigValues {
+  map<string, string> values = 1;
+  repeated string redacted = 2;
+}
+
+message ConfigUpdate {
+  map<string, string> values = 1;
+}

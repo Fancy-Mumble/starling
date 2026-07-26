@@ -1,0 +1,23 @@
+[package]
+name = "starling-onboarding"
+description = "onboarding flows and the responses to them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+sqlx.workspace = true
+
+async-trait.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use starling_model::{ChannelId, SessionId};
+use crate::ports::{ChannelId, SessionId};
 
 /// The highest slot a client may register.
 ///

@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+// ACL evaluation. Stateless, and scaled out by coalescing identical in-flight
+// queries rather than by caching — docs/diagrams/scaling.puml.
+package starling.permissions.v1;
+
+import "common.proto";
+
+service Permissions {
+  rpc Effective(EffectiveRequest) returns (EffectiveResponse);
+  rpc Check(CheckRequest) returns (starling.common.v1.Decision);
+  rpc GetAcl(AclRequest) returns (AclSet);
+  rpc SetAcl(SetAclRequest) returns (AclResult);
+  // A revocation invalidates before it is acknowledged; a grant may arrive
+  // lazily. A stale deny is safe, a stale grant is a security bug.
+  rpc WatchInvalidations(starling.common.v1.Scope) returns (stream Invalidation);
+}
+
+message EffectiveRequest {
+  starling.common.v1.Scope scope = 1;
+  Subject subject = 2;
+  uint32 channel = 3;
+}
+
+// Who the permissions are being evaluated for.
+//
+// A session and an account are not interchangeable: an unregistered guest has
+// a session and no account, and an operator edits an account with no session.
+message Subject {
+  uint32 session = 1;
+  uint64 account = 2;
+  string name = 3;
+  bool authenticated = 4;
+  repeated string tokens = 5;
+  bytes cert_hash = 6;
+}
+
+message EffectiveResponse {
+  // The 24-bit ChanACL::Perm set of ACL.h:21, including the Fancy additions.
+  uint32 granted = 1;
+  repeated string groups = 2;
+}
+
+message CheckRequest {
+  starling.common.v1.Scope scope = 1;
+  Subject subject = 2;
+  uint32 channel = 3;
+  uint32 permission = 4;
+}
+
+message AclRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 channel = 2;
+}
+
+message AclSet {
+  uint32 channel = 1;
+  bool inherit = 2;
+  repeated AclEntry acls = 3;
+  repeated Group groups = 4;
+}
+
+message AclEntry {
+  bool apply_here = 1;
+  bool apply_subs = 2;
+  bool inherited = 3;
+  optional uint64 account = 4;
+  optional string group = 5;
+  uint32 grant = 6;
+  uint32 deny = 7;
+}
+
+message Group {
+  string name = 1;
+  bool inherited = 2;
+  bool inherit = 3;
+  bool inheritable = 4;
+  repeated uint64 add = 5;
+  repeated uint64 remove = 6;
+  repeated uint64 inherited_members = 7;
+}
+
+message SetAclRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  AclSet acls = 3;
+}
+
+message AclResult {
+  bool applied = 1;
+  string refused = 2;
+}
+
+// Which cached decisions a subscriber must throw away.
+//
+// An empty channel list means the whole tree: an ACL change on an inheriting
+// parent can alter any descendant, and computing the exact set here would
+// duplicate the evaluator in every subscriber.
+message Invalidation {
+  repeated uint32 channels = 1;
+  repeated uint64 accounts = 2;
+  bool everything = 3;
+}

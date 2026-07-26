@@ -1,0 +1,34 @@
+[package]
+name = "starling-runtime"
+description = "What every Starling service needs: config, serving, health, drain, telemetry, storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+
+async-trait.workspace = true
+
+
+hyper-util.workspace = true
+
+serde.workspace = true
+
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tower = "0.5"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

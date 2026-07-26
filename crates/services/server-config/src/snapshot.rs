@@ -1,0 +1,168 @@
+//! The defaults, the field-level merge, and what is never read back.
+//!
+//! Every default here is murmur's, named after the `.ini` key it replaces, so a
+//! server that has never been configured behaves the way an operator migrating
+//! from murmur expects rather than the way a fresh design would have chosen.
+
+use std::collections::HashMap;
+
+use starling_proto_fancy::serverconfig::Snapshot;
+
+/// murmur's defaults, for a virtual server nobody has configured.
+#[must_use]
+pub fn defaults(virtual_server: u32) -> Snapshot {
+    Snapshot {
+        virtual_server,
+        version: 0,
+        welcome_text: String::new(),
+        password: String::new(),
+        max_users: 100,
+        max_bandwidth: 72_000,
+        text_message_length: 5_000,
+        image_message_length: 131_072,
+        allow_html: true,
+        allow_recording: true,
+        channel_nesting_limit: 10,
+        channel_count_limit: 1_000,
+        listeners_per_channel: 0,
+        listeners_per_user: 0,
+        cert_required: false,
+        log_days: 31,
+        // The leaky bucket that silently drops when it is wrong
+        // (`PORTING-PLAN.md` R5). These two numbers are murmur's.
+        message_limit: 1,
+        message_burst: 5,
+        plugin_message_limit: 4,
+        plugin_message_burst: 15,
+        registry_name: String::new(),
+        obfuscate_ips: false,
+        extra: HashMap::new(),
+    }
+}
+
+/// Copy only `fields` from `values` into `current`.
+///
+/// A whole-snapshot write would make two operators editing different settings
+/// silently overwrite each other, which is a data-loss bug that looks like a
+/// race and reproduces once a month.
+pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]) {
+    for field in fields {
+        match field.as_str() {
+            "welcome_text" => current.welcome_text = values.welcome_text.clone(),
+            "password" => current.password = values.password.clone(),
+            "max_users" => current.max_users = values.max_users,
+            "max_bandwidth" => current.max_bandwidth = values.max_bandwidth,
+            "text_message_length" => current.text_message_length = values.text_message_length,
+            "image_message_length" => current.image_message_length = values.image_message_length,
+            "allow_html" => current.allow_html = values.allow_html,
+            "allow_recording" => current.allow_recording = values.allow_recording,
+            "channel_nesting_limit" => current.channel_nesting_limit = values.channel_nesting_limit,
+            "channel_count_limit" => current.channel_count_limit = values.channel_count_limit,
+            "listeners_per_channel" => current.listeners_per_channel = values.listeners_per_channel,
+            "listeners_per_user" => current.listeners_per_user = values.listeners_per_user,
+            "cert_required" => current.cert_required = values.cert_required,
+            "log_days" => current.log_days = values.log_days,
+            "message_limit" => current.message_limit = values.message_limit,
+            "message_burst" => current.message_burst = values.message_burst,
+            "plugin_message_limit" => current.plugin_message_limit = values.plugin_message_limit,
+            "plugin_message_burst" => current.plugin_message_burst = values.plugin_message_burst,
+            "registry_name" => current.registry_name = values.registry_name.clone(),
+            "obfuscate_ips" => current.obfuscate_ips = values.obfuscate_ips,
+            other => {
+                // Unknown keys land in `extra` rather than being dropped: a
+                // service that adds an operator-facing knob should not need a
+                // proto release for it to be settable.
+                if let Some(value) = values.extra.get(other) {
+                    let _ = current.extra.insert(other.to_owned(), value.clone());
+                } else {
+                    tracing::warn!(field = other, "ignoring an unknown configuration field");
+                }
+            }
+        }
+    }
+}
+
+/// The readable settings, and the names of the ones withheld.
+///
+/// Secrets are named but not shown. Saying nothing at all would leave a client
+/// unable to tell "no password set" from "password withheld", and the two mean
+/// very different things to whoever is looking at the screen.
+#[must_use]
+pub fn redact(snapshot: &Snapshot) -> (HashMap<String, String>, Vec<String>) {
+    let mut values = HashMap::from([
+        ("welcome_text".to_owned(), snapshot.welcome_text.clone()),
+        ("max_users".to_owned(), snapshot.max_users.to_string()),
+        (
+            "max_bandwidth".to_owned(),
+            snapshot.max_bandwidth.to_string(),
+        ),
+        (
+            "text_message_length".to_owned(),
+            snapshot.text_message_length.to_string(),
+        ),
+        (
+            "image_message_length".to_owned(),
+            snapshot.image_message_length.to_string(),
+        ),
+        ("allow_html".to_owned(), snapshot.allow_html.to_string()),
+        (
+            "allow_recording".to_owned(),
+            snapshot.allow_recording.to_string(),
+        ),
+        (
+            "channel_nesting_limit".to_owned(),
+            snapshot.channel_nesting_limit.to_string(),
+        ),
+        (
+            "message_limit".to_owned(),
+            snapshot.message_limit.to_string(),
+        ),
+        (
+            "message_burst".to_owned(),
+            snapshot.message_burst.to_string(),
+        ),
+        (
+            "cert_required".to_owned(),
+            snapshot.cert_required.to_string(),
+        ),
+    ]);
+    for (key, value) in &snapshot.extra {
+        let _ = values.insert(key.clone(), value.clone());
+    }
+    (values, vec!["password".to_owned()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_field_is_kept_in_extra_rather_than_dropped() {
+        // A service adding an operator-facing knob should not need a proto
+        // release before an operator can set it.
+        let mut current = defaults(1);
+        let mut values = defaults(1);
+        let _ = values
+            .extra
+            .insert("whiteboard_max_strokes".to_owned(), "500".to_owned());
+        apply_fields(
+            &mut current,
+            &values,
+            &["whiteboard_max_strokes".to_owned()],
+        );
+        assert_eq!(
+            current.extra.get("whiteboard_max_strokes").map(String::as_str),
+            Some("500")
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_murmurs_and_not_a_fresh_designs() {
+        // An operator migrating from murmur must not silently get different
+        // limits than the ones their clients were tuned against.
+        let snapshot = defaults(1);
+        assert_eq!(snapshot.max_bandwidth, 72_000);
+        assert_eq!(snapshot.text_message_length, 5_000);
+        assert_eq!(snapshot.log_days, 31);
+    }
+}

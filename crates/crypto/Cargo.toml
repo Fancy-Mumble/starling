@@ -1,0 +1,30 @@
+[package]
+name = "starling-crypto"
+description = "Per-peer security negotiation — suites, TLS floors, cipher specs; no I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `rustls` rather than `tokio-rustls`: this crate needs the protocol-version
+# *types* to express a floor, not an async acceptor. Depending on the async
+# wrapper here would put a runtime behind a domain crate for no reason.
+[dependencies]
+aes.workspace = true
+chacha20.workspace = true
+rand.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+starling-gate.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+starling-proto.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

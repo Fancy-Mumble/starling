@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+// The uniform client plane: the only contract the gateway speaks to a
+// client-facing service.
+//
+// The gateway never parses a payload (docs/ARCHITECTURE.md §1), so every frame
+// here carries the u16 wire type from the frame header and the payload
+// verbatim. That is what lets a new service be a TOML block rather than a
+// gateway release.
+package starling.control.v1;
+
+// Implemented by every service that a client can reach.
+//
+// One long-lived bidirectional stream per (gateway process, service). HTTP/2
+// flow control is the backpressure between them — docs/ARCHITECTURE.md §5.
+service ClientPlane {
+  rpc Attach(stream ClientEvent) returns (stream ServerAction);
+}
+
+message ClientEvent {
+  oneof event {
+    Opened opened = 1;
+    Frame frame = 2;
+    Closed closed = 3;
+    GatewayHello hello = 4;
+  }
+}
+
+// A gateway process introduces itself once, at the head of the stream.
+//
+// The id lets a service address a Send at the pod that holds the connection;
+// a Send for a session another pod holds is dropped by this one.
+message GatewayHello {
+  string gateway_id = 1;
+  uint32 virtual_server = 2;
+}
+
+message Opened {
+  uint64 conn = 1;
+  string peer_addr = 2;
+  // SHA-1 of the peer's leaf certificate, as murmur hashes it. Empty when the
+  // client presented none.
+  bytes cert_hash = 3;
+  // The chain validated against a configured CA, not merely presented.
+  bool strong_cert = 4;
+  uint32 virtual_server = 5;
+}
+
+message Frame {
+  uint64 conn = 1;
+  // The u16 from the frame header, widened. Types are allocated in
+  // docs/PROTOCOL-COMPATIBILITY.md §3.
+  uint32 type = 2;
+  bytes payload = 3;
+  // 0 until session-lifecycle has reported a session for this connection.
+  uint32 session = 4;
+}
+
+message Closed {
+  uint64 conn = 1;
+  string reason = 2;
+}
+
+message ServerAction {
+  oneof action {
+    Send send = 1;
+    Disconnect disconnect = 2;
+    SessionUp session_up = 3;
+    SessionDown session_down = 4;
+    Throttle throttle = 5;
+  }
+}
+
+// Frames to write to clients.
+//
+// Addressing by session is the normal case; `conns` exists for the handshake,
+// where no session exists yet. Both empty means every authenticated session
+// this gateway holds.
+message Send {
+  repeated uint64 conns = 1;
+  repeated uint32 sessions = 2;
+  uint32 type = 3;
+  bytes payload = 4;
+  // Audio lane: full means drop the oldest and count it, never disconnect.
+  bool audio = 5;
+  // Sessions that must NOT receive this frame — the speaker's own session on a
+  // fan-out, which is otherwise the caller's job to subtract from a broadcast.
+  repeated uint32 except = 6;
+}
+
+message Disconnect {
+  uint64 conn = 1;
+  string reason = 2;
+}
+
+// Only session-lifecycle emits these. The gateway learns the conn↔session
+// mapping from them and nothing else.
+message SessionUp {
+  uint64 conn = 1;
+  uint32 session = 2;
+  uint64 account = 3;
+  string name = 4;
+  uint32 channel = 5;
+  // The Fancy extension version the client announced, 0 for a stock client.
+  uint64 fancy_version = 6;
+}
+
+message SessionDown {
+  uint64 conn = 1;
+  uint32 session = 2;
+}
+
+// A service asking the gateway to tighten a route for one connection, used
+// when a service detects abuse the bucket alone would not catch.
+message Throttle {
+  uint64 conn = 1;
+  uint32 seconds = 2;
+  string reason = 3;
+}

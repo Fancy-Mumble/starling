@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+// Push notifications for clients that are not connected. Optional: nobody
+// notices when it is down, which is exactly what its tier promises.
+package starling.push.v1;
+
+import "common.proto";
+
+service Push {
+  rpc Register(Registration) returns (starling.common.v1.Ack);
+  rpc Unregister(UnregisterRequest) returns (starling.common.v1.Ack);
+  rpc Notify(Notification) returns (NotifyResult);
+  rpc Subscriptions(SubscriptionRequest) returns (SubscriptionList);
+}
+
+message Registration {
+  starling.common.v1.Scope scope = 1;
+  uint64 account = 2;
+  string token = 3;
+  string platform = 4;
+  repeated uint32 channels = 5;
+}
+
+message UnregisterRequest {
+  starling.common.v1.Scope scope = 1;
+  uint64 account = 2;
+  string token = 3;
+}
+
+message Notification {
+  starling.common.v1.Scope scope = 1;
+  repeated uint64 accounts = 2;
+  string title = 3;
+  string body = 4;
+  map<string, string> data = 5;
+  // Recipients that are connected right now; they are skipped, because they
+  // already got the real message.
+  repeated uint64 skip_accounts = 6;
+}
+
+message NotifyResult {
+  uint32 delivered = 1;
+  uint32 skipped = 2;
+  uint32 failed = 3;
+}
+
+message SubscriptionRequest {
+  starling.common.v1.Scope scope = 1;
+  uint64 account = 2;
+}
+
+message SubscriptionList {
+  repeated Registration registrations = 1;
+}

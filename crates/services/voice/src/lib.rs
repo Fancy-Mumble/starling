@@ -1,54 +1,44 @@
-//! `starling-voice` — audio routing.
+//! `voice` — audio routing, and the only service that mints ciphers.
 //!
-//! Handed a decoded frame and told who sent it; says where it goes. It never
-//! learns which transport delivered the bytes, which is what lets one
-//! implementation serve both the UDP socket and the `UDPTunnel` path over TCP.
+//! **Audio needs no hop.** murmur already binds TCP and UDP as two independent
+//! sockets on one port number (`Server.cpp:125` calls `listen()`,
+//! `Server.cpp:193` calls `::bind()`), and they can live in different
+//! processes. So this service binds UDP:64738 itself, clients send audio
+//! straight to it, and the kernel does the demux — no gateway hop, no
+//! serialisation, no fan-out amplification. The only audio that reaches the
+//! control plane is `UDPTunnel` (type 1), the fallback for UDP-blocked clients,
+//! which is per client rather than per listener (`docs/ARCHITECTURE.md` §3).
 //!
-//! Upstream settles that question: its `msgUDPTunnel` handler asserts
-//! unreachable, because the tunnelled frame is intercepted before dispatch and
-//! fed into the same routing. Two implementations would be two copies of this
-//! differing only in how the bytes arrived.
+//! **Voice mints the ciphers, not `session-lifecycle`.** `CryptSetup` (15) is a
+//! control message, so session-lifecycle delivers it — but the key is used here
+//! to seal UDP, so it is generated here and handed over as a ready-made
+//! payload. Key material never crosses a service boundary in a form anything
+//! else could use.
 //!
-//! # The pieces
-//!
-//! | | |
-//! |---|---|
-//! | [`RoutingSnapshot`] | who hears whom — published by the authority, read lock-free here |
-//! | [`AudioPacket`] | one frame, decoded from either wire format |
-//! | [`AudioCodec`] | bytes to and from it — legacy or protobuf, chosen per peer |
-//! | [`VoicePeer`] | one client's cipher, codec and return path |
-//! | [`Router`] | the packet path, synchronous and testable without a socket |
-//! | [`VoiceService`] | the task that owns the router |
-//! | [`VoiceBridge`] | the adapter the authority talks to, in `starling-api`'s terms |
-//! | [`Target`] | what a speaker aimed at |
-//! | [`VoiceTarget`] | a whisper or shout slot a client filled in advance |
-//!
-//! Which session a datagram came from is **not** here: that is a transport
-//! question, and it is `starling-net`'s `PeerTable`. A transport with its own
-//! connection identity — QUIC, whose connection IDs survive NAT rebinding —
-//! needs no such table at all, and would not want one imposed by the routing
-//! crate.
-//!
-//! Per-peer encryption is `starling-crypto`'s business and per-peer addressing
-//! is `starling-net`'s. This crate decides *where* a frame goes — not how it is
-//! protected, and not how it gets there.
+//! Two realtime invariants hold throughout: **Opus is forwarded, never
+//! transcoded** — Starling is an SFU, not an MCU — and the real per-packet cost
+//! is **N seals, not one**, because every listener needs the frame under their
+//! own key.
 
-pub mod bridge;
 pub mod packet;
 pub mod peer;
+pub mod ports;
 pub mod router;
 pub mod routing;
-pub mod service;
 pub mod targets;
 pub mod varint;
+
+pub mod service;
+pub mod socket;
 
 #[cfg(test)]
 mod testing;
 
-pub use bridge::VoiceBridge;
 pub use packet::{AudioCodec, AudioPacket, Datagram, PacketError, Ping, ServerDetails, codec_for};
 pub use peer::VoicePeer;
+pub use ports::{AudioSource, ChannelId, ConnId, Datagrams, FrameSink, SessionId, Stuck};
 pub use router::{Router, RouterStats};
 pub use routing::{REGULAR_SPEECH, RoutingSnapshot, SERVER_LOOPBACK, Target};
-pub use service::{AudioCommand, ControlCommand, VoiceHandle, VoiceService, report_periodically};
+pub use service::VoiceService;
+pub use socket::VoiceSocket;
 pub use targets::{MAX_TARGET, ShoutTarget, TargetError, TargetRegistry, VoiceTarget};

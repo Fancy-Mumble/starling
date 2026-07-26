@@ -1,0 +1,26 @@
+[package]
+name = "starling-files"
+description = "bulk transfer: signed URLs and an HTTP listener of its own"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+
+async-trait.workspace = true
+subtle.workspace = true
+rand.workspace = true
+prost.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
