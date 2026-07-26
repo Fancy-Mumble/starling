@@ -7,9 +7,17 @@ Fancy fork).
 > describes what the server does (coordinate a flock of voices into one motion),
 > and is unique enough to grep for.
 
-Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — a microkernel with
-an actor core, in one process. Crate plan: [`docs/CRATES.md`](docs/CRATES.md).
+Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — a gateway in front,
+independent gRPC services behind it, and media planes that bypass the gateway
+entirely. Wire compatibility: [`docs/PROTOCOL-COMPATIBILITY.md`](docs/PROTOCOL-COMPATIBILITY.md).
+Config: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 Storage: [`docs/STORAGE.md`](docs/STORAGE.md).
+Diagrams: [`docs/diagrams/`](docs/diagrams/).
+
+> **The architecture in those documents is not what the code does.** The tree
+> still holds the earlier in-process microkernel — `starling-bus`, `starling-api`
+> and the `services/state` actor. Voice works there and is tested; everything
+> else is being redesigned around the documents above.
 
 **Status: Phase 0 (MVP).** Establishes sessions with the real FancyMumble
 client, pushes the channel tree, and relays chat. No voice, no persistence, no

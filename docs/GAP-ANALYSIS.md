@@ -49,8 +49,9 @@ socket.
 | V8 | Voice-path enforcement of mute/deaf/suppress/priority-speaker | `Server::processMsg` |
 | V9 | Positional-audio passthrough | `Server::processMsg` |
 
-`RESULTS.md` §4.3 C4 already flags that the Realtime-lane measurement used
-synthetic load and never carried voice.
+The bus experiments never carried real voice — the Realtime-lane measurement used
+synthetic load. Those experiments are gone with the bus; the conclusions that
+survived are in `ARCHITECTURE.md` §5.
 
 ## 2. Authority — the ACL subsystem
 

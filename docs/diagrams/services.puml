@@ -1,0 +1,179 @@
+@startuml services
+!theme plain
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 12
+skinparam ranksep 40
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title Services, grouped by the protocol they speak to a client
+
+header
+<b>FOUR PLANES, GROUPED BY PROTOCOL.</b>  Control is Mumble-over-TCP through the gateway.
+Realtime is UDP or WebRTC <b>straight to the service</b>.  Bulk and admin are plain HTTP.
+The gateway routes on the <b>16-bit type in the frame header</b> and never parses a payload, so a new service is a TOML block, not a release.
+Shard keys: <b>scaling.puml</b>.   Gateway internals: <b>gateway-internals.puml</b>.   Rationale: <b>ARCHITECTURE.md</b>.
+endheader
+
+actor "legacy Mumble\nclient" as legacy #EEEEEE
+actor "Fancy client" as fancy #E3F2FD
+actor "**operator**" as oper #F3E5F5
+
+component "**gateway**\nTLS · framing · rate limit\n**single writer per client socket**\nroutes by type, config-driven" as gw #FFE9D6
+
+database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring,\n**outliving any gateway pod**\nno client, no message type, no tier" as sstore #FFE0B2
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**control plane** — gRPC only; no client reaches these directly" as CTRL #FAFAFA {
+
+  package "essential — down means nobody logs in" as ESS #FFEBEE {
+    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeouts\n0,2,3,4,5,15,21 + **1000**" as slife #FFF9C4
+    component "**session-view**\n«the domain edge»\nthe composed live view of\nevery connected session.\nThe whole domain reads here.\nOwns nothing, writes nothing.\n**no client-facing type**" as sview #FFF9C4
+    component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms #FFFFFF
+    component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta #FFFFFF
+    component "**userdata**\nprofiles\naccount settings\n8,9,14,18,22 + **1003**" as users #FFFFFF
+    component "**server-config**\nruntime-mutable,\nper virtual server\n24,25 + **1013**" as scfg #FFFFFF
+  }
+
+  package "core — a feature dies" as CORE #FFF8E1 {
+    component "**text**\nhistory: **UUIDv7**\n11 + **1005**" as text #FFFFFF
+    component "**pchat**\nE2EE · key mgmt\nhistory: **UUIDv7**\n**1006**" as pchat #FFFFFF
+    component "**moderation**\nbans · kicks\n10 + **1007**" as mod #FFFFFF
+  }
+
+  package "optional — nobody notices" as OPT #E8F5E9 {
+    component "**plugins**  26 + **1010**\n**push** «FCM»  **1011**\n**audit** «UUIDv7»  **1012**\n**onboarding**  **1014**\n**social**  **1015**\n· reactions · receipts · typing\n· polls · watch · whiteboard\n**link-preview**  **1016**\n**context-actions**  16,17 + **1017**" as opt #FFFFFF
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**realtime plane** — UDP / WebRTC, client connects **directly**" as RT #FFEBEE {
+  component "**voice**  «core»\nSFU · routing · **mints the ciphers**\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n—\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied" as voice #FFFFFF
+  component "**screenshare**  «optional»\nstr0m SFU · own ICE ports\n**1008**" as share #FFFFFF
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**HTTP plane** — plain HTTPS, client connects **directly**" as HTTP #E8F5E9 {
+  component "**files / http**  «optional»\nsigned URLs · uploads · blobs\nplugin binaries · audit exports\n**1009**" as files #FFFFFF
+  component "**operator-api**  «admin»\nREST + OpenAPI\nauth **pluggable**: OIDC · JWT\nmTLS · token\ndefault **off**, localhost-bound" as opapi #F3E5F5
+}
+
+' ══════════════════════ control: TCP through the gateway ═══════════════════
+legacy -[#000000]-> gw : **TCP 64738**\nTLS + framing
+fancy  -[#000000]-> gw : **TCP 64738**\n+ **zstd** stream
+
+gw -[#1565C0]-> CTRL  : gRPC
+gw -[#1565C0]-> RT : gRPC — signalling\nand UDPTunnel only
+gw -[#1565C0]-> files : gRPC — mint a signed URL
+note on link #E3F2FD
+  Payload forwarded **verbatim** — already protobuf, never
+  re-encoded. Unix socket when co-located, TCP when not.
+  **Circuit breaker per service**, inbound shed by `tier`.
+  **RESUME**: a sequence number per session in a store that
+  outlives the pod, so a rolling deploy is not 10 000
+  simultaneous full floods.
+end note
+
+gw -[#F57C00]-> sstore : stamp · replay
+note on link #FFE0B2
+  **Why this is not in a tier.** `tier` decides what the gateway does
+  when a dependency is down, and both answers are wrong here:
+  **essential** would reject logins over a lost *optimisation*, and
+  **optional** claims nobody notices — false, because its absence
+  bites at the worst possible moment and the resulting herd can
+  saturate metadata, which *is* essential.
+  It is not a service at all: no client reaches it, it has no
+  message type, and it is never scaled on its own. It is the
+  gateway's own durable state, externalised so a pod can die.
+  **Legacy clients can never RESUME**, so staggered drain and
+  jittered reconnect hints are required regardless. This store
+  optimises a path that must already survive without it — which is
+  what "not essential" means.
+  It is reported in readiness as a **warning**, never as unready.
+end note
+
+' ══════════════════════ realtime: no gateway hop ═══════════════════════════
+legacy -[#C62828]-> voice : **UDP 64738**
+fancy  -[#C62828]-> voice : **UDP 64738**
+note on link #FFEBEE
+  Same port, different protocol, **different process** — murmur
+  binds these separately, Server.cpp:125 vs 193. So audio never
+  traverses the gateway. Only UDPTunnel, the UDP-blocked
+  fallback, comes through the control plane.
+  **Affinity is by channel, never by client.**
+  Per-packet cost is **N seals, not one**: every listener needs
+  the frame under their own key.
+end note
+
+fancy -[#C62828]-> share : **WebRTC / ICE**
+note on link #FFEBEE
+  Media direct to the SFU; only signalling via the gateway.
+  str0m is **ICE-lite**: it ignores trickled candidates, its own
+  rides in the SDP answer. Never trickle ICE through the control
+  plane, and retry offers until answered.
+end note
+
+' ══════════════════════ HTTP: bulk and admin ═══════════════════════════════
+fancy  -[#2E7D32]-> files : **HTTPS**, signed URL
+legacy -[#2E7D32]-> files : **HTTPS**
+oper   -[#6A1B9A]-> opapi : **HTTPS + REST**
+
+' ══════════════════════ the two halves of session ══════════════════════════
+slife -[#1565C0].-> sview : session up · down · moved · flags
+slife -[#1565C0]-> voice : mint a CryptSetup payload
+note on link #FFEBEE
+  **Voice mints the key, because voice is what uses it** to seal
+  UDP. Key material never crosses a service boundary; a
+  client-requested resync takes the same path.
+end note
+
+' ══════════════════════ session-view is the edge for the domain ════════════
+CORE -[#1565C0].-> sview : **one** composed snapshot stream
+OPT  -[#1565C0].-> sview
+RT   -[#1565C0].-> sview
+gw   -[#1565C0].-> sview
+note on link #FFF9C4
+  **Read here and nowhere else** — otherwise every service depends
+  on four others, with four caches each to keep warm.
+  It **forwards but never decides**, and is a
+  **subscription hub, not a proxy** — nothing on the audio path
+  makes a request.
+  **Every mailbox is bounded**, with a shed policy.
+end note
+
+sview -[#1565C0].-> users : profile changes
+sview -[#1565C0].-> perms : groups + current-channel perms
+sview -[#1565C0].-> meta  : channel · tree · membership
+sview -[#1565C0].-> scfg  : limits · bandwidth
+
+note bottom of sview #FFF9C4
+  **A stale deny is safe; a stale grant is a security bug.**
+  A revocation invalidates the view before it is acknowledged;
+  a grant may arrive lazily.
+end note
+
+opapi -[#6A1B9A]-> ESS : gRPC, **operator** context
+note on link #F3E5F5
+  **The one thing that does not read through session-view**, and
+  must not: that view is of *connected* users, while an operator
+  edits registered accounts, offline bans and config.
+  No service accepts an unauthenticated call.
+  **Fail closed on audit.**
+end note
+
+note bottom of ESS #FFFFFF
+  **Each service owns its own schema.** No service reads
+  another's tables. One migration tool, many schemas.
+end note
+
+legend bottom
+|= line |= plane |= transport |
+| <color:#000000>**black**</color> | control | Mumble over TCP+TLS, through the gateway, ordered per client |
+| <color:#C62828>**red**</color> | realtime | UDP or WebRTC, **direct to the service** |
+| <color:#2E7D32>**green**</color> | bulk | HTTPS, signed URL, out of band |
+| <color:#6A1B9A>**purple**</color> | admin | HTTPS + REST in, gRPC out, pluggable auth, default off |
+| <color:#1565C0>**blue**</color> | internal | gRPC — solid is a call, dotted is a cached subscription |
+endlegend
+
+@enduml
