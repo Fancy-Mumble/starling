@@ -192,6 +192,9 @@ mod tests {
             .fetch_one(service.store.pool())
             .await
             .expect("one row");
-        assert_eq!(row.try_get::<String, _>("value").ok().as_deref(), Some("yes"));
+        assert_eq!(
+            row.try_get::<String, _>("value").ok().as_deref(),
+            Some("yes")
+        );
     }
 }

@@ -216,17 +216,19 @@ impl TextService {
                     messages: page
                         .messages
                         .into_iter()
-                        .map(|message| starling_proto_fancy::fancy::feature::StoredMessage {
-                            message_id: Uuid7::from_slice(&message.id)
-                                .map(|id| id.to_string())
-                                .unwrap_or_default(),
-                            channel: message.channel,
-                            sender: 0,
-                            sender_name: message.sender_name,
-                            body: message.body,
-                            sent_at_ms: message.sent_at_ms,
-                            edited: false,
-                        })
+                        .map(
+                            |message| starling_proto_fancy::fancy::feature::StoredMessage {
+                                message_id: Uuid7::from_slice(&message.id)
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_default(),
+                                channel: message.channel,
+                                sender: 0,
+                                sender_name: message.sender_name,
+                                body: message.body,
+                                sent_at_ms: message.sent_at_ms,
+                                edited: false,
+                            },
+                        )
                         .collect(),
                 },
             )),
@@ -271,9 +273,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(&format!("sqlite:file:text-test-{id}?mode=memory&cache=shared"), 1)
-            .await
-            .expect("in-memory database");
+        let store = Store::open(
+            &format!("sqlite:file:text-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(TextService {
             store,
@@ -301,7 +306,10 @@ mod tests {
             let _ = service.record(1, &message(9, body)).await;
         }
         let page = service.history(1, 9, 10, &[]).await;
-        assert_eq!(page.messages.first().map(|m| m.body.as_str()), Some("third"));
+        assert_eq!(
+            page.messages.first().map(|m| m.body.as_str()),
+            Some("third")
+        );
     }
 
     #[tokio::test]

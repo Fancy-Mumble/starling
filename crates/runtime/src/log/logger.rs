@@ -225,7 +225,9 @@ mod tests {
     use super::*;
     use crate::log::sinks::{FanoutSink, MemorySink, NullSink};
 
-    fn logger_with_memory(capacity: usize) -> (Logger, LoggerShutdown, crate::log::sinks::MemoryHandle) {
+    fn logger_with_memory(
+        capacity: usize,
+    ) -> (Logger, LoggerShutdown, crate::log::sinks::MemoryHandle) {
         let sink = MemorySink::new(10_000);
         let handle = sink.handle();
         let (logger, shutdown) = Logger::spawn(Box::new(sink), capacity);

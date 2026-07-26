@@ -21,7 +21,9 @@ use starling_proto_fancy::moderation::{
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::now_ms;
-use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn};
+use starling_runtime::plane::{
+    Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn,
+};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use tonic::{Request, Response, Status};

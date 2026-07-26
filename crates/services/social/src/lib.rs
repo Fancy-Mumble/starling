@@ -49,7 +49,11 @@ impl SocialService {
             return None;
         }
         let multiple = state.poll.as_ref().is_some_and(|poll| poll.multiple);
-        let chosen = if multiple { options } else { &options[..1.min(options.len())] };
+        let chosen = if multiple {
+            options
+        } else {
+            &options[..1.min(options.len())]
+        };
         for option in chosen {
             if let Some(tally) = state.tallies.get_mut(*option as usize) {
                 *tally += 1;

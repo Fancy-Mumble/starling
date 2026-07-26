@@ -22,14 +22,12 @@ use crate::storage::{Migration, Store, StoreError};
 /// The one table, identical on all three backends.
 pub(crate) const SCHEMA: &[Migration<'static>] = &[Migration::new(
     "0001_plugin_kv",
-    &[
-        "CREATE TABLE IF NOT EXISTS plugin_kv (\
+    &["CREATE TABLE IF NOT EXISTS plugin_kv (\
              plugin_id VARCHAR(190) NOT NULL, \
              server_id BIGINT NOT NULL, \
              k BLOB NOT NULL, \
              v BLOB NOT NULL, \
-             PRIMARY KEY (plugin_id, server_id, k))",
-    ],
+             PRIMARY KEY (plugin_id, server_id, k))"],
 )];
 
 /// One write in a batch. A missing value is a delete.
@@ -74,13 +72,14 @@ impl KvStore {
         server: u32,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let row = sqlx::query("SELECT v FROM plugin_kv WHERE plugin_id = ? AND server_id = ? AND k = ?")
-            .bind(plugin)
-            .bind(i64::from(server))
-            .bind(key)
-            .fetch_optional(self.store.pool())
-            .await
-            .map_err(|error| StoreError::Query(format!("kv get: {error}")))?;
+        let row =
+            sqlx::query("SELECT v FROM plugin_kv WHERE plugin_id = ? AND server_id = ? AND k = ?")
+                .bind(plugin)
+                .bind(i64::from(server))
+                .bind(key)
+                .fetch_optional(self.store.pool())
+                .await
+                .map_err(|error| StoreError::Query(format!("kv get: {error}")))?;
         Ok(row.and_then(|row| row.try_get::<Vec<u8>, _>("v").ok()))
     }
 
@@ -199,17 +198,29 @@ mod tests {
         // The namespace is the isolation. If this ever passes across plugins,
         // the opacity rule is gone.
         let kv = kv().await;
-        kv.write("audit", 1, &[put(b"k", b"v")]).await.expect("write");
-        assert_eq!(kv.get("audit", 1, b"k").await.expect("get"), Some(b"v".to_vec()));
+        kv.write("audit", 1, &[put(b"k", b"v")])
+            .await
+            .expect("write");
+        assert_eq!(
+            kv.get("audit", 1, b"k").await.expect("get"),
+            Some(b"v".to_vec())
+        );
         assert_eq!(kv.get("pchat", 1, b"k").await.expect("get"), None);
     }
 
     #[tokio::test]
     async fn a_tenant_cannot_read_another_tenant_s_data() {
         let kv = kv().await;
-        kv.write("pchat", 1, &[put(b"k", b"one")]).await.expect("write");
-        kv.write("pchat", 2, &[put(b"k", b"two")]).await.expect("write");
-        assert_eq!(kv.get("pchat", 2, b"k").await.expect("get"), Some(b"two".to_vec()));
+        kv.write("pchat", 1, &[put(b"k", b"one")])
+            .await
+            .expect("write");
+        kv.write("pchat", 2, &[put(b"k", b"two")])
+            .await
+            .expect("write");
+        assert_eq!(
+            kv.get("pchat", 2, b"k").await.expect("get"),
+            Some(b"two".to_vec())
+        );
     }
 
     #[tokio::test]
@@ -220,11 +231,23 @@ mod tests {
         let ops: Vec<KvOp> = (1_u8..=3).map(|i| put(&[7, i], b"x")).collect();
         kv.write("pchat", 1, &ops).await.expect("write");
 
-        let forwards = kv.scan("pchat", 1, &[7, 0], &[8, 0], 10, false).await.expect("scan");
-        assert_eq!(forwards.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let forwards = kv
+            .scan("pchat", 1, &[7, 0], &[8, 0], 10, false)
+            .await
+            .expect("scan");
+        assert_eq!(
+            forwards.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
 
-        let backwards = kv.scan("pchat", 1, &[7, 0], &[8, 0], 2, true).await.expect("scan");
-        assert_eq!(backwards.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(), vec![3, 2]);
+        let backwards = kv
+            .scan("pchat", 1, &[7, 0], &[8, 0], 2, true)
+            .await
+            .expect("scan");
+        assert_eq!(
+            backwards.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
     }
 
     #[tokio::test]
@@ -244,7 +267,9 @@ mod tests {
     #[tokio::test]
     async fn a_missing_value_deletes() {
         let kv = kv().await;
-        kv.write("audit", 1, &[put(b"k", b"v")]).await.expect("write");
+        kv.write("audit", 1, &[put(b"k", b"v")])
+            .await
+            .expect("write");
         kv.write(
             "audit",
             1,

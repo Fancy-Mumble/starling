@@ -330,7 +330,10 @@ mod tests {
             text.types.push(1006);
         }
         let err = config.validate().expect_err("1006 belongs to pchat");
-        assert!(matches!(err, ConfigError::DuplicateType { type_id: 1006, .. }));
+        assert!(matches!(
+            err,
+            ConfigError::DuplicateType { type_id: 1006, .. }
+        ));
     }
 
     #[test]
@@ -349,7 +352,10 @@ mod tests {
         // that left this unset would quietly route audio through the gateway.
         let config = Config::with_defaults(Path::new("/run/starling"));
         assert_eq!(
-            config.services.get("voice").and_then(|v| v.udp_listen.clone()),
+            config
+                .services
+                .get("voice")
+                .and_then(|v| v.udp_listen.clone()),
             Some("0.0.0.0:64738".to_owned())
         );
     }

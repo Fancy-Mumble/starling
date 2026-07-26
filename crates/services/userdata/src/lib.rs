@@ -67,7 +67,10 @@ impl UserData for UserdataRpc {
     ) -> Result<Response<AuthResult>, Status> {
         let req = request.into_inner();
         Ok(Response::new(
-            self.0.accounts.authenticate(scope_of(req.scope), &req).await,
+            self.0
+                .accounts
+                .authenticate(scope_of(req.scope), &req)
+                .await,
         ))
     }
 
@@ -77,9 +80,7 @@ impl UserData for UserdataRpc {
         let found = match req.by {
             Some(lookup_request::By::Id(id)) => self.0.accounts.by_id(scope, id).await,
             Some(lookup_request::By::Name(name)) => self.0.accounts.by_name(scope, &name).await,
-            Some(lookup_request::By::CertHash(hash)) => {
-                self.0.accounts.by_cert(scope, &hash).await
-            }
+            Some(lookup_request::By::CertHash(hash)) => self.0.accounts.by_cert(scope, &hash).await,
             None => None,
         };
         found
@@ -92,7 +93,12 @@ impl UserData for UserdataRpc {
         Ok(Response::new(
             self.0
                 .accounts
-                .list(scope_of(req.scope), &req.name_prefix, req.limit, req.after_id)
+                .list(
+                    scope_of(req.scope),
+                    &req.name_prefix,
+                    req.limit,
+                    req.after_id,
+                )
                 .await,
         ))
     }
@@ -204,8 +210,15 @@ impl UserdataService {
         };
         let mut states = Vec::new();
         for session in &request.session_texture {
-            if let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*session)).await {
-                let texture = self.accounts.blob(inbound.scope, &account.texture_hash).await;
+            if let Some(account) = self
+                .accounts
+                .by_id(inbound.scope, u64::from(*session))
+                .await
+            {
+                let texture = self
+                    .accounts
+                    .blob(inbound.scope, &account.texture_hash)
+                    .await;
                 states.push(starling_proto::proto::tcp::UserState {
                     session: Some(*session),
                     texture,

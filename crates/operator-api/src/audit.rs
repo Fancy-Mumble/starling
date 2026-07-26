@@ -92,7 +92,8 @@ mod tests {
     use super::*;
 
     fn temp_log(name: &str) -> (AuditLog, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("starling-audit-{name}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("starling-audit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         (
             AuditLog::new(OperatorAudit {

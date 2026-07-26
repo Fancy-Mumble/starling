@@ -206,9 +206,7 @@ impl Serve for FilesService {
             ttl_ms: service
                 .url_ttl
                 .map_or(900_000, |ttl| ttl.get().as_millis() as u64),
-            max_upload: service
-                .max_upload
-                .map_or(512 * 1024 * 1024, ByteSize::get),
+            max_upload: service.max_upload.map_or(512 * 1024 * 1024, ByteSize::get),
             fanout: Fanout::default(),
         }))
     }
@@ -232,9 +230,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(&format!("sqlite:file:files-test-{id}?mode=memory&cache=shared"), 1)
-            .await
-            .expect("in-memory database");
+        let store = Store::open(
+            &format!("sqlite:file:files-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
         Arc::new(FilesService {
             store,

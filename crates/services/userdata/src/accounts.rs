@@ -101,7 +101,8 @@ impl Accounts {
                     cert_hash: row.try_get("cert_hash").unwrap_or_default(),
                     texture_hash: row.try_get("texture_hash").unwrap_or_default(),
                     comment_hash: row.try_get("comment_hash").unwrap_or_default(),
-                    created_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
+                    created_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default()
+                        as u64,
                     last_active_ms: row.try_get::<i64, _>("last_active_ms").unwrap_or_default()
                         as u64,
                     totp_enabled: row
@@ -116,7 +117,10 @@ impl Accounts {
                     .ok()
                     .flatten()
                     .and_then(|bytes| Secret::from_bytes(&bytes)),
-                totp: row.try_get::<Option<Vec<u8>>, _>("totp_secret").ok().flatten(),
+                totp: row
+                    .try_get::<Option<Vec<u8>>, _>("totp_secret")
+                    .ok()
+                    .flatten(),
             };
             *next = (*next).max(id + 1);
             let _ = cache.insert((scope, id), record);
@@ -166,9 +170,10 @@ impl Accounts {
     fn finish(&self, record: Record, request: &AuthRequest) -> AuthResult {
         use auth_result::Outcome;
         if let Some(secret) = &record.password
-            && !secret.verify(&request.password) {
-                return outcome(Outcome::WrongPassword, None);
-            }
+            && !secret.verify(&request.password)
+        {
+            return outcome(Outcome::WrongPassword, None);
+        }
         if let Some(totp) = &record.totp {
             if request.totp.is_empty() {
                 return outcome(Outcome::TotpRequired, None);
@@ -190,12 +195,14 @@ impl Accounts {
 
     /// One account by name.
     pub async fn by_name(&self, scope: u32, name: &str) -> Option<Account> {
-        self.record_by_name(scope, name).map(|record| record.account)
+        self.record_by_name(scope, name)
+            .map(|record| record.account)
     }
 
     /// One account by certificate hash.
     pub async fn by_cert(&self, scope: u32, hash: &[u8]) -> Option<Account> {
-        self.record_by_cert(scope, hash).map(|record| record.account)
+        self.record_by_cert(scope, hash)
+            .map(|record| record.account)
     }
 
     fn record_by_name(&self, scope: u32, name: &str) -> Option<Record> {
@@ -507,7 +514,10 @@ mod tests {
             name: "carol".to_owned(),
             ..Account::default()
         };
-        let _ = accounts.register(1, account.clone(), "").await.expect("first");
+        let _ = accounts
+            .register(1, account.clone(), "")
+            .await
+            .expect("first");
         assert!(accounts.register(1, account, "").await.is_err());
     }
 

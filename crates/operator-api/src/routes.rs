@@ -19,9 +19,9 @@ use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient
 use starling_proto_fancy::userdata::user_data_client::UserDataClient;
 use starling_proto_fancy::userdata::{Account, ListRequest, RegisterRequest};
 
+use crate::OperatorApi;
 use crate::audit::AuditRecord;
 use crate::auth::Refusal;
-use crate::OperatorApi;
 
 /// The router, with the API mounted at the root.
 pub fn router(api: Arc<OperatorApi>) -> Router {
@@ -38,7 +38,10 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
 
 /// The `OpenAPI` description, so an admin client is trivial in any language.
 async fn openapi() -> impl IntoResponse {
-    ([("content-type", "application/json")], crate::openapi::description())
+    (
+        [("content-type", "application/json")],
+        crate::openapi::description(),
+    )
 }
 
 /// What a refusal looks like on the wire.
@@ -189,7 +192,12 @@ async fn delete_account(
     headers: HeaderMap,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "userdata:write", &format!("DELETE /v1/accounts/{id}"))?;
+    let _ = admit(
+        &api,
+        &headers,
+        "userdata:write",
+        &format!("DELETE /v1/accounts/{id}"),
+    )?;
     let channel = api
         .resolver()
         .channel("userdata")

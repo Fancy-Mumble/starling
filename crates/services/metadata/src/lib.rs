@@ -28,8 +28,8 @@ use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::metadata::metadata_server::{Metadata, MetadataServer};
 use starling_proto_fancy::metadata::{
-    ChannelResult, CreateRequest, EnterRequest, EnterResult, LinkRequest, ListenRequest,
-    LeaveRequest, RemoveRequest, Tree, TreeEvent, TreeRequest, UpdateRequest,
+    ChannelResult, CreateRequest, EnterRequest, EnterResult, LeaveRequest, LinkRequest,
+    ListenRequest, RemoveRequest, Tree, TreeEvent, TreeRequest, UpdateRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
@@ -157,7 +157,10 @@ impl Metadata for MetadataRpc {
     ) -> Result<Response<ChannelResult>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
-        let result = self.0.trees.update(scope, req.channel, req.values, &req.fields);
+        let result = self
+            .0
+            .trees
+            .update(scope, req.channel, req.values, &req.fields);
         if let Some(channel) = &result.channel {
             self.0.announce(TreeEvent {
                 event: Some(starling_proto_fancy::metadata::tree_event::Event::Upsert(
@@ -195,15 +198,22 @@ impl Metadata for MetadataRpc {
     async fn link(&self, request: Request<LinkRequest>) -> Result<Response<ChannelResult>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
-        Ok(Response::new(
-            self.0.trees.link(scope, req.channel, &req.link, &req.unlink),
-        ))
+        Ok(Response::new(self.0.trees.link(
+            scope,
+            req.channel,
+            &req.link,
+            &req.unlink,
+        )))
     }
 
     async fn enter(&self, request: Request<EnterRequest>) -> Result<Response<EnterResult>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
-        Ok(Response::new(self.0.trees.enter(scope, req.session, req.channel)))
+        Ok(Response::new(self.0.trees.enter(
+            scope,
+            req.session,
+            req.channel,
+        )))
     }
 
     async fn leave(&self, request: Request<LeaveRequest>) -> Result<Response<Ack>, Status> {
@@ -238,22 +248,25 @@ impl MetadataService {
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
     fn on_channel_state(&self, inbound: &Inbound) -> Actions {
-        let Ok(state) = starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())
+        let Ok(state) =
+            starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())
         else {
             return Actions::new();
         };
         let result = match state.channel_id {
             Some(id) => {
                 let (channel, fields) = to_proto(&state, id);
-                self.trees
-                    .update(inbound.scope, id, Some(channel), &fields)
+                self.trees.update(inbound.scope, id, Some(channel), &fields)
             }
             None => {
                 let (channel, _) = to_proto(&state, 0);
                 // `temporary` is deprecated upstream but frozen, not removed:
                 // some clients still set it, and this proto is never changed
                 // (`docs/ARCHITECTURE.md` §7).
-                #[allow(deprecated, reason = "frozen upstream field, still sent by some clients")]
+                #[allow(
+                    deprecated,
+                    reason = "frozen upstream field, still sent by some clients"
+                )]
                 let temporary = state.temporary.unwrap_or(false);
                 self.trees.create(inbound.scope, Some(channel), temporary)
             }

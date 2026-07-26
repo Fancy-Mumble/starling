@@ -186,7 +186,14 @@ impl Plugins for PluginsRpc {
         let pairs = self
             .0
             .kv
-            .scan(&req.plugin, scope, &req.start, &req.end, req.limit, req.reverse)
+            .scan(
+                &req.plugin,
+                scope,
+                &req.start,
+                &req.end,
+                req.limit,
+                req.reverse,
+            )
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(KvPage {
@@ -225,7 +232,11 @@ impl ClientService for PluginsService {
         let outer = ServiceKind::Plugins.outer_type();
         match inbound.type_id {
             // Opaque client-to-client data: relayed, never inspected.
-            PLUGIN_DATA => vec![to_sessions(Vec::new(), PLUGIN_DATA, inbound.payload.clone())],
+            PLUGIN_DATA => vec![to_sessions(
+                Vec::new(),
+                PLUGIN_DATA,
+                inbound.payload.clone(),
+            )],
             id if id == outer => {
                 let Ok(envelope) = PluginsEnvelope::decode(inbound.payload.as_slice()) else {
                     return Actions::new();

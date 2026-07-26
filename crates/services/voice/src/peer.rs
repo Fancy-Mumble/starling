@@ -16,11 +16,11 @@
 
 use std::net::SocketAddr;
 
-use bytes::Bytes;
+use crate::ports::SessionId;
 use crate::ports::{ConnId, FrameSink};
+use bytes::Bytes;
 use starling_crypto::{VoiceCipher, VoiceError};
 use starling_gate::UdpFormat;
-use crate::ports::SessionId;
 use starling_proto::ControlMessage;
 
 use crate::packet::{AudioCodec, codec_for};

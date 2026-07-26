@@ -75,7 +75,11 @@ impl Gateway {
     /// [`GatewayError::NoRoutes`] when nothing is routed — a gateway with an
     /// empty table would accept clients and answer none of them, which looks
     /// like a hung server rather than a misconfiguration.
-    pub fn new(config: Arc<Config>, metrics: Metrics, health: Health) -> Result<Self, GatewayError> {
+    pub fn new(
+        config: Arc<Config>,
+        metrics: Metrics,
+        health: Health,
+    ) -> Result<Self, GatewayError> {
         let router = Router::from_config(&config);
         if router.is_empty() {
             return Err(GatewayError::NoRoutes);
@@ -128,8 +132,10 @@ impl Gateway {
         // absence is a lost optimisation, and rejecting logins over one would
         // be worse than the herd it prevents (`docs/ARCHITECTURE.md` §5).
         if !self.config.gateway.resume.enabled {
-            self.health
-                .set("session store", starling_runtime::health::Readiness::Warning);
+            self.health.set(
+                "session store",
+                starling_runtime::health::Readiness::Warning,
+            );
         }
 
         let acceptor = self.acceptor()?;
@@ -308,7 +314,9 @@ impl Gateway {
         let Some(route) = self.router.route(frame.type_id) else {
             // An unroutable type is dropped rather than fatal: a stale client
             // sending a burned type must not lose its session over it.
-            self.metrics.counter("starling_gateway_unroutable_frames").inc();
+            self.metrics
+                .counter("starling_gateway_unroutable_frames")
+                .inc();
             return true;
         };
 

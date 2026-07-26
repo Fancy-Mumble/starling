@@ -122,7 +122,10 @@ impl ClientHandle {
     /// Take the next audio frame, if there is one.
     #[must_use]
     pub fn pop_audio(&self) -> Option<Bytes> {
-        self.audio.lock().ok().and_then(|mut queue| queue.pop_front())
+        self.audio
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front())
     }
 
     /// Wait until an audio frame may be available.
@@ -195,15 +198,19 @@ impl Registry {
             let _ = conns.remove(&conn);
         }
         if let (Some(session), Ok(mut sessions)) = (session, self.sessions.lock())
-            && session != 0 {
-                let _ = sessions.remove(&session);
-            }
+            && session != 0
+        {
+            let _ = sessions.remove(&session);
+        }
     }
 
     /// The handle for a connection.
     #[must_use]
     pub fn by_conn(&self, conn: u64) -> Option<Arc<ClientHandle>> {
-        self.conns.lock().ok().and_then(|conns| conns.get(&conn).cloned())
+        self.conns
+            .lock()
+            .ok()
+            .and_then(|conns| conns.get(&conn).cloned())
     }
 
     /// The handle for a session, if this gateway holds it.
@@ -213,7 +220,11 @@ impl Registry {
     /// the frame.
     #[must_use]
     pub fn by_session(&self, session: u32) -> Option<Arc<ClientHandle>> {
-        let conn = self.sessions.lock().ok().and_then(|s| s.get(&session).copied())?;
+        let conn = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&session).copied())?;
         self.by_conn(conn)
     }
 
@@ -266,7 +277,11 @@ mod tests {
         // A late audio frame is worthless, so the newest is the one to keep.
         let (handle, _rx) = channel(1, "tok".to_owned(), 4, 2);
         for byte in [1_u8, 2, 3] {
-            assert!(handle.send(Lane::Audio, Bytes::copy_from_slice(&[byte])).is_ok());
+            assert!(
+                handle
+                    .send(Lane::Audio, Bytes::copy_from_slice(&[byte]))
+                    .is_ok()
+            );
         }
         assert_eq!(handle.dropped_audio(), 1);
         assert_eq!(handle.pop_audio(), Some(Bytes::copy_from_slice(&[2])));

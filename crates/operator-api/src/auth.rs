@@ -256,10 +256,7 @@ mod tests {
     #[test]
     fn a_token_with_no_scopes_is_refused_rather_than_admitted_as_harmless() {
         let auth = StaticTokens {
-            accepted: BTreeMap::from([(
-                "s3cret".to_owned(),
-                ("VAR".to_owned(), Vec::new()),
-            )]),
+            accepted: BTreeMap::from([("s3cret".to_owned(), ("VAR".to_owned(), Vec::new()))]),
         };
         assert_eq!(auth.identify(Some("Bearer s3cret")), Err(Refusal::Unscoped));
     }
@@ -289,7 +286,10 @@ mod tests {
             ..OperatorAuth::default()
         })
         .expect("an oidc authenticator");
-        assert_eq!(auth.identify(Some("Bearer anything")), Err(Refusal::Rejected));
+        assert_eq!(
+            auth.identify(Some("Bearer anything")),
+            Err(Refusal::Rejected)
+        );
     }
 
     #[test]
@@ -308,10 +308,7 @@ mod tests {
     #[test]
     fn a_client_certificate_subject_maps_to_the_scopes_configured_for_it() {
         let auth = SubjectMapped {
-            map: BTreeMap::from([(
-                "CN=admin-console".to_owned(),
-                vec!["*".to_owned()],
-            )]),
+            map: BTreeMap::from([("CN=admin-console".to_owned(), vec!["*".to_owned()])]),
         };
         let identity = auth
             .identify(Some("CN=admin-console"))

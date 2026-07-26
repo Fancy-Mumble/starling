@@ -32,8 +32,8 @@ use starling_proto_fancy::sessionview::{Announcement, Gone, Session, announcemen
 use starling_proto_fancy::types::ServiceKind;
 use starling_proto_fancy::userdata::user_data_client::UserDataClient;
 use starling_proto_fancy::userdata::{AuthRequest, auth_result};
-use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_proto_fancy::voice::MintRequest;
+use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_runtime::channel::Resolver;
 use starling_runtime::ids::now_ms;
 use starling_runtime::plane::{Actions, Fanout, Inbound, broadcast_except, to_conn};
@@ -99,7 +99,9 @@ impl Handshake {
         }
 
         let name = request.username.clone().unwrap_or_default();
-        let outcome = self.identify(inbound.scope, &name, &request, &pending).await;
+        let outcome = self
+            .identify(inbound.scope, &name, &request, &pending)
+            .await;
         let (account, name) = match outcome {
             Ok(identity) => identity,
             Err(action) => return vec![action],

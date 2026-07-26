@@ -54,10 +54,11 @@ impl Sessions {
     /// One session.
     #[must_use]
     pub fn get(&self, scope: u32, session: u32) -> Option<Session> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.get(&scope).and_then(|s| s.sessions.get(&session).cloned()))
+        self.inner.lock().ok().and_then(|inner| {
+            inner
+                .get(&scope)
+                .and_then(|s| s.sessions.get(&session).cloned())
+        })
     }
 
     /// Every session in `scope`, with the version they were read at.

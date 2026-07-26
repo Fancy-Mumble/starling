@@ -48,8 +48,8 @@ fn run(arguments: &[String]) -> Result<(), String> {
             let path = arguments
                 .get(1)
                 .ok_or("migrate-config needs a path to a mumble-server.ini")?;
-            let contents = std::fs::read_to_string(path)
-                .map_err(|error| format!("{path}: {error}"))?;
+            let contents =
+                std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
             // Every key murmur honours that has no home yet is reported on
             // stderr rather than dropped, so a migration is reviewable.
             let toml = starling_migrate::Ini::parse(&contents)

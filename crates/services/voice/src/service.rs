@@ -106,7 +106,11 @@ impl Voice for VoiceRpc {
             .sessions
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(&req.session).map(|minted| minted.fancy_version))
+            .and_then(|sessions| {
+                sessions
+                    .get(&req.session)
+                    .map(|minted| minted.fancy_version)
+            })
             .unwrap_or_default();
         Ok(Response::new(self.0.mint(req.session, fancy)))
     }

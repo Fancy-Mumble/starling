@@ -24,13 +24,10 @@
 //! It has **no client-facing message type**, which keeps it internal by
 //! construction rather than by convention.
 
-pub mod ids;
-
 pub mod cold;
 pub mod store;
 
 pub use cold::ColdRouter;
-pub use ids::SessionId;
 pub use store::Sessions;
 
 use std::sync::Arc;
@@ -172,7 +169,11 @@ impl SessionView for ViewRpc {
         // Forwarded untouched to the owning authority. The answer is not cached
         // here: caching a permission decision is what would make this a second
         // ACL engine.
-        self.0.cold.forward(request.into_inner()).await.map(Response::new)
+        self.0
+            .cold
+            .forward(request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 

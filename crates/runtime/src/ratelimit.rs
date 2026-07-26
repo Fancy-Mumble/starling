@@ -71,7 +71,9 @@ impl fmt::Display for Rate {
 
 impl<'de> Deserialize<'de> for Rate {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
