@@ -17,9 +17,9 @@
 //!
 //! Each `Step.Choice` names the channels it reveals and the ACL groups it joins
 //! the user to. That is the feature: the questionnaire is a way of asking which
-//! grants somebody wants, not a survey. Applying those grants is
-//! `PROTOCOL-MIGRATION.md` M2b's remaining half, the wire carries them now, and
-//! nothing here acts on them yet.
+//! grants somebody wants, not a survey. [`grants`] applies them, on submission
+//! and again whenever a client asks for the flow — see there for why they are
+//! read out of the operator's `Flow` and never off the wire.
 //!
 //! # What answers are keyed on
 //!
@@ -30,6 +30,8 @@
 //! accepted and dropped rather than stored under something that will not
 //! survive the connection.
 
+pub mod grants;
+
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -38,6 +40,8 @@ use starling_proto_fancy::fancy::feature::{
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
+
+use crate::grants::Grants;
 use starling_runtime::ids::now_ms;
 use starling_runtime::permit::Permit;
 use starling_runtime::plane::{
@@ -101,6 +105,7 @@ pub struct OnboardingService {
     config: RwLock<Option<Flow>>,
     roster: Arc<Roster>,
     permit: Permit,
+    grants: Grants,
     fanout: Fanout,
 }
 
@@ -187,6 +192,65 @@ impl OnboardingService {
         .bind(now_ms() as i64)
         .execute(self.store.pool())
         .await;
+    }
+
+    /// Make this account's grants real: the flow's defaults, plus whatever
+    /// their stored answers earn.
+    ///
+    /// Called on submission *and* on every query, which is what makes the
+    /// grant self-healing. A permissions service that was down when the
+    /// questionnaire was answered would otherwise leave the account short of
+    /// what it was promised for good, and the user has no way to ask again —
+    /// their answers are already on record, so a client has nothing to
+    /// re-submit.
+    ///
+    /// Idempotent all the way down: when nothing is missing, no ACL is written
+    /// and no invalidation reaches any connected client.
+    ///
+    /// Returns what was done, which is how a caller — and a test — tells
+    /// "there was nothing to grant" from "we tried and could not".
+    async fn apply_grants(&self, scope: u32, account: u64) -> grants::Applied {
+        let nothing = grants::Applied {
+            changed: 0,
+            complete: true,
+        };
+        let Some(flow) = self.config(scope).await else {
+            return nothing;
+        };
+        if !flow.enabled {
+            // The operator's off switch, and it has to mean something beyond
+            // "clients stop rendering it": a flow that is off hands out no new
+            // permissions. Existing ones are left alone — turning a flow off
+            // is not the same act as taking away what it granted, and guessing
+            // that it was would revoke access an operator never asked to
+            // revoke.
+            tracing::debug!(account, "the flow is disabled; no grants applied");
+            return nothing;
+        }
+        let answers = self.answers(scope, account).await.unwrap_or_default();
+        let wanted = grants::wanted(&flow, &answers);
+        let applied = self.grants.apply(scope, account, &wanted).await;
+        if applied.changed > 0 {
+            tracing::info!(
+                account,
+                channels = wanted.channels.len(),
+                groups = wanted.groups.len(),
+                wrote = applied.changed,
+                "onboarding grants applied"
+            );
+        }
+        if !applied.complete {
+            // Not fatal, and deliberately not surfaced to the client: the
+            // answers are stored, so the next connection retries. But a user
+            // who is missing a channel they were told they would get is a
+            // support question, and this is the line that answers it.
+            tracing::warn!(
+                account,
+                "some onboarding grants could not be applied; they will be \
+                 retried on the next connection"
+            );
+        }
+        applied
     }
 
     /// The delivery telling `inbound`'s client what it has on record.
@@ -293,6 +357,11 @@ impl ClientService for OnboardingService {
                 response.submitted_at_ms = now_ms();
                 response.flow_version = self.config(inbound.scope).await.map_or(0, |c| c.version);
                 self.record(inbound.scope, account, &response).await;
+                // Stored first, then granted, and never the other way round: a
+                // grant whose answers were not recorded cannot be re-derived,
+                // so it would survive as a permission nothing in the database
+                // explains.
+                let _ = self.apply_grants(inbound.scope, account).await;
                 // Echo it back: the client now knows its own answers are on
                 // record, from the same message it would have had to ask for.
                 vec![to_conn(
@@ -302,6 +371,13 @@ impl ClientService for OnboardingService {
                 )]
             }
             Some(onboarding_envelope::Body::Query(query)) => {
+                // A client asking for the flow is a user arriving, which is
+                // when `Flow.default_channels` is owed ("granted to everyone
+                // who arrives, whatever they answer") and when a grant that
+                // failed last time gets its retry.
+                if let Some(account) = self.roster.account_of(inbound.session) {
+                    let _ = self.apply_grants(inbound.scope, account).await;
+                }
                 let mut actions = Actions::new();
                 if let Some(flow) = self.config(inbound.scope).await {
                     actions.push(to_conn(
@@ -332,6 +408,7 @@ impl Serve for OnboardingService {
             config: RwLock::new(None),
             roster: Arc::new(Roster::new()),
             permit: Permit::new(ctx.resolver.clone()),
+            grants: Grants::new(ctx.resolver.clone()),
             fanout: Fanout::default(),
         }))
     }
@@ -368,17 +445,21 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        // A resolver that reaches nothing. These tests exercise storage, and a
+        // Permit that cannot ask denies, which is the safe way for it to be
+        // wrong if a test ever does reach the ACL path. `Grants` shares it, so
+        // applying one here writes nothing and reports itself incomplete —
+        // which is the behaviour worth having under test anyway.
+        let nowhere = starling_runtime::channel::Resolver::new(
+            Arc::new(starling_runtime::config::Config::default()),
+            starling_runtime::inproc::Broker::default(),
+        );
         Arc::new(OnboardingService {
             store,
             config: RwLock::new(None),
             roster: Arc::new(Roster::new()),
-            // A resolver that reaches nothing. These tests exercise storage,
-            // and a Permit that cannot ask denies, which is the safe way for
-            // it to be wrong if a test ever does reach the ACL path.
-            permit: Permit::new(starling_runtime::channel::Resolver::new(
-                Arc::new(starling_runtime::config::Config::default()),
-                starling_runtime::inproc::Broker::default(),
-            )),
+            permit: Permit::new(nowhere.clone()),
+            grants: Grants::new(nowhere),
             fanout: Fanout::default(),
         })
     }
@@ -453,6 +534,124 @@ mod tests {
     async fn a_server_with_no_flow_has_nothing_to_serve() {
         let service = service().await;
         assert!(service.config(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_flow_hands_out_nothing() {
+        // The operator's off switch has to mean more than "clients stop
+        // rendering it", or a flow turned off still quietly grants channels to
+        // everyone who connects.
+        let service = service().await;
+        let _ = service
+            .store_config(
+                1,
+                Flow {
+                    enabled: false,
+                    default_channels: vec![7],
+                    ..Flow::default()
+                },
+                "7",
+            )
+            .await;
+
+        let applied = service.apply_grants(1, 42).await;
+        assert_eq!(applied.changed, 0);
+        assert!(
+            applied.complete,
+            "nothing was owed, so nothing is outstanding, this must not read \
+             as a failed grant that gets retried forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_could_not_be_applied_says_so() {
+        // The resolver in these tests reaches no permissions service, which is
+        // exactly the case that must not pass silently: the user was promised
+        // a channel, the ACL was never written, and the only thing standing
+        // between that and a support ticket nobody can answer is this flag.
+        let service = service().await;
+        let _ = service
+            .store_config(
+                1,
+                Flow {
+                    enabled: true,
+                    default_channels: vec![7],
+                    ..Flow::default()
+                },
+                "7",
+            )
+            .await;
+
+        let applied = service.apply_grants(1, 42).await;
+        assert_eq!(applied.changed, 0);
+        assert!(!applied.complete, "an unreachable permissions service is not success");
+    }
+
+    #[tokio::test]
+    async fn a_flow_that_grants_nothing_asks_permissions_nothing() {
+        // Most servers' flows are informational. Those must not put an ACL read
+        // on every connection, which is what an unconditional apply would do.
+        let service = service().await;
+        let _ = service
+            .store_config(
+                1,
+                Flow {
+                    enabled: true,
+                    ..Flow::default()
+                },
+                "7",
+            )
+            .await;
+
+        let applied = service.apply_grants(1, 42).await;
+        assert!(applied.complete && applied.changed == 0);
+    }
+
+    #[tokio::test]
+    async fn grants_follow_the_stored_answers_not_the_message() {
+        // `apply_grants` re-reads what was recorded rather than taking the
+        // submission's word for it, which is what makes the retry on the next
+        // connection possible at all — by then the message is long gone.
+        let service = service().await;
+        let _ = service
+            .store_config(
+                1,
+                Flow {
+                    enabled: true,
+                    steps: vec![Step {
+                        id: "interests".to_owned(),
+                        choices: vec![step::Choice {
+                            id: "dev".to_owned(),
+                            channels: vec![7],
+                            ..step::Choice::default()
+                        }],
+                        ..Step::default()
+                    }],
+                    ..Flow::default()
+                },
+                "7",
+            )
+            .await;
+        service
+            .record(
+                1,
+                42,
+                &Response {
+                    answers: vec![starling_proto_fancy::fancy::feature::response::Answer {
+                        step_id: "interests".to_owned(),
+                        choice_ids: vec!["dev".to_owned()],
+                        text: String::new(),
+                    }],
+                    ..Response::default()
+                },
+            )
+            .await;
+
+        // Reaching the permissions service is what fails, and only a run that
+        // found something to grant gets that far.
+        assert!(!service.apply_grants(1, 42).await.complete);
+        // Another account answered nothing, so there is nothing to reach for.
+        assert!(service.apply_grants(1, 43).await.complete);
     }
 
     #[tokio::test]

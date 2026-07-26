@@ -21,6 +21,14 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Tests only, and deliberately. `grants` writes an ACL shape, and the only thing
+# that decides whether that shape means anything is the evaluator that reads it.
+# Asserting the bits by hand would assert my belief about ACL semantics, which
+# is precisely the belief worth checking: a grant that reads as applied and
+# evaluates to nothing is this repo's most common bug, not a hypothetical one.
+# Runtime coupling between services stays gRPC-only; a dev-dependency crosses
+# no such line.
+starling-permissions.workspace = true
 
 [lints]
 workspace = true

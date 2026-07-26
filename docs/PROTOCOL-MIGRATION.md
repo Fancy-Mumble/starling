@@ -41,7 +41,7 @@ coverage that follows each one as it gains a canon.
   carries `enabled` / `default_channels` / attribution, and `Response` batches
   a whole submission with the `flow_version` it answered, where the canon had
   a generic four-field wizard that could express none of it. Applying the
-  grants is the remaining half, listed under M2b.
+  grants is the other half, done in M2b below.
 * **M2h, make the break honest. Done.** Three changes in `vendor/client`:
   the handshake stops announcing `fancy_protocol` (extracted to
   `client::version_announcement`, so the claim has one home a test can read),
@@ -105,7 +105,7 @@ coverage that follows each one as it gains a canon.
   |---|---|---|
   | server-config | **done** | Real, and blocking. `ConfigValues` now carries `repeated Setting` (key, kind, group, label, value, secret, help) plus the snapshot `version` a client drops stale replies by. The schema lives in one table in `snapshot.rs` where each row holds both its metadata *and* the accessor that reads it, because the value map and the `redacted` name list were two lists keyed by the same strings, and two such lists drift into a password on a settings screen. Keys from `Snapshot.extra` are offered as untyped strings rather than dropped, so the add-a-knob-without-a-proto-release mechanism keeps working |
   | audit | **done**, and it was worse than a missing field | `Query` gained `target_account`; `AuditRecord` gained `target_account` and `target_channel`, which the store had held all along while the record dropped them, so "banned" arrived without saying whom, and a reader had to parse the human-readable `detail` to find out. **The real bug was underneath:** `QueryRequest` already carried `until_ms`, `category`, `target_account` and `before`, and the statement bound *none* of them. An operator narrowing the log got the whole log back, looking narrowed. A filter that is accepted and ignored is worse than one that is refused, because whoever reads the result believes it. Now built with a `QueryBuilder` so each clause sits beside its own bind |
-  | ~~onboarding~~ | done at M2a | the canon carries the grants; *applying* them is service work, below |
+  | ~~onboarding~~ | **done** | The canon carried the grants at M2a; applying them was service work, and is done below |
   | ~~plugins~~ | **not a gap on this plane** | The client-facing `Admin` arm is *refused by design*, "plugin administration is an operator action and takes an operator identity, which the client plane does not carry". `marketplace_id`, `installed_at`, `builtin` and `path` are an operator-surface concern, so they belong to operator-api's REST routes, not here. Epoch 0 put plugin admin on the client wire; Starling deliberately moved it |
   | ~~push~~ | **closed** | The canon had the semantics backwards, `Subscribe` was an *inclusion* list, and a user mutes two rooms out of forty rather than enumerating the other thirty-eight (and any channel created later would silently stop notifying). Now an exclusion list, which is the thing a person actually does. Closing it exposed that the feature was a **complete no-op**: `Subscribe` was never handled (it fell to `ok: false`), `Register` stored `channels: Vec::new()` and discarded the preference, every registration was filed under `account: 0` while every lookup asked for a real account, and `Notification` carried no channel, so delivery had nothing to compare a mute against. All four fixed; a muted channel no longer buzzes the phone, and there is a test saying so |
   | ~~link-preview~~ | **deferred, feature not built** | The service vets a URL and returns an empty `Preview`; it has no HTTP client at all. The rich embed, and the `preview_data`-versus-`image_key` question, which is a real design choice about whether thumbnails ride the control plane or the files service, gets decided with the fetcher that has to produce it |
@@ -118,8 +118,38 @@ coverage that follows each one as it gains a canon.
   the deferred two is simpler: **design the wire with the implementation, not
   ahead of it.**
 
-  Also outstanding here, and service work rather than protocol work: onboarding
-  **applies** none of the grants its `Step.Choice` now carries.
+  **onboarding now applies its grants** (`services/onboarding/src/grants.rs`),
+  which was the last of M2b and the only one that was service work rather than
+  protocol work. Four decisions in it are worth keeping:
+
+  * **The grants come out of the operator's `Flow`, never off the wire.** A
+    `Response` carries step ids and choice ids and nothing else; every channel
+    and group applied is looked up by those ids in the stored flow. An id
+    matching nothing grants nothing. The alternative shape — a client that
+    sends the grants it wants — is a client that sends itself `admin`.
+  * **Recorded as group membership, not an ACL entry per user.** Each revealed
+    channel gets one entry granting `@onboarded`, and onboarding adds accounts
+    to that group: an integer per user rather than a row per user on every
+    channel's ACL, which at ten thousand onboarded users is the difference
+    between a table an operator can read and one the evaluator walks on every
+    check.
+  * **Applied on submission *and* on every query.** Idempotent, so a user who
+    already holds everything causes no write and no invalidation, which is what
+    makes it safe to re-apply — and re-applying is the only way an account whose
+    grant failed (permissions down, group pruned) ever gets it back. Their
+    answers are already stored, so there is nothing for the client to re-submit.
+  * **It does not walk the tree, and it does not overrule a removal.** Reaching
+    a channel needs `Traverse` on the path to it, but granting that would widen
+    permissions on channels the flow never named; and an account an operator put
+    in a group's `remove` list stays out, because a closer `remove` beats an
+    `add` at evaluation, so re-adding would read as applied and do nothing. It
+    logs instead.
+
+  The tests go through the **real evaluator** from `permissions` (a
+  dev-dependency, no runtime coupling), because the failure worth catching is
+  not a mistyped field but an ACL shape the evaluator ignores: `apply_subs`
+  where `apply_here` was meant, or a group left non-inheritable, both of which
+  look correct in a debug print and grant nothing.
 * **M2c, the client moves to the canon. Vendoring done; the codec is the
   rest.** `vendor/client` now carries `proto/fancy/*.proto` mirrored from here
   and compiles all eight into `proto::fancy::*`, under the same two-pass
