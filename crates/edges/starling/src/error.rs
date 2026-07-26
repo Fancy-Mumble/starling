@@ -39,4 +39,22 @@ pub(crate) enum StartupError {
     /// The listener could not bind, or failed while serving.
     #[error(transparent)]
     Listen(#[from] ListenError),
+
+    /// The configured database could not be opened.
+    ///
+    /// Fatal on purpose: a server that starts without the database it was told
+    /// to use accepts registrations and silently drops them, which is worse than
+    /// not starting. Not configuring one at all is a different thing and is not
+    /// an error.
+    ///
+    /// Not `#[from]`: the URL has to be redacted on the way in, and a blanket
+    /// conversion would let a call site skip that.
+    #[error("could not open the database at {url}: {source}")]
+    Database {
+        /// The URL, with any password removed.
+        url: String,
+        /// What the store said.
+        #[source]
+        source: starling_api::StoreError,
+    },
 }

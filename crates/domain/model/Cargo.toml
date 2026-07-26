@@ -10,6 +10,7 @@ publish.workspace = true
 # needs the wire `Version` type and nothing else. Adding async, sockets or a
 # database here would defeat the point of the crate (PORTING-PLAN.md §2.1).
 [dependencies]
+serde.workspace = true
 bitflags = { workspace = true }
 starling-proto.workspace = true
 

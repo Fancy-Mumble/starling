@@ -88,6 +88,18 @@ pub struct ServerConfig {
     pub server_password: String,
     /// Everything a client is told during the handshake.
     pub limits: Limits,
+
+    /// Where persistent state lives.
+    ///
+    /// A sqlx connection URL naming SQLite, MySQL or PostgreSQL. Empty means
+    /// persist nothing: every control path still works and the server starts
+    /// clean each time, which is a legitimate way to run a throwaway instance
+    /// and is what the e2e suite uses.
+    ///
+    /// Defaulting to a file rather than to nothing would silently create a
+    /// database next to the binary the first time anyone ran the server, and
+    /// then silently keep using it.
+    pub database_url: String,
 }
 
 impl ServerConfig {
@@ -120,6 +132,7 @@ impl Default for ServerConfig {
             register_name: "Root".into(),
             server_password: String::new(),
             limits: Limits::default(),
+            database_url: String::new(),
         }
     }
 }

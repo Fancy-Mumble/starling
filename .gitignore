@@ -1,5 +1,14 @@
 /target
 **/*.rs.bk
+
 # Auto-generated on first boot when no cert is configured.
 /starling-data/
 *.pem
+
+# Editor and OS cruft. Here because this repo has contributors now, not
+# because any of it has ever been committed.
+/.vscode/
+/.idea/
+*.swp
+.DS_Store
+Thumbs.db

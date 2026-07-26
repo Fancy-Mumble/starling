@@ -58,7 +58,19 @@ key = "starling-data/key.pem"
 # listed here so the shape is known, but are not accepted yet - adding one now
 # is a startup error.
 #
-# [database]        # Phase 2: url = "sqlite://starling-data/starling.db"
+# Where registered accounts, channels, ACLs, groups and bans are kept.
+#
+# Omit the whole section to persist nothing: the server works exactly the same
+# and starts clean every time. That is the right setting for a throwaway or
+# test instance, and it is the default because creating a database file nobody
+# asked for is a worse surprise than not having one.
+#
+# SQLite needs no server and is the sensible choice for a single instance;
+# MySQL and PostgreSQL are there for deployments that already run one.
+# [database]
+# url = "sqlite://starling-data/starling.db"
+# url = "postgres://starling:secret@localhost/starling"
+# url = "mysql://starling:secret@localhost/starling"
 # [security]        # Phase 1: policy = "compatibility-first" | "modern-only"
 # [plugins]         # Phase 3
 # [pchat]           # Phase 4

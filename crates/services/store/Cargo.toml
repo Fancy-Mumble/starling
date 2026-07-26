@@ -1,0 +1,24 @@
+[package]
+name = "starling-store"
+description = "Persistence: the schema and its repositories, over SQLite, MySQL or PostgreSQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Implements `starling-api`'s repository traits. Nothing above this crate names
+# sqlx, and nothing below it knows persistence exists.
+[dependencies]
+async-trait.workspace = true
+sqlx.workspace = true
+postcard.workspace = true
+starling-bus.workspace = true
+tracing.workspace = true
+starling-api.workspace = true
+starling-model.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

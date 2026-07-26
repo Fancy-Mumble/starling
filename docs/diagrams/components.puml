@@ -1,0 +1,149 @@
+@startuml components
+!theme plain
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 18
+skinparam ranksep 45
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title Components — everything meets on the bus
+
+header
+<b>TWO KINDS OF BUS TRAFFIC, AND THE DIFFERENCE IS THE WHOLE DESIGN.</b>
+A <b>request</b> is addressed, carries a deadline, expects one reply.  An <b>event</b> is published to subscribers, carries no deadline, expects nothing back.
+<b>Nothing on the audio path may be a request.</b>   Rationale for every edge: see README.
+endheader
+
+component "**starling**  «binary»\ncomposition root —\ncreates each component and\n**injects its initial config**" as bin #FFF8DC
+
+package "starling-bus  «kernel»" as KERNEL #FFE9D6 {
+  component "**bus**\nports · lanes · envelopes\nsubscription by protobuf message type,\nregistered at link time «**inventory**».\n**One mechanism. There is no dynamic half.**\n—\nGuarantees **FIFO per sender-receiver pair**,\nand nothing stronger. That is all ordering needs." as bus #FFFFFF
+  component "**deadline scheduler**\nabsolute **Instant** deadlines — no delta\nbookkeeping, no accumulated drift\n«tokio_util **DelayQueue**, a timing wheel»" as sched #FFFFFF
+}
+
+component "**starling-net**\nthe only component that touches a socket,\nand the only one that encrypts.\n**Runs the main loop.**\nFive parts inside — see net-internals.puml" as NET #E6F0FA
+
+package "core — privileged, in-process, never sandboxed" as CORE #E6F0FA {
+
+  package "connection-manager — the connection layer" as CMAN #BBFFAA {
+    component "**dispatcher + lifecycle**\nadmission: bans · rate limit · handshake deadline\npre-auth: **Version** · **Authenticate** · verdict\nthen: look up the mailbox and forward — nothing else,\nso it cannot block\n—\n**SlotMap** «PeerKey, mailbox»: index + generation.\nThe **index is the wire session u32**." as cmc #FFFFFF
+    component "**peer**  [0..*]  «own tokio task and mailbox»\nnot a bus port, but still its **own task** — peers run\nin parallel and a stalled one stalls only itself.\nOwns its state outright: no lock, no sharing.\n—\nsession · protocol · flags · session policy\n—\nFirst act after auth: subscribe, take a **versioned**\nsnapshot, discard deltas at or below it, then send\nCryptSetup, CodecVersion, the flood, ServerSync.\nThe flood **awaits the socket** instead of queueing —\nblocking its own task blocks nobody else." as peer #AADD00
+  }
+
+  component "**channel-tree**\nholds **exactly** three things: the tree,\nchannel links, and which session sits\nin which channel.\n**Not** accounts, bans or ACLs — those\nhave their own owners.\n—\n**Single writer**, so the order it applies\nmutations is a total order.\nA monotonic **version** stamps every\nsnapshot and every delta." as chan #DDDDFF
+  component "**config**\ninitial values are **injected at construction**,\nnot published. The bus carries **changes only**." as cfg #FFFFFF
+  component "**starling-store**\nsqlx · SQLite · MySQL · Postgres" as store #FFFFFF
+}
+
+package "features — reach everything through the bus, and only the bus" as FEAT #EAF7EA {
+  component "**permission-query**\nall ACL evaluation" as fperm #FFFFFF
+  component "**query-users**" as fusers #FFFFFF
+  component "**text-handler**\npchat and normal chat" as ftext #FFFFFF
+  component "**admin-request**" as fadmin #FFFFFF
+  component "**voice**\naudio router · codec framing\n**local user cache**, fed by events" as voice #FFDDDD
+}
+
+component "**domain**  «values, no mechanism»\nstarling-proto · -model · -gate · -log\n—\ncrypto and tls live in net;\nconfig types in the config component" as domain #EAF0F7
+
+' ═══════════════════════ net to the bus ══════════════════════════════════
+NET <..> bus : frames, **opaque**
+
+' ═══════════════════════ the connection layer ════════════════════════════
+bus ..> cmc : connection opened · closed,\nand every frame for one
+cmc *-- peer : spawns on connect, reaps on close
+cmc <--> bus : answers about any peer it owns
+note on link
+  **One address on the bus, N tasks behind it.**
+  No subscription transfer at handover, so it cannot race;
+  no shared parallelism lost, because each peer is a task.
+end note
+
+cmc -[#red]-> sched : **cancel(peer)**
+note on link #FFD6D6
+  When a peer is reaped, the requests cman had in flight on its
+  behalf are dropped **at once** — nothing is waiting for those
+  replies any more. A peer that is merely **slow** is not cancelled,
+  nor is a slow database. Those expire on their own deadline.
+end note
+
+' ═══════════════════════ channels and the audio path ═════════════════════
+chan <--> bus : tree, links, occupancy
+chan ..>  bus : **membership snapshot**
+bus  ..> voice : joined · moved · muted · left
+note on link #FFDDDD
+  Voice updates its **local cache** from these events and never
+  asks who is in a channel: at 50 packets/second/speaker that
+  would put a round trip and a deadline on a 10 ms budget.
+  **Cache the rare thing, never poll it.**
+end note
+voice ..> bus : one frame + **recipient set**
+note on link #FFDDDD
+  One message, not one per listener. **net** fans out, because
+  only net knows which recipients have a working UDP path
+  and which must be tunnelled over TCP.
+end note
+
+' ═══════════════════════ everyone else ═══════════════════════════════════
+fperm  <--> bus
+fusers <--> bus
+ftext  <--> bus
+fadmin <--> bus
+store  <--> bus : the only door\nto durable data
+cfg    ..>  bus : changes only
+
+' ═══════════════════════ structural ══════════════════════════════════════
+bin *-- KERNEL
+bin *-- NET
+bin *-- CORE
+bin *-- FEAT
+bus --> sched : arms a deadline per request
+
+NET  -[#808080,dotted]-> domain
+CORE -[#808080,dotted]-> domain
+FEAT -[#808080,dotted]-> domain
+
+note bottom of KERNEL #E8F5E9
+  **ORDERING is per-stream, never global.**
+  A client needs its own frames in order; there is no
+  cross-client requirement. Order comes from the
+  **single-writer sources**, never from the bus — which
+  guarantees only FIFO per sender-receiver pair, and an
+  mpsc gives that for free.
+  **All control for one connection rides one lane.** Audio has
+  its own lane and may reorder: Mumble audio carries its own
+  sequence number for the client's jitter buffer, so lane
+  priority can never break an ordering that is required.
+end note
+
+note bottom of NET #E8F5E9
+  **BACKPRESSURE.**
+  **A slow consumer never backpressures a shared producer** —
+  it is disconnected instead. Otherwise one bad socket
+  head-of-line blocks every other client.
+  · control queue full  ->  **disconnect that client.** Dropping a
+    UserState desyncs it permanently and silently; unbounded
+    queueing is a memory DoS. Reconnect re-syncs.
+  · audio queue full  ->  **drop oldest, count it.** A late frame
+    is worthless.
+  · UDP would block  ->  **drop. Never queue.**
+  · component to component  ->  the **deadline** already does this.
+end note
+
+legend bottom
+|= line |= meaning |
+| solid, two arrowheads | **bus request** — addressed, carries a deadline, expects one reply |
+| dashed | **bus event** — published to subscribers, no deadline, no reply |
+| solid, one arrowhead | a direct call **inside** a component — never crosses the bus |
+| filled diamond | creates and owns |
+| <color:red>red</color> | cancellation — drops a deadline before it fires |
+| <color:#808080>grey dotted</color> | compile-time dependency only |
+|= colour |= |
+|<#FFF8DC>    | composition root |
+|<#FFE9D6>    | kernel |
+|<#E6F0FA>    | privileged — owns a resource |
+|<#EAF7EA>    | feature — replaceable, sandboxable, bus-only |
+|<#EAF0F7>    | domain — values, no mechanism |
+endlegend
+
+@enduml

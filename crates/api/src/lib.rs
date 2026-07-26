@@ -38,6 +38,8 @@ pub mod effects;
 pub mod feature;
 pub mod handler;
 pub mod outbound;
+pub mod store;
+pub mod store_protocol;
 pub mod voice;
 
 pub use audio::{AudioSink, AudioSource, Datagrams, NoAudio, NoDatagrams};
@@ -48,6 +50,12 @@ pub use feature::{Feature, registered};
 pub use handler::{Access, Handler};
 pub use outbound::{FrameSink, NoOutbound, Outbound, Stuck};
 pub use starling_config::{Limits, ServerConfig};
+pub use store_protocol::{StoreReply, StoreRequest, StoredWorld};
+pub use store::{
+    AclRepository, AclTarget, BanRepository, ChannelRepository, ConfigRepository, LogRepository,
+    Store, StoreError, StoredAcl, StoredBan, StoredChannel, StoredGroup, StoredGroupMember,
+    StoredListener, StoredUser, UserRepository,
+};
 pub use voice::{
     AudienceView, NoVoice, Shout, VoiceKeying, VoiceLink, VoiceTargetSlot, VoiceUpdate,
 };

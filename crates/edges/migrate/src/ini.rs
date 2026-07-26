@@ -64,6 +64,53 @@ impl Ini {
     }
 
     /// murmur accepts `true`/`false` and `1`/`0`.
+    /// murmur's database settings, as a sqlx connection URL.
+    ///
+    /// murmur spreads this across six keys and a Qt driver name; sqlx wants one
+    /// string. The translation is the whole of what a `.ini` says about storage,
+    /// so an operator migrating does not have to work out the URL themselves —
+    /// and getting it wrong means starting against an empty database, which
+    /// looks exactly like data loss.
+    ///
+    /// An empty `database` with no driver means murmur's own default, which is a
+    /// SQLite file called `murmur.sqlite` beside the binary. That is reproduced
+    /// rather than guessed at, because "no database configured" and "the default
+    /// database" are different situations with the same empty value.
+    fn database_url(&self) -> String {
+        let driver = self.string("dbDriver", "QSQLITE");
+        let name = self.string("database", "");
+        let host = self.string("dbHost", "localhost");
+        let user = self.string("dbUsername", "");
+        let password = self.string("dbPassword", "");
+
+        // Qt's driver names, which are what a murmur `.ini` actually contains.
+        let scheme = match driver.to_ascii_uppercase().as_str() {
+            "QMYSQL" => "mysql",
+            "QPSQL" => "postgres",
+            // Including `QSQLITE` and anything unrecognised: murmur falls back
+            // to SQLite too, and a URL that names a file is recoverable in a way
+            // that a URL naming the wrong server is not.
+            _ => "sqlite",
+        };
+
+        if scheme == "sqlite" {
+            let path = if name.is_empty() {
+                "murmur.sqlite"
+            } else {
+                &name
+            };
+            return format!("sqlite://{path}");
+        }
+
+        let port = self.number::<u16>("dbPort", if scheme == "mysql" { 3306 } else { 5432 });
+        let credentials = match (user.is_empty(), password.is_empty()) {
+            (true, _) => String::new(),
+            (false, true) => format!("{user}@"),
+            (false, false) => format!("{user}:{password}@"),
+        };
+        format!("{scheme}://{credentials}{host}:{port}/{name}")
+    }
+
     fn boolean(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
             None => default,
@@ -131,6 +178,7 @@ impl ConfigSource for Ini {
                 port: self.number("port", base.port),
                 register_name: self.string("registerName", &base.register_name),
                 server_password: self.string("serverpassword", &base.server_password),
+                database_url: self.database_url(),
                 limits: Limits {
                     max_users: self.number("users", base.limits.max_users),
                     max_bandwidth: self.number("bandwidth", base.limits.max_bandwidth),
@@ -249,6 +297,67 @@ registerName=Fancy Mumble e2e
         assert_eq!(config.limits.max_image_message_length, 10_485_760);
         assert!(config.limits.allow_html);
         assert!(!config.requires_password());
+    }
+
+    #[test]
+    fn sqlite_is_the_default_and_names_murmurs_own_file() {
+        // "No database configured" and "murmur's default database" are the same
+        // empty value in a `.ini`, and they mean the same thing — the file
+        // beside the binary. Guessing "no database" would silently discard every
+        // registered account on migration.
+        let ini = Ini::parse("");
+        assert_eq!(ini.database_url(), "sqlite://murmur.sqlite");
+    }
+
+    #[test]
+    fn a_sqlite_path_is_carried_across() {
+        let ini = Ini::parse("database=/var/lib/mumble/server.sqlite");
+        assert_eq!(ini.database_url(), "sqlite:///var/lib/mumble/server.sqlite");
+    }
+
+    #[test]
+    fn qt_driver_names_map_to_sqlx_schemes() {
+        // A `.ini` contains Qt's names, not sqlx's.
+        for (driver, expected) in [("QMYSQL", "mysql"), ("QPSQL", "postgres")] {
+            let ini = Ini::parse(&format!(
+                "dbDriver={driver}\ndatabase=mumble\ndbUsername=murmur\ndbPassword=secret\ndbHost=db.local"
+            ));
+            let url = ini.database_url();
+            assert!(url.starts_with(&format!("{expected}://")), "{url}");
+            assert!(url.contains("murmur:secret@db.local"), "{url}");
+            assert!(url.ends_with("/mumble"), "{url}");
+        }
+    }
+
+    #[test]
+    fn each_server_gets_its_conventional_port_when_unset() {
+        assert!(
+            Ini::parse("dbDriver=QMYSQL\ndatabase=m\ndbUsername=u")
+                .database_url()
+                .contains(":3306/")
+        );
+        assert!(
+            Ini::parse("dbDriver=QPSQL\ndatabase=m\ndbUsername=u")
+                .database_url()
+                .contains(":5432/")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_driver_falls_back_to_sqlite() {
+        // As murmur does. A URL naming a file is recoverable; one naming the
+        // wrong server is not.
+        let ini = Ini::parse("dbDriver=QODBC\ndatabase=x.db");
+        assert_eq!(ini.database_url(), "sqlite://x.db");
+    }
+
+    #[test]
+    fn a_password_free_account_produces_no_stray_colon() {
+        // `user:@host` is a different credential from `user@host` to some
+        // drivers, and an empty password is not the same as none.
+        let url = Ini::parse("dbDriver=QPSQL\ndatabase=m\ndbUsername=murmur").database_url();
+        assert!(url.contains("murmur@"), "{url}");
+        assert!(!url.contains("murmur:@"), "{url}");
     }
 
     #[test]

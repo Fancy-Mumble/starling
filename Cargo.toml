@@ -10,6 +10,7 @@ members = [
     "crates/domain/gate",
     "crates/services/net",
     "crates/services/state",
+    "crates/services/store",
     "crates/services/voice",
     "crates/services/tls",
     "crates/api",
@@ -86,6 +87,7 @@ prost-build = "0.14.3"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 

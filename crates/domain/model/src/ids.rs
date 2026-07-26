@@ -13,11 +13,11 @@ pub const ROOT_CHANNEL: ChannelId = ChannelId(0);
 /// [`SessionAllocator`](crate::session::SessionAllocator)), so they identify a
 /// *connection*, never a person. Use [`UserId`] for anything that must outlive a
 /// connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SessionId(pub u32);
 
 /// A channel's id. [`ROOT_CHANNEL`] is always `0`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ChannelId(pub u32);
 
 /// A *registered* user's persistent id.
@@ -25,7 +25,7 @@ pub struct ChannelId(pub u32);
 /// Signed because murmur uses `-1` for "not registered"; that is modelled here
 /// as `Option<UserId>` at the call sites, with `UserId(0)` reserved for
 /// SuperUser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UserId(pub u32);
 
 impl UserId {
