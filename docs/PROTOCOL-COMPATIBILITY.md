@@ -287,18 +287,37 @@ proto3:
 
 ## 5. Enforcement
 
-`scripts/check-proto-drift.sh` currently asserts that Starling's proto matches
-`vendor/server`'s, describing the fork as "upstream's source of truth". It is not
- it is the fork. That check has been verifying Fancy-consistency and saying
-nothing about Mumble compatibility.
+The rule at the top of this document is worth exactly what enforces it, and for
+a long time that was one script that believed the wrong thing:
+`check-proto-drift.sh` asserted Starling's proto matched `vendor/server`'s while
+calling the fork "upstream's source of truth". It is not — it is the fork. So
+the check verified Fancy-consistency and said nothing about Mumble
+compatibility, which is how §1's numbering drift survived.
 
-It needs to become two checks with two meanings:
+There are now three scripts asking five distinct questions — hygiene carries
+three of them, because they share nothing but the file they live in. All are
+offline, take seconds, and run in CI:
 
-1. **compatibility**, upstream messages, field numbers 1-99, against
-   `mumble-voip/mumble`. A failure here is a released-client break
-2. **consistency**, everything else, against `vendor/server` and
-   `vendor/client`. A failure here is a coordination bug between our own trees
+| check | question it answers | a failure means |
+|---|---|---|
+| `check-proto-compat.py` | does our upstream surface still match `mumble-voip/mumble`? | a **released-client break** |
+| `check-proto-drift.sh` | do our three trees carry the same contract, L0 and L2? | a coordination bug between our own trees |
+| `check-proto-hygiene.py`, numbering | is any Fancy field in the burned 100–999 range? | a future upstream field collides with ours, silently |
+| `check-proto-hygiene.py`, frozen tags | did a shipped L2 message renumber? | every peer on the old build reads the wrong fields |
+| `check-proto-hygiene.py`, outer types | does the client's copy of the type table match `ServiceKind`? | a well-formed frame arrives at the wrong service and is skipped |
 
-Plus a third that would have caught this class years earlier:
+Two things to know about how they divide the work.
 
-3. **no Fancy field below 100** in any upstream message
+**The drift check cannot see a rule all three trees break identically** — it
+compares them with each other, so unanimity reads as health. That blindness is
+by construction, not an oversight, and it is exactly the shape §1's drift had.
+Hygiene covers the rules that live outside any single tree's copy, and the
+compatibility check covers the one question no comparison among our own trees
+can answer.
+
+**None of them is evidence about the encoders.** They prove the schemas agree;
+D1 was two implementations that both compiled against agreeing schemas and put
+different bytes on the wire. That needs the golden frames in
+`scripts/canon-fixtures.json` — captured bytes, one side asserting it produces
+them and the other that it reads them back as the same meaning. See
+`PROTOCOL-MIGRATION.md` M6.

@@ -15,9 +15,14 @@ present honest. The L2 tags stay movable until M2c because no shipped peer
 speaks the canon, the one client that claims epoch 1 speaks a dead dialect of
 it, and after M4 they are frozen like everything else.
 
-Remaining work runs in this order: **M2b → M2c → M3 → M4 → M5 → M6.** M2h and
-M2p are done; M2c is the one that reverts M2h's degradation, and must not land
-before M2b has given the client something worth encoding.
+**M1 through M6 have all landed.** They ran in the order M2h → M2p → M2a →
+M2b → M2c → M3 → M4 → M5 → M6, each intermediate state shippable, and the
+entries below are kept as the record of what each one changed and why — the
+reasoning is the part that outlives the step.
+
+What remains is not a milestone but a list: the services still relaying because
+they have no canon (screenshare, link-preview, userdata), and the fixture
+coverage that follows each one as it gains a canon.
 
 * **M1, canon markers. Done.** Tombstone the proto2 envelope block in
   `Mumble.proto`; land `fancy/wire.proto` and `SyncDelta`; this document.
@@ -345,7 +350,7 @@ before M2b has given the client something worth encoding.
   it, or it cannot read its own connection. All-false is therefore both the
   default and what an unknown connection reads as, and a stock client lands
   there correctly by sending no `Hello` at all.
-* **M6, enforcement. Partly done; taken early because it guards the rest.**
+* **M6, enforcement. Done; taken early because it guards the rest.**
   The three checks of `PROTOCOL-COMPATIBILITY.md` §5:
 
   * **consistency**, `check-proto-drift.sh`, which already compared L0's wire
@@ -365,9 +370,25 @@ before M2b has given the client something worth encoding.
     what distinguishes them. Both were verified by reintroducing the original
     bug and watching the check fail with file and line: a Fancy field taking
     upstream's next number, and onboarding's dead-block import.
-  * **compatibility**, upstream surface vs `mumble-voip/mumble`, still
-    outstanding. It needs a remote, and none is configured here; a failure
-    there is a released-client break, so it is the one that most wants doing.
+  * **compatibility**, `check-proto-compat.py`, new. Our upstream surface
+    against `mumble-voip/mumble` itself, which the other two checks cannot
+    speak to: they compare our trees with each other, and three trees agreeing
+    on a break is still a break. No remote is configured, so it reads
+    `upstream/1.6.x` out of `vendor/server`, where the merge history already
+    carries it — the comparison was the missing part, not the bytes.
+
+    It compares against **1.6.x, not 1.5.x**, and the difference is not
+    cosmetic: run against 1.5 it reports three false alarms
+    (`UserRemove.ban_certificate`, `UserRemove.ban_ip`, `UserStats`'s rolling
+    stats), all of them real 1.6 fields. A check that cries wolf on day one is
+    one people learn to skip.
+
+    Verified the way the others were, by breaking it on purpose: a Fancy field
+    squatting a number upstream already uses, and an upstream field widened
+    under us. It names both. It also prints, every run, the one risk we chose
+    to keep: `Version.fancy_version = 6` is pinned on upstream's next free
+    number in `Version` (§1), so the day upstream uses it, this is the line
+    that says so.
 
   A fourth check landed with M4/M5: **outer-type agreement.** The client names
   outer types as its own constants because it does not link `proto-fancy`, so
@@ -378,11 +399,28 @@ before M2b has given the client something worth encoding.
   by pointing the client's `PUSH` at the plugins service and watching the check
   name both values.
 
-  Still outstanding: an **honesty check** on the epoch, the tree announcing
-  `fancy_protocol = 1` must be the tree whose codec encodes the canon,
-  asserted by the e2e suite round-tripping one Fancy message per service
-  rather than by anyone's claim in a document. Both docs claimed states the
-  code contradicted; only the round-trip is evidence. M2c has now made it
-  writable, and the three structural checks above narrow what it has to cover:
-  the protos are identical, the frozen tags cannot move, and the outer types
-  agree, so what remains for it is the codecs themselves.
+  And the fifth, the one the other four cannot give: an **honesty check** on
+  the epoch. The tree announcing `fancy_protocol = 1` must be the tree whose
+  codec encodes the canon. Everything above is structural — it proves the
+  `.proto` files match, the frozen tags have not moved and the outer types
+  agree. None of that is evidence about the *encoders*, and D1 was two
+  confident encoders, not two disagreeing schemas.
+
+  It is **golden frames**, `scripts/canon-fixtures.json`: complete frames
+  (`type ‖ len ‖ payload`) captured from the client's encoder and checked in as
+  bytes. The client asserts it still produces them
+  (`mumble-protocol/tests/canon_fixtures.rs`); Starling asserts it decodes them
+  into the meaning the fixture names (`proto-fancy/tests/canon_fixtures.rs`) —
+  the *meaning*, not merely that parsing succeeded, since a frame decoded into
+  the wrong fields parses beautifully.
+
+  Bytes rather than a helper both sides import, deliberately: such a helper
+  agrees with itself while disagreeing with the wire, which is not a
+  hypothetical failure mode, it is D1's. For the same reason the two copies of
+  the fixture are compared to each other, because two copies with nothing
+  comparing them is the outer-type table again — and that check caught a real
+  divergence the first time it ran.
+
+  Which leaves one honest gap: the fixtures cover social (typing, reaction).
+  Extending them is one entry per message, and the services still on the relay
+  (screenshare, link-preview, userdata) have no canon to capture yet.
