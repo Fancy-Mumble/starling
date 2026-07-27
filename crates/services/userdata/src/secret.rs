@@ -151,7 +151,59 @@ pub fn verify_totp(secret: &[u8], code: &str, unix_seconds: u64) -> bool {
     })
 }
 
-fn totp(secret: &[u8], counter: u64) -> u32 {
+/// How many bytes a new TOTP secret gets.
+///
+/// RFC 4226 §4 requires at least 128 bits and recommends 160, which is also
+/// the HMAC-SHA1 block size, so a longer secret would be hashed down to this
+/// anyway and a shorter one is weaker for nothing.
+const TOTP_SECRET_BYTES: usize = 20;
+
+/// A fresh TOTP secret, from the same generator the SuperUser password uses.
+///
+/// `rand::rng()` is seeded from the operating system and reseeded as it runs;
+/// what matters here is only that nothing else can reproduce it, because a
+/// predictable second factor is worse than none — the account is trusted more
+/// for having one.
+#[must_use]
+pub fn new_totp_secret() -> Vec<u8> {
+    use rand::RngExt as _;
+    let mut rng = rand::rng();
+    (0..TOTP_SECRET_BYTES).map(|_| rng.random()).collect()
+}
+
+/// RFC 4648 base32, unpadded — the form every authenticator app takes.
+///
+/// Written out rather than pulled in as a dependency: it is fifteen lines, and
+/// the alternative is a supply-chain edge on the one path that hands out key
+/// material.
+#[must_use]
+pub fn base32(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let mut buffer: u16 = 0;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let index = ((buffer >> bits) & 0x1f) as usize;
+            out.push(char::from(ALPHABET[index]));
+        }
+    }
+    if bits > 0 {
+        let index = ((buffer << (5 - bits)) & 0x1f) as usize;
+        out.push(char::from(ALPHABET[index]));
+    }
+    out
+}
+
+/// The code `secret` shows at `counter`.
+///
+/// `pub(crate)` for the enrolment tests, which have to be able to *produce*
+/// a code and not only check one. Nothing on a wire calls it: the server
+/// never generates a code, it only ever verifies the one a client sends.
+pub(crate) fn totp(secret: &[u8], counter: u64) -> u32 {
     let Ok(mut mac) = <Hmac<Sha1> as KeyInit>::new_from_slice(secret) else {
         return u32::MAX;
     };

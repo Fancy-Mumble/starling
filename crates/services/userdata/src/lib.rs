@@ -17,6 +17,8 @@ pub mod accounts;
 mod directory;
 pub mod secret;
 
+pub mod selfservice;
+
 pub use accounts::Accounts;
 pub use ids::UserId;
 pub use secret::{Secret, verify_totp};
@@ -66,6 +68,11 @@ pub struct UserdataService {
     resolver: Resolver,
     /// The operator-facing record of account changes.
     trail: Trail,
+    /// TOTP secrets handed out and not yet confirmed by a code.
+    ///
+    /// In memory on purpose, see `selfservice`: an enrolment nobody finished
+    /// should evaporate rather than sit in the database looking enabled.
+    enrolling: std::sync::Mutex<selfservice::Enrolments>,
 }
 
 /// The client on `session`, as an audit actor.
@@ -256,6 +263,7 @@ impl ClientService for UserdataService {
             QUERY_USERS => self.on_query_users(&inbound),
             USER_LIST => self.on_user_list(&inbound).await,
             REQUEST_BLOB => self.on_request_blob(&inbound).await,
+            type_id if type_id == outer_type() => self.on_self_service(&inbound).await,
             _ => Actions::new(),
         }
     }
@@ -431,6 +439,7 @@ impl Serve for UserdataService {
             permit: Permit::new(ctx.resolver.clone()),
             trail: Trail::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
+            enrolling: std::sync::Mutex::default(),
         }))
     }
 

@@ -119,24 +119,40 @@ message UserdataEnvelope {
     AccountAck ack = 2;
     Settings settings = 3;
     SettingsUpdate settings_update = 4;
+    SettingsQuery settings_query = 5;
   }
 }
 
 // The account self-service surface: everything a user may change about their
 // own account. Each carries the current password, because a hijacked session
 // must not be able to lock the owner out.
+//
+// **Nothing here names an account.** The server resolves the caller's own from
+// the session the frame arrived on, so this is a surface that can only ever act
+// on the person using it; an id on the wire would be an id a client could
+// change.
 message AccountAction {
   enum Kind {
-    SET_PASSWORD = 0;
-    SET_EMAIL = 1;
-    RENAME = 2;
-    ENABLE_TOTP = 3;
-    DISABLE_TOTP = 4;
-    UNREGISTER = 5;
+    // Not an action, and the zero value on purpose.
+    //
+    // proto3 cannot distinguish an unset enum from its first value, so with
+    // `SET_PASSWORD = 0` a default-constructed message — a client that forgot
+    // the field, a decode of the wrong bytes — *was* a request to set the
+    // password to the empty string. The dangerous default has to be the one
+    // that means nothing.
+    UNSPECIFIED = 0;
+    SET_PASSWORD = 1;
+    SET_EMAIL = 2;
+    RENAME = 3;
+    ENABLE_TOTP = 4;
+    DISABLE_TOTP = 5;
+    UNREGISTER = 6;
   }
   Kind kind = 1;
   string current_password = 2;
   string value = 3;
+  // A code from the authenticator, when one is needed: confirming an
+  // enrolment, and proving the device is still in hand before TOTP comes off.
   string totp = 4;
 }
 
@@ -144,10 +160,19 @@ message AccountAck {
   AccountAction.Kind kind = 1;
   bool ok = 2;
   string detail = 3;
-  // Set on ENABLE_TOTP only, and only once.
+  // The new secret, base32 as an authenticator expects it. Sent **only** in
+  // answer to the first half of an ENABLE_TOTP, and never stored anywhere it
+  // can be read back: enrolment is not finished until a code derived from it
+  // comes back, so a client that loses this asks again and gets a new one
+  // rather than a locked account.
   string totp_secret = 4;
 }
 
+// This account's stored client settings.
+//
+// Server to client. Sent in answer to a `SettingsQuery` and after every
+// `SettingsUpdate`, so the client's copy is always something the server said
+// rather than something the client assumed took effect.
 message Settings {
   map<string, string> values = 1;
 }
@@ -156,6 +181,13 @@ message SettingsUpdate {
   map<string, string> set = 1;
   repeated string unset = 2;
 }
+
+// "Send me my settings."
+//
+// Explicit rather than implied by an empty `Settings`: a client and a server
+// that both use one message for the question and the answer eventually send it
+// to each other at the same time, and neither can tell which it received.
+message SettingsQuery {}
 
 // -- 1013 server-config -----------------------------------------------------
 

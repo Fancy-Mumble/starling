@@ -576,6 +576,86 @@ impl Accounts {
         Ok(record.account)
     }
 
+    /// Whether `password` is this account's current password.
+    ///
+    /// **Blocking**, 210 000 PBKDF2 rounds, and the caller is responsible for
+    /// running it somewhere that may block — the same rule
+    /// [`Accounts::authenticate`] carries, and for the same reason: 30 ms in
+    /// release and 1.45 s in a debug build, on a runtime worker that serves
+    /// every other client meanwhile.
+    ///
+    /// An account with **no** stored password answers `false` for any input,
+    /// including the empty string. Those accounts are reached by certificate,
+    /// and a self-service action must not become free because the owner logs in
+    /// with one.
+    #[must_use]
+    pub fn password_matches(&self, scope: u32, id: u64, password: &str) -> bool {
+        let stored = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).and_then(|r| r.password.clone()));
+        stored.is_some_and(|secret| secret.verify(password))
+    }
+
+    /// Whether `code` is a current TOTP code for this account.
+    ///
+    /// False when the account has no TOTP at all, deliberately: the caller
+    /// asking is usually about to take a second factor *off*, and "there was
+    /// nothing to prove" must not read as "the proof succeeded".
+    #[must_use]
+    pub fn totp_matches(&self, scope: u32, id: u64, code: &str) -> bool {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(&(scope, id))
+                    .and_then(|record| record.totp.clone())
+            })
+            .is_some_and(|secret| verify_totp(&secret, code, now_ms() / 1000))
+    }
+
+    /// Whether this account has a second factor enabled.
+    #[must_use]
+    pub fn totp_enabled(&self, scope: u32, id: u64) -> bool {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).map(|record| record.totp.is_some()))
+            .unwrap_or_default()
+    }
+
+    /// Turn the second factor on with `secret`, or off with `None`.
+    ///
+    /// Separate from [`Accounts::update`] because a TOTP secret is not a field
+    /// a caller supplies: enabling one is a server-generated secret confirmed
+    /// by a code derived from it, and `UpdateRequest` has a shape for neither.
+    /// `"totp"` was in `update`'s *sensitive* list with no arm to match it, so
+    /// a caller asking to change it was answered `Ok` and nothing happened.
+    ///
+    /// # Errors
+    ///
+    /// A message when there is no such account.
+    pub async fn set_totp(&self, scope: u32, id: u64, secret: Option<Vec<u8>>) -> Result<(), String> {
+        let Some(mut record) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).cloned())
+        else {
+            return Err("no such account".to_owned());
+        };
+        record.totp = secret;
+        record.account.totp_enabled = record.totp.is_some();
+        record.account.last_active_ms = now_ms();
+        self.write(scope, &record).await;
+        if let Ok(mut cache) = self.cache.lock() {
+            let _ = cache.insert((scope, id), record);
+        }
+        Ok(())
+    }
+
     /// Whether this virtual server's SuperUser has a password set.
     ///
     /// For the operator surface, which should be able to say "the administrator
