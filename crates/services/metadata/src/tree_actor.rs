@@ -212,11 +212,14 @@ impl Trees {
             for victim in &doomed {
                 let _ = state.channels.remove(victim);
             }
-            for membership in state.members.values_mut() {
-                if doomed.contains(&membership.channel) {
-                    membership.channel = 0;
-                }
-            }
+            // An iterator chain rather than a `for`: nothing here observes the
+            // order, and saying so in the shape keeps `iter_over_hash_type`
+            // pointed at the loops where order would leak out.
+            state
+                .members
+                .values_mut()
+                .filter(|membership| doomed.contains(&membership.channel))
+                .for_each(|membership| membership.channel = 0);
             state.version += 1;
             ChannelResult {
                 applied: true,
@@ -362,9 +365,21 @@ fn descendants(state: &TreeState, root: u32) -> Vec<u32> {
     while index < found.len() {
         let parent = found[index];
         index += 1;
-        for channel in state.channels.values() {
-            if channel.parent == Some(parent) && !found.contains(&channel.id) {
-                found.push(channel.id);
+        let mut children: Vec<u32> = state
+            .channels
+            .values()
+            .filter(|channel| channel.parent == Some(parent))
+            .map(|channel| channel.id)
+            .collect();
+        // Sorted because the scan above walks a `HashMap`, whose order is
+        // randomised per process. Every caller today treats the result as a set,
+        // so the order is not observable — but this is the list of channels a
+        // removal destroys, and the day one of them reports it to clients the
+        // ordering would differ between two servers running the same code.
+        children.sort_unstable();
+        for id in children {
+            if !found.contains(&id) {
+                found.push(id);
             }
         }
     }

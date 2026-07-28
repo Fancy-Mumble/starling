@@ -3,6 +3,7 @@ name = "starling-migrate"
 description = "murmur compatibility: read a mumble-server.ini, and the migrate-config command"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

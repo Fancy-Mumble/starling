@@ -225,7 +225,7 @@ impl Writer {
                 self.u8(u8::try_from(v >> 24).unwrap_or(0) | 0xE0);
                 self.big_endian(v, 3);
             }
-            v if v <= u64::from(u32::MAX) => {
+            v if u32::try_from(v).is_ok() => {
                 self.u8(0xF0);
                 self.big_endian(v, 4);
             }

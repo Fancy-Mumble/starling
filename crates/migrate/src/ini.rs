@@ -229,8 +229,7 @@ const UNIMPLEMENTED: &[(&str, &str)] = &[
 ];
 
 fn strip_comment(line: &str) -> &str {
-    let cut = line.find([';', '#']).unwrap_or(line.len());
-    &line[..cut]
+    line.split_once([';', '#']).map_or(line, |(live, _)| live)
 }
 
 fn unquote(value: &str) -> &str {

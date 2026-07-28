@@ -3,6 +3,7 @@ name = "starling-voice"
 description = "audio routing: its own UDP socket, the ciphers, and no gateway hop"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -14,7 +15,6 @@ starling-crypto.workspace = true
 starling-gate.workspace = true
 bytes.workspace = true
 
-async-trait.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -37,7 +37,6 @@ pub use routes::router;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
 /// The service.
@@ -77,7 +76,6 @@ impl OperatorApi {
     }
 }
 
-#[async_trait]
 impl Serve for OperatorApi {
     const NAME: &'static str = "operator-api";
 
@@ -96,9 +94,8 @@ impl Serve for OperatorApi {
             // the opposite exposure to the gateway's.
             listen: service
                 .listen
-                .clone()
                 .unwrap_or_else(|| "127.0.0.1:8081".to_owned()),
-            resolver: ctx.resolver.clone(),
+            resolver: ctx.resolver,
         }))
     }
 

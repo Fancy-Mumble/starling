@@ -3,6 +3,7 @@ name = "starling-userdata"
 description = "registered accounts, profiles, account settings and content-addressed blobs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -18,7 +19,6 @@ rand.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 
-async-trait.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tracing.workspace = true

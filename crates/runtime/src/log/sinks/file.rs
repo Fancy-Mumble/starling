@@ -71,7 +71,12 @@ impl FileSink {
             } else {
                 self.numbered(generation - 1)
             };
-            if from.exists() {
+            // `fs::exists`, not `Path::exists`: the latter answers "no" both
+            // when the file is absent and when the directory cannot be read, so
+            // a permissions fault would silently skip a generation and drop the
+            // logs in it. "Cannot tell" is treated as present, which costs a
+            // rename that fails harmlessly and is already ignored below.
+            if std::fs::exists(&from).unwrap_or(true) {
                 let _ = std::fs::rename(&from, self.numbered(generation));
             }
         }

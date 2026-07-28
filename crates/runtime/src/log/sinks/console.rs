@@ -96,7 +96,13 @@ mod tests {
 
     impl Write for Captured {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("test lock").extend_from_slice(buf);
+            // Reported rather than panicked: this is the `Write` a sink writes
+            // into, so a poisoned lock should surface as the sink error the
+            // real code path already handles, not as a second panic.
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("the capture buffer is poisoned"))?
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {

@@ -41,12 +41,18 @@ impl FromStr for HumanDuration {
         let value: u64 = value
             .parse()
             .map_err(|_| format!("{text:?} does not start with a number"))?;
+        // `from_mins`/`from_hours` name the unit instead of spelling out the
+        // factor. They panic on overflow, where `value * 60` wrapped silently in
+        // a release build, so the range is checked first and something too long
+        // to represent comes back as the parse error this function already
+        // returns — an operator's typo is not a reason to take the server down.
         let duration = match unit.trim() {
             "ms" => Duration::from_millis(value),
             "s" => Duration::from_secs(value),
-            "m" => Duration::from_secs(value * 60),
-            "h" => Duration::from_secs(value * 3600),
-            "d" => Duration::from_secs(value * 86400),
+            "m" if value <= u64::MAX / 60 => Duration::from_mins(value),
+            "h" if value <= u64::MAX / 3600 => Duration::from_hours(value),
+            "d" if value <= u64::MAX / 86_400 => Duration::from_hours(value * 24),
+            "m" | "h" | "d" => return Err(format!("{text:?} is too long to represent")),
             other => return Err(format!("unknown time unit {other:?}: use ms, s, m, h or d")),
         };
         Ok(Self(duration))
