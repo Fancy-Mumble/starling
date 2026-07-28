@@ -24,7 +24,17 @@
 //! whole value here is that a drifting codec cannot quietly re-baseline itself.
 
 use prost::Message as _;
+use starling_proto_fancy::fancy::pchat::{PchatEnvelope, pchat_envelope};
 use starling_proto_fancy::fancy::social::{SocialEnvelope, social_envelope};
+use starling_proto_fancy::types::ServiceKind;
+
+/// The outer types these fixtures travel under, from the table that owns them.
+///
+/// Read from `ServiceKind` rather than written out again: a second copy of the
+/// number is the thing `check-proto-hygiene.py`'s outer-type check exists to
+/// catch, and putting one in the test that guards routing would be funny.
+const SOCIAL: u16 = ServiceKind::Social.outer_type();
+const PCHAT: u16 = ServiceKind::Pchat.outer_type();
 
 // A test target inherits the crate's dependencies and `unused_crate_dependencies`
 // judges it on its own imports, so the three this test does not touch have to be
@@ -128,10 +138,24 @@ fn starling_reads_every_frame_the_client_writes() {
             fixture.name
         );
 
-        let envelope = SocialEnvelope::decode(&frame[HEADER..])
-            .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name));
+        // Decoded as the service the outer type routes it to, which is the
+        // whole of what the gateway knows: an envelope decoded as the wrong
+        // service is the D1 shape, and it very often *succeeds*.
+        let carries_a_body = match outer {
+            SOCIAL => SocialEnvelope::decode(&frame[HEADER..])
+                .map(|envelope| envelope.body.is_some())
+                .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name)),
+            PCHAT => PchatEnvelope::decode(&frame[HEADER..])
+                .map(|envelope| envelope.body.is_some())
+                .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name)),
+            other => panic!(
+                "{}: outer type {other} has no service in this test; a fixture \
+                 for a service nothing decodes proves nothing",
+                fixture.name
+            ),
+        };
         assert!(
-            envelope.body.is_some(),
+            carries_a_body,
             "{}: decoded to an empty envelope, the shapes have diverged and \
              protobuf did not notice, which is exactly D1",
             fixture.name
@@ -181,4 +205,71 @@ fn the_reaction_keeps_its_emoji_and_its_target() {
         kind,
         starling_proto_fancy::fancy::wire::emoji::Kind::Unicode("\u{1f44d}".to_owned())
     );
+}
+
+#[test]
+fn the_poll_keeps_its_question_and_the_order_of_its_options() {
+    // Order is not decoration: a client renders option 0 first and sends back
+    // the *index* it was shown, so options that arrive reordered record votes
+    // for the wrong answer, and nothing anywhere reports a problem.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("poll"))
+        .expect("the poll fixture");
+    let envelope = SocialEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(social_envelope::Body::Poll(poll)) = envelope.body else {
+        panic!("expected a poll, got {:?}", envelope.body);
+    };
+    assert_eq!(poll.poll_id, "p-1");
+    assert_eq!(poll.channel, 4);
+    assert_eq!(poll.question, "lunch?");
+    assert_eq!(poll.options, vec!["yes".to_owned(), "no".to_owned()]);
+    assert!(!poll.multiple);
+}
+
+#[test]
+fn the_pchat_message_arrives_whole_and_unattributed() {
+    // Two properties in one frame. The ciphertext is opaque and must survive
+    // byte for byte, since the server cannot tell a corrupted one from a valid
+    // one and the recipient's decryption is what finds out.
+    //
+    // And `sender_cert` must be **empty**: it is stamped by the server from the
+    // TLS connection, so a value arriving from the wire would be a claim about
+    // identity, and pchat's whole archive is keyed on it.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("encrypted message"))
+        .expect("the pchat fixture");
+    let envelope = PchatEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(pchat_envelope::Body::Message(message)) = envelope.body else {
+        panic!("expected a message, got {:?}", envelope.body);
+    };
+    assert_eq!(message.message_id, "m-7");
+    assert_eq!(message.channel, 4);
+    assert_eq!(message.ciphertext, vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(message.sent_at_ms, 1_700_000_000_000);
+    assert_eq!(message.epoch, 2);
+    assert_eq!(message.chain_index, 9);
+    assert!(
+        message.sender_cert.is_empty(),
+        "a client-supplied sender_cert is a claim, not an identity"
+    );
+}
+
+#[test]
+fn the_fetch_asks_for_the_page_size_it_meant() {
+    // The bug `Cursor::page_size` exists for: an unset limit is
+    // proto3-indistinguishable from 0, and every caller used to clamp 0 up to
+    // 1, so a client that never set the field paged one message at a time. A
+    // fixture that carries a real limit is what keeps the field on the wire.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("fetch"))
+        .expect("the fetch fixture");
+    let envelope = PchatEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(pchat_envelope::Body::Fetch(fetch)) = envelope.body else {
+        panic!("expected a fetch, got {:?}", envelope.body);
+    };
+    assert_eq!(fetch.channel, 4);
+    assert_eq!(fetch.page.map(|page| page.limit), Some(50));
 }
