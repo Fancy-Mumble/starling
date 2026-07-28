@@ -9,9 +9,10 @@
 //! group memberships, and a trait taking only ids would have to fetch them —
 //! which is how murmur's `ACLCache` ends up threaded through everything.
 
-mod bits;
-
-pub use bits::Perm;
+// The bits themselves are the wire contract and live with it, so a
+// service enforcing a permission can name one without depending on this
+// crate. Re-exported so `crate::perm::Perm` still resolves here.
+pub use starling_proto_fancy::perm::Perm;
 
 /// Evaluates what a subject may do.
 ///

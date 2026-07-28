@@ -7,6 +7,10 @@
 //! Comparison is constant-time: a signature check that leaks its progress
 //! through timing is a signature check an attacker can walk.
 
+// `new_from_slice` is qualified with `KeyInit` at the call below: it moved
+// there from `Mac` in hmac 0.13. HMAC still overrides it to accept a key of
+// any length, so this is a relocation, not a change to what a short secret
+// does.
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 use starling_runtime::serve::ServiceError;
@@ -18,7 +22,7 @@ pub type Signature = String;
 /// Sign a grant.
 #[must_use]
 pub fn sign(secret: &[u8], method: &str, key: &str, expires_at_ms: u64) -> Signature {
-    let Ok(mut mac) = <Hmac<Sha256> as hmac::Mac>::new_from_slice(secret) else {
+    let Ok(mut mac) = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret) else {
         return String::new();
     };
     mac.update(method.as_bytes());

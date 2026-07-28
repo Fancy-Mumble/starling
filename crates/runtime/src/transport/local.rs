@@ -1,14 +1,8 @@
-//! The three transports a service can be served over and dialled on.
+//! The connection wrapper every transport hands to tonic.
 //!
 //! tonic ships a TCP listener and nothing else, because everything else is a
-//! deployment question. Starling has three deployment answers — a TCP endpoint
-//! across hosts, a Unix socket when co-located, and an in-memory pipe under
-//! `--all-in-one` — so each needs the small amount of glue tonic asks for: a
-//! type implementing [`Connected`] on the server side, and a connector on the
-//! client side.
-//!
-//! Keeping them here means a service never mentions a transport, and
-//! `--all-in-one` is genuinely the same code rather than a second path.
+//! deployment question. Each transport therefore supplies the small amount of
+//! glue tonic asks for on the server side: a type implementing [`Connected`].
 
 use std::io;
 use std::pin::Pin;
@@ -16,6 +10,8 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tonic::transport::server::Connected;
+
+use super::{BoxedIo, Io};
 
 /// A byte stream tonic will accept as a server connection.
 ///
@@ -30,6 +26,20 @@ impl<T> LocalStream<T> {
     /// Wrap a stream so tonic will serve over it.
     pub const fn new(inner: T) -> Self {
         Self(inner)
+    }
+}
+
+impl<T: Io> LocalStream<T> {
+    /// Forget which transport produced this connection.
+    ///
+    /// tonic serves one stream type per call, so the transports have to agree
+    /// on one. Erasing here rather than making each transport's listener type
+    /// visible is what keeps [`super::Transport`] object-safe — and since the
+    /// wrapper is already pure delegation it costs one vtable hop per read,
+    /// and nothing per byte.
+    #[must_use]
+    pub fn erase(self) -> LocalStream<BoxedIo> {
+        LocalStream(Box::new(self.0))
     }
 }
 
@@ -98,5 +108,19 @@ mod tests {
         server.write_all(b"pong").await.expect("write back");
         let _ = client.read_exact(&mut buf).await.expect("read back");
         assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
+    async fn an_erased_stream_still_carries_bytes() {
+        // Erasure is what lets three transports share one serve call; if it
+        // broke, every transport would break at once and identically.
+        let (client, server) = tokio::io::duplex(IN_PROCESS_BUFFER);
+        let mut client = LocalStream::new(client);
+        let mut server = LocalStream::new(server).erase();
+
+        client.write_all(b"ping").await.expect("write");
+        let mut buf = [0_u8; 4];
+        let _ = server.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"ping");
     }
 }

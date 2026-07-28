@@ -59,6 +59,13 @@ burst = 20
 [gateway.limits.plugin]
 rate = "4/s"
 burst = 15
+# Tunnelled audio, for every client whose UDP is blocked. A client sending 10 ms
+# Opus frames emits a hundred a second, so the control bucket would cut it off
+# mid-sentence with silence as the only symptom. murmur does not limit this path
+# at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
+[gateway.limits.audio]
+rate = "200/s"
+burst = 400
 
 # A Fancy client that reconnects replays only the gap rather than pulling a
 # full flood of every ChannelState and UserState. Legacy clients cannot resume.
@@ -74,17 +81,50 @@ log_format = "text"          # json | text
 # metrics = "0.0.0.0:9090"
 # otlp_endpoint = "http://otel-collector:4317"
 
+# The operator event log: who connected, what was refused, what an
+# administrator changed. Distinct from [telemetry] above, which carries
+# developer diagnostics and is driven by RUST_LOG — this one is the record you
+# are entitled to keep, and it has its own level and destinations.
+#
+# Developer diagnostics are the other dial: RUST_LOG=debug shows per-connection
+# detail, RUST_LOG=trace adds every frame and every reply, and
+# RUST_LOG=starling_voice=trace narrows that to one service.
+[logging]
+level = "info"               # debug | info | notice | warning | error
+# Empty means every category. Named, it records only these:
+#   server | session | channel | message | permission | security | plugin | admin
+categories = []
+queue = 4096                 # records buffered before the writer drops and counts
+
+[logging.console]
+enabled = true               # to stderr
+
+# [logging.file]
+# path = "/var/log/starling/server.log"
+# max_bytes = 33554432       # rotate past this; 0 disables rotation
+# keep = 5                   # rotated generations to retain
+
+[logging.memory]
+enabled = true               # the ring the admin API reads
+records = 1000
+
 # -- Services ---------------------------------------------------------------
 #
 # Every block takes the same keys. `types` is the outer message type from
 # docs/PROTOCOL-COMPATIBILITY.md §3 — one number per service, because a
 # service's own message types live in its nested envelope and the gateway never
 # looks inside. Adding a service is three lines and no gateway release.
+#
+# The `unix:` endpoints below are the co-located deployment on a Unix host. On
+# Windows the equivalent is `pipe:` — a named pipe, whose ACL is the boundary
+# file permissions are here — and a `unix:` endpoint is refused at startup
+# rather than quietly served over something else. Running with no --config at
+# all picks the right one for the platform; see docs/CONFIGURATION.md.
 
 [services.session-lifecycle]
 endpoint = "unix:/run/starling/session-lifecycle.sock"
 tier = "essential"
-types = [0, 2, 3, 4, 5, 15, 21, 1000]
+types = [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
 
 [services.session-view]
 endpoint = "unix:/run/starling/session-view.sock"
@@ -104,7 +144,7 @@ types = [6, 7, 1002]
 [services.userdata]
 endpoint = "unix:/run/starling/userdata.sock"
 tier = "essential"
-types = [9, 14, 18, 22, 23, 1003]
+types = [14, 18, 23, 1003]
 
 [services.server-config]
 endpoint = "unix:/run/starling/server-config.sock"
@@ -116,6 +156,7 @@ endpoint = "unix:/run/starling/voice.sock"
 tier = "core"
 types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
 udp_listen = "0.0.0.0:64738" # voice's OWN socket — audio skips the gateway
+limits = "audio"             # never the 1/s control bucket: this is speech
 
 [services.text]
 endpoint = "unix:/run/starling/text.sock"

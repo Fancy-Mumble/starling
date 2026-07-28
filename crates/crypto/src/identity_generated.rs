@@ -1,6 +1,8 @@
 //! Generate a self-signed identity and persist it.
 
 use crate::identity::TlsIdentity;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -27,11 +29,22 @@ impl SelfSigned {
         }
     }
 
+    /// Write one generated file, refusing to replace anything already there.
+    ///
+    /// `create_new` rather than `fs::write`: [`load_or_generate`] establishes
+    /// that neither path exists before it gets here, but a check and a write are
+    /// two operations and the file that appears between them belongs to whoever
+    /// won the race. Truncating it would swap a live server's key underneath it
+    /// — the fingerprint change that check exists to prevent.
+    ///
+    /// [`load_or_generate`]: crate::identity::load_or_generate
     fn write(&self, path: &Path, contents: &str) -> Result<(), TlsError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).at(parent)?;
         }
-        std::fs::write(path, contents).at(path)
+        File::create_new(path)
+            .and_then(|mut file| file.write_all(contents.as_bytes()))
+            .at(path)
     }
 }
 
@@ -51,7 +64,8 @@ impl CertificateSource for SelfSigned {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
 
         self.write(&self.cert, &generated.cert.pem())?;
-        self.write(&self.key, &generated.key_pair.serialize_pem())?;
+        // `signing_key` in rcgen 0.14; `key_pair` before it.
+        self.write(&self.key, &generated.signing_key.serialize_pem())?;
 
         warn!(
             cert = %self.cert.display(),
@@ -61,7 +75,9 @@ impl CertificateSource for SelfSigned {
         Ok(TlsIdentity {
             certs: vec![CertificateDer::from(generated.cert)],
             // `serialize_der` emits PKCS#8, which is what rustls wants.
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der())),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                generated.signing_key.serialize_der(),
+            )),
         })
     }
 }

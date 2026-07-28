@@ -1,0 +1,285 @@
+# Starling deployment configuration for docker compose.
+#
+# The multi-process shape of docs/ARCHITECTURE.md: a gateway in front,
+# independent gRPC services behind it, and the media planes bypassing the
+# gateway entirely. This differs from starling.example.toml in exactly one
+# respect — endpoints are `http://<name>:50051` rather than Unix sockets,
+# because "co-located, and file permissions are the auth" stops being true the
+# moment each service is its own container.
+#
+# Every container mounts this same file and is told which service to be:
+#
+#   starling text --config /etc/starling/starling.toml
+#
+# so the routing table one service sees is the routing table all of them see.
+# A per-container file would let two of them disagree about where a third is.
+#
+# Unknown keys are rejected at startup rather than ignored, so a typo fails
+# loudly instead of silently leaving a limit at its default.
+
+[runtime]
+# False on purpose: this file is the twenty-one-container deployment. The
+# `all-in-one` compose profile passes `--all-in-one`, which overrides this at
+# the command line rather than needing a second file.
+all_in_one = false
+# A named volume, because the gateway generates its certificate here on first
+# boot and Mumble clients identify a server by certificate fingerprint — a
+# fresh pair on every restart is a security warning for every connected client.
+# The per-service SQLite files live here too, one per service.
+data_dir = "/var/lib/starling"
+
+[[virtual_servers]]
+id = 1
+name = "Starling"
+port = 64738
+
+# -- The gateway ------------------------------------------------------------
+
+[gateway]
+# 0.0.0.0 rather than the container's own name: this is the one listener
+# reached from outside the compose network, through a published port.
+listen_tcp = "0.0.0.0:64738"
+# Per client. Full means disconnect that client: dropping a control message
+# desyncs it permanently and silently, and unbounded queueing is a memory DoS.
+control_queue = 4096
+# Per client, for tunnelled audio. Full means drop the oldest and count it.
+audio_queue = 128
+default_deadline = "5s"
+# Deadlines alone fail slowly, so a service that keeps failing is shed at the
+# door instead of being waited on.
+breaker_failures = 5
+breaker_cooldown = "10s"
+
+[gateway.tls]
+# Omit both and a self-signed pair is generated in `data_dir` on first boot, as
+# murmur does. Mount your own and set these two to use a real certificate.
+# cert = "/etc/starling/tls/cert.pem"
+# key  = "/etc/starling/tls/key.pem"
+
+# Buckets are per route, never one shared. murmur's single 1 msg/s bucket
+# silently ate screen-share SDP offers; here a throttled message is reported.
+[gateway.limits.control]
+rate = "1/s"
+burst = 5
+[gateway.limits.signalling]
+rate = "10/s"
+burst = 20
+[gateway.limits.plugin]
+rate = "4/s"
+burst = 15
+# Tunnelled audio, for every client whose UDP is blocked. A client sending 10 ms
+# Opus frames emits a hundred a second, so the control bucket would cut it off
+# mid-sentence with silence as the only symptom. murmur does not limit this path
+# at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
+[gateway.limits.audio]
+rate = "200/s"
+burst = 400
+
+# A Fancy client that reconnects replays only the gap rather than pulling a
+# full flood of every ChannelState and UserState. Legacy clients cannot resume.
+[gateway.resume]
+enabled = true
+ring = 256
+ttl = "120s"
+
+# -- Observability ----------------------------------------------------------
+
+[telemetry]
+# `docker compose logs` is a terminal, not a log collector. Switch to "json"
+# when something downstream is parsing it.
+log_format = "text"
+# Neither key below binds a listener in this build — the runtime records that
+# OTLP is configured and keeps spans local, and nothing serves the metrics
+# registry over HTTP yet. Left commented so enabling them is a deliberate act
+# rather than a setting that appears to work.
+# metrics = "0.0.0.0:9090"
+# otlp_endpoint = "http://otel-collector:4317"
+
+# -- Services ---------------------------------------------------------------
+#
+# One block per container. `endpoint` is both where the service binds and where
+# every other service dials it — the runtime has one address per service, not a
+# bind/advertise pair — so the host part must be the compose service name.
+# Docker's embedded resolver answers a container's own network alias, so
+# binding `text:50051` inside the `text` container binds that container's own
+# address, and one line stays the single source of truth for both directions.
+#
+# If a deployment ever puts a container on several networks, that bind picks
+# one of them. The escape hatch is per-container and needs no change here:
+# give that one container STARLING_SERVICES_TEXT_ENDPOINT=http://0.0.0.0:50051,
+# which overrides only its own entry, only where it binds.
+#
+# `types` is the outer message type from docs/PROTOCOL-COMPATIBILITY.md §3 —
+# one number per service, because a service's own message types live in its
+# nested envelope and the gateway never looks inside.
+
+[services.session-lifecycle]
+endpoint = "http://session-lifecycle:50051"
+tier = "essential"
+types = [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
+
+[services.session-view]
+endpoint = "http://session-view:50051"
+tier = "essential"
+types = []                   # no client-facing type: internal by construction
+
+[services.permissions]
+endpoint = "http://permissions:50051"
+tier = "essential"
+types = [12, 13, 20, 1001]
+
+[services.metadata]
+endpoint = "http://metadata:50051"
+tier = "essential"
+types = [6, 7, 1002]
+
+[services.userdata]
+endpoint = "http://userdata:50051"
+tier = "essential"
+types = [14, 18, 23, 1003]
+
+[services.server-config]
+endpoint = "http://server-config:50051"
+tier = "essential"
+types = [24, 25, 1013]
+
+[services.voice]
+endpoint = "http://voice:50051"
+tier = "core"
+types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
+# Voice's OWN socket — audio skips the gateway. A legacy client sends UDP to
+# the host:port it made TCP to, which is why compose publishes this container's
+# UDP 64738 on the same host port the gateway publishes TCP 64738 on.
+udp_listen = "0.0.0.0:64738"
+limits = "audio" # never the 1/s control bucket: this is speech
+# Deliberately no `public_url`: setting it advertises an explicit voice
+# endpoint to Fancy clients, which only makes sense once voice is reachable
+# somewhere other than the gateway's address.
+
+[services.text]
+endpoint = "http://text:50051"
+tier = "core"
+types = [11, 1005]
+
+[services.pchat]
+endpoint = "http://pchat:50051"
+tier = "core"
+types = [1006]
+
+[services.moderation]
+endpoint = "http://moderation:50051"
+tier = "core"
+types = [8, 10, 1007]
+
+[services.screenshare]
+endpoint = "http://screenshare:50051"
+tier = "optional"
+types = [1008]
+limits = "signalling"        # not the 1/s control bucket
+
+[services.files]
+endpoint = "http://files:50051"
+tier = "optional"
+types = [1009]
+listen = "0.0.0.0:8080"      # its own HTTP listener, published by compose
+# What the signed URLs handed out over the control channel point at, which is
+# what a *client* must be able to reach — not what the container binds. Change
+# this to your public name the moment the stack is not on localhost.
+public_url = "http://localhost:8080"
+url_ttl = "15m"
+max_upload = "512MiB"
+
+[services.plugins]
+endpoint = "http://plugins:50051"
+tier = "optional"
+types = [26, 1010]
+limits = "plugin"
+
+[services.push]
+endpoint = "http://push:50051"
+tier = "optional"
+types = [1011]
+
+[services.audit]
+endpoint = "http://audit:50051"
+tier = "optional"
+types = [1012]
+
+[services.onboarding]
+endpoint = "http://onboarding:50051"
+tier = "optional"
+types = [1014]
+
+[services.social]
+endpoint = "http://social:50051"
+tier = "optional"
+types = [1015]
+
+[services.link-preview]
+endpoint = "http://link-preview:50051"
+tier = "optional"
+types = [1016]
+
+[services.context-actions]
+endpoint = "http://context-actions:50051"
+tier = "optional"
+types = [16, 17, 1017]
+
+# The one service with no `endpoint`, because nothing dials it — it dials the
+# public Mumble server list, hourly, and has no gRPC surface to reach. It does
+# nothing at all until `registry_name`, `registry_password` and `registry_url`
+# are set in `server-config`, which is where murmur keeps them too.
+[services.directory]
+tier = "optional"
+types = []
+
+[services.directory.options]
+# Where the public list's own certificate is verified. Debian's path, which is
+# what this image is; change it for an image that keeps its trust store
+# elsewhere. A missing bundle is a startup error for the announcement rather
+# than a silent unverified POST — the document carries a shared secret.
+trust_store = "/etc/ssl/certs/ca-certificates.crt"
+
+# -- Storage, per service ---------------------------------------------------
+#
+# Each service owns its own schema; no service reads another's tables. With no
+# block, a SQLite file under `data_dir` named after the service is used — which
+# is what every service above does, so twenty separate files in one volume.
+#
+# Point a service at a real database when it outgrows that:
+#
+# [services.pchat.storage]
+# url = "postgres://starling:@db/starling_pchat"
+# max_connections = 16
+
+# -- The admin plane --------------------------------------------------------
+#
+# The replacement for Ice: REST + OpenAPI, authentication is whatever you
+# already run, and every action is recorded before it happens. Off by default
+# and published only on loopback when on, because it wants the opposite
+# exposure to the gateway's. The `admin` compose profile starts it.
+#
+# Unlike every other block, this one needs BOTH `endpoint` and `listen`: the
+# runtime serves a (empty) gRPC surface at `endpoint` for every service that
+# does not opt out, and the REST API is a second listener on top.
+
+[services.operator-api]
+enabled = false
+endpoint = "http://operator-api:50051"
+listen = "0.0.0.0:8081"      # published as 127.0.0.1:8081 on the host only
+tier = "optional"
+types = []
+
+[services.operator-api.auth]
+mode = "token"               # oidc | jwt | mtls | token
+
+[services.operator-api.auth.token]
+# The variable's name, never the secret itself. Compose passes it through from
+# the host environment; there is no default, so an unset variable is an
+# unusable token rather than a known one.
+tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
+
+[services.operator-api.audit]
+path = "/var/lib/starling/operator-audit.log"
+# Cannot be recorded -> it does not happen.
+fail_closed = true

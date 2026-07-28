@@ -69,6 +69,26 @@ impl Logger {
         Self::spawn(Box::new(crate::log::sinks::NullSink), 1)
     }
 
+    /// The shared discard-everything logger.
+    ///
+    /// [`Self::disabled`] hands back a [`LoggerShutdown`] the caller must keep,
+    /// which is wrong for the two places that want a logger and have nowhere to
+    /// put one: a [`ServiceContext`](crate::serve::ServiceContext) built in a
+    /// test, and a unit started by something that never configured logging.
+    /// Dropping that handle would stop the writer and turn every later `log`
+    /// into a silent increment of the dropped counter — a logger that looks
+    /// alive and is not.
+    ///
+    /// So the pair is parked in a `LazyLock` and lives for the process: one
+    /// thread for the whole program however many contexts ask for it, and no
+    /// leak, because the `LazyLock` owns the shutdown rather than forgetting it.
+    #[must_use]
+    pub fn null() -> Self {
+        static NULL: std::sync::LazyLock<(Logger, LoggerShutdown)> =
+            std::sync::LazyLock::new(Logger::disabled);
+        NULL.0.clone()
+    }
+
     /// Queue a record. Never blocks; never fails.
     ///
     /// If the queue is full the record is dropped and counted — see

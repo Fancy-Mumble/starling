@@ -56,6 +56,7 @@ pub struct ClientHandle {
     audio_wake: Arc<Notify>,
     audio_capacity: usize,
     dropped_audio: Arc<AtomicU32>,
+    close: Arc<Notify>,
 }
 
 impl ClientHandle {
@@ -132,6 +133,25 @@ impl ClientHandle {
     pub async fn audio_ready(&self) {
         self.audio_wake.notified().await;
     }
+
+    /// Ask this connection to end.
+    ///
+    /// A service that kicks or bans somebody, and the handshake evicting a
+    /// ghost, both need the socket *closed* — forgetting the registry entry
+    /// leaves the client connected, still able to send, and still rendered by
+    /// everyone else because no service was ever told the session ended.
+    ///
+    /// `notify_one` rather than `notify_waiters`: it stores a permit when
+    /// nothing is waiting yet, so a close that races the read loop reaching its
+    /// `select!` still lands instead of being dropped on the floor.
+    pub fn close(&self) {
+        self.close.notify_one();
+    }
+
+    /// Resolves once [`Self::close`] has been called.
+    pub async fn closed(&self) {
+        self.close.notified().await;
+    }
 }
 
 /// Build a handle and the control receiver its writer task drains.
@@ -153,6 +173,7 @@ pub fn channel(
         audio_wake: Arc::new(Notify::new()),
         audio_capacity: audio_queue.max(1),
         dropped_audio: Arc::new(AtomicU32::new(0)),
+        close: Arc::new(Notify::new()),
     });
     (handle, rx)
 }

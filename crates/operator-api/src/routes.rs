@@ -10,14 +10,16 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use starling_proto_fancy::common::Scope;
+use starling_proto_fancy::common::{Actor, Operator, Scope, actor};
 use starling_proto_fancy::moderation::moderation_client::ModerationClient;
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
 use starling_proto_fancy::userdata::user_data_client::UserDataClient;
-use starling_proto_fancy::userdata::{Account, ListRequest, RegisterRequest};
+use starling_proto_fancy::userdata::{
+    Account, ListRequest, LookupRequest, RegisterRequest, UpdateRequest, lookup_request,
+};
 
 use crate::OperatorApi;
 use crate::audit::AuditRecord;
@@ -29,7 +31,12 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/v1/accounts", get(list_accounts).post(create_account))
-        .route("/v1/accounts/{id}", delete(delete_account))
+        // Setting the SuperUser password is `PUT /v1/accounts/0`: the
+        // administrator is an account, so it takes the account route.
+        .route(
+            "/v1/accounts/{id}",
+            put(update_account).delete(delete_account),
+        )
         .route("/v1/bans", get(list_bans))
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/whoami", post(whoami))
@@ -128,6 +135,41 @@ struct NewAccount {
     password: String,
 }
 
+/// A change to one account. Absent fields are left alone.
+///
+/// `Option` per field rather than `String`: "not mentioned" and "set to empty"
+/// are different requests, and collapsing them would make omitting a name a
+/// silent way to erase it.
+#[derive(Debug, Deserialize)]
+struct AccountUpdate {
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    /// Which virtual server the account belongs to. Defaults to the first.
+    #[serde(default)]
+    virtual_server: Option<u32>,
+}
+
+impl AccountUpdate {
+    /// The field names userdata should write, in the order they were declared.
+    fn fields(&self) -> Vec<String> {
+        let mut fields = Vec::new();
+        if self.password.is_some() {
+            fields.push("password".to_owned());
+        }
+        if self.name.is_some() {
+            fields.push("name".to_owned());
+        }
+        if self.email.is_some() {
+            fields.push("email".to_owned());
+        }
+        fields
+    }
+}
+
 async fn list_accounts(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
@@ -136,7 +178,6 @@ async fn list_accounts(
     let channel = api
         .resolver()
         .channel("userdata")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let page = UserDataClient::new(channel)
@@ -167,7 +208,6 @@ async fn create_account(
     let channel = api
         .resolver()
         .channel("userdata")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let account = UserDataClient::new(channel)
@@ -187,6 +227,106 @@ async fn create_account(
     Ok(Json(AccountJson::from(account.into_inner())))
 }
 
+/// Change named fields of one account.
+///
+/// Only the fields present in the body are written, which is what makes this a
+/// general edit rather than a whole-object replace: two operators changing
+/// different settings must not silently overwrite each other, and userdata
+/// enforces that with an explicit field list rather than by diffing.
+///
+/// **This is also how the SuperUser password is set** — the administrator is
+/// simply account `0`:
+///
+/// ```text
+/// PUT /v1/accounts/0  {"password":"…"}
+/// ```
+///
+/// There is deliberately no separate superuser route. One would be this endpoint
+/// with a hard-coded id, and it would drift: a change to how a password is
+/// written here would have to be remembered there.
+///
+/// The account has to exist. For the administrator it always does — userdata
+/// creates it on first boot — but a userdata database restored from before that
+/// has no way back in over HTTP, which is what `starling
+/// set-superuser-password` is for.
+async fn update_account(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+    Json(change): Json<AccountUpdate>,
+) -> Result<Json<AccountJson>, (StatusCode, Json<ApiError>)> {
+    let subject = admit(
+        &api,
+        &headers,
+        "userdata:write",
+        &format!("PUT /v1/accounts/{id}"),
+    )?;
+
+    // Absent means "leave it alone"; present-but-empty is a request to store an
+    // empty password, which would leave a login that any password opens. The two
+    // are different, so they are distinguished rather than both defaulted.
+    if change.password.as_deref().is_some_and(str::is_empty) {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "a password cannot be set to the empty string",
+        ));
+    }
+    let fields = change.fields();
+    if fields.is_empty() {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "no fields to change; send at least one of password, name, email",
+        ));
+    }
+
+    let scope = Some(Scope {
+        virtual_server: change.virtual_server.unwrap_or(1),
+    });
+    let channel = api
+        .resolver()
+        .channel("userdata")
+        .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
+    let mut userdata = UserDataClient::new(channel);
+
+    // Asked about before it is changed, so a missing id is a 404 rather than the
+    // 403 a refused change is. userdata reports both as `permission_denied`, and
+    // an operator cannot act on "denied" when the truth is "no such account".
+    let _ = userdata
+        .lookup(LookupRequest {
+            scope,
+            by: Some(lookup_request::By::Id(id)),
+        })
+        .await
+        .map_err(|_| refuse(StatusCode::NOT_FOUND, "no such account"))?;
+
+    let updated = userdata
+        .update(UpdateRequest {
+            scope,
+            // The operator identity is load-bearing: without it userdata demands
+            // the *current* password before changing a sensitive field, which is
+            // exactly what an operator resetting a lost credential does not have.
+            actor: Some(Actor {
+                who: Some(actor::Who::Operator(Operator {
+                    subject,
+                    scopes: vec!["userdata:write".to_owned()],
+                })),
+            }),
+            id,
+            fields,
+            values: Some(Account {
+                name: change.name.unwrap_or_default(),
+                email: change.email.unwrap_or_default(),
+                ..Account::default()
+            }),
+            password: change.password.unwrap_or_default(),
+            current_password: String::new(),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::FORBIDDEN, status.message()))?;
+
+    Ok(Json(AccountJson::from(updated.into_inner())))
+}
+
 async fn delete_account(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
@@ -201,7 +341,6 @@ async fn delete_account(
     let channel = api
         .resolver()
         .channel("userdata")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let _ = UserDataClient::new(channel)
@@ -223,7 +362,6 @@ async fn list_bans(
     let channel = api
         .resolver()
         .channel("moderation")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let bans = ModerationClient::new(channel)
@@ -256,7 +394,6 @@ async fn get_config(
     let channel = api
         .resolver()
         .channel("server-config")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let snapshot = ServerConfigClient::new(channel)
@@ -288,7 +425,6 @@ async fn set_config(
     let channel = api
         .resolver()
         .channel("server-config")
-        .await
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let mut snapshot = starling_proto_fancy::serverconfig::Snapshot {

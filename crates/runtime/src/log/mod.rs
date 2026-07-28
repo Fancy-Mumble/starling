@@ -52,3 +52,23 @@ pub use sink::{LogSink, SinkContext, SinkError};
 pub use sinks::{
     ConsoleSink, FanoutSink, FileSink, FilterSink, MemoryHandle, MemorySink, NullSink,
 };
+
+/// Render an [`Actor`](starling_proto_fancy::common::Actor) for a record.
+///
+/// "Who did this" is the first question asked of any administrative record, and
+/// the answer is a `oneof` that renders as `Some(Session(7))` if left to
+/// `Debug`. Every service that logs an action needs the same short form, so it
+/// lives here rather than being written slightly differently in each.
+///
+/// An absent actor is `"unknown"` rather than empty: a moderation record with a
+/// blank actor field reads like a bug in the log, not like a missing caller.
+#[must_use]
+pub fn describe_actor(actor: Option<&starling_proto_fancy::common::Actor>) -> String {
+    use starling_proto_fancy::common::actor::Who;
+    match actor.and_then(|actor| actor.who.as_ref()) {
+        Some(Who::Session(session)) => format!("session:{session}"),
+        Some(Who::Operator(operator)) => format!("operator:{}", operator.subject),
+        Some(Who::Internal(_)) => "internal".to_owned(),
+        None => "unknown".to_owned(),
+    }
+}

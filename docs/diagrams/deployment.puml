@@ -23,12 +23,24 @@ package "cluster" as K8S #F5F5F5 {
   node "**Ingress**\nHTTPS\n«the only one that fits»" as ing #C8E6C9
 
   node "**gateway** pods\nreplicas: N\nstateful per connection,\n**but resumable elsewhere**" as gwpod #FFE9D6
-  node "**session store**\nsequence + replay buffer\noutlives any gateway pod" as sstore #FFE0B2
+  node "**session store**\nsequence + replay buffer\nmeant to outlive any gateway pod\n**«not built»** — in-process today" as sstore #FFE0B2
   node "**voice** pods\nreplicas: N\nholds ciphers + membership cache" as vpod #FFF8E1
   node "**files/http** pods\nstateless" as fpod #E8F5E9
   node "**essential** pods\nsession · permissions\nmetadata · userdata" as epod #FFEBEE
   node "**optional** pods\npush · audit · polls · …" as opod #E8F5E9
+  node "**directory**\nsingleton per virtual server\nno inbound port at all" as dpod #EDE7F6
 }
+
+cloud "**publist.mumble.info**" as publist #EDE7F6
+dpod -[#4527A0]-> publist : hourly HTTPS
+note right of dpod #EDE7F6
+  **The one pod nothing connects to.** No `Service`, no
+  `Ingress`, no port — it only makes an outbound request, so
+  there is nothing to expose and nothing to load balance.
+  **replicas: 1**, and that is a correctness bound rather than a
+  capacity one: each replica announces on its own hourly timer,
+  so two of them are two registrations of the same server.
+end note
 
 legacy --> lbtcp
 fancy  --> lbtcp
@@ -109,10 +121,19 @@ end note
 
 note as COMPOSE #FFFFFF
   **docker compose** is the same picture with the load
-  balancers replaced by published ports, and voice
-  co-located with the gateway so legacy UDP lands right.
+  balancers replaced by published ports. `docker-compose.yml`
+  runs it: **twenty containers** from one image, started in
+  tier order, each differing only in its `command`.
+  voice does not need co-locating there — it publishes UDP
+  64738 while the gateway publishes TCP 64738, so a legacy
+  client still sees one host:port pair.
   **--all-in-one** collapses every pod into one container:
-  same binary, same TOML, gRPC replaced by in-process calls.
+  same binary, same TOML, one process.
+  **«not built»: it is not using in-process pipes.** A service
+  resolves its *own* endpoint through the broker, which cannot
+  know it before it has registered, so every service falls back
+  to the configured local socket. The mode works; the transport
+  underneath is a socket, not a pipe.
 end note
 
 @enduml

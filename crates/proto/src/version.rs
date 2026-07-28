@@ -88,6 +88,14 @@ impl Version {
     }
 }
 
+/// The Mumble version Starling implements.
+///
+/// One constant, because a server reports its version on two unrelated paths —
+/// the `Version` message at the top of the handshake, and the UDP ping a server
+/// browser sends before connecting at all — and the two disagreeing is a bug
+/// nothing fails on. Both paths encode *this*.
+pub const MUMBLE_VERSION: Version = Version::new(1, 6, 0);
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
@@ -111,6 +119,21 @@ mod tests {
             Version::decode_v2(0x0001_0006_0000_0000),
             Version::new(1, 6, 0)
         );
+    }
+
+    #[test]
+    fn the_announced_version_is_encoded_at_the_documented_offsets() {
+        // A v2 version written as a literal is off by sixteen bits if the patch
+        // shift is forgotten, and the result is a plausible-looking number that
+        // decodes to a completely different release: 0x0001_0006_0000 is 0.1.6,
+        // not 1.6.0. Nothing on either path fails on that — the handshake
+        // completes and the ping is answered — so it is asserted here.
+        assert_eq!(MUMBLE_VERSION.encode_v2(), 0x0001_0006_0000_0000);
+        assert_eq!(
+            Version::decode_v2(MUMBLE_VERSION.encode_v2()),
+            MUMBLE_VERSION
+        );
+        assert_eq!(MUMBLE_VERSION.to_string(), "1.6.0");
     }
 
     #[test]

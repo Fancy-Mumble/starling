@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::fancy::screenshare::{
     Answer, ScreenshareEnvelope, Start, Viewers, screenshare_envelope,
@@ -40,7 +39,6 @@ pub struct ScreenshareService {
     fanout: Fanout,
 }
 
-#[async_trait]
 impl ClientService for ScreenshareService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Screenshare.outer_type();
@@ -48,6 +46,15 @@ impl ClientService for ScreenshareService {
             return Actions::new();
         }
         let Ok(envelope) = ScreenshareEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable ScreenshareEnvelope"
+            );
             return Actions::new();
         };
 
@@ -92,11 +99,7 @@ impl ClientService for ScreenshareService {
                 if let Ok(mut shares) = self.shares.lock() {
                     let _ = shares.remove(&stop.share_id);
                 }
-                vec![broadcast_except(
-                    inbound.session,
-                    outer,
-                    inbound.payload.clone(),
-                )]
+                vec![broadcast_except(inbound.session, outer, inbound.payload)]
             }
             Some(screenshare_envelope::Body::Viewers(request)) => {
                 // Joining is implicit in asking: a client that wants the viewer
@@ -142,7 +145,6 @@ impl ClientService for ScreenshareService {
     }
 }
 
-#[async_trait]
 impl Serve for ScreenshareService {
     const NAME: &'static str = "screenshare";
 
@@ -162,7 +164,7 @@ impl Serve for ScreenshareService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 }

@@ -61,7 +61,7 @@ impl Default for GatewayConfig {
     }
 }
 
-/// murmur's single bucket, plus the two routes that must not share it.
+/// murmur's single bucket, plus the routes that must not share it.
 fn default_limits() -> BTreeMap<String, LimitConfig> {
     BTreeMap::from([
         (
@@ -69,6 +69,23 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
             LimitConfig {
                 rate: Rate::per_second(1.0),
                 burst: 5,
+            },
+        ),
+        // Tunnelled audio, which is the fallback path for every client whose
+        // UDP is blocked. Opus frames are 10 ms to 60 ms; a client sending the
+        // usual 10 ms frames emits a hundred a second, and the burst covers the
+        // jitter of a client that batches rather than paces them.
+        //
+        // Deliberately generous, because the cost of being wrong is asymmetric:
+        // too high wastes some bandwidth from one client, while too low cuts a
+        // person off mid-sentence with no error anywhere. Upstream does not
+        // rate-limit this path at all (`Server.cpp:1905`), so a bucket is
+        // already stricter than murmur.
+        (
+            "audio".to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(200.0),
+                burst: 400,
             },
         ),
         (
@@ -146,8 +163,26 @@ mod tests {
         // change behaviour they were built around.
         let limits = GatewayConfig::default().limits;
         let control = limits.get("control").copied().expect("control bucket");
-        assert_eq!(control.rate.as_per_second(), 1.0);
+        assert!(
+            (control.rate.as_per_second() - 1.0).abs() < f64::EPSILON,
+            "the default control bucket is murmur's 1 msg/s"
+        );
         assert_eq!(control.burst, 5);
+    }
+
+    #[test]
+    fn audio_is_not_charged_to_the_control_bucket() {
+        // The bug this exists for: tunnelled audio was routed to `control`,
+        // which is murmur's 1 message per second. A client talking over TCP —
+        // everyone behind a UDP-blocking firewall — was throttled off the air
+        // after its first five frames, and the only symptom was silence.
+        let limits = GatewayConfig::default().limits;
+        let audio = limits.get("audio").copied().expect("audio bucket");
+        assert!(
+            audio.rate.as_per_second() >= 100.0,
+            "a client sending 10 ms Opus frames emits a hundred a second"
+        );
+        assert!(audio.burst >= 100);
     }
 
     #[test]

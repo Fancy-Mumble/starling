@@ -3,6 +3,7 @@ name = "starling"
 description = "One image, one entrypoint: a service name, or --all-in-one"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -36,17 +37,24 @@ starling-onboarding.workspace = true
 starling-social.workspace = true
 starling-link-preview.workspace = true
 starling-context-actions.workspace = true
+starling-directory.workspace = true
 
 tokio.workspace = true
 tracing.workspace = true
+# Not just for tests: `migrate-config` reports the keys it could not place
+# through `tracing`, and without a subscriber installed that report is
+# discarded rather than printed.
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 starling-proto.workspace = true
+# The client half of the voice cipher, so the audio test puts a genuinely
+# sealed datagram on the wire rather than one the server would never accept.
+starling-crypto.workspace = true
 bytes.workspace = true
 prost.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -8,7 +8,10 @@
 //! the kind of bug that survives review precisely because the fast version
 //! looks correct.
 
-use hmac::{Hmac, Mac};
+// `KeyInit` carries `new_from_slice` from hmac 0.13 on; `Mac` still carries
+// `update`/`finalize`. HMAC keeps its own variable-length key handling, so
+// nothing about how these keys are accepted has changed.
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
@@ -104,11 +107,11 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap_or_else(|_| {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).unwrap_or_else(|_| {
         // `new_from_slice` only fails for key lengths HMAC cannot take, and
         // HMAC-SHA256 accepts every length. The fallback keeps the `unwrap_used`
         // rule without inventing an error path nobody can hit.
-        <Hmac<Sha256> as Mac>::new_from_slice(&[0_u8; 32]).unwrap_or_else(|_| unreachable_mac())
+        <Hmac<Sha256> as KeyInit>::new_from_slice(&[0_u8; 32]).unwrap_or_else(|_| unreachable_mac())
     });
     mac.update(data);
     mac.finalize().into_bytes().into()
@@ -136,7 +139,7 @@ pub fn verify_totp(secret: &[u8], code: &str, unix_seconds: u64) -> bool {
 }
 
 fn totp(secret: &[u8], counter: u64) -> u32 {
-    let Ok(mut mac) = <Hmac<Sha1> as Mac>::new_from_slice(secret) else {
+    let Ok(mut mac) = <Hmac<Sha1> as KeyInit>::new_from_slice(secret) else {
         return u32::MAX;
     };
     mac.update(&counter.to_be_bytes());

@@ -13,11 +13,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::BytesMut;
+use starling_crypto::peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 use starling_proto::codec;
 use starling_proto_fancy::control::{ClientEvent, Frame, Opened, client_event};
 use starling_runtime::config::Config;
 use starling_runtime::health::Health;
 use starling_runtime::ids::now_ms;
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::metrics::Metrics;
 use starling_runtime::shutdown::Shutdown;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -63,6 +65,7 @@ pub struct Gateway {
     resume: ResumeStore,
     metrics: Metrics,
     health: Health,
+    logger: Logger,
     next_conn: AtomicU64,
     gateway_id: String,
 }
@@ -79,6 +82,7 @@ impl Gateway {
         config: Arc<Config>,
         metrics: Metrics,
         health: Health,
+        logger: Logger,
     ) -> Result<Self, GatewayError> {
         let router = Router::from_config(&config);
         if router.is_empty() {
@@ -92,6 +96,7 @@ impl Gateway {
             resume,
             metrics,
             health,
+            logger,
             next_conn: AtomicU64::new(1),
             gateway_id: format!("gw-{}", std::process::id()),
             config,
@@ -146,14 +151,30 @@ impl Gateway {
                 address: address.clone(),
                 source,
             })?;
-        tracing::info!(%address, routes = self.router.len(), "gateway listening");
+        self.logger.log(
+            LogEvent::info(Category::Server, "gateway listening")
+                .with("address", address.clone())
+                .with("routes", self.router.len())
+                .with("gateway", self.gateway_id.clone()),
+        );
         self.health.ready("listener");
 
         loop {
             tokio::select! {
                 _ = shutdown.wait() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { continue };
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            // Running out of descriptors arrives here, and it
+                            // looks exactly like an idle server otherwise.
+                            self.logger.log(
+                                LogEvent::warning(Category::Server, "accept failed")
+                                    .with("error", error.to_string()),
+                            );
+                            continue;
+                        }
+                    };
                     let gateway = Arc::clone(&self);
                     let acceptor = acceptor.clone();
                     drop(tokio::spawn(async move {
@@ -165,7 +186,10 @@ impl Gateway {
             }
         }
 
-        tracing::info!("gateway draining");
+        self.logger.log(
+            LogEvent::info(Category::Server, "gateway draining")
+                .with("connections", self.registry.len()),
+        );
         Ok(())
     }
 
@@ -201,10 +225,53 @@ impl Gateway {
         // (`ring`), so a second install would only ever be this same one.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
+        // Ask for a client certificate. `with_no_client_auth()` was here, and
+        // it does not merely skip validation — it means the server never sends
+        // a `CertificateRequest`, so no client ever offers one and every peer
+        // arrives with an empty hash. Certificate identity is how Mumble binds
+        // a registered account, admits a user without a password and enforces a
+        // certificate ban; all three were unreachable, silently, because the
+        // question was never asked.
+        //
+        // The verifier accepts any issuer, which is the correct policy for
+        // Mumble's self-signed clients rather than a relaxation — see
+        // `starling_crypto::peer_cert`. Possession of the private key is still
+        // proved during the handshake.
+        let provider = rustls::crypto::CryptoProvider::get_default().map_or_else(
+            || Arc::new(rustls::crypto::ring::default_provider()),
+            Arc::clone,
+        );
         let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(AcceptAnyClientCertificate::new(provider))
             .with_single_cert(identity.certs, identity.key)?;
         Ok(TlsAcceptor::from(Arc::new(config)))
+    }
+
+    /// Note a new connection, in both logs.
+    ///
+    /// Split out of [`Self::serve_client`] because it is the one part of
+    /// accepting a client that is purely a record: no state changes here, and
+    /// the loop below reads better without twenty lines of field-building in
+    /// the middle of it.
+    fn record_connected(
+        &self,
+        conn: u64,
+        peer: std::net::SocketAddr,
+        certificate: Option<&PeerCertificate>,
+    ) {
+        let mut connected = LogEvent::info(Category::Session, "client connected")
+            .with("conn", conn)
+            .with("peer", peer.to_string())
+            .with("connections", self.registry.len());
+        // Only when there is one. A blank field on every guest trains an
+        // operator to stop reading it, and the hash is the thing a ban or a
+        // registration is keyed by — it is worth seeing when present.
+        if let Some(certificate) = certificate {
+            connected = connected
+                .with("certificate", certificate.hex())
+                .with("strong_cert", certificate.strong);
+        }
+        self.logger.log(connected);
     }
 
     /// One client, from TLS handshake to disconnect.
@@ -214,7 +281,31 @@ impl Gateway {
         acceptor: TlsAcceptor,
         peer: std::net::SocketAddr,
     ) -> Result<(), std::io::Error> {
-        let tls = acceptor.accept(stream).await?;
+        let tls = match acceptor.accept(stream).await {
+            Ok(tls) => tls,
+            Err(error) => {
+                // A failed TLS handshake is the single most common "the client
+                // cannot connect and the server says nothing" report: an expired
+                // certificate, a client pinned to TLS 1.0, a plaintext probe.
+                tracing::debug!(%peer, %error, "tls handshake failed");
+                self.logger.log(
+                    LogEvent::notice(Category::Security, "tls handshake failed")
+                        .with("peer", peer.to_string())
+                        .with("error", error.to_string()),
+                );
+                self.metrics.counter("starling_gateway_tls_failures").inc();
+                return Err(error);
+            }
+        };
+        // Read before the stream is split: the chain lives on the rustls
+        // connection, and after `tokio::io::split` there is no handle left that
+        // can be asked for it.
+        let peer_cert = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(PeerCertificate::from_chain);
+
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let token = format!("{}-{conn}", self.gateway_id);
 
@@ -227,11 +318,22 @@ impl Gateway {
         self.registry.insert(Arc::clone(&handle));
         self.metrics.counter("starling_gateway_connections").inc();
 
+        self.record_connected(conn, peer, peer_cert.as_ref());
+
         self.attachments.broadcast_opened(&Opened {
             conn,
             peer_addr: peer.to_string(),
-            cert_hash: Vec::new(),
-            strong_cert: false,
+            cert_hash: peer_cert
+                .as_ref()
+                .map(|certificate| certificate.hash.clone())
+                .unwrap_or_default(),
+            strong_cert: peer_cert
+                .as_ref()
+                .is_some_and(|certificate| certificate.strong),
+            certificates: peer_cert
+                .as_ref()
+                .map(|certificate| certificate.chain.clone())
+                .unwrap_or_default(),
             virtual_server: self.virtual_server(),
         });
 
@@ -263,7 +365,28 @@ impl Gateway {
         let mut scratch = vec![0_u8; 8 * 1024];
 
         let reason = loop {
-            let read = reader.read(&mut scratch).await?;
+            let read = tokio::select! {
+                // A service asked for this client to go — a kick, a ban, or the
+                // handshake evicting a ghost. Without this the read loop sits
+                // here until the peer happens to say something, so a kicked
+                // client stays connected and keeps talking.
+                () = handle.closed() => break "disconnected by the server",
+                read = reader.read(&mut scratch) => match read {
+                    Ok(read) => read,
+                    // This used to be `?`, which returned before `finish` ran —
+                    // and an I/O error is how *most* disconnects actually
+                    // arrive: a client that crashed, a network that dropped, a
+                    // reset. The clean `close_notify` below is the rare one.
+                    // Skipping `finish` left the connection in the registry,
+                    // never told the services the session was gone, and so left
+                    // every other client rendering a user who is no longer
+                    // there.
+                    Err(error) => {
+                        tracing::debug!(conn, %error, "connection ended abruptly");
+                        break "connection reset";
+                    }
+                },
+            };
             if read == 0 {
                 break "peer closed";
             }
@@ -314,6 +437,11 @@ impl Gateway {
         let Some(route) = self.router.route(frame.type_id) else {
             // An unroutable type is dropped rather than fatal: a stale client
             // sending a burned type must not lose its session over it.
+            tracing::debug!(
+                conn = handle.conn,
+                type_id = frame.type_id,
+                "unroutable frame dropped"
+            );
             self.metrics
                 .counter("starling_gateway_unroutable_frames")
                 .inc();
@@ -323,6 +451,13 @@ impl Gateway {
         match limiter.check(&route.bucket, now_ms()) {
             Verdict::Allow => {}
             Verdict::Throttle { retry_after_ms } => {
+                tracing::debug!(
+                    conn = handle.conn,
+                    session = handle.session(),
+                    bucket = %route.bucket,
+                    retry_after_ms,
+                    "throttled"
+                );
                 self.metrics.counter("starling_gateway_throttled").inc();
                 self.notify_throttled(handle, frame.type_id, &route.bucket, retry_after_ms);
                 return true;
@@ -330,11 +465,24 @@ impl Gateway {
         }
 
         let Some(link) = self.attachments.get(&route.service) else {
+            // Nothing is attached for this service, so the client's frame goes
+            // nowhere and it will simply never be answered.
+            tracing::warn!(
+                conn = handle.conn,
+                service = %route.service,
+                type_id = frame.type_id,
+                "no attachment for the routed service; frame dropped"
+            );
             return true;
         };
         if !link.healthy() && route.tier.sheddable() {
             // Shed at the door rather than making the client wait a deadline
             // for the same answer.
+            tracing::debug!(
+                conn = handle.conn,
+                service = %route.service,
+                "shed: the service is unhealthy"
+            );
             self.metrics.counter("starling_gateway_shed").inc();
             return true;
         }
@@ -379,9 +527,27 @@ impl Gateway {
 
     fn finish(&self, conn: u64, reason: &str, writer: &tokio::task::JoinHandle<()>) {
         writer.abort();
+        // Read before the removal: afterwards there is no handle to ask, and
+        // the session is the only id the rest of the log is keyed by.
+        let handle = self.registry.by_conn(conn);
+        let session = handle.as_ref().map_or(0, |h| h.session());
+        let dropped_audio = handle.as_ref().map_or(0, |h| h.dropped_audio());
+
         self.registry.remove(conn);
         self.attachments.broadcast_closed(conn, reason);
         self.metrics.counter("starling_gateway_disconnects").inc();
+
+        let mut event = LogEvent::info(Category::Session, "client disconnected")
+            .with("conn", conn)
+            .with("session", session)
+            .with("reason", reason.to_owned())
+            .with("connections", self.registry.len());
+        // Only when it happened: a zero on every disconnect trains an operator
+        // to stop reading the field.
+        if dropped_audio > 0 {
+            event = event.with("dropped_audio", dropped_audio);
+        }
+        self.logger.log(event);
     }
 
     /// Who is connected, for the admin surface and tests.
@@ -402,7 +568,7 @@ mod tests {
         // is the hardest failure to attribute.
         let mut config = Config::with_defaults(Path::new("/run/starling"));
         config.services.clear();
-        let err = Gateway::new(Arc::new(config), Metrics::new(), Health::new())
+        let err = Gateway::new(Arc::new(config), Metrics::new(), Health::new(), Logger::null())
             .expect_err("an empty table must be refused");
         assert!(matches!(err, GatewayError::NoRoutes));
     }
@@ -410,7 +576,7 @@ mod tests {
     #[test]
     fn a_gateway_over_the_shipped_defaults_routes_every_service() {
         let config = Config::with_defaults(Path::new("/run/starling"));
-        let gateway = Gateway::new(Arc::new(config), Metrics::new(), Health::new())
+        let gateway = Gateway::new(Arc::new(config), Metrics::new(), Health::new(), Logger::null())
             .expect("the defaults must be servable");
         assert!(gateway.router.route(11).is_some());
         assert_eq!(gateway.router.services().len(), 18);

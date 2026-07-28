@@ -19,7 +19,7 @@
 //! without inventing a construction that needs its own analysis.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
@@ -114,10 +114,16 @@ impl VoiceSession {
         hkdf.expand(direction.label(), &mut directional)
             .unwrap_or_else(|_| unreachable!("32 bytes is within HKDF's output limit"));
 
-        let subkey = chacha20::hchacha::<chacha20::cipher::consts::U10>(
-            Key::from_slice(&directional),
-            salt.into(),
-        );
+        // `R20` and not `R12`/`R8`: it is the 20-round ChaCha the AEAD below
+        // uses, and it is the same round count the previous `U10` asked for —
+        // that spelled ten *double* rounds, which `Rounds::COUNT` still records
+        // as 10 for `R20`. Naming the variant after the rounds rather than the
+        // doublings is the whole of the change; picking a neighbour here would
+        // weaken the cipher without failing anything.
+        // `(&…).into()` rather than the deprecated `Key::from_slice`: both
+        // arrays are fixed at 32 bytes by their types, so the conversion
+        // cannot fail and needs no unwrap to say so.
+        let subkey = chacha20::hchacha::<chacha20::R20>((&directional).into(), salt.into());
         directional.zeroize();
 
         let cipher = ChaCha20Poly1305::new(&subkey);
@@ -172,8 +178,14 @@ impl VoiceSession {
         if packet.len() < MIN_PACKET_LEN {
             return Err(VoiceError::Truncated { len: packet.len() });
         }
-        let (header, body) = packet.split_at(WIRE_COUNTER_BYTES);
-        let truncated = u16::from_be_bytes([header[0], header[1]]);
+        // The length check above is the real bound — a packet also needs a tag,
+        // not just a counter — but reading the counter through
+        // `split_first_chunk` keeps that read correct on its own terms rather
+        // than resting on a check five lines away.
+        let Some((header, body)) = packet.split_first_chunk::<WIRE_COUNTER_BYTES>() else {
+            return Err(VoiceError::Truncated { len: packet.len() });
+        };
+        let truncated = u16::from_be_bytes(*header);
 
         // Reconstruct without recording: an unauthenticated packet must not be
         // able to move the window, or an attacker could jump it forward with a
@@ -393,7 +405,7 @@ mod tests {
         let mut nonce = [0_u8; 24];
         nonce[..SALT_LEN].copy_from_slice(&SALT);
 
-        let opened = XChaCha20Poly1305::new(Key::from_slice(&directional))
+        let opened = XChaCha20Poly1305::new((&directional).into())
             .decrypt(
                 (&nonce).into(),
                 Payload {

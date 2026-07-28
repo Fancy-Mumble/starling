@@ -9,10 +9,10 @@
 //! writes is [`Serve::build`], its gRPC routes, and optionally a background
 //! task.
 
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tonic::service::Routes;
 
 use crate::channel::Resolver;
@@ -20,6 +20,7 @@ use crate::config::{Config, ConfigError, ServiceConfig};
 use crate::health::Health;
 use crate::inproc::Broker;
 use crate::listen::{ListenError, serve_routes};
+use crate::log::{Category, LogEvent, Logger};
 use crate::metrics::Metrics;
 use crate::shutdown::Shutdown;
 use crate::storage::{Store, StoreError};
@@ -38,6 +39,13 @@ pub struct ServiceContext {
     pub health: Health,
     /// Counters. Everything lost is counted.
     pub metrics: Metrics,
+    /// The operator event log.
+    ///
+    /// Every service holds the same one: the writer is process-wide, and a
+    /// clone is only a channel handle. Use it for what an operator would want
+    /// to read months later — a login, a refusal, a ban — and `tracing` for
+    /// what a developer wants while reproducing a bug.
+    pub logger: Logger,
     /// Drain.
     pub shutdown: Shutdown,
     /// The in-process switchboard, used only under `--all-in-one`.
@@ -84,14 +92,38 @@ impl ServiceContext {
     }
 
     fn default_storage_url(&self) -> String {
-        let dir: PathBuf = self.config.runtime.data_dir.clone();
-        let _ = std::fs::create_dir_all(&dir);
-        format!("sqlite://{}/{}.db?mode=rwc", dir.display(), self.name)
+        let dir: &Path = &self.config.runtime.data_dir;
+        let _ = std::fs::create_dir_all(dir);
+        sqlite_url(dir, &self.name)
     }
 }
 
+/// The URL for `service`'s own database file under `dir`.
+///
+/// `sqlite:` and not `sqlite://`. Those two slashes introduce a URL *authority*,
+/// so everything up to the next separator is parsed as a host — which for
+/// `C:\srv\starling` means the drive letter becomes the host and the database is
+/// looked for at the filesystem root, reported as nothing more than "unable to
+/// open database file". Unix hides the mistake completely, because a data
+/// directory there starts with `/` and leaves the authority empty.
+///
+/// With no authority the whole remainder is the filename, which is also what
+/// lets the spaces and brackets a real data directory contains survive without
+/// percent-encoding a path by hand.
+fn sqlite_url(dir: &Path, service: &str) -> String {
+    format!(
+        "sqlite:{}?mode=rwc",
+        dir.join(format!("{service}.db")).display()
+    )
+}
+
 /// What a service implements to be servable.
-#[async_trait]
+///
+/// The async methods are written as `-> impl Future<..> + Send` rather than as
+/// `async fn`. The trait is `Sized`, so nothing here needs boxing, but `run`
+/// below is spawned over a generic `S: Serve` and a plain `async fn` in a trait
+/// gives no way to require its future is `Send` — return-type notation is still
+/// unstable. Implementations may, and do, write `async fn` regardless.
 pub trait Serve: Send + Sync + Sized + 'static {
     /// The configuration key and log name.
     const NAME: &'static str;
@@ -107,7 +139,7 @@ pub trait Serve: Send + Sync + Sized + 'static {
     ///
     /// Anything that can fail an operator's configuration belongs here, so a
     /// misconfigured service fails at startup rather than on the first request.
-    async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError>;
+    fn build(ctx: ServiceContext) -> impl Future<Output = Result<Arc<Self>, ServiceError>> + Send;
 
     /// The gRPC surface. A service may register several servers.
     fn routes(self: Arc<Self>) -> Routes;
@@ -115,9 +147,12 @@ pub trait Serve: Send + Sync + Sized + 'static {
     /// Background work: sockets this service owns, sweeps, subscriptions.
     ///
     /// Returning is a shutdown, not an error. The default does nothing.
-    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+    fn run(
+        self: Arc<Self>,
+        ctx: ServiceContext,
+    ) -> impl Future<Output = Result<(), ServiceError>> + Send {
         let _ = ctx;
-        Ok(())
+        async { Ok(()) }
     }
 }
 
@@ -153,18 +188,24 @@ impl ServiceError {
 }
 
 /// Build a context for `name` from `config`.
+///
+/// `logger` is a parameter rather than something defaulted here because a
+/// service that logs nowhere looks exactly like a service where nothing is
+/// happening. A caller with no log to give says so with [`Logger::null`].
 #[must_use]
 pub fn context(
     name: &str,
     config: Arc<Config>,
     broker: Broker,
     shutdown: Shutdown,
+    logger: Logger,
 ) -> ServiceContext {
     ServiceContext {
         name: name.to_owned(),
         resolver: Resolver::new(Arc::clone(&config), broker.clone()),
         health: Health::new(),
         metrics: Metrics::new(),
+        logger,
         shutdown,
         broker,
         config,
@@ -179,7 +220,21 @@ pub fn context(
 /// failing is logged and ends that task; it does not take the process down,
 /// because a service whose sweep failed is still worth answering queries.
 pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
-    let service = S::build(ctx.clone()).await?;
+    let service = match S::build(ctx.clone()).await {
+        Ok(service) => service,
+        Err(error) => {
+            // A service that cannot be built is the operator's problem, not the
+            // developer's: it means the configuration it was handed is wrong.
+            ctx.logger.log(
+                LogEvent::error(Category::Server, "service failed to start")
+                    .with("service", ctx.name.clone())
+                    .with("error", error.to_string()),
+            );
+            return Err(error);
+        }
+    };
+    ctx.logger
+        .log(LogEvent::info(Category::Server, "service started").with("service", ctx.name.clone()));
 
     let background = {
         let service = Arc::clone(&service);
@@ -187,7 +242,11 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         tokio::spawn(async move {
             let result = service.run(ctx.clone()).await;
             if let Err(error) = &result {
-                tracing::error!(service = %ctx.name, %error, "background task stopped");
+                ctx.logger.log(
+                    LogEvent::error(Category::Server, "background task stopped")
+                        .with("service", ctx.name.clone())
+                        .with("error", error.to_string()),
+                );
             }
             result
         })
@@ -205,10 +264,10 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         };
     }
 
-    let endpoint = ctx.resolver.endpoint(&ctx.name)?;
+    let transport = ctx.resolver.transport(&ctx.name)?;
     let result = serve_routes(
         &ctx.name,
-        &endpoint,
+        transport.as_ref(),
         &ctx.broker,
         service.routes(),
         ctx.shutdown.clone(),
@@ -216,6 +275,8 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     .await;
 
     background.abort();
+    ctx.logger
+        .log(LogEvent::info(Category::Server, "service stopped").with("service", ctx.name.clone()));
     result.map_err(ServiceError::from)
 }
 
@@ -228,13 +289,21 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
 pub fn serve<S: Serve>() -> Result<(), ServiceError> {
     let config = load_config()?;
     telemetry::install(&config.telemetry);
+    let log = crate::log::LogRuntime::start_from(&config.logging);
+    let logger = log.logger().clone();
+
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let shutdown = Shutdown::new();
         shutdown.install_signal_handler();
-        let ctx = context(S::NAME, Arc::new(config), Broker::new(), shutdown);
+        let ctx = context(S::NAME, Arc::new(config), Broker::new(), shutdown, logger);
         run::<S>(ctx).await
-    })
+    });
+
+    // After the runtime is done, so records written on the way out are not lost
+    // to a writer that stopped first.
+    log.finish();
+    result
 }
 
 /// Start one service inside a process that is already running others.
@@ -244,9 +313,18 @@ pub fn serve<S: Serve>() -> Result<(), ServiceError> {
 pub fn spawn<S: Serve>(ctx: ServiceContext) -> tokio::task::JoinHandle<Result<(), ServiceError>> {
     tokio::spawn(async move {
         let name = ctx.name.clone();
+        let logger = ctx.logger.clone();
         let result = run::<S>(ctx).await;
         if let Err(error) = &result {
-            tracing::error!(service = %name, %error, "service stopped");
+            // Distinct from the "service stopped" `run` records on the way out:
+            // that one is a service draining normally, this is one that failed.
+            // Same words, opposite meanings — which is why they need different
+            // severities rather than one shared line.
+            logger.log(
+                LogEvent::error(Category::Server, "service failed")
+                    .with("service", name)
+                    .with("error", error.to_string()),
+            );
         }
         result
     })
@@ -259,10 +337,10 @@ fn load_config() -> Result<Config, ConfigError> {
         if arg == "--config"
             && let Some(path) = args.next()
         {
-            return Config::load(std::path::Path::new(&path));
+            return Config::load(Path::new(&path));
         }
     }
-    let mut config = Config::with_defaults(std::path::Path::new("/run/starling"));
+    let mut config = Config::with_defaults(Path::new("/run/starling"));
     crate::config::apply_environment(&mut config, &std::env::vars().collect::<Vec<_>>())?;
     Ok(config)
 }
@@ -274,7 +352,13 @@ mod tests {
 
     fn ctx(name: &str) -> ServiceContext {
         let config = Config::with_defaults(Path::new("/run/starling"));
-        context(name, Arc::new(config), Broker::new(), Shutdown::new())
+        context(
+            name,
+            Arc::new(config),
+            Broker::new(),
+            Shutdown::new(),
+            Logger::null(),
+        )
     }
 
     #[test]
@@ -295,9 +379,34 @@ mod tests {
     fn the_default_database_is_per_service_not_shared() {
         // No service reads another's tables, and one file would invite it.
         assert_ne!(
-            ctx("pchat").default_storage_url(),
-            ctx("audit").default_storage_url()
+            sqlite_url(Path::new("/var/lib/starling"), "pchat"),
+            sqlite_url(Path::new("/var/lib/starling"), "audit")
         );
-        assert!(ctx("pchat").default_storage_url().contains("pchat"));
+        assert!(
+            sqlite_url(Path::new("/var/lib/starling"), "pchat").contains("pchat"),
+            "a service's database has to be findable by its name"
+        );
+    }
+
+    #[test]
+    fn a_data_directory_is_never_parsed_as_a_url_authority() {
+        // `sqlite://C:\srv\…` reads the drive letter as the host and then opens
+        // nothing. Unix cannot reproduce it — a data directory there starts with
+        // `/`, which leaves the authority empty — so this assertion is the only
+        // thing standing between the shipped default and a Windows server whose
+        // every persisting service dies at startup.
+        for dir in [
+            r"C:\srv\starling data",
+            "/var/lib/starling",
+            "starling-data",
+        ] {
+            let url = sqlite_url(Path::new(dir), "text");
+            assert!(
+                !url.starts_with("sqlite://"),
+                "{url} puts {dir} in the authority"
+            );
+            assert!(url.starts_with("sqlite:"), "{url} lost its scheme");
+            assert!(url.contains(dir), "{url} lost the directory it was given");
+        }
     }
 }

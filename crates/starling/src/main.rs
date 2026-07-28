@@ -14,19 +14,36 @@
 //! ```
 
 mod compose;
+mod superuser;
 mod units;
 
 #[cfg(test)]
 mod e2e;
 
+use std::io::{self, Write as _};
 use std::process::ExitCode;
+
+/// Write `text` to stdout, reporting a failed write instead of dying on it.
+///
+/// The `print!` family panics when stdout is gone, and `starling --help | head`
+/// is enough to make that happen: `head` exits, the pipe closes, and a usage
+/// message turns into a panic and a non-zero exit. Writing through the handle
+/// makes a broken pipe the ordinary error it is.
+pub(crate) fn out(text: &str) -> Result<(), String> {
+    io::stdout()
+        .lock()
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("writing to stdout: {error}"))
+}
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match run(&arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("starling: {message}");
+            // Ignored rather than reported: this *is* the reporting path, and
+            // there is nowhere left to report a stderr that will not take it.
+            let _ = writeln!(io::stderr().lock(), "starling: {message}");
             ExitCode::FAILURE
         }
     }
@@ -36,28 +53,30 @@ fn main() -> ExitCode {
 fn run(arguments: &[String]) -> Result<(), String> {
     let first = arguments.first().map(String::as_str);
     match first {
-        None | Some("--help" | "-h") => {
-            println!("{}", usage());
-            Ok(())
-        }
-        Some("--version" | "-V") => {
-            println!("starling {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        None | Some("--help" | "-h") => out(&format!("{}\n", usage())),
+        Some("--version" | "-V") => out(&format!("starling {}\n", env!("CARGO_PKG_VERSION"))),
         Some("migrate-config") => {
             let path = arguments
                 .get(1)
                 .ok_or("migrate-config needs a path to a mumble-server.ini")?;
             let contents =
                 std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
-            // Every key murmur honours that has no home yet is reported on
-            // stderr rather than dropped, so a migration is reviewable.
+            // Every key murmur honours that has no home yet is reported rather
+            // than dropped, so a migration is reviewable. `migrate` reports them
+            // through `tracing`, which goes nowhere at all unless a subscriber
+            // is installed first — so one is, on stderr, leaving stdout to carry
+            // the TOML alone for `starling migrate-config x.ini > starling.toml`.
+            let _ = tracing_subscriber::fmt()
+                .with_writer(io::stderr)
+                .without_time()
+                .with_target(false)
+                .try_init();
             let toml = starling_migrate::Ini::parse(&contents)
                 .migrate()
                 .map_err(|error| error.to_string())?;
-            print!("{toml}");
-            Ok(())
+            out(&toml)
         }
+        Some("set-superuser-password") => superuser::set_password(arguments),
         Some("--all-in-one") => compose::all_in_one(arguments).map_err(|error| error.to_string()),
         Some(name) if !name.starts_with('-') => {
             compose::one(name, arguments).map_err(|error| error.to_string())
@@ -71,7 +90,8 @@ fn usage() -> String {
     let mut lines = String::from(
         "usage: starling <component> [--config <file>]\n\
          \x20      starling --all-in-one [--config <file>]\n\
-         \x20      starling migrate-config <mumble-server.ini>\n\n\
+         \x20      starling migrate-config <mumble-server.ini>\n\
+         \x20      starling set-superuser-password <password> [--server <id>] [--config <file>]\n\n\
          components:\n\x20 gateway\n",
     );
     for name in units::names() {

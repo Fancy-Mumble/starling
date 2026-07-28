@@ -58,6 +58,27 @@ message Snapshot {
   uint32 plugin_message_burst = 27;
   string registry_name = 28;
   bool obfuscate_ips = 29;
+
+  // Whether this server answers an unauthenticated UDP ping with its version
+  // and user counts. murmur's `allowping`, default true, and it gates two
+  // things rather than one: the ping a server browser sends, and public-list
+  // registration — which refuses to run without it, because a listing nobody
+  // can measure is a dead entry.
+  bool allow_ping = 30;
+  // The rest of murmur's `register*` block. Operational rather than deployment
+  // settings because murmur lets an operator change them while the server runs.
+  //
+  // `registry_password` is the shared secret that proves to the public list that
+  // a later update concerns the same server as the first. It is a secret: never
+  // read back, and never logged.
+  string registry_password = 31;
+  // The web page a listing links to. murmur refuses to register without one.
+  string registry_url = 32;
+  // The DNS name the list should reach this server at, when it differs from
+  // whatever address the registration happens to arrive from.
+  string registry_hostname = 33;
+  // Free-text country or region. Optional in murmur, and omitted when empty.
+  string registry_location = 34;
   // Settings a later service adds, so an operator-facing knob does not need a
   // proto release to exist.
   map<string, string> extra = 40;

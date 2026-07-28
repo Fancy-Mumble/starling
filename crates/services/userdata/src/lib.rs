@@ -22,15 +22,16 @@ pub use secret::{Secret, verify_totp};
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::{Ack, Scope};
+use starling_proto_fancy::identity;
 use starling_proto_fancy::types::ServiceKind;
 use starling_proto_fancy::userdata::user_data_server::{UserData, UserDataServer};
 use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, Blob, BlobRef, BlobRequest, DeleteRequest,
     ListRequest, LookupRequest, RegisterRequest, UpdateRequest, auth_result, lookup_request,
 };
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use tonic::{Request, Response, Status};
@@ -45,6 +46,7 @@ const REQUEST_BLOB: u16 = 23;
 pub struct UserdataService {
     accounts: Accounts,
     fanout: Fanout,
+    logger: Logger,
 }
 
 impl UserdataService {
@@ -66,21 +68,27 @@ impl UserData for UserdataRpc {
         request: Request<AuthRequest>,
     ) -> Result<Response<AuthResult>, Status> {
         let req = request.into_inner();
-        Ok(Response::new(
-            self.0
-                .accounts
-                .authenticate(scope_of(req.scope), &req)
-                .await,
-        ))
+        let result = self.0.accounts.authenticate(scope_of(req.scope), &req);
+
+        // The refusal reason is decided here and only the enum reaches
+        // session-lifecycle, so this is the one place that can say which
+        // credential was wrong without the password going anywhere near a log.
+        tracing::debug!(
+            name = %req.name,
+            outcome = result.outcome,
+            strong_cert = req.strong_cert,
+            "authentication decided"
+        );
+        Ok(Response::new(result))
     }
 
     async fn lookup(&self, request: Request<LookupRequest>) -> Result<Response<Account>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
         let found = match req.by {
-            Some(lookup_request::By::Id(id)) => self.0.accounts.by_id(scope, id).await,
-            Some(lookup_request::By::Name(name)) => self.0.accounts.by_name(scope, &name).await,
-            Some(lookup_request::By::CertHash(hash)) => self.0.accounts.by_cert(scope, &hash).await,
+            Some(lookup_request::By::Id(id)) => self.0.accounts.by_id(scope, id),
+            Some(lookup_request::By::Name(name)) => self.0.accounts.by_name(scope, &name),
+            Some(lookup_request::By::CertHash(hash)) => self.0.accounts.by_cert(scope, &hash),
             None => None,
         };
         found
@@ -90,17 +98,12 @@ impl UserData for UserdataRpc {
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<AccountPage>, Status> {
         let req = request.into_inner();
-        Ok(Response::new(
-            self.0
-                .accounts
-                .list(
-                    scope_of(req.scope),
-                    &req.name_prefix,
-                    req.limit,
-                    req.after_id,
-                )
-                .await,
-        ))
+        Ok(Response::new(self.0.accounts.list(
+            scope_of(req.scope),
+            &req.name_prefix,
+            req.limit,
+            req.after_id,
+        )))
     }
 
     async fn register(
@@ -112,12 +115,27 @@ impl UserData for UserdataRpc {
         let Some(account) = req.account else {
             return Err(Status::invalid_argument("no account was described"));
         };
-        self.0
+        let name = account.name.clone();
+        match self
+            .0
             .accounts
             .register(scope, account, &req.password)
             .await
-            .map(Response::new)
-            .map_err(Status::already_exists)
+        {
+            Ok(account) => {
+                self.0.logger.log(
+                    LogEvent::notice(Category::Admin, "account registered")
+                        .with("account", account.id)
+                        .with("name", name)
+                        .with("scope", scope),
+                );
+                Ok(Response::new(account))
+            }
+            Err(refused) => {
+                tracing::info!(%name, %refused, "account registration refused");
+                Err(Status::already_exists(refused))
+            }
+        }
     }
 
     async fn update(&self, request: Request<UpdateRequest>) -> Result<Response<Account>, Status> {
@@ -164,11 +182,10 @@ impl UserData for UserdataRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for UserdataService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
-            QUERY_USERS => self.on_query_users(&inbound).await,
+            QUERY_USERS => self.on_query_users(&inbound),
             REQUEST_BLOB => self.on_request_blob(&inbound).await,
             _ => Actions::new(),
         }
@@ -177,7 +194,7 @@ impl ClientService for UserdataService {
 
 impl UserdataService {
     /// `QueryUsers`: names to ids and back, in one round trip.
-    async fn on_query_users(&self, inbound: &Inbound) -> Actions {
+    fn on_query_users(&self, inbound: &Inbound) -> Actions {
         let Ok(query) = starling_proto::proto::tcp::QueryUsers::decode(inbound.payload.as_slice())
         else {
             return Actions::new();
@@ -185,13 +202,13 @@ impl UserdataService {
         let mut ids = Vec::new();
         let mut names = Vec::new();
         for id in &query.ids {
-            if let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*id)).await {
+            if let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*id)) {
                 ids.push(*id);
                 names.push(account.name);
             }
         }
         for name in &query.names {
-            if let Some(account) = self.accounts.by_name(inbound.scope, name).await {
+            if let Some(account) = self.accounts.by_name(inbound.scope, name) {
                 ids.push(account.id as u32);
                 names.push(account.name);
             }
@@ -210,11 +227,7 @@ impl UserdataService {
         };
         let mut states = Vec::new();
         for session in &request.session_texture {
-            if let Some(account) = self
-                .accounts
-                .by_id(inbound.scope, u64::from(*session))
-                .await
-            {
+            if let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*session)) {
                 let texture = self
                     .accounts
                     .blob(inbound.scope, &account.texture_hash)
@@ -233,26 +246,68 @@ impl UserdataService {
     }
 }
 
-#[async_trait]
 impl Serve for UserdataService {
     const NAME: &'static str = "userdata";
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         ctx.health.gate("accounts loaded");
         let accounts = Accounts::open(ctx.storage().await?).await?;
+
+        // Every virtual server gets an administrator on its first boot, because
+        // a server with no way in is a server that has to be rebuilt. The
+        // password is generated and announced exactly once, at creation — a
+        // restart never repeats it, so this is safe to run unconditionally.
+        for scope in ctx.virtual_servers() {
+            if let Some(password) = accounts.ensure_superuser(scope).await {
+                announce_superuser(&ctx, scope, &password);
+            }
+        }
+
         ctx.health.ready("accounts loaded");
         Ok(Arc::new(Self {
             accounts,
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(UserDataServer::new(UserdataRpc(Arc::clone(&self))))
             .add_service(plane)
     }
+}
+
+/// Print a freshly generated SuperUser password where an operator will see it.
+///
+/// The **only** place Starling writes a password in the clear, and it is
+/// deliberate: this credential exists nowhere else, so a line nobody sees is an
+/// administrator account nobody can use. murmur makes the same trade.
+///
+/// Sent to both records for the same reason. `tracing` is what is on the console
+/// of whoever just ran the server, and the operator log is what survives to be
+/// read afterwards — an operator who scrolled past it needs the second one, and
+/// one who is following `docker compose up` needs the first.
+///
+/// It is announced once, at creation. Re-announcing on every boot would leave a
+/// live administrator password in every log aggregator the deployment has.
+fn announce_superuser(ctx: &ServiceContext, scope: u32, password: &str) {
+    // The operator log only, and deliberately not `tracing` as well. This is
+    // the one line in the system that prints a live administrator password, so
+    // printing it twice doubles the number of places it can be scraped from —
+    // and the two went to the same console anyway. The operator log is the
+    // right home: it is what an operator is reading at first boot, and it is
+    // the stream a deployment can point at a file with restricted permissions.
+    ctx.logger.log(
+        LogEvent::notice(
+            Category::Server,
+            "superuser account created; this password is shown once and cannot be recovered",
+        )
+        .with("virtual_server", scope)
+        .with("user", identity::SUPERUSER_NAME.to_owned())
+        .with("password", password.to_owned()),
+    );
 }
 
 /// The scope a request names, defaulting to the first virtual server.

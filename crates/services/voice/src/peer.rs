@@ -93,6 +93,18 @@ impl VoicePeer {
         self.udp = Some(addr);
     }
 
+    /// Forget the proven address, sending this peer's audio down the tunnel.
+    ///
+    /// A client that starts tunnelling has told us its UDP path stopped working
+    /// — murmur reads exactly that from an arriving `UDPTunnel` and clears
+    /// `aiUdpFlag` (`Server.cpp:1911`). Without it the server keeps sending
+    /// datagrams into a path that no longer delivers, and the user is audible
+    /// but hears nobody, which is a failure no counter reports and the affected
+    /// person cannot diagnose.
+    pub fn unbind(&mut self) {
+        self.udp = None;
+    }
+
     /// Decrypt one received packet.
     ///
     /// # Errors

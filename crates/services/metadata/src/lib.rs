@@ -23,7 +23,6 @@ pub use tree_actor::Trees;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::metadata::metadata_server::{Metadata, MetadataServer};
@@ -31,7 +30,10 @@ use starling_proto_fancy::metadata::{
     ChannelResult, CreateRequest, EnterRequest, EnterResult, LeaveRequest, LinkRequest,
     ListenRequest, RemoveRequest, Tree, TreeEvent, TreeRequest, UpdateRequest,
 };
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::Migration;
@@ -66,6 +68,13 @@ pub struct MetadataService {
     trees: Trees,
     events: broadcast::Sender<TreeEvent>,
     fanout: Fanout,
+    logger: Logger,
+    /// Asks `permissions` before every mutation a client asks for.
+    ///
+    /// Not an `Option`. A service that could be built without one would have a
+    /// state in which every check is skipped, and nothing at the call site
+    /// would look different.
+    permit: Permit,
 }
 
 impl MetadataService {
@@ -209,16 +218,44 @@ impl Metadata for MetadataRpc {
     async fn enter(&self, request: Request<EnterRequest>) -> Result<Response<EnterResult>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
-        Ok(Response::new(self.0.trees.enter(
-            scope,
-            req.session,
-            req.channel,
-        )))
+        let result = self.0.trees.enter(scope, req.session, req.channel);
+
+        // Who is where is the second question an operator asks after who is
+        // connected, and a refusal here is what a user experiences as "I click
+        // the channel and nothing happens".
+        if result.applied {
+            self.0.logger.log(
+                LogEvent::info(Category::Channel, "user entered a channel")
+                    .with("session", req.session)
+                    .with("channel", req.channel)
+                    .with("previous", result.previous.unwrap_or(0))
+                    .with("scope", scope),
+            );
+        } else {
+            self.0.logger.log(
+                LogEvent::notice(Category::Channel, "channel entry refused")
+                    .with("session", req.session)
+                    .with("channel", req.channel)
+                    .with("reason", result.refused.clone()),
+            );
+        }
+
+        // A temporary channel that emptied is gone, and a client rendering it
+        // has no other way to find out.
+        if let Some(collected) = result.collected {
+            self.0.logger.log(
+                LogEvent::info(Category::Channel, "temporary channel collected")
+                    .with("channel", collected)
+                    .with("scope", scope),
+            );
+        }
+        Ok(Response::new(result))
     }
 
     async fn leave(&self, request: Request<LeaveRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
         let scope = scope_of(req.scope);
+        tracing::debug!(session = req.session, scope, "user left its channel");
         self.0.trees.leave(scope, req.session);
         Ok(Response::new(Ack {}))
     }
@@ -233,26 +270,67 @@ impl Metadata for MetadataRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for MetadataService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
-            CHANNEL_STATE => self.on_channel_state(&inbound),
-            CHANNEL_REMOVE => self.on_channel_remove(&inbound),
+            CHANNEL_STATE => self.on_channel_state(&inbound).await,
+            CHANNEL_REMOVE => self.on_channel_remove(&inbound).await,
             _ => Actions::new(),
         }
     }
 }
 
 impl MetadataService {
+    /// Whether the client on `inbound` holds `needed` in `channel`.
+    ///
+    /// A thin wrapper so the call sites read in [`Perm`] rather than in raw
+    /// bits. [`Permit::allows`] denies on any failure, including `permissions`
+    /// being unreachable, so there is no error case for a caller to get wrong.
+    async fn allows(&self, inbound: &Inbound, channel: u32, needed: Perm) -> bool {
+        self.permit.allows(inbound, channel, needed.bits()).await
+    }
+
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
-    fn on_channel_state(&self, inbound: &Inbound) -> Actions {
+    async fn on_channel_state(&self, inbound: &Inbound) -> Actions {
         let Ok(state) =
             starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())
         else {
+            tracing::debug!(conn = inbound.conn, "undecodable ChannelState");
             return Actions::new();
         };
+        let creating = state.channel_id.is_none();
+
+        // `temporary` is deprecated upstream but frozen, not removed: some
+        // clients still set it, and this proto is never changed
+        // (`docs/ARCHITECTURE.md` §7).
+        // `expect` rather than `allow`, matching `serialize.rs`: it deletes
+        // itself if the field is ever un-deprecated.
+        #[expect(
+            deprecated,
+            reason = "frozen upstream field, still sent by some clients"
+        )]
+        let temporary = state.temporary.unwrap_or(false);
+
+        // Checked before anything is written, and against the channel the
+        // permission is *about*: creating is authorised on the parent, because
+        // the new channel does not exist to hold an ACL yet, while editing is
+        // authorised on the channel being edited.
+        let (channel_asked_about, needed) = if creating {
+            let parent = state.parent.unwrap_or(ROOT_CHANNEL.0);
+            let make = if temporary {
+                Perm::MAKE_TEMP_CHANNEL
+            } else {
+                Perm::MAKE_CHANNEL
+            };
+            (parent, make)
+        } else {
+            (state.channel_id.unwrap_or(ROOT_CHANNEL.0), Perm::WRITE)
+        };
+        if !self.allows(inbound, channel_asked_about, needed).await {
+            return vec![permission_denied(inbound, needed, channel_asked_about)];
+        }
+
         let result = match state.channel_id {
             Some(id) => {
                 let (channel, fields) = to_proto(&state, id);
@@ -260,36 +338,71 @@ impl MetadataService {
             }
             None => {
                 let (channel, _) = to_proto(&state, 0);
-                // `temporary` is deprecated upstream but frozen, not removed:
-                // some clients still set it, and this proto is never changed
-                // (`docs/ARCHITECTURE.md` §7).
-                #[allow(
-                    deprecated,
-                    reason = "frozen upstream field, still sent by some clients"
-                )]
-                let temporary = state.temporary.unwrap_or(false);
                 self.trees.create(inbound.scope, Some(channel), temporary)
             }
         };
         match result.channel {
-            Some(channel) => vec![to_sessions(
-                Vec::new(),
-                CHANNEL_STATE,
-                channel_state(&channel).encode_to_vec(),
-            )],
-            None => Actions::new(),
+            Some(channel) => {
+                self.logger.log(
+                    LogEvent::info(
+                        Category::Channel,
+                        if creating {
+                            "channel created"
+                        } else {
+                            "channel updated"
+                        },
+                    )
+                    .with("channel", channel.id)
+                    .with("name", channel.name.clone())
+                    .with("session", inbound.session)
+                    .with("scope", inbound.scope),
+                );
+                vec![to_sessions(
+                    Vec::new(),
+                    CHANNEL_STATE,
+                    channel_state(&channel).encode_to_vec(),
+                )]
+            }
+            None => {
+                // Refused or a no-op, and the client is told nothing either
+                // way — so this is the only record that it was attempted.
+                tracing::debug!(
+                    conn = inbound.conn,
+                    session = inbound.session,
+                    creating,
+                    "channel change had no effect"
+                );
+                Actions::new()
+            }
         }
     }
 
-    fn on_channel_remove(&self, inbound: &Inbound) -> Actions {
+    async fn on_channel_remove(&self, inbound: &Inbound) -> Actions {
         let Ok(remove) =
             starling_proto::proto::tcp::ChannelRemove::decode(inbound.payload.as_slice())
         else {
+            tracing::debug!(conn = inbound.conn, "undecodable ChannelRemove");
             return Actions::new();
         };
+        // Removing a channel is editing it, so it takes the same permission
+        // murmur asks for: `Write` on the channel itself.
+        if !self.allows(inbound, remove.channel_id, Perm::WRITE).await {
+            return vec![permission_denied(inbound, Perm::WRITE, remove.channel_id)];
+        }
         if !self.trees.remove(inbound.scope, remove.channel_id).applied {
+            tracing::debug!(
+                session = inbound.session,
+                channel = remove.channel_id,
+                "channel removal had no effect"
+            );
             return Actions::new();
         }
+        self.logger.log(
+            LogEvent::notice(Category::Channel, "channel removed")
+                .with("channel", remove.channel_id)
+                .with("session", inbound.session)
+                .with("scope", inbound.scope),
+        );
         vec![to_sessions(
             Vec::new(),
             CHANNEL_REMOVE,
@@ -298,7 +411,6 @@ impl MetadataService {
     }
 }
 
-#[async_trait]
 impl Serve for MetadataService {
     const NAME: &'static str = "metadata";
 
@@ -316,11 +428,13 @@ impl Serve for MetadataService {
             trees,
             events,
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
+            permit: Permit::new(ctx.resolver.clone()),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(MetadataServer::new(MetadataRpc(Arc::clone(&self))))
             .add_service(plane)

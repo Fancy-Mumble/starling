@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use starling_runtime::config::Config;
 use starling_runtime::inproc::Broker;
+use starling_runtime::log::{Category, LogEvent, LogRuntime};
 use starling_runtime::serve::{ServiceError, context};
 use starling_runtime::shutdown::Shutdown;
 use starling_runtime::telemetry;
@@ -20,12 +21,19 @@ use crate::units;
 pub(crate) fn one(name: &str, arguments: &[String]) -> Result<(), ServiceError> {
     let config = load(arguments)?;
     telemetry::install(&config.telemetry);
+    let log = LogRuntime::start_from(&config.logging);
+    log.logger().log(
+        LogEvent::info(Category::Server, "starling starting")
+            .with("component", name.to_owned())
+            .with("version", env!("CARGO_PKG_VERSION")),
+    );
+    let logger = log.logger().clone();
     let runtime = tokio::runtime::Runtime::new()?;
 
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let shutdown = Shutdown::new();
         shutdown.install_signal_handler();
-        let ctx = context(name, Arc::new(config), Broker::new(), shutdown);
+        let ctx = context(name, Arc::new(config), Broker::new(), shutdown, logger);
         let Some(handle) = units::spawn(name, ctx) else {
             return Err(ServiceError::service(format!("no service named {name:?}")));
         };
@@ -33,7 +41,13 @@ pub(crate) fn one(name: &str, arguments: &[String]) -> Result<(), ServiceError> 
             Ok(result) => result,
             Err(error) => Err(ServiceError::service(format!("{name} stopped: {error}"))),
         }
-    })
+    });
+
+    log.logger().log(
+        LogEvent::info(Category::Server, "starling stopped").with("component", name.to_owned()),
+    );
+    log.finish();
+    result
 }
 
 /// Run every service, plus the gateway, in one process.
@@ -41,10 +55,18 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
     let mut config = load(arguments)?;
     config.runtime.all_in_one = true;
     telemetry::install(&config.telemetry);
+    let log = LogRuntime::start_from(&config.logging);
+    log.logger().log(
+        LogEvent::info(Category::Server, "starling starting")
+            .with("component", "all-in-one")
+            .with("version", env!("CARGO_PKG_VERSION"))
+            .with("data_dir", config.runtime.data_dir.display().to_string()),
+    );
+    let logger = log.logger().clone();
     let config = Arc::new(config);
     let runtime = tokio::runtime::Runtime::new()?;
 
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let shutdown = Shutdown::new();
         shutdown.install_signal_handler();
         let broker = Broker::new();
@@ -54,14 +76,32 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
         // them. Not a correctness problem — attachments retry — but a second of
         // log noise on every boot is a second of log noise nobody reads after.
         let mut handles = Vec::new();
+        let mut skipped = Vec::new();
         for name in units::names() {
             if !enabled(&config, name) {
+                skipped.push(*name);
                 continue;
             }
-            let ctx = context(name, Arc::clone(&config), broker.clone(), shutdown.clone());
+            let ctx = context(
+                name,
+                Arc::clone(&config),
+                broker.clone(),
+                shutdown.clone(),
+                logger.clone(),
+            );
             if let Some(handle) = units::spawn(name, ctx) {
                 handles.push((*name, handle));
             }
+        }
+
+        // Which services are *not* running is the question behind most "why is
+        // this feature dead" reports, and it is unanswerable from a log that
+        // only records what started.
+        if !skipped.is_empty() {
+            logger.log(
+                LogEvent::notice(Category::Server, "services disabled by configuration")
+                    .with("services", skipped.join(", ")),
+            );
         }
 
         let gateway_ctx = context(
@@ -69,12 +109,17 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
             Arc::clone(&config),
             broker.clone(),
             shutdown.clone(),
+            logger.clone(),
         );
         let Some(gateway) = units::spawn("gateway", gateway_ctx) else {
             return Err(ServiceError::service("the gateway could not be started"));
         };
 
         tracing::info!(services = handles.len(), "all-in-one");
+        logger.log(
+            LogEvent::info(Category::Server, "all services started")
+                .with("services", handles.len()),
+        );
         let result = match gateway.await {
             Ok(result) => result,
             Err(error) => Err(ServiceError::service(format!("gateway stopped: {error}"))),
@@ -82,14 +127,24 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
 
         // Draining the gateway drains everything: a service outliving the
         // socket that feeds it is a process that will not exit.
+        logger.log(LogEvent::info(Category::Server, "draining"));
         shutdown.drain();
         for (name, handle) in handles {
             if let Err(error) = handle.await {
-                tracing::warn!(service = name, %error, "service did not stop cleanly");
+                logger.log(
+                    LogEvent::warning(Category::Server, "service did not stop cleanly")
+                        .with("service", name)
+                        .with("error", error.to_string()),
+                );
             }
         }
         result
-    })
+    });
+
+    log.logger()
+        .log(LogEvent::info(Category::Server, "starling stopped").with("component", "all-in-one"));
+    log.finish();
+    result
 }
 
 /// Whether a service should run in this process.
@@ -101,7 +156,7 @@ pub(crate) fn enabled(config: &Config, name: &str) -> bool {
 }
 
 /// `--config <path>`, or the built-in defaults.
-fn load(arguments: &[String]) -> Result<Config, ServiceError> {
+pub(crate) fn load(arguments: &[String]) -> Result<Config, ServiceError> {
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         if argument == "--config" {
@@ -128,7 +183,7 @@ mod tests {
         // The highest-privilege surface must not appear because somebody ran
         // the binary with no file.
         let config = Config::with_defaults(Path::new("/run/starling"));
-        let mut bare = config.clone();
+        let mut bare = config;
         bare.services.clear();
         assert!(!enabled(&bare, "operator-api"));
         assert!(enabled(&bare, "text"));

@@ -23,6 +23,7 @@ use prost::Message as _;
 use starling_proto::proto::tcp;
 use starling_proto_fancy::control::{ServerAction, SessionUp, server_action};
 use starling_proto_fancy::fancy::session::{SessionEnvelope, session_envelope};
+use starling_proto_fancy::identity;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::metadata::{EnterRequest, TreeRequest};
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
@@ -35,17 +36,22 @@ use starling_proto_fancy::userdata::{AuthRequest, auth_result};
 use starling_proto_fancy::voice::MintRequest;
 use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_runtime::channel::Resolver;
-use starling_runtime::ids::now_ms;
-use starling_runtime::plane::{Actions, Fanout, Inbound, broadcast_except, to_conn};
+use starling_runtime::log::{Category, LogEvent};
+use starling_runtime::plane::{Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn};
 use starling_runtime::serve::ServiceContext;
 
-use crate::state::Connections;
+use crate::state::{Connections, PendingConnection};
 
 /// The Mumble version Starling announces.
 ///
 /// 1.6.0: the protobuf UDP format is available from 1.5.0, and announcing less
 /// would pin every client to the legacy audio framing.
-const MUMBLE_VERSION_V2: u64 = 0x0001_0006_0000;
+///
+/// Encoded rather than written out. The literal this replaced was
+/// `0x0001_0006_0000`, which is missing the sixteen-bit patch shift and decodes
+/// to **0.1.6** — below every feature gate the number exists to pass, and
+/// invisible because the handshake completes either way.
+const MUMBLE_VERSION_V2: u64 = starling_proto::MUMBLE_VERSION.encode_v2();
 
 /// Everything the handshake needs to reach.
 #[derive(Debug, Clone)]
@@ -67,6 +73,58 @@ pub fn server_version() -> tcp::Version {
     }
 }
 
+/// The whole of what a connection is, in the shape `session-view` stores.
+///
+/// **`Upsert` replaces; it does not merge** (`session-view/src/lib.rs:181`).
+/// session-view keeps exactly the `Session` it is handed, so a field omitted
+/// here is not left alone — it is written as `false`, `0` or empty. Proto3
+/// cannot tell "unset" from "false" for a `bool`, so there is no partial
+/// update to send even in principle.
+///
+/// That is not a hypothetical. `announce_changed` used to rebuild the session
+/// without `mute`, `deaf` or `suppress`, and `voice` reads a speaker's silence
+/// **only** from session-view (`voice/src/view.rs:146`). So a moderator's mute
+/// was applied to the connection record, broadcast to every client, rendered in
+/// every user list — and then un-applied in the one place that decides whether
+/// the packets are forwarded. The user showed as muted and stayed audible.
+///
+/// Written out field by field with no `..Session::default()`, which is what hid
+/// the omission: a new field on the message should fail to compile here and
+/// make somebody choose, rather than silently defaulting on every announcement.
+fn session_record(pending: &PendingConnection) -> Session {
+    let (account, registered) = identity::wire(pending.account);
+    Session {
+        session: pending.session,
+        conn: pending.conn,
+        gateway_id: pending.gateway.clone(),
+        account,
+        registered,
+        name: pending.name.clone(),
+        channel: pending.channel,
+        self_mute: pending.self_mute,
+        self_deaf: pending.self_deaf,
+        // The moderator-owned flags. The reason this function exists.
+        mute: pending.mute,
+        deaf: pending.deaf,
+        suppress: pending.suppress,
+        priority_speaker: pending.priority_speaker,
+        fancy_version: pending.fancy_version,
+        address: pending.address.clone(),
+        cert_hash: pending.cert_hash.clone(),
+        // From the record, not `now_ms()`: this is the moment the peer
+        // connected, and recomputing it on every change would reset the uptime
+        // the client shows each time somebody muted them.
+        connected_at_ms: pending.connected_at_ms,
+        // Nothing populates these yet, and saying so here is the point of
+        // writing the fields out. `listening` waits on channel listeners
+        // (GAP-ANALYSIS V5), `recording` on a client that reports it, and
+        // `max_bandwidth` is a server-config value rather than a per-peer one.
+        listening: Vec::new(),
+        recording: false,
+        max_bandwidth: 0,
+    }
+}
+
 impl Handshake {
     /// A handshake over `resolver`.
     #[must_use]
@@ -81,24 +139,52 @@ impl Handshake {
     /// The whole handshake, from `Authenticate` to `SuggestConfig`.
     pub async fn authenticate(&self, connections: &Connections, inbound: &Inbound) -> Actions {
         let Ok(request) = tcp::Authenticate::decode(inbound.payload.as_slice()) else {
+            // Undecodable at the very first step: almost always a client
+            // speaking a different protocol at a Mumble port.
+            tracing::warn!(
+                conn = inbound.conn,
+                len = inbound.payload.len(),
+                "undecodable Authenticate"
+            );
+            self.ctx.logger.log(
+                LogEvent::notice(Category::Session, "malformed authentication")
+                    .with("conn", inbound.conn),
+            );
             return Actions::new();
         };
         let Some(pending) = connections.get(inbound.conn) else {
+            tracing::warn!(
+                conn = inbound.conn,
+                "Authenticate for an unknown connection"
+            );
             return Actions::new();
         };
+
+        let name = request.username.clone().unwrap_or_default();
+        // `Authenticate` is where a client announces Opus
+        // (`vendor/server/src/murmur/Messages.cpp:538`), so it is recorded
+        // before anything can refuse the login and lose it.
+        connections.record_opus(inbound.conn, request.opus.unwrap_or(false));
+        tracing::debug!(
+            conn = inbound.conn,
+            %name,
+            fancy = pending.fancy_version,
+            opus = request.opus.unwrap_or(false),
+            "authenticating"
+        );
 
         let config = self.config(inbound.scope).await;
         if !config.password.is_empty()
             && request.password.as_deref().unwrap_or_default() != config.password
         {
-            return vec![reject(
+            return vec![self.refuse(
                 inbound.conn,
+                &name,
                 tcp::reject::RejectType::WrongServerPw,
                 "wrong server password",
             )];
         }
 
-        let name = request.username.clone().unwrap_or_default();
         let outcome = self
             .identify(inbound.scope, &name, &request, &pending)
             .await;
@@ -107,28 +193,128 @@ impl Handshake {
             Err(action) => return vec![action],
         };
 
-        let Some(session) = connections.allocate(inbound.conn, account, &name) else {
-            return vec![reject(
+        // Somebody is already here under this name or this account
+        // (`vendor/server/src/murmur/Messages.cpp:418`). murmur never lets two
+        // live sessions share a name: either this one is refused, or the older
+        // one is a ghost and gets kicked. Doing neither is how a server ends up
+        // with three of the same user in the tree.
+        let ghost = connections.duplicate_of(inbound.conn, account, &name);
+        if let Some(ghost) = &ghost
+            && !may_replace(&pending, ghost, account)
+        {
+            return vec![self.refuse(
                 inbound.conn,
+                &name,
+                tcp::reject::RejectType::UsernameInUse,
+                "that name is already in use",
+            )];
+        }
+
+        let Some(session) = connections.allocate(inbound.conn, account, &name) else {
+            return vec![self.refuse(
+                inbound.conn,
+                &name,
                 tcp::reject::RejectType::ServerFull,
                 "the server is full",
             )];
         };
 
+        // The line the operator asked for: somebody is now on the server.
+        //
+        // `registered` comes from the option itself rather than from `id != 0`.
+        // That comparison read the administrator as a guest, because its account
+        // id is 0.
+        let (id, registered) = identity::wire(account);
+        self.ctx.logger.log(
+            LogEvent::info(Category::Session, "user authenticated")
+                .with("conn", inbound.conn)
+                .with("session", session)
+                .with("name", name.clone())
+                .with("account", id)
+                .with("registered", registered)
+                .with("address", pending.address.clone())
+                .with("fancy", pending.fancy_version != 0),
+        );
+
+        let actions = self
+            .welcome(inbound, session, account, &name, &config, &pending)
+            .await;
+
+        self.announce_up(connections, inbound.conn).await;
+        self.enter_root(inbound.scope, session).await;
+
+        // After the new session is up, as murmur does (`Messages.cpp:506`):
+        // the replacement is complete before the old one goes, so the name is
+        // never briefly absent from everyone's tree.
+        if let Some(ghost) = ghost {
+            self.kick_ghost(&ghost);
+        }
+        actions
+    }
+
+    /// Disconnect the older session a reconnecting user left behind.
+    ///
+    /// Pushed through the fan-out rather than returned with this connection's
+    /// actions, because the ghost may be held by a different gateway pod
+    /// entirely — the pod that does not have it ignores the frame, which is
+    /// exactly the broadcast contract the plane already relies on.
+    ///
+    /// The `UserRemove` every other client needs is not sent here: closing the
+    /// connection makes the gateway report it closed, and the ordinary
+    /// disconnect path already broadcasts that. Sending one here too would
+    /// remove the user twice.
+    fn kick_ghost(&self, ghost: &PendingConnection) {
+        tracing::info!(
+            conn = ghost.conn,
+            session = ghost.session,
+            name = %ghost.name,
+            "disconnecting a ghost: the same user connected again"
+        );
+        self.ctx.logger.log(
+            LogEvent::notice(Category::Session, "ghost disconnected")
+                .with("conn", ghost.conn)
+                .with("session", ghost.session)
+                .with("name", ghost.name.clone())
+                .with("reason", "the same user connected from elsewhere"),
+        );
+        self.fanout.push(disconnect(
+            ghost.conn,
+            "You connected to the server from another device",
+        ));
+    }
+
+    /// Everything the client is sent once it is admitted, in murmur's order.
+    ///
+    /// Split out of [`Self::authenticate`] because the two answer different
+    /// questions: that one decides *whether* the peer may in, this one composes
+    /// the world it is handed. The ordering constraints documented at the top of
+    /// this module all live here.
+    async fn welcome(
+        &self,
+        inbound: &Inbound,
+        session: u32,
+        account: Option<u64>,
+        name: &str,
+        config: &Snapshot,
+        pending: &PendingConnection,
+    ) -> Actions {
         let mut actions = Vec::new();
-        actions.push(self.crypt_setup(inbound, session, &pending).await);
+        actions.push(self.crypt_setup(inbound, session, pending).await);
         actions.push(to_conn(inbound.conn, 21, codec_version().encode_to_vec()));
         actions.extend(self.channel_flood(inbound).await);
-        actions.extend(self.user_states(inbound, session, &name).await);
+        actions.extend(
+            self.user_states(inbound, session, account, name, pending)
+                .await,
+        );
         actions.push(to_conn(
             inbound.conn,
             5,
-            server_sync(session, &config).encode_to_vec(),
+            server_sync(session, config).encode_to_vec(),
         ));
         actions.push(to_conn(
             inbound.conn,
             24,
-            server_config(&config).encode_to_vec(),
+            server_config(config).encode_to_vec(),
         ));
         actions.push(to_conn(
             inbound.conn,
@@ -142,8 +328,11 @@ impl Handshake {
             action: Some(server_action::Action::SessionUp(SessionUp {
                 conn: inbound.conn,
                 session,
-                account,
-                name: name.clone(),
+                // Flattened, and safe to flatten: the gateway routes and does not
+                // authorize, so it never reads this field. Nothing downstream of
+                // here makes a permission decision from it.
+                account: identity::wire(account).0,
+                name: name.to_owned(),
                 channel: 0,
                 fancy_version: pending.fancy_version,
             })),
@@ -157,14 +346,16 @@ impl Handshake {
         // out of order would desync a client that keys off first-seen.
         let joined = tcp::UserState {
             session: Some(session),
-            name: Some(name.clone()),
+            name: Some(name.to_owned()),
             channel_id: Some(0),
+            // Everyone else's user list is built from this one message, so it
+            // needs the registration marker — and the certificate hash — just
+            // as much as the client's own copy above does.
+            user_id: account.map(|id| id as u32),
+            hash: hex_hash(&pending.cert_hash),
             ..tcp::UserState::default()
         };
         actions.push(broadcast_except(session, 9, joined.encode_to_vec()));
-
-        self.announce_up(inbound, session, account, &name).await;
-        self.enter_root(inbound.scope, session).await;
         actions
     }
 
@@ -174,13 +365,25 @@ impl Handshake {
         scope: u32,
         name: &str,
         request: &tcp::Authenticate,
-        pending: &crate::state::PendingConnection,
-    ) -> Result<(u64, String), ServerAction> {
-        let Ok(channel) = self.resolver.channel("userdata").await else {
+        pending: &PendingConnection,
+    ) -> Result<(Option<u64>, String), ServerAction> {
+        let Ok(channel) = self.resolver.channel("userdata") else {
             // Userdata is essential: without it a login cannot be decided, and
             // guessing would either lock everyone out or let everyone in.
-            return Err(reject(
+            // Logged as an error, not a refusal: it is the server that is
+            // broken here, not the credentials.
+            tracing::error!(
+                conn = pending.conn,
+                "userdata is unreachable; refusing login"
+            );
+            self.ctx.logger.log(
+                LogEvent::error(Category::Session, "the account service is unreachable")
+                    .with("conn", pending.conn)
+                    .with("name", name.to_owned()),
+            );
+            return Err(self.refuse(
                 pending.conn,
+                name,
                 tcp::reject::RejectType::None,
                 "the account service is unavailable",
             ));
@@ -198,62 +401,56 @@ impl Handshake {
             })
             .await;
 
-        let Ok(result) = result else {
-            return Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::None,
-                "the account service refused the request",
-            ));
+        let result = match result {
+            Ok(result) => result,
+            Err(status) => {
+                tracing::error!(
+                    conn = pending.conn,
+                    %status,
+                    "userdata refused the authentication request"
+                );
+                self.ctx.logger.log(
+                    LogEvent::error(Category::Session, "the account service refused the request")
+                        .with("conn", pending.conn)
+                        .with("name", name.to_owned())
+                        .with("error", status.message().to_owned()),
+                );
+                return Err(self.refuse(
+                    pending.conn,
+                    name,
+                    tcp::reject::RejectType::None,
+                    "the account service refused the request",
+                ));
+            }
         };
         let result = result.into_inner();
         let outcome = auth_result::Outcome::try_from(result.outcome)
             .unwrap_or(auth_result::Outcome::UnknownAccount);
 
-        match outcome {
-            auth_result::Outcome::Ok => Ok((
-                result.account.as_ref().map_or(0, |account| account.id),
+        if matches!(outcome, auth_result::Outcome::Ok) {
+            // `Option<Account>`, kept as an option. Flattening an absent account
+            // to 0 here is what made a guest indistinguishable from the
+            // SuperUser, whose account id *is* 0 — see
+            // `starling_proto_fancy::identity`.
+            //
+            // `guest` is authoritative when the two disagree: userdata sets it
+            // for a name accepted without an account, and resolving the
+            // contradiction towards "no account" is the direction that grants
+            // nothing.
+            let account = if result.guest {
+                None
+            } else {
+                result.account.as_ref().map(|account| account.id)
+            };
+            return Ok((
+                account,
                 result
                     .account
                     .map_or_else(|| name.to_owned(), |account| account.name),
-            )),
-            auth_result::Outcome::WrongPassword => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::WrongUserPw,
-                "wrong password",
-            )),
-            auth_result::Outcome::NameTaken => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::UsernameInUse,
-                "that name is registered to another certificate",
-            )),
-            auth_result::Outcome::CertRequired => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::NoCertificate,
-                "this server requires a certificate",
-            )),
-            auth_result::Outcome::InvalidName => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::InvalidUsername,
-                "that name is not allowed",
-            )),
-            // The fork carries these two so a client can retry with a code
-            // rather than guess why it was refused.
-            auth_result::Outcome::TotpRequired => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::TotpRequired,
-                "this account requires a one-time code",
-            )),
-            auth_result::Outcome::TotpInvalid => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::TotpInvalid,
-                "that one-time code is wrong",
-            )),
-            auth_result::Outcome::UnknownAccount => Err(reject(
-                pending.conn,
-                tcp::reject::RejectType::AuthenticatorFail,
-                "authentication failed",
-            )),
+            ));
         }
+        let (kind, reason) = refusal_for(outcome);
+        Err(self.refuse(pending.conn, name, kind, reason))
     }
 
     /// `CryptSetup`, minted by voice.
@@ -265,9 +462,9 @@ impl Handshake {
         &self,
         inbound: &Inbound,
         session: u32,
-        pending: &crate::state::PendingConnection,
+        pending: &PendingConnection,
     ) -> ServerAction {
-        let payload = match self.resolver.channel("voice").await {
+        let payload = match self.resolver.channel("voice") {
             Ok(channel) => VoiceClient::new(channel)
                 .mint(MintRequest {
                     scope: Some(starling_proto_fancy::common::Scope {
@@ -277,6 +474,7 @@ impl Handshake {
                     fancy_version: pending.fancy_version,
                     mumble_version: pending.mumble_version,
                     address: pending.address.clone(),
+                    conn: inbound.conn,
                 })
                 .await
                 .map(|material| material.into_inner().crypt_setup)
@@ -290,7 +488,7 @@ impl Handshake {
 
     /// Every channel, breadth-first from the root.
     async fn channel_flood(&self, inbound: &Inbound) -> Actions {
-        let Ok(channel) = self.resolver.channel("metadata").await else {
+        let Ok(channel) = self.resolver.channel("metadata") else {
             return Actions::new();
         };
         let Ok(tree) = MetadataClient::new(channel)
@@ -327,16 +525,39 @@ impl Handshake {
     }
 
     /// The client's own `UserState`, then everyone else's.
-    async fn user_states(&self, inbound: &Inbound, session: u32, name: &str) -> Actions {
+    async fn user_states(
+        &self,
+        inbound: &Inbound,
+        session: u32,
+        account: Option<u64>,
+        name: &str,
+        pending: &PendingConnection,
+    ) -> Actions {
         let own = tcp::UserState {
             session: Some(session),
             name: Some(name.to_owned()),
             channel_id: Some(0),
+            // The certificate hash, hex-encoded as murmur sends it
+            // (`Server.cpp:1686`). A client will not offer "Register" for a
+            // user it believes has no certificate
+            // (`vendor/server/src/mumble/MainWindow.cpp:1817`) — registration
+            // binds an account to a certificate, so without one there is
+            // nothing to bind. Omitting this greys the entry out for everybody,
+            // including the administrator.
+            hash: hex_hash(&pending.cert_hash),
+            // `user_id` is the *only* thing that marks a user as registered to
+            // a Mumble client: it is what draws the authenticated icon and what
+            // "Registered Users" is keyed by. Leaving it unset — which every
+            // `UserState` here used to do — renders the administrator as an
+            // anonymous guest, however carefully the server authenticated them.
+            //
+            // Absent for a guest rather than 0, because 0 is the SuperUser's id.
+            user_id: account.map(|id| id as u32),
             ..tcp::UserState::default()
         };
         let mut actions = vec![to_conn(inbound.conn, 9, own.encode_to_vec())];
 
-        let Ok(channel) = self.resolver.channel("session-view").await else {
+        let Ok(channel) = self.resolver.channel("session-view") else {
             return actions;
         };
         let Ok(sessions) = SessionViewClient::new(channel)
@@ -361,6 +582,11 @@ impl Handshake {
                 channel_id: Some(other.channel),
                 self_mute: Some(other.self_mute),
                 self_deaf: Some(other.self_deaf),
+                // Through `identity`, not `other.account` directly: the pair is
+                // meaningless without the flag, and account 0 is the SuperUser
+                // rather than "nobody".
+                user_id: identity::account(other.registered, other.account).map(|id| id as u32),
+                hash: hex_hash(&other.cert_hash),
                 ..tcp::UserState::default()
             };
             actions.push(to_conn(inbound.conn, 9, state.encode_to_vec()));
@@ -369,23 +595,22 @@ impl Handshake {
     }
 
     /// Tell session-view a session exists.
-    async fn announce_up(&self, inbound: &Inbound, session: u32, account: u64, name: &str) {
-        let announcement = Announcement {
-            scope: Some(starling_proto_fancy::common::Scope {
-                virtual_server: inbound.scope,
-            }),
-            what: Some(announcement::What::Up(Session {
-                session,
-                conn: inbound.conn,
-                gateway_id: inbound.gateway.clone(),
-                account,
-                name: name.to_owned(),
-                channel: 0,
-                connected_at_ms: now_ms(),
-                ..Session::default()
-            })),
+    ///
+    /// Built from the connection record rather than from the arguments to hand,
+    /// so that "up" and "changed" cannot describe the same session differently
+    /// — the address, certificate and client version are on the record and were
+    /// being dropped here.
+    async fn announce_up(&self, connections: &Connections, conn: u64) {
+        let Some(pending) = connections.get(conn) else {
+            return;
         };
-        self.announce(announcement).await;
+        self.announce(Announcement {
+            scope: Some(starling_proto_fancy::common::Scope {
+                virtual_server: pending.scope,
+            }),
+            what: Some(announcement::What::Up(session_record(&pending))),
+        })
+        .await;
     }
 
     /// Tell session-view a session has changed.
@@ -397,17 +622,7 @@ impl Handshake {
             scope: Some(starling_proto_fancy::common::Scope {
                 virtual_server: pending.scope,
             }),
-            what: Some(announcement::What::Changed(Session {
-                session: pending.session,
-                conn,
-                gateway_id: pending.gateway,
-                account: pending.account,
-                name: pending.name,
-                channel: pending.channel,
-                self_mute: pending.self_mute,
-                self_deaf: pending.self_deaf,
-                ..Session::default()
-            })),
+            what: Some(announcement::What::Changed(session_record(&pending))),
         })
         .await;
     }
@@ -425,7 +640,7 @@ impl Handshake {
     }
 
     async fn announce(&self, announcement: Announcement) {
-        let Ok(channel) = self.resolver.channel("session-view").await else {
+        let Ok(channel) = self.resolver.channel("session-view") else {
             return;
         };
         if let Err(status) = SessionViewClient::new(channel).announce(announcement).await {
@@ -435,22 +650,36 @@ impl Handshake {
 
     /// Put a new session in the root channel.
     async fn enter_root(&self, scope: u32, session: u32) {
-        let Ok(channel) = self.resolver.channel("metadata").await else {
-            return;
-        };
-        let _ = MetadataClient::new(channel)
+        let _ = self.enter(scope, session, 0).await;
+    }
+
+    /// Move `session` into `channel`, if metadata allows it.
+    ///
+    /// `None` when metadata could not be reached, which is different from a
+    /// refusal: the caller tells the user nothing happened rather than telling
+    /// them they lack a permission they may well hold.
+    pub async fn enter(
+        &self,
+        scope: u32,
+        session: u32,
+        channel: u32,
+    ) -> Option<starling_proto_fancy::metadata::EnterResult> {
+        let transport = self.resolver.channel("metadata").ok()?;
+        MetadataClient::new(transport)
             .enter(EnterRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
                     virtual_server: scope,
                 }),
                 session,
-                channel: 0,
+                channel,
             })
-            .await;
+            .await
+            .ok()
+            .map(tonic::Response::into_inner)
     }
 
     /// The Fancy extensions: hello, resume, lazy subscription.
-    pub async fn fancy(&self, connections: &Connections, inbound: &Inbound) -> Actions {
+    pub fn fancy(&self, connections: &Connections, inbound: &Inbound) -> Actions {
         let Ok(envelope) = SessionEnvelope::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
@@ -483,14 +712,14 @@ impl Handshake {
     }
 
     /// The operational settings, or the shipped defaults if it is unreachable.
-    async fn config(&self, scope: u32) -> Snapshot {
+    pub async fn config(&self, scope: u32) -> Snapshot {
         let fallback = Snapshot {
             virtual_server: scope,
             max_users: 100,
             max_bandwidth: 72_000,
             ..Snapshot::default()
         };
-        let Ok(channel) = self.resolver.channel("server-config").await else {
+        let Ok(channel) = self.resolver.channel("server-config") else {
             return fallback;
         };
         ServerConfigClient::new(channel)
@@ -504,6 +733,12 @@ impl Handshake {
             .unwrap_or(fallback)
     }
 
+    /// How to reach other services, for the handlers outside this type.
+    #[must_use]
+    pub const fn resolver(&self) -> &Resolver {
+        &self.resolver
+    }
+
     /// The fan-out handle, for pushes that are not replies.
     #[must_use]
     pub fn fanout(&self) -> &Fanout {
@@ -515,6 +750,121 @@ impl Handshake {
     pub fn context(&self) -> &ServiceContext {
         &self.ctx
     }
+
+    /// Refuse a login, and record why.
+    ///
+    /// Every refusal in the handshake goes through here, which is what makes
+    /// "nobody can log in" answerable from the log alone — the client is told a
+    /// `Reject` type it usually renders as one generic sentence, and without
+    /// this the server's own reason existed only as the argument to a function
+    /// that discarded it.
+    fn refuse(
+        &self,
+        conn: u64,
+        name: &str,
+        kind: tcp::reject::RejectType,
+        reason: &str,
+    ) -> ServerAction {
+        self.ctx.logger.log(
+            LogEvent::warning(Category::Session, "login refused")
+                .with("conn", conn)
+                .with("name", name.to_owned())
+                .with("reason", reason.to_owned())
+                .with("reject", format!("{kind:?}")),
+        );
+        reject(conn, kind, reason)
+    }
+}
+
+/// Whether `arriving` may take over from the `ghost` already using the name.
+///
+/// murmur's rule, transcribed from `Messages.cpp:429`. Three ways in:
+///
+/// * **A registered account.** The account has already been proved by password
+///   or certificate, so the arriving peer *is* that user and the older session
+///   is a leftover.
+/// * **The same address.** This is murmur's "allow reuse of name from same IP",
+///   and it is the case that matters in practice: a client whose connection
+///   dropped reconnects before the server has noticed, and refusing would lock
+///   somebody out of their own name until a timeout they cannot see.
+/// * **The same certificate.** Identity without registration — proof enough
+///   that this is the same person on a different network.
+///
+/// Anything else is a stranger taking a name that is in use, which is the case
+/// `UsernameInUse` exists for.
+fn may_replace(
+    arriving: &PendingConnection,
+    ghost: &PendingConnection,
+    account: Option<u64>,
+) -> bool {
+    // A registered account is proof it is the same person. `is_some`, not
+    // `!= 0`: the administrator holds account 0, and reading that as "no
+    // account" sent it down the address-and-certificate path instead.
+    if account.is_some() {
+        return true;
+    }
+    if address_of(&arriving.address) == address_of(&ghost.address) {
+        return true;
+    }
+    !arriving.cert_hash.is_empty() && arriving.cert_hash == ghost.cert_hash
+}
+
+/// The address without its port.
+///
+/// Compared without the port deliberately: a reconnect is a *new* TCP
+/// connection and so always has a different source port, and comparing the
+/// whole `host:port` string would mean the same-address rule never once
+/// matched — turning every reconnect after a drop into `UsernameInUse`.
+fn address_of(peer: &str) -> &str {
+    // An IPv6 literal is bracketed, so its own colons are not the separator.
+    match peer.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => peer.split(':').next().unwrap_or(peer),
+    }
+}
+
+/// The `Reject` type and the sentence that go with an unsuccessful outcome.
+///
+/// A table rather than eight arms inline, because what this is *is* a mapping:
+/// userdata decides the outcome, and the wire needs the murmur reject code and
+/// something a human can read. `Ok` is absent on purpose — it is not a refusal,
+/// and giving it a row here would mean inventing a reason for a success.
+fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'static str) {
+    use auth_result::Outcome;
+    use tcp::reject::RejectType;
+    match outcome {
+        Outcome::WrongPassword => (RejectType::WrongUserPw, "wrong password"),
+        Outcome::NameTaken => (
+            RejectType::UsernameInUse,
+            "that name is registered to another certificate",
+        ),
+        Outcome::CertRequired => (
+            RejectType::NoCertificate,
+            "this server requires a certificate",
+        ),
+        Outcome::InvalidName => (RejectType::InvalidUsername, "that name is not allowed"),
+        // The fork carries these two so a client can retry with a code rather
+        // than guess why it was refused.
+        Outcome::TotpRequired => (
+            RejectType::TotpRequired,
+            "this account requires a one-time code",
+        ),
+        Outcome::TotpInvalid => (RejectType::TotpInvalid, "that one-time code is wrong"),
+        // `Ok` cannot reach here — the caller returns before asking — and an
+        // unknown account is the catch-all the enum's default already is.
+        Outcome::UnknownAccount | Outcome::Ok => {
+            (RejectType::AuthenticatorFail, "authentication failed")
+        }
+    }
+}
+
+/// A certificate hash as the wire carries it: lower-case hex, or absent.
+///
+/// Absent rather than empty for a peer with no certificate, because the client
+/// tests emptiness to decide whether registration is even possible and an empty
+/// string would answer that question the same way at more cost.
+fn hex_hash(cert_hash: &[u8]) -> Option<String> {
+    (!cert_hash.is_empty()).then(|| cert_hash.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// A refusal the client can act on.
@@ -572,12 +922,160 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_peer_with_a_certificate_has_its_hash_announced() {
+        // A client will not offer "Register" for a user it believes has no
+        // certificate (`vendor/server/src/mumble/MainWindow.cpp:1817`), because
+        // registration binds an account to one. Omitting this greys the entry
+        // out for everybody, administrator included — which is what it did.
+        assert_eq!(
+            hex_hash(&[0xaf, 0x08, 0xa1]),
+            Some("af08a1".to_owned()),
+            "lower-case hex, as murmur sends it"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_one_announces_no_hash_at_all() {
+        // Absent, not empty. The client tests emptiness to decide whether
+        // registration is possible, so both answer the question the same way —
+        // but only one of them costs a field on every `UserState`.
+        assert_eq!(hex_hash(&[]), None);
+    }
+
+    #[test]
     fn the_announced_version_is_new_enough_for_protobuf_audio() {
         // Announcing less than 1.5.0 pins every client to the legacy UDP
         // framing, where the packet type is the codec and there is nowhere to
         // name a cipher.
         const { assert!(MUMBLE_VERSION_V2 >= 0x0001_0005_0000) };
         assert_eq!(server_version().version_v2, Some(MUMBLE_VERSION_V2));
+    }
+
+    fn peer(address: &str, cert: &[u8]) -> PendingConnection {
+        PendingConnection {
+            address: address.to_owned(),
+            cert_hash: cert.to_vec(),
+            ..PendingConnection::default()
+        }
+    }
+
+    #[test]
+    fn a_moderators_mute_reaches_the_service_that_enforces_it() {
+        // The bug this function exists for. `voice` decides whether to forward a
+        // speaker's packets from the session-view record and nothing else
+        // (`voice/src/view.rs:146`), and this announcement *replaces* that
+        // record. Dropping `mute` here left the user muted in every client's
+        // user list and audible to everyone in the channel.
+        let muted = PendingConnection {
+            session: 7,
+            mute: true,
+            deaf: true,
+            suppress: true,
+            priority_speaker: true,
+            ..PendingConnection::default()
+        };
+
+        let announced = session_record(&muted);
+
+        assert!(announced.mute, "a moderator mute must survive the trip");
+        assert!(announced.deaf, "and so must a deafen");
+        assert!(announced.suppress);
+        assert!(announced.priority_speaker);
+    }
+
+    #[test]
+    fn an_unrelated_change_does_not_silently_lift_a_mute() {
+        // The shape of the original failure: a *different* edit — moving
+        // channel, setting a comment — rebuilt the whole record, and every one
+        // of those announcements un-muted the user in session-view. Anything
+        // that rebuilds from the connection must carry the flags it did not set.
+        let mut pending = PendingConnection {
+            session: 7,
+            mute: true,
+            ..PendingConnection::default()
+        };
+        pending.channel = 4;
+
+        assert!(
+            session_record(&pending).mute,
+            "a channel move must not lift a moderator's mute"
+        );
+    }
+
+    #[test]
+    fn the_connect_time_is_the_peers_own_not_the_moment_of_the_change() {
+        // Recomputed here, every mute would reset the uptime the client shows.
+        let pending = PendingConnection {
+            connected_at_ms: 1_000,
+            ..PendingConnection::default()
+        };
+        assert_eq!(session_record(&pending).connected_at_ms, 1_000);
+    }
+
+    #[test]
+    fn a_stranger_may_not_take_a_name_that_is_in_use() {
+        // The bug this rule exists for: without it the same name connects any
+        // number of times and every client renders several of the same person.
+        let ghost = peer("10.0.0.1:50000", &[]);
+        let arriving = peer("10.0.0.2:50001", &[]);
+        assert!(!may_replace(&arriving, &ghost, None));
+    }
+
+    #[test]
+    fn reconnecting_from_the_same_address_replaces_your_own_ghost() {
+        // murmur's "allow reuse of name from same IP" (`Messages.cpp:428`).
+        // This is the case that actually happens: a dropped connection the
+        // server has not noticed yet, and the same person coming back. The
+        // ports differ because a reconnect is always a new TCP connection —
+        // comparing them would make this rule dead.
+        let ghost = peer("10.0.0.1:50000", &[]);
+        let arriving = peer("10.0.0.1:61234", &[]);
+        assert!(may_replace(&arriving, &ghost, None));
+    }
+
+    #[test]
+    fn a_registered_account_always_replaces_its_own_ghost() {
+        // The account has already been proved, so the arriving peer *is* that
+        // user however their address changed.
+        let ghost = peer("10.0.0.1:50000", &[]);
+        let arriving = peer("198.51.100.7:50001", &[]);
+        assert!(may_replace(&arriving, &ghost, Some(7)));
+    }
+
+    #[test]
+    fn the_same_certificate_replaces_its_ghost_from_a_new_network() {
+        let ghost = peer("10.0.0.1:50000", &[1, 2, 3]);
+        let arriving = peer("198.51.100.7:50001", &[1, 2, 3]);
+        assert!(may_replace(&arriving, &ghost, None));
+    }
+
+    #[test]
+    fn an_absent_certificate_is_not_a_match_for_another_absent_one() {
+        // Two clients with no certificate both carry an empty hash. Treating
+        // that as "the same certificate" would let anyone displace anyone.
+        let ghost = peer("10.0.0.1:50000", &[]);
+        let arriving = peer("198.51.100.7:50001", &[]);
+        assert!(!may_replace(&arriving, &ghost, None));
+    }
+
+    #[test]
+    fn an_address_is_compared_without_its_port() {
+        assert_eq!(address_of("10.0.0.1:50000"), "10.0.0.1");
+        assert_eq!(address_of("[2001:db8::1]:50000"), "2001:db8::1");
+        // Bare forms, in case a gateway ever reports one.
+        assert_eq!(address_of("10.0.0.1"), "10.0.0.1");
+    }
+
+    #[test]
+    fn an_ipv6_peer_reconnecting_is_recognised_as_the_same_address() {
+        // Splitting on the first colon would read the host as "[2001" for both
+        // and match every IPv6 client to every other one.
+        let ghost = peer("[2001:db8::1]:50000", &[]);
+        let arriving = peer("[2001:db8::1]:61234", &[]);
+        assert!(may_replace(&arriving, &ghost, None));
+
+        let other = peer("[2001:db8::2]:61234", &[]);
+        assert!(!may_replace(&other, &ghost, None));
     }
 
     #[test]

@@ -103,6 +103,14 @@ pub struct Router {
     by_host: HashMap<IpAddr, Vec<ConnId>>,
     datagrams: Box<dyn Datagrams>,
     details: ServerDetails,
+    /// Whether an *unauthenticated* ping is answered. murmur's `allowping`.
+    ///
+    /// Only the anonymous path. The connectivity ping a connected peer sends is
+    /// never gated by this — murmur does not gate it either
+    /// (`Server.cpp:1165`), and it is how a client works out whether its UDP
+    /// path functions at all. Gating it would silence audio for every client on
+    /// a server whose operator only meant to leave the public list.
+    allow_ping: bool,
     stats: RouterStats,
     /// Frames received from each session.
     heard_from: HashMap<SessionId, u64>,
@@ -120,6 +128,9 @@ impl Router {
             by_host: HashMap::new(),
             datagrams,
             details,
+            // murmur's default, and the reason a fresh server appears in a
+            // server browser at all.
+            allow_ping: true,
             stats: RouterStats::default(),
             heard_from: HashMap::new(),
         }
@@ -139,6 +150,32 @@ impl Router {
     /// Replace the view of who hears whom.
     pub fn publish(&mut self, snapshot: RoutingSnapshot) {
         self.snapshot = snapshot;
+    }
+
+    /// Replace what a ping is answered with.
+    ///
+    /// Separate from construction for the same reason [`Self::publish`] is: the
+    /// user count changes whenever somebody connects and the limits change
+    /// whenever an operator edits them, while the router is built once. Nothing
+    /// on the packet path may make a request, so these are pushed in rather
+    /// than fetched when a ping arrives.
+    pub fn set_details(&mut self, details: ServerDetails) {
+        self.details = details;
+    }
+
+    /// What a ping is currently answered with.
+    #[must_use]
+    pub const fn details(&self) -> ServerDetails {
+        self.details
+    }
+
+    /// Whether an unauthenticated ping is answered at all.
+    ///
+    /// murmur's `allowping`. Off means a server browser cannot measure this
+    /// server and it cannot appear on the public list — which is why
+    /// registration refuses to run without it.
+    pub const fn set_allow_ping(&mut self, allow: bool) {
+        self.allow_ping = allow;
     }
 
     /// Take on a peer that has finished its handshake.
@@ -188,6 +225,20 @@ impl Router {
         self.peers.len()
     }
 
+    /// Whether a session's audio is travelling by UDP rather than the tunnel.
+    ///
+    /// The honest answer to what a client's own connection indicator shows, and
+    /// it can only be answered here: an address is recorded when a datagram
+    /// from it *authenticates*, so this is the one place that knows whether the
+    /// UDP path was ever proven rather than merely configured.
+    #[must_use]
+    pub fn on_udp(&self, session: SessionId) -> bool {
+        self.by_session
+            .get(&session)
+            .and_then(|conn| self.peers.get(conn))
+            .is_some_and(|peer| peer.udp_addr().is_some())
+    }
+
     /// Counters, for the admin surface.
     #[must_use]
     pub fn stats(&self) -> RouterStats {
@@ -207,33 +258,29 @@ impl Router {
 
     /// Handle one frame of audio, from wherever it arrived.
     pub fn accept(&mut self, from: AudioSource, frame: &[u8]) {
-        let Some((origin, plain)) = self.attribute(from, frame) else {
-            self.stats.unattributed = self.stats.unattributed.saturating_add(1);
-            self.report_unattributed(from, frame.len());
-            return;
-        };
-
-        // Learning the address *after* the packet authenticated is the whole
-        // point: binding on arrival would let anyone redirect a victim's audio
-        // by sending one spoofed datagram from the right port.
-        if let Attributed::Datagram(conn, addr) = origin {
-            self.bind(conn, addr);
+        if !self.deliver(from, frame) {
+            self.unattributed(from, frame.len());
         }
+    }
 
-        let conn = origin.conn();
-        let Some(peer) = self.peers.get(&conn) else {
+    /// One datagram off the voice port, whatever it turns out to be.
+    ///
+    /// The port carries three things that can only be told apart by trying:
+    /// audio from a connected peer, that peer's *encrypted* ping, and an
+    /// **anonymous** ping from something that has never connected — a client's
+    /// server browser, or the public list measuring a server it has not spoken
+    /// to.
+    ///
+    /// Attribution is tried first, because it is the only one of the three that
+    /// proves anything. A frame that authenticates is therefore never treated
+    /// as an anonymous ping, so a connected peer cannot be talked into an
+    /// unencrypted reply by sending a plaintext one.
+    pub fn accept_datagram(&mut self, addr: SocketAddr, frame: &[u8]) {
+        let from = AudioSource::Datagram(addr);
+        if self.deliver(from, frame) || self.answer_anonymous_ping(addr, frame) {
             return;
-        };
-
-        match peer.codec().decode(&plain) {
-            Ok(Datagram::Audio(packet)) => self.route(conn, packet),
-            Ok(Datagram::Ping(ping)) => {
-                let details = ping.wants_details.then_some(self.details);
-                let reply = peer.codec().encode_ping(&ping, details);
-                self.reply(conn, origin, &reply);
-            }
-            Err(_) => self.stats.malformed = self.stats.malformed.saturating_add(1),
         }
+        self.unattributed(from, frame.len());
     }
 
     /// Answer an unauthenticated ping on the voice port.
@@ -243,16 +290,108 @@ impl Router {
     /// server it has never spoken to. Deliberately not encrypted: there is no
     /// session to encrypt under, and nothing here is secret.
     pub fn accept_anonymous_ping(&mut self, addr: SocketAddr, frame: &[u8]) {
+        if !self.answer_anonymous_ping(addr, frame) {
+            self.unattributed(AudioSource::Datagram(addr), frame.len());
+        }
+    }
+
+    /// Route one frame to whoever should hear it, if anything claims it.
+    ///
+    /// Returns whether a peer authenticated the frame — the caller decides what
+    /// an unclaimed one means, because that differs by transport: on the tunnel
+    /// it can only be a fault, and on the UDP port it is usually an anonymous
+    /// ping or simply the internet.
+    fn deliver(&mut self, from: AudioSource, frame: &[u8]) -> bool {
+        let Some((origin, plain)) = self.attribute(from, frame) else {
+            return false;
+        };
+
+        // Learning the address *after* the packet authenticated is the whole
+        // point: binding on arrival would let anyone redirect a victim's audio
+        // by sending one spoofed datagram from the right port.
+        match origin {
+            Attributed::Datagram(conn, addr) => self.bind(conn, addr),
+            // A peer that has started tunnelling is telling us its UDP path
+            // stopped working, so we must stop sending datagrams to it. murmur
+            // reads the same thing from an arriving `UDPTunnel`
+            // (`Server.cpp:1911`). Without this the peer stays audible and
+            // hears nobody, for the rest of the session.
+            Attributed::Tunnel(conn) => self.unbind(conn),
+        }
+
+        let conn = origin.conn();
+        let Some(peer) = self.peers.get(&conn) else {
+            return true;
+        };
+
+        match peer.codec().decode(&plain) {
+            Ok(Datagram::Audio(packet)) => self.route(conn, packet),
+            Ok(Datagram::Ping(ping)) => {
+                let details = ping.wants_details.then_some(self.details);
+                let reply = peer.codec().encode_ping(&ping, details);
+                self.reply(conn, origin, &reply);
+            }
+            Err(error) => {
+                self.stats.malformed = self.stats.malformed.saturating_add(1);
+                self.report_malformed(conn, &plain, &error);
+            }
+        }
+        true
+    }
+
+    /// Say why a frame that decrypted could not be parsed — but not every time.
+    ///
+    /// The failure with no other symptom worth having: the peer is attributed,
+    /// its cipher works, its packets are counted as received, and the audio is
+    /// silently dropped. Every aggregate looks healthy and the person is
+    /// inaudible.
+    ///
+    /// It is nearly always the two sides disagreeing about the wire format, so
+    /// the peer's negotiated codec and the frame's leading byte are what
+    /// identify it: `protobuf` against a leading `4` is a legacy Opus packet on
+    /// a protobuf peer, and `legacy` against a leading `0` is the reverse.
+    fn report_malformed(&self, conn: ConnId, plain: &[u8], error: &crate::packet::PacketError) {
+        /// How many to report before falling silent.
+        const LOUD_UNTIL: u64 = 5;
+
+        if self.stats.malformed > LOUD_UNTIL {
+            return;
+        }
+        let Some(peer) = self.peers.get(&conn) else {
+            return;
+        };
+        debug!(
+            %conn,
+            session = %peer.session(),
+            codec = peer.codec().name(),
+            lead = plain.first().copied().unwrap_or_default(),
+            len = plain.len(),
+            %error,
+            "voice frame decrypted but did not parse; this peer is inaudible"
+        );
+    }
+
+    /// Reply to an anonymous ping, and report whether it was one.
+    fn answer_anonymous_ping(&mut self, addr: SocketAddr, frame: &[u8]) -> bool {
+        if !self.allow_ping {
+            return false;
+        }
         // Protobuf only. A stock client that has not connected sends the legacy
         // form, but so does every amplification-attack toolkit, and upstream
         // removed the legacy anonymous ping for exactly that reason.
         let Ok(Datagram::Ping(ping)) = ProtobufCodec.decode(frame) else {
-            self.stats.unattributed = self.stats.unattributed.saturating_add(1);
-            return;
+            return false;
         };
         let details = ping.wants_details.then_some(self.details);
         self.datagrams
             .send_to(addr, ProtobufCodec.encode_ping(&ping, details));
+        true
+    }
+
+    /// Count a datagram nobody claimed, and say so the first few times.
+    fn unattributed(&mut self, from: AudioSource, len: usize) {
+        self.stats.unattributed = self.stats.unattributed.saturating_add(1);
+        self.report_unattributed(from, len);
     }
 
     /// Say something about a datagram nobody claimed — but not every time.
@@ -332,6 +471,23 @@ impl Router {
                 None
             }
         }
+    }
+
+    /// Stop sending `conn` datagrams, because it has fallen back to the tunnel.
+    ///
+    /// The address index goes too. Leaving it would keep a stale entry that a
+    /// later peer arriving at that address could inherit, which is the same
+    /// hazard [`Self::bind`] clears before rebinding.
+    fn unbind(&mut self, conn: ConnId) {
+        let Some(peer) = self.peers.get_mut(&conn) else {
+            return;
+        };
+        if peer.udp_addr().is_none() {
+            return; // Already tunnelling: the overwhelmingly common case.
+        }
+        debug!(%conn, session = %peer.session(), "peer fell back to the tunnel; its UDP path is no longer used");
+        peer.unbind();
+        self.by_addr.retain(|_, bound| *bound != conn);
     }
 
     /// Record that `conn`'s datagrams arrive from `addr`.
@@ -467,7 +623,9 @@ mod tests {
     use crate::packet::codec_for;
     use crate::ports::ChannelId;
     use crate::testing::{RecordingDatagrams, TestPeer};
+    use prost::Message as _;
     use starling_gate::UdpFormat;
+    use starling_proto::proto::udp as mumble_udp;
 
     const LOBBY: ChannelId = ChannelId(0);
     const ALICE: SessionId = SessionId(1);
@@ -523,6 +681,132 @@ mod tests {
         router.accept(AudioSource::Datagram(addr(BOB_AT)), &probe);
         sent.clear();
         (router, sent, alice, bob)
+    }
+
+    /// What a client's server browser puts on the wire before it has connected.
+    ///
+    /// Built here rather than with the server's own `encode_ping` on purpose: a
+    /// test that asks the implementation what a ping looks like agrees with it
+    /// whatever it does. This is the one byte of prefix and the one protobuf
+    /// message an unconnected Mumble client actually sends.
+    fn anonymous_ping(timestamp: u64) -> Bytes {
+        let mut frame = vec![1_u8];
+        let _ = mumble_udp::Ping {
+            timestamp,
+            request_extended_information: true,
+            ..mumble_udp::Ping::default()
+        }
+        .encode(&mut frame);
+        Bytes::from(frame)
+    }
+
+    /// The details out of a ping reply, as a browser reads them.
+    fn reply_details(frame: &[u8]) -> mumble_udp::Ping {
+        assert_eq!(frame.first(), Some(&1), "not a protobuf ping");
+        mumble_udp::Ping::decode(&frame[1..]).expect("a well-formed ping reply")
+    }
+
+    #[test]
+    fn an_anonymous_ping_is_answered_with_the_server_details() {
+        // The server browser, and the public server list measuring a server it
+        // has never connected to. Nothing is attached and nothing has a key, so
+        // this is the one reply that is deliberately unencrypted.
+        let sent = RecordingDatagrams::new();
+        let mut router = Router::new(Box::new(sent.clone()), details());
+
+        router.accept_datagram(addr(40_000), &anonymous_ping(0x1234));
+
+        let (to, bytes) = sent.only();
+        assert_eq!(to, addr(40_000), "the reply must go back to the asker");
+        let reply = reply_details(&bytes);
+        assert_eq!(reply.timestamp, 0x1234, "the timestamp is echoed untouched");
+        assert_eq!(reply.user_count, 2);
+        assert_eq!(reply.max_user_count, 10);
+        assert_eq!(reply.max_bandwidth_per_user, 72_000);
+        assert!(
+            !reply.request_extended_information,
+            "the reply must not itself be a request"
+        );
+    }
+
+    #[test]
+    fn an_anonymous_ping_reports_the_details_it_was_last_given() {
+        // The count changes whenever somebody connects, and it is pushed in
+        // rather than fetched: a ping is answered from the packet path, and
+        // nothing on the packet path may make a request.
+        let sent = RecordingDatagrams::new();
+        let mut router = Router::new(Box::new(sent.clone()), details());
+        router.set_details(ServerDetails {
+            users: 41,
+            max_users: 200,
+            ..details()
+        });
+
+        router.accept_datagram(addr(40_001), &anonymous_ping(1));
+
+        let reply = reply_details(&sent.only().1);
+        assert_eq!(reply.user_count, 41);
+        assert_eq!(reply.max_user_count, 200);
+    }
+
+    #[test]
+    fn a_connected_peer_is_never_answered_in_the_clear() {
+        // Attribution is tried before the anonymous path, so a peer that has a
+        // key gets its ping sealed under that key. If the order were reversed a
+        // client could downgrade its own reply to plaintext by sending one, and
+        // it would then discard the answer as undecryptable.
+        let (mut router, sent, mut alice, _bob) = lobby_on_udp();
+
+        router.accept_datagram(addr(ALICE_AT), &alice.ping(0x99));
+
+        let (to, bytes) = sent.only();
+        assert_eq!(to, addr(ALICE_AT));
+        // Readable only after decrypting: `hear_ping` opens it under Alice's
+        // key, which a plaintext reply would fail.
+        assert_eq!(alice.hear_ping(&bytes).timestamp, 0x99);
+    }
+
+    #[test]
+    fn allow_ping_off_silences_the_anonymous_ping() {
+        // murmur's `allowping`. An operator who turns it off wants to be absent
+        // from server browsers and the public list.
+        let sent = RecordingDatagrams::new();
+        let mut router = Router::new(Box::new(sent.clone()), details());
+        router.set_allow_ping(false);
+
+        router.accept_datagram(addr(40_003), &anonymous_ping(1));
+
+        assert!(sent.is_empty(), "an anonymous ping must not be answered");
+    }
+
+    #[test]
+    fn allow_ping_off_does_not_silence_a_connected_peers_connectivity_ping() {
+        // The bug this test exists for: gating both would leave every client on
+        // the server unable to confirm its UDP path, so all of them would fall
+        // back to tunnelling audio over TCP — from a setting whose description
+        // is about being listed publicly. murmur does not gate this one either
+        // (`Server.cpp:1165`).
+        let (mut router, sent, mut alice, _bob) = lobby_on_udp();
+        router.set_allow_ping(false);
+
+        router.accept_datagram(addr(ALICE_AT), &alice.ping(0x7));
+
+        let (to, bytes) = sent.only();
+        assert_eq!(to, addr(ALICE_AT));
+        assert_eq!(alice.hear_ping(&bytes).timestamp, 0x7);
+    }
+
+    #[test]
+    fn a_datagram_that_is_neither_audio_nor_a_ping_is_counted_and_dropped() {
+        // An open UDP port receives whatever the internet sends it. Counting is
+        // the whole response: replying would make the port an amplifier.
+        let sent = RecordingDatagrams::new();
+        let mut router = Router::new(Box::new(sent.clone()), details());
+
+        router.accept_datagram(addr(40_002), b"not a mumble packet at all");
+
+        assert!(sent.is_empty(), "junk must never be answered");
+        assert_eq!(router.stats().unattributed, 1, "counted exactly once");
     }
 
     #[test]
@@ -614,6 +898,37 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_that_starts_tunnelling_stops_being_sent_datagrams() {
+        // UDP breaking mid-call is routine — a NAT entry expiring, a network
+        // changing — and the client's response is to tunnel. If the server kept
+        // sending datagrams into the dead path, that person would remain
+        // audible to everyone and hear nobody, with every counter healthy.
+        let (mut router, sent, mut alice, mut bob) = lobby_on_udp();
+        assert_eq!(router.peers[&2].udp_addr(), Some(addr(BOB_AT)));
+
+        // Bob tunnels one frame, which is how he says his UDP is gone.
+        router.accept(AudioSource::Tunnel(2), &bob.speak_tunnelled(b"my udp died"));
+        assert_eq!(router.peers[&2].udp_addr(), None, "bob is still on UDP");
+        assert!(
+            !router.by_addr.values().any(|bound| *bound == 2),
+            "a stale address a later peer could inherit"
+        );
+
+        // So alice's next frame reaches him over the tunnel, not the socket.
+        sent.clear();
+        router.accept(
+            AudioSource::Datagram(addr(ALICE_AT)),
+            &alice.speak(b"still here?"),
+        );
+        assert!(sent.is_empty(), "audio went to bob's dead UDP path");
+        assert_eq!(
+            bob.tunnelled().len(),
+            2,
+            "bob was not sent the frame at all"
+        );
+    }
+
+    #[test]
     fn a_peer_with_no_udp_path_is_tunnelled() {
         // Everyone behind a restrictive firewall depends on this.
         let (mut router, sent, mut alice, bob) = lobby();
@@ -669,7 +984,7 @@ mod tests {
         // A 1.4 client and a 1.5 client in one channel. Relaying the bytes
         // unchanged would hand one of them a packet it cannot parse.
         let sent = RecordingDatagrams::new();
-        let mut router = Router::new(Box::new(sent.clone()), details());
+        let mut router = Router::new(Box::new(sent), details());
 
         let mut alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
         let mut bob = TestPeer::new(2, BOB, UdpFormat::Legacy);
@@ -797,7 +1112,7 @@ mod tests {
         // One slow client must not be able to hold up everyone else's audio, so
         // its frames are dropped rather than queued.
         let sent = RecordingDatagrams::new();
-        let mut router = Router::new(Box::new(sent.clone()), details());
+        let mut router = Router::new(Box::new(sent), details());
         let mut alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
         let bob = TestPeer::new(2, BOB, UdpFormat::Protobuf);
         router.attach(alice.attach(), addr(0).ip());

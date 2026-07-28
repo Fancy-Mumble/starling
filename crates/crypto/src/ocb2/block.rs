@@ -9,7 +9,11 @@
 //! pairs wrapped in `SWAP64`, which is this with the endianness handled by hand.
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt as _, BlockEncrypt as _, KeyInit as _};
+// `BlockCipherEncrypt`/`BlockCipherDecrypt` in `cipher` 0.5; they were
+// `BlockEncrypt`/`BlockDecrypt` before it. A rename only — the block operations
+// below are the same primitive, which matters because OCB2's offsets are
+// derived from them and a substituted primitive would still compile.
+use aes::cipher::{BlockCipherDecrypt as _, BlockCipherEncrypt as _, KeyInit as _};
 
 /// AES's block size, and OCB2's.
 pub const BLOCK_LEN: usize = 16;

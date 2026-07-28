@@ -167,6 +167,30 @@ impl ClientCodec {
     }
 }
 
+/// One frame of normal speech, shaped the way a real client puts it on the wire.
+///
+/// Unencrypted, which is what the `UDPTunnel` path carries. For the UDP path,
+/// seal it with that peer's own cipher.
+pub(crate) fn as_client_sends(format: UdpFormat, opus: &[u8]) -> Bytes {
+    ClientCodec(format).encode_audio(&AudioPacket {
+        target: REGULAR_SPEECH,
+        sender: SessionId(0),
+        opus: Bytes::copy_from_slice(opus),
+        ..AudioPacket::silent()
+    })
+}
+
+/// Read a server-to-client frame the way the client on the other end would.
+///
+/// Deliberately not [`crate::packet::AudioCodec::decode`], which is the
+/// *inbound* half and is not its inverse: a client-to-server frame carries no
+/// trusted sender, so decoding an outbound frame with it silently reports
+/// `sender = 0` and any test asserting on attribution passes for the wrong
+/// reason.
+pub(crate) fn as_client_hears(format: UdpFormat, bytes: &[u8]) -> AudioPacket {
+    ClientCodec(format).decode_audio(bytes)
+}
+
 /// A [`Datagrams`] that keeps everything it was given.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RecordingDatagrams {

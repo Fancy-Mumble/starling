@@ -36,6 +36,17 @@ pub fn defaults(virtual_server: u32) -> Snapshot {
         plugin_message_burst: 15,
         registry_name: String::new(),
         obfuscate_ips: false,
+        // murmur's default, and the reason a fresh server is visible in a
+        // server browser at all.
+        allow_ping: true,
+        // Every one of these empty is what stops an unconfigured server from
+        // announcing itself: registration refuses without a name, a password
+        // and a URL, so the safe default is silence rather than a listing the
+        // operator never asked for.
+        registry_password: String::new(),
+        registry_url: String::new(),
+        registry_hostname: String::new(),
+        registry_location: String::new(),
         extra: HashMap::new(),
     }
 }
@@ -68,6 +79,11 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
             "plugin_message_burst" => current.plugin_message_burst = values.plugin_message_burst,
             "registry_name" => current.registry_name = values.registry_name.clone(),
             "obfuscate_ips" => current.obfuscate_ips = values.obfuscate_ips,
+            "allow_ping" => current.allow_ping = values.allow_ping,
+            "registry_password" => current.registry_password = values.registry_password.clone(),
+            "registry_url" => current.registry_url = values.registry_url.clone(),
+            "registry_hostname" => current.registry_hostname = values.registry_hostname.clone(),
+            "registry_location" => current.registry_location = values.registry_location.clone(),
             other => {
                 // Unknown keys land in `extra` rather than being dropped: a
                 // service that adds an operator-facing knob should not need a
@@ -125,11 +141,31 @@ pub fn redact(snapshot: &Snapshot) -> (HashMap<String, String>, Vec<String>) {
             "cert_required".to_owned(),
             snapshot.cert_required.to_string(),
         ),
+        ("allow_ping".to_owned(), snapshot.allow_ping.to_string()),
+        ("registry_name".to_owned(), snapshot.registry_name.clone()),
+        ("registry_url".to_owned(), snapshot.registry_url.clone()),
+        (
+            "registry_hostname".to_owned(),
+            snapshot.registry_hostname.clone(),
+        ),
+        (
+            "registry_location".to_owned(),
+            snapshot.registry_location.clone(),
+        ),
     ]);
-    for (key, value) in &snapshot.extra {
-        let _ = values.insert(key.clone(), value.clone());
-    }
-    (values, vec!["password".to_owned()])
+    values.extend(
+        snapshot
+            .extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    // Named but not shown. The registry password proves to the public list that
+    // a later update is the same server as the first, so it is exactly as much
+    // a secret as the server password is.
+    (
+        values,
+        vec!["password".to_owned(), "registry_password".to_owned()],
+    )
 }
 
 #[cfg(test)]
@@ -156,6 +192,33 @@ mod tests {
                 .get("whiteboard_max_strokes")
                 .map(String::as_str),
             Some("500")
+        );
+    }
+
+    #[test]
+    fn a_server_nobody_configured_is_pingable_but_unlisted() {
+        // Two different defaults, and both are murmur's. Ping on, because a
+        // server absent from every browser looks broken. Registration off,
+        // because announcing a server to a public list is the operator's
+        // decision and cannot be undone by them changing their mind.
+        let snapshot = defaults(1);
+        assert!(snapshot.allow_ping);
+        assert!(snapshot.registry_name.is_empty());
+        assert!(snapshot.registry_password.is_empty());
+        assert!(snapshot.registry_url.is_empty());
+    }
+
+    #[test]
+    fn the_registry_password_is_named_but_never_shown() {
+        // A client must be able to tell "not set" from "withheld"; the two mean
+        // very different things to whoever is looking at the screen.
+        let mut snapshot = defaults(1);
+        snapshot.registry_password = "hunter2".to_owned();
+        let (values, withheld) = redact(&snapshot);
+        assert!(withheld.contains(&"registry_password".to_owned()));
+        assert!(
+            !values.values().any(|value| value.contains("hunter2")),
+            "the registry password must not appear in a readable field"
         );
     }
 

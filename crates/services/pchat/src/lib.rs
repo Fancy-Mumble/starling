@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::fancy::pchat::{
     Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
@@ -159,7 +158,6 @@ impl PchatService {
     }
 }
 
-#[async_trait]
 impl ClientService for PchatService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Pchat.outer_type();
@@ -167,6 +165,15 @@ impl ClientService for PchatService {
             return Actions::new();
         }
         let Ok(envelope) = PchatEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable PchatEnvelope"
+            );
             return Actions::new();
         };
 
@@ -220,7 +227,6 @@ impl ClientService for PchatService {
     }
 }
 
-#[async_trait]
 impl Serve for PchatService {
     const NAME: &'static str = "pchat";
 
@@ -234,7 +240,7 @@ impl Serve for PchatService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 

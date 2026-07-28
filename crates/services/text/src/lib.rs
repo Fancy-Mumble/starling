@@ -10,14 +10,16 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::feature::{TextEnvelope, text_envelope};
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::text::text_server::{Text, TextServer};
 use starling_proto_fancy::text::{HistoryPage, HistoryRequest, PurgeRequest, StoredMessage};
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
+use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
 };
@@ -50,6 +52,9 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
 pub struct TextService {
     store: Store,
     fanout: Fanout,
+    logger: Logger,
+    /// Asks `permissions` before a message reaches anyone.
+    permit: Permit,
 }
 
 impl TextService {
@@ -152,7 +157,6 @@ impl Text for TextRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for TextService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
@@ -168,11 +172,53 @@ impl TextService {
         let Ok(message) =
             starling_proto::proto::tcp::TextMessage::decode(inbound.payload.as_slice())
         else {
+            tracing::debug!(conn = inbound.conn, "undecodable TextMessage");
             return Actions::new();
         };
         if message.message.is_empty() {
             return Actions::new();
         }
+
+        // Checked before the message is stored or delivered, and against every
+        // channel it is addressed to: a message naming five channels the sender
+        // may not write to must not reach the one they may. murmur refuses the
+        // whole message rather than delivering it partially, and a partial
+        // delivery is the worse answer — the sender is told nothing and some
+        // recipients saw it.
+        for channel in message
+            .channel_id
+            .iter()
+            .chain(message.tree_id.iter())
+            .copied()
+        {
+            if !self
+                .permit
+                .allows(inbound, channel, Perm::TEXT_MESSAGE.bits())
+                .await
+            {
+                return vec![permission_denied(inbound, Perm::TEXT_MESSAGE, channel)];
+            }
+        }
+
+        // The body is deliberately absent: this log is kept for as long as the
+        // retention policy says and read by whoever operates the server, which
+        // is not consent to archive everybody's conversations. Length and
+        // destination are enough to answer "was it delivered".
+        tracing::debug!(
+            session = inbound.session,
+            channels = message.channel_id.len(),
+            trees = message.tree_id.len(),
+            sessions = message.session.len(),
+            len = message.message.len(),
+            "text message"
+        );
+        self.logger.log(
+            LogEvent::info(Category::Message, "text message")
+                .with("session", inbound.session)
+                .with("channel", message.channel_id.first().copied().unwrap_or(0))
+                .with("recipients", message.session.len())
+                .with("length", message.message.len()),
+        );
 
         let mut stored = StoredMessage {
             id: Vec::new(),
@@ -241,7 +287,6 @@ impl TextService {
     }
 }
 
-#[async_trait]
 impl Serve for TextService {
     const NAME: &'static str = "text";
 
@@ -251,11 +296,13 @@ impl Serve for TextService {
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
+            logger: ctx.logger.clone(),
+            permit: Permit::new(ctx.resolver.clone()),
         }))
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(TextServer::new(TextRpc(Arc::clone(&self))))
             .add_service(plane)
@@ -283,6 +330,17 @@ mod tests {
         Arc::new(TextService {
             store,
             fanout: Fanout::default(),
+            logger: Logger::null(),
+            // Points at a `permissions` nothing is serving, so every check
+            // denies. These tests exercise storage and history, not delivery;
+            // a test that wanted delivery would have to stand one up, which is
+            // the right amount of friction for skipping an authorisation.
+            permit: Permit::new(starling_runtime::channel::Resolver::new(
+                Arc::new(starling_runtime::config::Config::with_defaults(
+                    std::path::Path::new("/run/starling"),
+                )),
+                starling_runtime::inproc::Broker::new(),
+            )),
         })
     }
 

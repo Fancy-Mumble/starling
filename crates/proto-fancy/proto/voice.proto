@@ -30,6 +30,12 @@ message MintRequest {
   // The Mumble protocol version, which decides the UDP wire format.
   uint64 mumble_version = 4;
   string address = 5;
+  // The gateway's name for this connection.
+  //
+  // Minting is also when the peer joins the packet path, and both halves of
+  // that need the connection: tunnelled audio arrives labelled with it, and a
+  // disconnect is announced by it and nothing else.
+  uint64 conn = 6;
 }
 
 message ResyncRequest {

@@ -18,10 +18,10 @@
 //! is the service tracking which pod holds which session, which is the routing
 //! table the gateway already owns.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use starling_proto_fancy::control::client_plane_server::{ClientPlane, ClientPlaneServer};
 use starling_proto_fancy::control::{
     ClientEvent, Opened, ServerAction, client_event, server_action,
@@ -148,7 +148,14 @@ impl Fanout {
         }
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<ServerAction> {
+    /// Receive everything pushed from now on.
+    ///
+    /// Public because a service that pushes from somewhere other than a
+    /// [`ClientService`] method — voice's packet path is the one that does —
+    /// has no returned `Actions` for a test to inspect, and asserting on what
+    /// reached the gateway is the only way to test it end to end.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ServerAction> {
         self.tx.subscribe()
     }
 }
@@ -160,20 +167,24 @@ impl Default for Fanout {
 }
 
 /// What a service implements to be reachable by a client.
-#[async_trait]
+///
+/// Written as `-> impl Future<..> + Send` for the reason given on
+/// [`Serve`](crate::serve::Serve): these run inside a spawned task over a
+/// generic `S: ClientService`, and a plain `async fn` in a trait cannot promise
+/// its future is `Send`. Implementations still write `async fn`.
 pub trait ClientService: Send + Sync + 'static {
     /// A new connection was accepted. Nothing is known about it yet beyond its
     /// address and certificate.
-    async fn opened(&self, _opened: &Opened, _gateway: &str) -> Actions {
-        Actions::new()
+    fn opened(&self, _opened: &Opened, _gateway: &str) -> impl Future<Output = Actions> + Send {
+        async { Actions::new() }
     }
 
     /// A frame arrived for one of this service's types.
-    async fn frame(&self, inbound: Inbound) -> Actions;
+    fn frame(&self, inbound: Inbound) -> impl Future<Output = Actions> + Send;
 
     /// A connection went away.
-    async fn closed(&self, _conn: u64, _reason: &str) -> Actions {
-        Actions::new()
+    fn closed(&self, _conn: u64, _reason: &str) -> impl Future<Output = Actions> + Send {
+        async { Actions::new() }
     }
 }
 
@@ -182,13 +193,23 @@ pub trait ClientService: Send + Sync + 'static {
 pub struct Plane<S> {
     service: Arc<S>,
     fanout: Fanout,
+    name: &'static str,
 }
 
 impl<S: ClientService> Plane<S> {
     /// Wrap `service`, pushing through `fanout`.
+    ///
+    /// `name` is what this service is called in the log. It is passed in rather
+    /// than derived because [`ClientService`] deliberately knows nothing about
+    /// deployment — but a frame log that cannot say *which* of nineteen
+    /// services handled the frame is not worth writing.
     #[must_use]
-    pub fn new(service: Arc<S>, fanout: Fanout) -> Self {
-        Self { service, fanout }
+    pub fn new(service: Arc<S>, fanout: Fanout, name: &'static str) -> Self {
+        Self {
+            service,
+            fanout,
+            name,
+        }
     }
 
     /// The gRPC server to register in a service's routes.
@@ -210,7 +231,10 @@ impl<S: ClientService> ClientPlane for Plane<S> {
     ) -> Result<Response<Self::AttachStream>, Status> {
         let service = Arc::clone(&self.service);
         let pushes = self.fanout.subscribe();
+        let name = self.name;
         let mut inbound = request.into_inner();
+
+        tracing::info!(service = name, "gateway attached");
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ServerAction, Status>>(256);
 
@@ -222,17 +246,22 @@ impl<S: ClientService> ClientPlane for Plane<S> {
             let mut scope = 0_u32;
             while let Some(event) = inbound.next().await {
                 let Ok(event) = event else { break };
-                let actions = handle(&service, event, &mut gateway, &mut scope).await;
+                let actions = handle(&service, event, &mut gateway, &mut scope, name).await;
                 for action in actions {
                     if replies.send(Ok(action)).await.is_err() {
                         return;
                     }
                 }
             }
+            // Losing the attachment is how a service stops receiving anything
+            // at all, and it is silent from the client's side: frames simply
+            // stop being answered.
+            tracing::info!(service = name, %gateway, "gateway detached");
         }));
 
         drop(tokio::spawn(async move {
             let mut pushes = pushes;
+            let mut lagged = 0_u64;
             loop {
                 match pushes.recv().await {
                     Ok(action) => {
@@ -244,7 +273,18 @@ impl<S: ClientService> ClientPlane for Plane<S> {
                     // counted by the caller's metrics and the stream continues,
                     // because dropping the attachment would cost every session
                     // on that pod rather than the frames it already missed.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        // Warned rather than left to the metric alone: this is
+                        // the shape of "some users did not see a message" and
+                        // it is otherwise indistinguishable from a bug.
+                        lagged += missed;
+                        tracing::warn!(
+                            service = name,
+                            missed,
+                            total = lagged,
+                            "gateway fell behind; pushes were lost"
+                        );
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -256,35 +296,113 @@ impl<S: ClientService> ClientPlane for Plane<S> {
     }
 }
 
+/// One event from a gateway, dispatched to the service and logged.
+///
+/// Every client frame for every service passes through here, which makes it the
+/// one place per-service traffic can be made visible without nineteen services
+/// each remembering to do it. It is `debug`/`trace` rather than `info` on
+/// purpose: this is per-frame and would drown an operator, so the audience is a
+/// developer who has turned `RUST_LOG` up while reproducing something.
 async fn handle<S: ClientService>(
     service: &Arc<S>,
     event: ClientEvent,
     gateway: &mut String,
     scope: &mut u32,
+    name: &'static str,
 ) -> Actions {
     match event.event {
         Some(client_event::Event::Hello(hello)) => {
+            tracing::debug!(
+                service = name,
+                gateway = %hello.gateway_id,
+                scope = hello.virtual_server,
+                "hello"
+            );
             *gateway = hello.gateway_id;
             *scope = hello.virtual_server;
             Actions::new()
         }
-        Some(client_event::Event::Opened(opened)) => service.opened(&opened, gateway).await,
+        Some(client_event::Event::Opened(opened)) => {
+            tracing::debug!(
+                service = name,
+                conn = opened.conn,
+                peer = %opened.peer_addr,
+                "connection opened"
+            );
+            let actions = service.opened(&opened, gateway).await;
+            trace_actions(name, opened.conn, 0, &actions);
+            actions
+        }
         Some(client_event::Event::Frame(frame)) => {
-            service
+            let (conn, session, type_id, len) = (
+                frame.conn,
+                frame.session,
+                frame.r#type as u16,
+                frame.payload.len(),
+            );
+            tracing::trace!(service = name, conn, session, type_id, len, "frame");
+            let actions = service
                 .frame(Inbound {
-                    conn: frame.conn,
-                    session: frame.session,
-                    type_id: frame.r#type as u16,
+                    conn,
+                    session,
+                    type_id,
                     payload: frame.payload,
                     gateway: gateway.clone(),
                     scope: *scope,
                 })
-                .await
+                .await;
+            trace_actions(name, conn, session, &actions);
+            actions
         }
         Some(client_event::Event::Closed(closed)) => {
-            service.closed(closed.conn, &closed.reason).await
+            tracing::debug!(
+                service = name,
+                conn = closed.conn,
+                reason = %closed.reason,
+                "connection closed"
+            );
+            let actions = service.closed(closed.conn, &closed.reason).await;
+            trace_actions(name, closed.conn, 0, &actions);
+            actions
         }
-        None => Actions::new(),
+        None => {
+            // An event with nothing in it means the two sides disagree about
+            // the protobuf, which is a deployment skew rather than bad input.
+            tracing::warn!(service = name, "empty client event");
+            Actions::new()
+        }
+    }
+}
+
+/// Record what a service decided to do, when the developer asked for detail.
+///
+/// The reply is the half that is missing when a client "did not get" something:
+/// the inbound frame is visible on the wire, the decision is not.
+fn trace_actions(name: &'static str, conn: u64, session: u32, actions: &[ServerAction]) {
+    if actions.is_empty() || !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    for action in actions {
+        match &action.action {
+            Some(server_action::Action::Send(send)) => tracing::trace!(
+                service = name,
+                conn,
+                session,
+                type_id = send.r#type,
+                len = send.payload.len(),
+                sessions = send.sessions.len(),
+                conns = send.conns.len(),
+                audio = send.audio,
+                "reply"
+            ),
+            Some(server_action::Action::Disconnect(disconnect)) => tracing::debug!(
+                service = name,
+                conn = disconnect.conn,
+                reason = %disconnect.reason,
+                "service asked for a disconnect"
+            ),
+            _ => {}
+        }
     }
 }
 

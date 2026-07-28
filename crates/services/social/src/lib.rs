@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::fancy::social::{
     PollState, SocialEnvelope, WatchState, WatchSync, social_envelope, watch_sync,
@@ -116,7 +115,6 @@ impl SocialService {
     }
 }
 
-#[async_trait]
 impl ClientService for SocialService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Social.outer_type();
@@ -124,6 +122,15 @@ impl ClientService for SocialService {
             return Actions::new();
         }
         let Ok(envelope) = SocialEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable SocialEnvelope"
+            );
             return Actions::new();
         };
 
@@ -177,14 +184,12 @@ impl ClientService for SocialService {
             }
             // Reactions, typing and receipts are pure fan-out: the server holds
             // no state a client could not rebuild from the stream itself.
-            Some(social_envelope::Body::Reaction(_))
-            | Some(social_envelope::Body::Typing(_))
-            | Some(social_envelope::Body::Receipt(_))
-            | Some(social_envelope::Body::Clear(_)) => vec![broadcast_except(
-                inbound.session,
-                outer,
-                inbound.payload.clone(),
-            )],
+            Some(
+                social_envelope::Body::Reaction(_)
+                | social_envelope::Body::Typing(_)
+                | social_envelope::Body::Receipt(_)
+                | social_envelope::Body::Clear(_),
+            ) => vec![broadcast_except(inbound.session, outer, inbound.payload)],
             _ => {
                 let _ = to_conn(inbound.conn, outer, Vec::new());
                 Actions::new()
@@ -193,7 +198,6 @@ impl ClientService for SocialService {
     }
 }
 
-#[async_trait]
 impl Serve for SocialService {
     const NAME: &'static str = "social";
 
@@ -206,7 +210,7 @@ impl Serve for SocialService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default().add_service(plane)
     }
 }
@@ -277,7 +281,7 @@ mod tests {
         let seek = WatchSync {
             kind: watch_sync::Kind::State as i32,
             position_s: 90.0,
-            ..start.clone()
+            ..start
         };
         assert!(service.watch(&seek, 6).is_none(), "a viewer cannot seek");
         let driven = service.watch(&seek, 5).expect("the host can");

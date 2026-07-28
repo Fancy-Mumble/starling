@@ -212,6 +212,52 @@ mod tests {
     }
 
     #[test]
+    fn the_server_cipher_is_the_mirror_of_the_client_the_same_material_builds() {
+        // The failure this catches: a server that seals under the nonce it
+        // should be opening with. Every packet then fails its tag, in both
+        // directions, and the symptom is a handshake that looks perfect
+        // followed by total silence — which is indistinguishable from a
+        // microphone problem at the other end.
+        //
+        // Both ciphers, because the crossover is written out twice.
+        for choice in [CipherChoice::Ocb2Aes128, CipherChoice::XChaCha20Poly1305] {
+            let secrets = VoiceSecrets::generate(choice).expect("entropy");
+            let mut server = secrets.server_cipher();
+
+            let mut client: Box<dyn crate::stream::VoiceCipher> = match &secrets {
+                VoiceSecrets::Legacy(keys) => Box::new(crate::ocb2::Ocb2::new(
+                    *keys.key(),
+                    // The client's half: it sends under the client nonce and
+                    // expects the server's, so the pair is the other way round.
+                    crate::ocb2::Block(*keys.server_nonce()),
+                    crate::ocb2::Block(*keys.client_nonce()),
+                )),
+                VoiceSecrets::Modern(keys) => {
+                    Box::new(crate::modern::XChaCha20Voice::for_client(keys))
+                }
+            };
+
+            let up = client.seal(b"client to server", &[]).expect("client seals");
+            assert_eq!(
+                server
+                    .open(&up, &[])
+                    .expect("the server opens what the client sealed"),
+                b"client to server",
+                "{choice:?}"
+            );
+
+            let down = server.seal(b"server to client", &[]).expect("server seals");
+            assert_eq!(
+                client
+                    .open(&down, &[])
+                    .expect("the client opens what the server sealed"),
+                b"server to client",
+                "{choice:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_two_directions_get_different_salts() {
         // Sharing one salt would give both directions the same subkey, undoing
         // the separation `Direction` exists for.
@@ -400,6 +446,31 @@ impl VoiceSecrets {
         match self {
             Self::Legacy(_) => CipherChoice::Ocb2Aes128,
             Self::Modern(_) => CipherChoice::XChaCha20Poly1305,
+        }
+    }
+
+    /// The server's half of the session this material describes.
+    ///
+    /// The counterpart to what the client builds from the same `CryptSetup`, and
+    /// deliberately here rather than in the voice service: both halves of both
+    /// ciphers already live in this crate, and the one mistake that matters — a
+    /// server that sends under the nonce it should be receiving under — is only
+    /// visible when the two are written next to each other.
+    ///
+    /// Boxed because the two ciphers have different per-packet state and the
+    /// packet path holds one per peer without caring which.
+    #[must_use]
+    pub fn server_cipher(&self) -> Box<dyn crate::stream::VoiceCipher> {
+        match self {
+            // `Ocb2::new` takes the two nonces in wire order and is already the
+            // server's half: it sends under the server nonce and receives under
+            // the client's.
+            Self::Legacy(keys) => Box::new(crate::ocb2::Ocb2::new(
+                *keys.key(),
+                crate::ocb2::Block(*keys.client_nonce()),
+                crate::ocb2::Block(*keys.server_nonce()),
+            )),
+            Self::Modern(keys) => Box::new(crate::modern::XChaCha20Voice::for_server(keys)),
         }
     }
 

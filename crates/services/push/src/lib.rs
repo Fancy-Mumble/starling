@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::feature::{PushAck, PushEnvelope, push_envelope};
@@ -50,7 +49,7 @@ impl PushService {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let _ = sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO push_registration (server_id, account_id, token, platform, channels) \
              VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT (server_id, token) DO UPDATE SET \
@@ -64,6 +63,22 @@ impl PushService {
         .bind(channels)
         .execute(self.store.pool())
         .await;
+
+        // The caller is acknowledged regardless, so a failure here is a device
+        // that believes it is registered and will never be notified.
+        match result {
+            Ok(_) => tracing::debug!(
+                account = registration.account,
+                platform = %registration.platform,
+                channels = registration.channels.len(),
+                "push registration stored"
+            ),
+            Err(error) => tracing::error!(
+                account = registration.account,
+                %error,
+                "could not store a push registration"
+            ),
+        }
     }
 
     async fn subscriptions(&self, scope: u32, account: u64) -> Vec<Registration> {
@@ -157,7 +172,6 @@ impl Push for PushRpc {
     }
 }
 
-#[async_trait]
 impl ClientService for PushService {
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Push.outer_type();
@@ -165,6 +179,15 @@ impl ClientService for PushService {
             return Actions::new();
         }
         let Ok(envelope) = PushEnvelope::decode(inbound.payload.as_slice()) else {
+            // Dropped silently before: an envelope this service cannot read
+            // means a client newer than the server, and the symptom is a
+            // feature that does nothing at all.
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable PushEnvelope"
+            );
             return Actions::new();
         };
         let ok = match envelope.body {
@@ -204,7 +227,6 @@ impl ClientService for PushService {
     }
 }
 
-#[async_trait]
 impl Serve for PushService {
     const NAME: &'static str = "push";
 
@@ -218,7 +240,7 @@ impl Serve for PushService {
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
-        let plane = Plane::new(Arc::clone(&self), self.fanout.clone()).into_server();
+        let plane = Plane::new(Arc::clone(&self), self.fanout.clone(), Self::NAME).into_server();
         tonic::service::Routes::default()
             .add_service(PushServer::new(PushRpc(Arc::clone(&self))))
             .add_service(plane)

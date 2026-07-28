@@ -31,6 +31,21 @@ package "**scales out, bounded by the key**" as BOUND #FFF9C4 {
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
+package "**must not scale out at all**" as SINGLE #EDE7F6 {
+  component "**directory**\nshard: **none — one per virtual server**" as dir #FFFFFF
+}
+
+note bottom of SINGLE #EDE7F6
+  **Replicating this is not slower, it is wrong.** Each replica runs its own
+  hourly timer, so N of them are N announcements of one server to the public
+  list — and the list keys an entry by certificate fingerprint, which every
+  replica shares. They would overwrite each other with racing user counts.
+  It carries no request load to spread: one HTTPS POST an hour, and the counts
+  in it come from session-view rather than from anything local. So there is no
+  shard key to design, and the bound is **replicas: 1**.
+end note
+
+' ═══════════════════════════════════════════════════════════════════════════
 package "**does not scale out for legacy clients**" as PINNED #FFCDD2 {
   component "**voice**\nshard: **channel, never client**" as voice #FFFFFF
 }
@@ -74,12 +89,21 @@ note bottom of FREE #FFFFFF
   load shedding at the gateway fails fast instead.
 end note
 
+note as BUILT #EEEEEE
+  **Nothing here is sharded yet.** Every key above is a decision recorded
+  before it becomes expensive — a shard key cannot be retrofitted, because
+  changing one changes every caller. What runs today is one process per
+  service, so the amber and red boxes are warnings about where growth stops,
+  not descriptions of a running deployment.
+end note
+
 legend bottom
 |= colour |= meaning |
 |<#C8E6C9>   | scales out freely — add pods |
 |<#FFF9C4>   | scales out along a declared key |
 |<#FFE082>   | scales out **only if** the key is designed in now |
 |<#FFCDD2>   | cannot scale out; a protocol limit, not a code one |
+|<#EDE7F6>   | must not be replicated; correctness, not capacity |
 endlegend
 
 @enduml

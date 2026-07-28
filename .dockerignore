@@ -1,0 +1,33 @@
+# The build context is the whole workspace, and `target/` is the largest thing
+# in it by orders of magnitude. Sending it would also be pointless: the builder
+# stage compiles into its own cache mount.
+/target
+/deploy/target
+
+# Generated on first boot when no certificate is configured. A stale host cert
+# must never be baked into an image.
+/starling-data/
+*.pem
+
+# Nothing in the build reads git history, and the submodule's .git is a
+# pointer into another tree anyway.
+.git
+.gitattributes
+.gitignore
+
+# Not inputs to `cargo build`.
+/docs/
+/.github/
+/scripts/
+/deploy/
+Dockerfile
+.dockerignore
+docker-compose.yml
+*.md
+
+# Editor and OS cruft.
+/.vscode/
+/.idea/
+*.swp
+.DS_Store
+Thumbs.db

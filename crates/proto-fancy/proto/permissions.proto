@@ -9,6 +9,19 @@ import "common.proto";
 service Permissions {
   rpc Effective(EffectiveRequest) returns (EffectiveResponse);
   rpc Check(CheckRequest) returns (starling.common.v1.Decision);
+  // The check a service enforcing a client's action should use.
+  //
+  // Names a *session* rather than carrying a `Subject`, and that is the whole
+  // point: `Check` lets its caller state who the subject is, so a caller that
+  // built one carelessly — or was compromised — can assert
+  // `account = 0, registered = true` and be told it is the SuperUser. Here the
+  // caller supplies only the session id the frame arrived on, and this service
+  // resolves the identity itself through `session-view`.
+  //
+  // `Check` remains for callers that legitimately hold an identity the session
+  // view does not have: `operator-api` acting as an operator, and `session-view`
+  // itself, which *is* the authority on who a session is.
+  rpc CheckSession(SessionCheckRequest) returns (starling.common.v1.Decision);
   rpc GetAcl(AclRequest) returns (AclSet);
   rpc SetAcl(SetAclRequest) returns (AclResult);
   // A revocation invalidates before it is acknowledged; a grant may arrive
@@ -28,9 +41,21 @@ message EffectiveRequest {
 // a session and no account, and an operator edits an account with no session.
 message Subject {
   uint32 session = 1;
+  // The registered account id — meaningful ONLY when `registered` is set.
+  //
+  // An unregistered subject carries 0 here, and 0 is also the SuperUser's id, so
+  // reading this field alone identifies every guest as the administrator. Use
+  // `starling_proto_fancy::identity` rather than comparing it directly.
   uint64 account = 2;
   string name = 3;
-  bool authenticated = 4;
+  // Whether `account` names a real account: murmur's `@auth` predicate,
+  // `iId >= 0` (`vendor/server/src/Group.cpp:154`).
+  //
+  // Named `registered` and not `authenticated` on purpose. It was the latter,
+  // and it was populated as "has a session id" — true for every connected
+  // client — which put anonymous guests in `@auth` alongside registered users.
+  // The field number is unchanged; only the name and its meaning are.
+  bool registered = 4;
   repeated string tokens = 5;
   bytes cert_hash = 6;
 }
@@ -45,6 +70,19 @@ message CheckRequest {
   starling.common.v1.Scope scope = 1;
   Subject subject = 2;
   uint32 channel = 3;
+  uint32 permission = 4;
+}
+
+// "May the client on this session do this here?"
+//
+// The identity is deliberately absent: it is not the caller's to state.
+message SessionCheckRequest {
+  starling.common.v1.Scope scope = 1;
+  // The session the frame arrived on. Zero — a client that has not finished
+  // its handshake — resolves to nothing and is therefore denied.
+  uint32 session = 2;
+  uint32 channel = 3;
+  // The bit being asked for. More than one bit means all of them are required.
   uint32 permission = 4;
 }
 

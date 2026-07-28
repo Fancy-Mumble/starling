@@ -34,6 +34,18 @@ pub fn description() -> String {
             "Change operational settings",
             "server-config:write",
         ),
+        (
+            "/v1/accounts/{id}",
+            "put",
+            "Change an account; id 0 is the SuperUser, so this sets its password",
+            "userdata:write",
+        ),
+        (
+            "/v1/accounts/{id}",
+            "delete",
+            "Delete an account",
+            "userdata:write",
+        ),
         ("/v1/whoami", "post", "Identify the caller", "*"),
     ];
 

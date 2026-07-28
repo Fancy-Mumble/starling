@@ -7,7 +7,7 @@ Starling splits them, because they have different lifetimes:
 
 | | **Deployment — this file** | **Operational — the `server-config` service** |
 |---|---|---|
-| Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `bandwidth`, `messagelimit`, `users`, `welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`, `certrequired` |
+| Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `bandwidth`, `messagelimit`, `users`, `welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`, `certrequired`, `allow_ping`, `registry_*` |
 | Changed by | editing this file | an operator, at runtime, like murmur |
 | Takes effect | on restart | immediately, republished to subscribers |
 | Scope | the process | per virtual server |
@@ -162,6 +162,40 @@ url_ttl    = "15m"
 max_upload = "512MiB"
 ```
 
+### Endpoints
+
+`endpoint` says where a service is reached, and it is the only key that changes
+between one VPS and twenty-four pods.
+
+| Written | Means |
+|---|---|
+| `http://text:50051` | across hosts; Kubernetes DNS fills the name in |
+| `unix:/run/starling/text.sock` | co-located, and file permissions are the auth |
+| `pipe:starling/text` | the same on Windows, where the pipe's ACL is the auth |
+| `inproc:text` | in-process, under `--all-in-one` |
+
+A bare `host:port` is refused rather than assumed to be TCP: assuming it would
+make `unix` a typo away from silently opening a TCP socket on a host that
+expected a permission boundary.
+
+The co-located form is the platform's own, and **only one of the two exists in a
+given build** — a Unix socket cannot be served on Windows, and a named pipe
+cannot be served anywhere else. An endpoint naming the other one is a startup
+error rather than a substitution, so a configuration file carried between
+platforms says so instead of quietly binding a different kind of boundary than
+it asked for. A deployment meant to run on both should use `http://` for the
+services it shares, or let `--all-in-one` and the built-in defaults pick.
+
+With no `--config` file at all, every service is given the local form for
+whichever platform it is running on, under the run directory — so a first boot
+needs no port allocated for anything but the gateway.
+
+> On Windows, `\\.\pipe\` is one flat namespace for the whole machine with no
+> directories and no working directory, so the run directory is folded into each
+> pipe's name to keep two servers apart. That name is capped at 256 characters
+> by the OS; a very deeply nested data directory is reported at startup as the
+> length problem it is, and the fix is a shorter one.
+
 ### Adding a service
 
 Three lines, no gateway release:
@@ -175,6 +209,43 @@ types    = [1018]
 
 The gateway routes on the outer type and forwards the payload verbatim, so it
 needs no generated stubs for the new service and no knowledge of its schema.
+
+### The one service with no endpoint
+
+`directory` announces this server to the public Mumble list. Nothing dials it, so
+it has no `endpoint` and no gRPC surface — the only two lines it needs here are
+its tier and where to find a trust store:
+
+```toml
+[services.directory]
+tier = "optional"
+types = []
+
+[services.directory.options]
+# The public list's certificate is verified against this bundle. A missing one
+# fails the announcement rather than posting unverified — the payload carries a
+# shared secret.
+trust_store = "/etc/ssl/certs/ca-certificates.crt"
+```
+
+**Everything that decides *whether* it announces is operational, not here**,
+because murmur lets an operator change it while the server runs. In
+`server-config`:
+
+| Setting | murmur | Meaning |
+|---|---|---|
+| `registry_name` | `registerName` | the name to be listed under; empty means do not register |
+| `registry_password` | `registerPassword` | the secret that authenticates later updates |
+| `registry_url` | `registerUrl` | the web page the listing links to; required |
+| `registry_hostname` | `registerHostname` | the DNS name to be reached at; empty means "whatever address this arrived from" |
+| `registry_location` | `registerLocation` | free text, omitted when empty |
+| `allow_ping` | `allowping` | answer unauthenticated UDP pings; **required to register** |
+
+Two of those rules surprise people, and both are murmur's rather than ours: a
+server with a `password` set is **never** listed, and `allow_ping = false` also
+prevents registration — a listing the list cannot measure is a dead entry. When a
+server is not being announced, the reason is logged once per interval, naming the
+specific condition rather than "missing required fields".
 
 ## Storage, per service
 

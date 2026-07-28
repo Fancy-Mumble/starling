@@ -32,11 +32,11 @@ pub use store::Sessions;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
+use starling_proto_fancy::permissions::Subject;
 use starling_proto_fancy::sessionview::session_view_server::{SessionView, SessionViewServer};
 use starling_proto_fancy::sessionview::{
     Announcement, ColdAnswer, ColdQuery, GetRequest, Session, Sessions as SessionList,
-    SubscribeRequest, ViewEvent, announcement, view_event,
+    SubscribeRequest, ViewEvent, announcement, cold_query, view_event,
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use tokio::sync::broadcast;
@@ -63,6 +63,34 @@ impl SessionViewService {
 
     fn publish(&self, event: ViewEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// The identified subject a cold query is about, if it is about one.
+    ///
+    /// This is the composition the whole service exists to do: an ACL query
+    /// names a *session*, and the authority that answers it needs to know which
+    /// *account* that session holds. Permissions cannot look it up — that would
+    /// reverse the cold-query edge — so the answer is assembled here.
+    ///
+    /// `None` when the query is not about a subject, or names a session this view
+    /// has never seen. A caller that gets `None` evaluates as an anonymous guest,
+    /// which is the safe direction.
+    fn asker(&self, query: &ColdQuery) -> Option<Subject> {
+        let scope = query.scope.map_or(1, |scope| scope.virtual_server);
+        let Some(cold_query::Query::Acl(acl)) = &query.query else {
+            return None;
+        };
+        let session = self.sessions.get(scope, acl.session)?;
+        Some(Subject {
+            session: session.session,
+            // Carried as the pair, never re-derived: `account` alone cannot say
+            // whether it is the SuperUser or a guest, because both are zero.
+            account: session.account,
+            registered: session.registered,
+            name: session.name,
+            cert_hash: session.cert_hash,
+            ..Subject::default()
+        })
     }
 }
 
@@ -169,15 +197,17 @@ impl SessionView for ViewRpc {
         // Forwarded untouched to the owning authority. The answer is not cached
         // here: caching a permission decision is what would make this a second
         // ACL engine.
-        self.0
-            .cold
-            .forward(request.into_inner())
-            .await
-            .map(Response::new)
+        //
+        // The *subject* is composed here, though, and that is not caching a
+        // decision — it is this service doing the one job it exists for. An ACL
+        // query names a session, and only the read model knows which account
+        // that session holds.
+        let query = request.into_inner();
+        let asker = self.0.asker(&query);
+        self.0.cold.forward(query, asker).await.map(Response::new)
     }
 }
 
-#[async_trait]
 impl Serve for SessionViewService {
     const NAME: &'static str = "session-view";
 
@@ -186,7 +216,7 @@ impl Serve for SessionViewService {
         Ok(Arc::new(Self {
             sessions: Sessions::new(),
             events,
-            cold: ColdRouter::new(ctx.resolver.clone()),
+            cold: ColdRouter::new(ctx.resolver),
         }))
     }
 

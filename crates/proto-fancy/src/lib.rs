@@ -15,6 +15,8 @@
 //! makes "never break a native Mumble client" structural rather than a rule
 //! someone has to remember.
 
+pub mod identity;
+pub mod perm;
 pub mod types;
 
 /// Generated code, one module per proto package.
@@ -156,4 +158,5 @@ pub mod fancy {
     );
 }
 
+pub use perm::Perm;
 pub use types::{OuterType, ServiceKind};

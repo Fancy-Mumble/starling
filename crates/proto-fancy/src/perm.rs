@@ -3,6 +3,12 @@
 //! Values are transcribed from `vendor/server/src/ACL.h:21`, including the Fancy
 //! fork's additions. They are **wire-visible** — sent in `ServerSync.permissions`
 //! and `PermissionQuery.permissions` — so they must never be renumbered.
+//!
+//! It lives in the contract crate rather than in `starling-permissions` because
+//! it is not policy: every service that *enforces* a permission needs to name
+//! the bit it is asking for, and none of them should have to depend on the ACL
+//! engine to do it. The engine that evaluates these stays in
+//! `starling-permissions`.
 
 use bitflags::bitflags;
 
@@ -82,13 +88,41 @@ impl Perm {
     /// No permissions.
     pub const NONE: Self = Self::empty();
 
-    /// Every permission — what SuperUser is granted (`Messages.cpp:756`).
+    /// Every permission.
     ///
     /// Generated from the declaration above, so it covers every flag by
     /// construction. It excludes `ACL.h`'s `Cached` marker (`0x8000000`)
     /// because that bit is internal bookkeeping and is deliberately not
     /// declared here; it must never reach a client.
     pub const ALL: Self = Self::all();
+
+    /// What every subject starts with, before any ACL entry is applied.
+    ///
+    /// murmur's `ChanACL::effectivePermissions` seeds the walk with exactly
+    /// these (`vendor/server/src/ACL.cpp:130`) rather than with nothing, and the
+    /// difference is the whole behaviour of an unconfigured server: starting
+    /// from empty means a fresh server grants **nobody** anything — no talking,
+    /// no text, not even entering a channel — and every client shows every
+    /// action greyed out with no ACL to point at as the cause.
+    ///
+    /// An operator takes permissions *away* from here with a deny entry. That
+    /// direction is what makes a default set safe: it is the same set murmur has
+    /// had for twenty years, and it contains nothing administrative.
+    pub const DEFAULT: Self = Self::TRAVERSE
+        .union(Self::ENTER)
+        .union(Self::SPEAK)
+        .union(Self::WHISPER)
+        .union(Self::TEXT_MESSAGE)
+        .union(Self::LISTEN);
+
+    /// What the SuperUser is granted, before any ACL is consulted.
+    ///
+    /// Everything **except speaking and whispering**
+    /// (`vendor/server/src/ACL.cpp:106`). That exclusion is deliberate upstream
+    /// and worth keeping: the administrator account exists to administer, and an
+    /// operator who logs in as SuperUser to fix something should not silently be
+    /// transmitting into whatever channel they land in.
+    pub const SUPERUSER: Self = Self::ALL.difference(Self::SPEAK).difference(Self::WHISPER);
 }
 
 impl Perm {

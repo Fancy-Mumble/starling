@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use starling_proto_fancy::identity;
 use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, BlobRef, UpdateRequest, auth_result,
 };
@@ -15,6 +16,29 @@ use starling_runtime::ids::now_ms;
 use starling_runtime::storage::{Migration, Store, StoreError};
 
 use crate::secret::{Secret, verify_totp};
+
+/// How many characters a generated SuperUser password has.
+///
+/// Twenty from a 56-character alphabet is about 116 bits, which is far past
+/// anything that matters — the length is chosen for what it *cannot* be, namely
+/// short enough for somebody to decide it is fine to leave as it is.
+const GENERATED_PASSWORD_LEN: usize = 20;
+
+/// The alphabet a generated password is drawn from.
+///
+/// No `0`/`O`, `1`/`l`/`I`: this is read off a terminal and typed into a client
+/// by hand, and a password that cannot be transcribed reliably gets replaced by
+/// a short one the operator chose instead.
+const PASSWORD_ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// A fresh SuperUser password.
+fn generated_password() -> String {
+    use rand::RngExt as _;
+    let mut rng = rand::rng();
+    (0..GENERATED_PASSWORD_LEN)
+        .map(|_| char::from(PASSWORD_ALPHABET[rng.random_range(0..PASSWORD_ALPHABET.len())]))
+        .collect()
+}
 
 /// The schema.
 const SCHEMA: &[Migration<'static>] = &[Migration::new(
@@ -52,6 +76,20 @@ struct Record {
     account: Account,
     password: Option<Secret>,
     totp: Option<Vec<u8>>,
+}
+
+/// What the peer has already proved by the time the password is considered.
+///
+/// The distinction matters only in one case, and that case is a security hole:
+/// an account with no stored password. Reached by certificate that is fine — the
+/// certificate *was* the proof. Reached by name it is not, and the two paths are
+/// otherwise identical enough to be confused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    /// The certificate matched this account.
+    Certificate,
+    /// Only a name was given; the password is the whole of the evidence.
+    PasswordOnly,
 }
 
 impl Accounts {
@@ -132,7 +170,7 @@ impl Accounts {
     /// The name-taken case is murmur's impersonation guard: a registered name
     /// belongs to the certificate that registered it, so a stranger presenting
     /// it is refused rather than let in as a guest with that name.
-    pub async fn authenticate(&self, scope: u32, request: &AuthRequest) -> AuthResult {
+    pub fn authenticate(&self, scope: u32, request: &AuthRequest) -> AuthResult {
         use auth_result::Outcome;
 
         if request.name.trim().is_empty() {
@@ -147,11 +185,14 @@ impl Accounts {
 
         match (by_cert, by_name) {
             // A certificate that matches an account is the strongest signal
-            // murmur has, and it authenticates on its own.
-            (Some(record), _) => self.finish(record, request),
+            // murmur has, and it authenticates on its own — the certificate is
+            // the proof, so no password is demanded on top of it.
+            (Some(record), _) => self.finish(record, request, Proof::Certificate),
             (None, Some(record)) => {
                 if record.account.cert_hash.is_empty() {
-                    self.finish(record, request)
+                    // Only a name was offered, so only the password can prove
+                    // it belongs to this peer.
+                    self.finish(record, request, Proof::PasswordOnly)
                 } else {
                     outcome(Outcome::NameTaken, None)
                 }
@@ -167,12 +208,31 @@ impl Accounts {
         }
     }
 
-    fn finish(&self, record: Record, request: &AuthRequest) -> AuthResult {
+    fn finish(&self, record: Record, request: &AuthRequest, proof: Proof) -> AuthResult {
         use auth_result::Outcome;
-        if let Some(secret) = &record.password
-            && !secret.verify(&request.password)
-        {
-            return outcome(Outcome::WrongPassword, None);
+        match (&record.password, proof) {
+            (Some(secret), _) if !secret.verify(&request.password) => {
+                return outcome(Outcome::WrongPassword, None);
+            }
+            // A registered account with no stored password, claimed by name
+            // alone. There is nothing here to check, so accepting would hand
+            // the account — and every permission it holds — to whoever typed
+            // the name. It is refused rather than downgraded to a guest,
+            // because a guest wearing a registered name is the impersonation
+            // the name-taken branch above exists to prevent.
+            //
+            // Reachable through data, not just code: an account row written
+            // before passwords were stored has a NULL there, and a SuperUser in
+            // that state is a server anyone can administer.
+            (None, Proof::PasswordOnly) => {
+                tracing::warn!(
+                    name = %record.account.name,
+                    account = record.account.id,
+                    "refusing a registered account that has no password to check"
+                );
+                return outcome(Outcome::WrongPassword, None);
+            }
+            _ => {}
         }
         if let Some(totp) = &record.totp {
             if request.totp.is_empty() {
@@ -186,7 +246,7 @@ impl Accounts {
     }
 
     /// One account by id.
-    pub async fn by_id(&self, scope: u32, id: u64) -> Option<Account> {
+    pub fn by_id(&self, scope: u32, id: u64) -> Option<Account> {
         self.cache
             .lock()
             .ok()
@@ -194,13 +254,13 @@ impl Accounts {
     }
 
     /// One account by name.
-    pub async fn by_name(&self, scope: u32, name: &str) -> Option<Account> {
+    pub fn by_name(&self, scope: u32, name: &str) -> Option<Account> {
         self.record_by_name(scope, name)
             .map(|record| record.account)
     }
 
     /// One account by certificate hash.
-    pub async fn by_cert(&self, scope: u32, hash: &[u8]) -> Option<Account> {
+    pub fn by_cert(&self, scope: u32, hash: &[u8]) -> Option<Account> {
         self.record_by_cert(scope, hash)
             .map(|record| record.account)
     }
@@ -225,7 +285,7 @@ impl Accounts {
     }
 
     /// A page of accounts, ordered by id.
-    pub async fn list(&self, scope: u32, prefix: &str, limit: u32, after: u64) -> AccountPage {
+    pub fn list(&self, scope: u32, prefix: &str, limit: u32, after: u64) -> AccountPage {
         let limit = limit.clamp(1, 500) as usize;
         let mut accounts: Vec<Account> = self
             .cache
@@ -286,6 +346,63 @@ impl Accounts {
         Ok(account)
     }
 
+    /// Create the SuperUser for this virtual server if it has none.
+    ///
+    /// Returns the password it generated, and **only** when it generated one.
+    /// `None` means the account was already there, which is what makes this safe
+    /// to call on every boot: the credential is announced exactly once, at
+    /// creation, and a restart never prints it again. murmur does the same thing
+    /// for the same reason — an operator who missed the line uses
+    /// `set-superuser-password` rather than expecting it to reappear.
+    pub async fn ensure_superuser(&self, scope: u32) -> Option<String> {
+        if self.by_id(scope, identity::SUPERUSER).is_some() {
+            return None;
+        }
+        let password = generated_password();
+        self.write_superuser(scope, &password).await;
+        Some(password)
+    }
+
+    /// Set the SuperUser's password, creating the account if it is missing.
+    ///
+    /// Create-or-update rather than update: a deployment whose userdata database
+    /// was restored from before the account existed must still be recoverable,
+    /// and "no such account" would be a dead end with no other way out.
+    pub async fn set_superuser_password(&self, scope: u32, password: &str) {
+        self.write_superuser(scope, password).await;
+    }
+
+    /// Write the SuperUser record for `scope` with `password`.
+    async fn write_superuser(&self, scope: u32, password: &str) {
+        let now = now_ms();
+        let existing = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, identity::SUPERUSER)).cloned());
+
+        let mut record = existing.unwrap_or_else(|| Record {
+            account: Account {
+                id: identity::SUPERUSER,
+                name: identity::SUPERUSER_NAME.to_owned(),
+                created_at_ms: now,
+                ..Account::default()
+            },
+            password: None,
+            totp: None,
+        });
+        // Deliberately leaves `cert_hash` empty. A certificate on this account
+        // would authenticate it *without* the password, and the administrator
+        // login is the one place that must always be something you know.
+        record.password = Some(Secret::new(password));
+        record.account.last_active_ms = now;
+
+        self.write(scope, &record).await;
+        if let Ok(mut cache) = self.cache.lock() {
+            let _ = cache.insert((scope, identity::SUPERUSER), record);
+        }
+    }
+
     /// Update named fields of an account.
     ///
     /// # Errors
@@ -336,6 +453,14 @@ impl Accounts {
             let _ = cache.insert((scope, request.id), record.clone());
         }
         Ok(record.account)
+    }
+
+    /// Whether this virtual server's SuperUser has a password set.
+    ///
+    /// For the operator surface, which should be able to say "the administrator
+    /// login exists" without being able to read what it is.
+    pub fn has_superuser(&self, scope: u32) -> bool {
+        self.by_id(scope, identity::SUPERUSER).is_some()
     }
 
     /// Delete an account.
@@ -454,10 +579,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_superuser_is_created_once_and_announced_once() {
+        // Announcing on every boot would leave a live administrator password in
+        // every log the deployment ships to.
+        let accounts = accounts().await;
+
+        let password = accounts
+            .ensure_superuser(1)
+            .await
+            .expect("the first boot creates the account");
+        assert_eq!(password.len(), GENERATED_PASSWORD_LEN);
+        assert!(
+            accounts.ensure_superuser(1).await.is_none(),
+            "a second boot must not create or re-announce anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_generated_password_actually_logs_in_as_the_superuser() {
+        // The whole point, and the thing a constant-mismatch bug would break
+        // silently: the announced password must authenticate, and the result
+        // must be the SuperUser's account rather than a guest with that name.
+        let accounts = accounts().await;
+        let password = accounts.ensure_superuser(1).await.expect("created");
+
+        let result = accounts.authenticate(1, &auth(identity::SUPERUSER_NAME, &password));
+
+        assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
+        assert!(!result.guest, "the SuperUser is not a guest");
+        let account = result.account.expect("an account");
+        assert_eq!(account.id, identity::SUPERUSER);
+        assert!(identity::is_superuser(true, account.id));
+    }
+
+    #[tokio::test]
+    async fn a_registered_account_with_no_password_cannot_be_claimed_by_name() {
+        // Reachable through data, not code: an account row written before
+        // passwords were stored carries a NULL, and the check used to be
+        // skipped entirely when there was nothing to check — so the name alone
+        // was enough. For a SuperUser in that state it hands over the server.
+        let accounts = accounts().await;
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "legacy".to_owned(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered without a password, as an old row would be");
+
+        for attempt in ["", "guess", "anything at all"] {
+            let result = accounts.authenticate(1, &auth("legacy", attempt));
+            assert_eq!(
+                result.outcome,
+                auth_result::Outcome::WrongPassword as i32,
+                "{attempt:?} must not be accepted as proof of a passwordless account"
+            );
+            assert!(result.account.is_none());
+            assert!(
+                !result.guest,
+                "and it must not fall back to a guest wearing the registered name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_certificate_still_authenticates_an_account_that_has_no_password() {
+        // The other half of the rule above: a certificate *is* the proof, so
+        // requiring a password on top of it would lock out every account that
+        // registered by certificate — which is how Mumble expects it to work.
+        let accounts = accounts().await;
+        let hash = vec![9_u8, 9, 9, 9];
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "by-cert".to_owned(),
+                    cert_hash: hash.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        let result = accounts.authenticate(
+            1,
+            &AuthRequest {
+                cert_hash: hash,
+                ..auth("by-cert", "")
+            },
+        );
+        assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
+        assert!(result.account.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_wrong_superuser_password_is_refused_rather_than_downgraded() {
+        // The failure that would matter most: falling back to a guest session
+        // named "SuperUser" would let anyone in under the administrator's name.
+        let accounts = accounts().await;
+        let _ = accounts.ensure_superuser(1).await.expect("created");
+
+        let result = accounts.authenticate(1, &auth(identity::SUPERUSER_NAME, "not the password"));
+
+        assert_eq!(result.outcome, auth_result::Outcome::WrongPassword as i32);
+        assert!(result.account.is_none());
+        assert!(!result.guest);
+    }
+
+    #[tokio::test]
+    async fn setting_the_password_replaces_the_generated_one() {
+        let accounts = accounts().await;
+        let generated = accounts.ensure_superuser(1).await.expect("created");
+
+        accounts
+            .set_superuser_password(1, "chosen by the operator")
+            .await;
+
+        assert_eq!(
+            accounts
+                .authenticate(1, &auth(identity::SUPERUSER_NAME, &generated))
+                .outcome,
+            auth_result::Outcome::WrongPassword as i32,
+            "the generated password must stop working"
+        );
+        assert_eq!(
+            accounts
+                .authenticate(1, &auth(identity::SUPERUSER_NAME, "chosen by the operator"))
+                .outcome,
+            auth_result::Outcome::Ok as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn the_password_can_be_set_before_the_account_exists() {
+        // The recovery path: a userdata database restored from before the
+        // account existed must not be a dead end.
+        let accounts = accounts().await;
+        assert!(!accounts.has_superuser(1));
+
+        accounts.set_superuser_password(1, "recovered").await;
+
+        assert!(accounts.has_superuser(1));
+        assert_eq!(
+            accounts
+                .authenticate(1, &auth(identity::SUPERUSER_NAME, "recovered"))
+                .outcome,
+            auth_result::Outcome::Ok as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn each_virtual_server_gets_its_own_administrator() {
+        // One password across every virtual server would make them one server
+        // for the only purpose that matters.
+        let accounts = accounts().await;
+        let first = accounts.ensure_superuser(1).await.expect("created");
+        let second = accounts.ensure_superuser(2).await.expect("created");
+        assert_ne!(first, second);
+
+        assert_eq!(
+            accounts
+                .authenticate(2, &auth(identity::SUPERUSER_NAME, &first))
+                .outcome,
+            auth_result::Outcome::WrongPassword as i32,
+            "one server's administrator password must not open another"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registered_account_never_collides_with_the_superuser() {
+        // Ids are handed out from 2, so the administrator's 0 is unreachable by
+        // registration. If that ever changed, the first two users to register
+        // would silently become administrators.
+        let accounts = accounts().await;
+        let _ = accounts.ensure_superuser(1).await.expect("created");
+
+        let registered = accounts
+            .register(
+                1,
+                Account {
+                    name: "alice".to_owned(),
+                    ..Account::default()
+                },
+                "pw",
+            )
+            .await
+            .expect("registered");
+
+        assert!(registered.id > identity::SUPERUSER);
+        assert!(!identity::is_superuser(true, registered.id));
+    }
+
+    #[tokio::test]
     async fn an_unregistered_name_connects_as_a_guest() {
         // What a Mumble server does by default; whether guests are allowed at
         // all is server-config's question.
-        let result = accounts().await.authenticate(1, &auth("visitor", "")).await;
+        let result = accounts().await.authenticate(1, &auth("visitor", ""));
         assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
         assert!(result.guest);
     }
@@ -477,10 +799,10 @@ mod tests {
             .await
             .expect("register");
 
-        let wrong = accounts.authenticate(1, &auth("alice", "hunter3")).await;
+        let wrong = accounts.authenticate(1, &auth("alice", "hunter3"));
         assert_eq!(wrong.outcome, auth_result::Outcome::WrongPassword as i32);
 
-        let right = accounts.authenticate(1, &auth("alice", "hunter2")).await;
+        let right = accounts.authenticate(1, &auth("alice", "hunter2"));
         assert_eq!(right.outcome, auth_result::Outcome::Ok as i32);
         assert!(!right.guest);
     }
@@ -503,7 +825,7 @@ mod tests {
             .await
             .expect("register");
 
-        let stranger = accounts.authenticate(1, &auth("bob", "")).await;
+        let stranger = accounts.authenticate(1, &auth("bob", ""));
         assert_eq!(stranger.outcome, auth_result::Outcome::NameTaken as i32);
     }
 
