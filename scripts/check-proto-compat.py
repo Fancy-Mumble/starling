@@ -107,10 +107,16 @@ def fields(proto: str) -> dict[str, dict[str, tuple[int, str]]]:
 
 def main() -> int:
     here = pathlib.Path(__file__).resolve().parent.parent
-    root = here.parent.parent
     branch = DEFAULT_BRANCH
+    positional = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
     if "--branch" in sys.argv:
         branch = sys.argv[sys.argv.index("--branch") + 1]
+        positional = [arg for arg in positional if arg != branch]
+    # The repo root may be named, and has to be when this runs out of a `git
+    # worktree`: the sibling trees are then nowhere near this file, so deriving
+    # the root from its own location finds no `vendor/server`, and the check
+    # skips — which reads exactly like a check that passed.
+    root = pathlib.Path(positional[0]).resolve() if positional else here.parent.parent
 
     fork = root / FORK
     try:
