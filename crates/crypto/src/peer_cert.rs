@@ -163,7 +163,12 @@ impl ClientCertVerifier for AcceptAnyClientCertificate {
         // rustls's own implementation, not a hand-written one: this is the
         // check that makes the hash mean anything, and it is the last place
         // that should have bespoke cryptography in it.
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -172,7 +177,12 @@ impl ClientCertVerifier for AcceptAnyClientCertificate {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

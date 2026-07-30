@@ -19,7 +19,7 @@ component "**services**\ngRPC" as svc #E8F5E9
 
 package "starling-gateway" as GW #FFE9D6 {
   component "**event loop**  «reactor»\nthe one place that awaits socket readiness" as loop #FFFFFF
-  component "**listener**\nTCP accept · TLS handshake\nmints the connection id" as listener #FFFFFF
+  component "**listener**\nTCP accept · TLS handshake\nmints the connection id\n—\n**requests a client certificate**, accepts any\nissuer, hands the SHA-1 to the services" as listener #FFFFFF
   component "**connection**  [0..*]\none TLS stream · control framing\n«type u16 + len u32»\n—\n**two bounded queues, two policies:**\ncontrol full -> **disconnect**\naudio full -> **drop oldest, count**" as conn #FFFFFF
   component "**router**\nreads the u16 type, looks it up in TOML,\nforwards the payload **verbatim**.\n**No generated stubs. No schemas.**" as router #FFF9C4
   component "**limiter**\na bucket **per route**, never one shared" as lim #FFF9C4
@@ -95,10 +95,39 @@ note bottom of conn
   produced them. No lane rule and no version counter needed.
 end note
 
+note right of listener #E3F2FD
+  **Why it asks for a certificate it will not validate.**
+  In Mumble a certificate *is* the identity: a registered account
+  is bound to one, a ban can be issued against one, and a client
+  presenting the right one is admitted without a password.
+  None of that is reachable unless the server sends a
+  `CertificateRequest` — with `with_no_client_auth()` it never
+  does, so every peer arrives anonymous and all three mechanisms
+  are silently unreachable.
+  Clients are self-signed by design, so **any issuer is accepted**
+  and the hash is treated as an *identifier*, not as a third
+  party's opinion. Possession of the private key is still proved
+  in the handshake, so the hash cannot simply be copied.
+  `strong_cert` is set only when a chain verified against a
+  configured CA, and it is the only field an operator should key
+  a privilege off.
+end note
+
 note bottom of loop
   **Why the loop is separate from the wire format.**
   "Await readiness and pump gRPC" and "speak Mumble's framing"
   are two jobs. Fused, they become one file nobody can review.
+end note
+
+note bottom of listener #FFF9C4
+  **Every way a connection ends must reach one place.**
+  The read loop breaks on a clean close, on an I/O error — a
+  crashed client, a reset, a dropped network, which is how *most*
+  disconnects actually arrive — and on a service asking for the
+  client to go. All three run the same teardown: forget the
+  registry entry, tell the services, count it.
+  Skipping it on any path leaves the connection in the registry
+  and every other client rendering a user who has gone.
 end note
 
 note left of conn #E8F5E9

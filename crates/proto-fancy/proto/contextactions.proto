@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+// Context-menu entries an external system adds, and the triggers back.
+//
+// The service already carried the client half — a plugin's entries, and the
+// trigger routed back to it — but had no gRPC surface at all, so nothing
+// outside a connected client could add an entry or be told it was chosen.
+//
+// The server never learns what an action *does*. An entry carries its owner's
+// identifier and a trigger is routed back by it, which is what lets an
+// operator add a menu item without teaching the server the feature behind it.
+package starling.contextactions.v1;
+
+import "common.proto";
+
+service ContextActions {
+  rpc Add(AddRequest) returns (starling.common.v1.Ack);
+  rpc Remove(RemoveRequest) returns (starling.common.v1.Ack);
+  // Triggers, as users choose entries. One stream per owner: an operator is
+  // told about its own entries and never about another's, because the trigger
+  // is routed by owner and a cross-owner delivery would leak that the other
+  // entry exists.
+  rpc Watch(WatchRequest) returns (stream Trigger);
+}
+
+// Where an entry appears. The values are upstream's ContextActionModify
+// context bits, so a client renders them without a translation table.
+enum Context {
+  CONTEXT_UNSPECIFIED = 0;
+  CONTEXT_SERVER = 1;
+  CONTEXT_CHANNEL = 2;
+  CONTEXT_USER = 4;
+}
+
+message Entry {
+  // Unique per owner, and what a Trigger names.
+  string action = 1;
+  // What the user sees.
+  string text = 2;
+  // Who owns this entry. An operator's subject, or a plugin's identifier.
+  string owner = 3;
+  // A bitwise OR of Context values: an entry can sit in more than one menu.
+  uint32 context = 4;
+}
+
+message AddRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  Entry entry = 3;
+}
+
+message RemoveRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  string owner = 3;
+  string action = 4;
+}
+
+message WatchRequest {
+  starling.common.v1.Scope scope = 1;
+  string owner = 2;
+}
+
+// A user chose an entry.
+//
+// Carries the session and channel it was chosen against: an entry in the user
+// menu is meaningless without knowing which user it was invoked on.
+message Trigger {
+  string action = 1;
+  string owner = 2;
+  // Who invoked it.
+  uint32 actor_session = 3;
+  // The user it was invoked on, 0 when it was not a user menu entry.
+  uint32 session = 4;
+  // The channel it was invoked on, 0 when it was not a channel menu entry.
+  uint32 channel = 5;
+  uint64 at_ms = 6;
+}

@@ -25,12 +25,14 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::identity;
+use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_proto_fancy::userdata::user_data_server::{UserData, UserDataServer};
 use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, Blob, BlobRef, BlobRequest, DeleteRequest,
     ListRequest, LookupRequest, RegisterRequest, UpdateRequest, auth_result, lookup_request,
 };
+use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -47,6 +49,9 @@ pub struct UserdataService {
     accounts: Accounts,
     fanout: Fanout,
     logger: Logger,
+    /// To reach `session-view`, which is the only place that knows which
+    /// account a session belongs to — see [`UserdataService::sessions`].
+    resolver: Resolver,
 }
 
 impl UserdataService {
@@ -219,15 +224,37 @@ impl UserdataService {
 
     /// `RequestBlob`: a primary-key lookup, because storage is content-addressed
     /// even though murmur's is not.
+    ///
+    /// The request names **sessions**, and blobs hang off **accounts**. This
+    /// used to pass the session id straight to `by_id` as though the two were
+    /// the same number. They are not related at all — sessions are handed out
+    /// per connection and reused after a disconnect — so the answer was
+    /// whichever account happened to share the integer: usually none, and
+    /// occasionally somebody else's avatar.
     async fn on_request_blob(&self, inbound: &Inbound) -> Actions {
         let Ok(request) =
             starling_proto::proto::tcp::RequestBlob::decode(inbound.payload.as_slice())
         else {
             return Actions::new();
         };
+
+        let sessions = self.sessions(inbound.scope).await;
+        let account_of = |session: u32| {
+            sessions
+                .iter()
+                .find(|other| other.session == session)
+                .and_then(|other| identity::account(other.registered, other.account))
+        };
+
         let mut states = Vec::new();
         for session in &request.session_texture {
-            if let Some(account) = self.accounts.by_id(inbound.scope, u64::from(*session)) {
+            let Some(id) = account_of(*session) else {
+                // A guest, or a session that left between asking and answering.
+                // Neither is an error: murmur answers what it can and says
+                // nothing about the rest.
+                continue;
+            };
+            if let Some(account) = self.accounts.by_id(inbound.scope, id) {
                 let texture = self
                     .accounts
                     .blob(inbound.scope, &account.texture_hash)
@@ -239,10 +266,49 @@ impl UserdataService {
                 });
             }
         }
+        for session in &request.session_comment {
+            let Some(id) = account_of(*session) else {
+                continue;
+            };
+            if let Some(account) = self.accounts.by_id(inbound.scope, id) {
+                let comment = self
+                    .accounts
+                    .blob(inbound.scope, &account.comment_hash)
+                    .await
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                states.push(starling_proto::proto::tcp::UserState {
+                    session: Some(*session),
+                    comment,
+                    ..starling_proto::proto::tcp::UserState::default()
+                });
+            }
+        }
         states
             .into_iter()
             .map(|state| to_conn(inbound.conn, 9, state.encode_to_vec()))
             .collect()
+    }
+
+    /// Every live session on a virtual server, from `session-view`.
+    ///
+    /// Fetched per request rather than subscribed to: `RequestBlob` arrives
+    /// once per avatar a client has never seen, which is rare and bursty, and a
+    /// maintained mirror of the whole session table would be a second copy of
+    /// state this service does not otherwise need.
+    async fn sessions(&self, scope: u32) -> Vec<starling_proto_fancy::sessionview::Session> {
+        let Ok(channel) = self.resolver.channel("session-view") else {
+            return Vec::new();
+        };
+        SessionViewClient::new(channel)
+            .list(starling_proto_fancy::sessionview::SubscribeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+                subscriber: "userdata".to_owned(),
+            })
+            .await
+            .map(|sessions| sessions.into_inner().sessions)
+            .unwrap_or_default()
     }
 }
 
@@ -268,6 +334,7 @@ impl Serve for UserdataService {
             accounts,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            resolver: ctx.resolver.clone(),
         }))
     }
 

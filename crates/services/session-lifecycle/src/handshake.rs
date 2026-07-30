@@ -26,6 +26,7 @@ use starling_proto_fancy::fancy::session::{SessionEnvelope, session_envelope};
 use starling_proto_fancy::identity;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::metadata::{EnterRequest, TreeRequest};
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
 use starling_proto_fancy::serverconfig::{GetRequest, Snapshot};
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
@@ -40,7 +41,7 @@ use starling_runtime::log::{Category, LogEvent};
 use starling_runtime::plane::{Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn};
 use starling_runtime::serve::ServiceContext;
 
-use crate::state::{Connections, PendingConnection};
+use crate::state::{Connections, Identity, PendingConnection};
 
 /// The Mumble version Starling announces.
 ///
@@ -53,6 +54,27 @@ use crate::state::{Connections, PendingConnection};
 /// invisible because the handshake completes either way.
 const MUMBLE_VERSION_V2: u64 = starling_proto::MUMBLE_VERSION.encode_v2();
 
+/// Upstream `PermissionQuery`, pushed on channel entry as murmur does.
+const PERMISSION_QUERY: u16 = 20;
+
+/// The root channel, which is always id 0.
+const ROOT_CHANNEL: u32 = 0;
+
+/// `Channel.flags` bit for a hidden channel, from `metadata`'s `tree_actor.rs`.
+///
+/// Written out rather than imported: a service depending on another service's
+/// crate is the coupling the gRPC boundary exists to prevent, and the layout is
+/// documented on `Channel.flags` in `metadata.proto`.
+const FLAG_HIDDEN: u32 = 1;
+
+/// The Fancy wire epoch Starling speaks (`Mumble.proto`, `Version.fancy_protocol`).
+///
+/// Epoch 1: upstream 0–99 flat and frozen, every Fancy service behind one outer
+/// type ≥ 1000. Starling has never spoken epoch 0's interleaved 100–999 layout,
+/// and cannot — `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
+/// unroutable, and §3 is the scheme this number names.
+const FANCY_PROTOCOL: u32 = 1;
+
 /// Everything the handshake needs to reach.
 #[derive(Debug, Clone)]
 pub struct Handshake {
@@ -62,10 +84,19 @@ pub struct Handshake {
 }
 
 /// The `Version` Starling sends first, before the client has said anything.
+///
+/// **`fancy_version` is deliberately absent.** It is a product version, and a
+/// client reads it as "this server implements the Fancy features up to X" —
+/// then sends those features on epoch 0's numbering, which Starling routes
+/// nowhere. Claiming it would therefore *break* clients that work today: with
+/// the field absent they fall back to `PluginDataTransmission`, which is
+/// epoch-independent and which Starling relays correctly. The epoch below is
+/// how a client learns there are Fancy extensions here at all.
 #[must_use]
 pub fn server_version() -> tcp::Version {
     tcp::Version {
         version_v2: Some(MUMBLE_VERSION_V2),
+        fancy_protocol: Some(FANCY_PROTOCOL),
         release: Some(format!("Starling {}", env!("CARGO_PKG_VERSION"))),
         os: Some(std::env::consts::OS.to_owned()),
         os_version: Some(std::env::consts::ARCH.to_owned()),
@@ -111,6 +142,11 @@ fn session_record(pending: &PendingConnection) -> Session {
         fancy_version: pending.fancy_version,
         address: pending.address.clone(),
         cert_hash: pending.cert_hash.clone(),
+        // The account's profile, so that every client that builds its roster
+        // from the view — which is every client that was already connected —
+        // sees the avatar of someone who joined after it did.
+        comment_hash: pending.comment_hash.clone(),
+        texture_hash: pending.texture_hash.clone(),
         // From the record, not `now_ms()`: this is the moment the peer
         // connected, and recomputing it on every change would reset the uptime
         // the client shows each time somebody muted them.
@@ -188,32 +224,36 @@ impl Handshake {
         let outcome = self
             .identify(inbound.scope, &name, &request, &pending)
             .await;
-        let (account, name) = match outcome {
+        let identity = match outcome {
             Ok(identity) => identity,
             Err(action) => return vec![action],
         };
+        // Borrowed, not re-bound: `identity` owns the name from here on, and
+        // the stored profile hashes travel with it into `welcome`.
+        let account = identity.account;
+        let name = identity.name.as_str();
 
         // Somebody is already here under this name or this account
         // (`vendor/server/src/murmur/Messages.cpp:418`). murmur never lets two
         // live sessions share a name: either this one is refused, or the older
         // one is a ghost and gets kicked. Doing neither is how a server ends up
         // with three of the same user in the tree.
-        let ghost = connections.duplicate_of(inbound.conn, account, &name);
+        let ghost = connections.duplicate_of(inbound.conn, account, name);
         if let Some(ghost) = &ghost
             && !may_replace(&pending, ghost, account)
         {
             return vec![self.refuse(
                 inbound.conn,
-                &name,
+                name,
                 tcp::reject::RejectType::UsernameInUse,
                 "that name is already in use",
             )];
         }
 
-        let Some(session) = connections.allocate(inbound.conn, account, &name) else {
+        let Some(session) = connections.allocate(inbound.conn, &identity) else {
             return vec![self.refuse(
                 inbound.conn,
-                &name,
+                name,
                 tcp::reject::RejectType::ServerFull,
                 "the server is full",
             )];
@@ -229,19 +269,26 @@ impl Handshake {
             LogEvent::info(Category::Session, "user authenticated")
                 .with("conn", inbound.conn)
                 .with("session", session)
-                .with("name", name.clone())
+                .with("name", name.to_owned())
                 .with("account", id)
                 .with("registered", registered)
                 .with("address", pending.address.clone())
                 .with("fancy", pending.fancy_version != 0),
         );
 
-        let actions = self
-            .welcome(inbound, session, account, &name, &config, &pending)
+        let mut actions = self
+            .welcome(inbound, session, &identity, &config, &pending)
             .await;
 
         self.announce_up(connections, inbound.conn).await;
         self.enter_root(inbound.scope, session).await;
+
+        // Told, not asked. Sent after the announce so `permissions` can resolve
+        // the session, and after entering root so the answer is about the
+        // channel the client is actually in — the one its menus are drawn from.
+        if let Some(pending) = connections.get(inbound.conn) {
+            actions.extend(self.push_permissions(&pending, ROOT_CHANNEL).await);
+        }
 
         // After the new session is up, as murmur does (`Messages.cpp:506`):
         // the replacement is complete before the old one goes, so the name is
@@ -293,19 +340,18 @@ impl Handshake {
         &self,
         inbound: &Inbound,
         session: u32,
-        account: Option<u64>,
-        name: &str,
+        identity: &Identity,
         config: &Snapshot,
         pending: &PendingConnection,
     ) -> Actions {
+        let account = identity.account;
+        let name = identity.name.as_str();
+
         let mut actions = Vec::new();
         actions.push(self.crypt_setup(inbound, session, pending).await);
         actions.push(to_conn(inbound.conn, 21, codec_version().encode_to_vec()));
         actions.extend(self.channel_flood(inbound).await);
-        actions.extend(
-            self.user_states(inbound, session, account, name, pending)
-                .await,
-        );
+        actions.extend(self.user_states(inbound, session, identity, pending).await);
         actions.push(to_conn(
             inbound.conn,
             5,
@@ -353,6 +399,14 @@ impl Handshake {
             // as much as the client's own copy above does.
             user_id: account.map(|id| id as u32),
             hash: hex_hash(&pending.cert_hash),
+            // And the stored profile, for the same reason: this is the only
+            // message the already-connected clients get about the new arrival,
+            // so an avatar left out here is one nobody but its owner ever sees.
+            // The hashes, not the bodies — the client fetches those with
+            // `RequestBlob` if it wants them, which is what keeps a 500 KiB
+            // picture out of a broadcast to every session on the server.
+            comment_hash: blob_hash(&identity.comment_hash),
+            texture_hash: blob_hash(&identity.texture_hash),
             ..tcp::UserState::default()
         };
         actions.push(broadcast_except(session, 9, joined.encode_to_vec()));
@@ -366,7 +420,7 @@ impl Handshake {
         name: &str,
         request: &tcp::Authenticate,
         pending: &PendingConnection,
-    ) -> Result<(Option<u64>, String), ServerAction> {
+    ) -> Result<Identity, ServerAction> {
         let Ok(channel) = self.resolver.channel("userdata") else {
             // Userdata is essential: without it a login cannot be decided, and
             // guessing would either lock everyone out or let everyone in.
@@ -442,12 +496,30 @@ impl Handshake {
             } else {
                 result.account.as_ref().map(|account| account.id)
             };
-            return Ok((
+            let name = result
+                .account
+                .as_ref()
+                .map_or_else(|| name.to_owned(), |account| account.name.clone());
+
+            // The stored profile arrives on the same answer, so it is taken
+            // here rather than looked up again in each of the three places that
+            // build a `UserState` from it.
+            //
+            // Only when the session really holds the account: `guest` above can
+            // strip an account id from a login that still carried an account
+            // record, and an anonymous session must not wear the avatar of the
+            // name it borrowed.
+            let (comment_hash, texture_hash) = match (account, result.account) {
+                (Some(_), Some(record)) => (record.comment_hash, record.texture_hash),
+                _ => (Vec::new(), Vec::new()),
+            };
+
+            return Ok(Identity {
                 account,
-                result
-                    .account
-                    .map_or_else(|| name.to_owned(), |account| account.name),
-            ));
+                name,
+                comment_hash,
+                texture_hash,
+            });
         }
         let (kind, reason) = refusal_for(outcome);
         Err(self.refuse(pending.conn, name, kind, reason))
@@ -486,7 +558,104 @@ impl Handshake {
         to_conn(inbound.conn, 15, payload)
     }
 
-    /// Every channel, breadth-first from the root.
+    /// Tell a client what it may do in a channel, without being asked.
+    ///
+    /// murmur pushes this on every channel entry — the channel and its parent
+    /// (`Server.cpp:2319`) — and a client builds its UI from it: an action it
+    /// holds no permission for is not greyed out, it is *absent*. Starling only
+    /// ever answered an explicit `PermissionQuery`, so a client that did not
+    /// ask (or asked before the tree it wanted to ask about existed) rendered
+    /// as though the user could do nothing at all. Every admin action was
+    /// missing from the menus with nothing in any log to explain it.
+    ///
+    /// Best-effort: a client that never learns its permissions shows fewer
+    /// actions than it holds, which is the safe direction, and every action it
+    /// does attempt is authorised again on its own path.
+    /// The identity is taken from the connection record, not asserted blank.
+    /// `effective` trusts the `Subject` it is handed, and a default one is an
+    /// unregistered guest — so asking with only a session id would report the
+    /// administrator's own permissions as a stranger's and hide every action
+    /// from them. This service is the authority on who just authenticated, so
+    /// it is entitled to state it, through `identity` rather than by comparing
+    /// `account` to zero.
+    async fn push_permissions(&self, pending: &PendingConnection, channel: u32) -> Actions {
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+        use starling_proto_fancy::permissions::{EffectiveRequest, Subject};
+
+        let Ok(transport) = self.resolver.channel("permissions") else {
+            return Actions::new();
+        };
+        let (account, registered) = identity::wire(pending.account);
+        let Ok(answer) = PermissionsClient::new(transport)
+            .effective(EffectiveRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: pending.scope,
+                }),
+                subject: Some(Subject {
+                    session: pending.session,
+                    account,
+                    registered,
+                    name: pending.name.clone(),
+                    cert_hash: pending.cert_hash.clone(),
+                    tokens: Vec::new(),
+                }),
+                channel,
+            })
+            .await
+        else {
+            return Actions::new();
+        };
+
+        let granted = answer.into_inner().granted;
+        tracing::debug!(
+            session = pending.session,
+            channel,
+            granted = format!("{granted:#x}"),
+            "pushing permissions"
+        );
+        let query = tcp::PermissionQuery {
+            channel_id: Some(channel),
+            permissions: Some(granted),
+            flush: Some(false),
+        };
+        vec![to_conn(
+            pending.conn,
+            PERMISSION_QUERY,
+            query.encode_to_vec(),
+        )]
+    }
+
+    /// Whether this session may see a hidden channel.
+    ///
+    /// Asked of `permissions` through `CheckSession`, which resolves who the
+    /// session is server-side — the identity is never the caller's to state.
+    ///
+    /// **Denies on any failure**, including `permissions` being unreachable.
+    /// The alternative is that an outage reveals every private room on the
+    /// server, and a channel briefly missing from a tree is recoverable where
+    /// that is not.
+    async fn may_see(&self, scope: u32, session: u32, channel: u32) -> bool {
+        use starling_proto_fancy::permissions::SessionCheckRequest;
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+
+        let Ok(transport) = self.resolver.channel("permissions") else {
+            tracing::warn!(channel, "permissions is unreachable; hiding the channel");
+            return false;
+        };
+        PermissionsClient::new(transport)
+            .check_session(SessionCheckRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: scope,
+                }),
+                session,
+                channel,
+                permission: Perm::SEE_CHANNEL.bits(),
+            })
+            .await
+            .is_ok_and(|decision| decision.into_inner().allowed)
+    }
+
+    /// Every channel the client may see, breadth-first from the root.
     async fn channel_flood(&self, inbound: &Inbound) -> Actions {
         let Ok(channel) = self.resolver.channel("metadata") else {
             return Actions::new();
@@ -506,7 +675,30 @@ impl Handshake {
         // Breadth-first: a client cannot render a channel before its parent
         // exists, and murmur sends them in this order for the same reason.
         channels.sort_by_key(|channel| (channel.parent.unwrap_or(0), channel.id));
-        channels
+
+        // A hidden channel is only sent to a client that holds `SeeChannel` on
+        // it. Without this the flag was decorative: `SEE_CHANNEL` was defined
+        // and never read, so every private room — and, because the client
+        // builds its tree from these messages, everyone sitting in one — was
+        // announced to every user who connected.
+        //
+        // Only hidden channels cost a permission check. The common case is a
+        // server with none, and a check per channel per login would put a
+        // round trip on the handshake for a question whose answer is almost
+        // always "it is not hidden".
+        let mut visible = Vec::with_capacity(channels.len());
+        for channel in channels {
+            if channel.flags & FLAG_HIDDEN != 0
+                && !self
+                    .may_see(inbound.scope, inbound.session, channel.id)
+                    .await
+            {
+                continue;
+            }
+            visible.push(channel);
+        }
+
+        visible
             .into_iter()
             .map(|channel| {
                 let state = tcp::ChannelState {
@@ -529,13 +721,12 @@ impl Handshake {
         &self,
         inbound: &Inbound,
         session: u32,
-        account: Option<u64>,
-        name: &str,
+        identity: &Identity,
         pending: &PendingConnection,
     ) -> Actions {
         let own = tcp::UserState {
             session: Some(session),
-            name: Some(name.to_owned()),
+            name: Some(identity.name.clone()),
             channel_id: Some(0),
             // The certificate hash, hex-encoded as murmur sends it
             // (`Server.cpp:1686`). A client will not offer "Register" for a
@@ -552,7 +743,14 @@ impl Handshake {
             // anonymous guest, however carefully the server authenticated them.
             //
             // Absent for a guest rather than 0, because 0 is the SuperUser's id.
-            user_id: account.map(|id| id as u32),
+            user_id: identity.account.map(|id| id as u32),
+            // The profile stored on the account, which is how a picture set
+            // anywhere other than this client — the web user manager, another
+            // device, a previous session — is on the user the moment they
+            // connect. Without these two the avatar existed on the account, in
+            // the blob store and in nobody's user list.
+            comment_hash: blob_hash(&identity.comment_hash),
+            texture_hash: blob_hash(&identity.texture_hash),
             ..tcp::UserState::default()
         };
         let mut actions = vec![to_conn(inbound.conn, 9, own.encode_to_vec())];
@@ -587,6 +785,12 @@ impl Handshake {
                 // rather than "nobody".
                 user_id: identity::account(other.registered, other.account).map(|id| id as u32),
                 hash: hex_hash(&other.cert_hash),
+                // Carried on the view for exactly this: the roster a client is
+                // handed on connect is built here, so an avatar missing from
+                // this loop is one that only appears for people who happened to
+                // be connected when its owner joined.
+                comment_hash: blob_hash(&other.comment_hash),
+                texture_hash: blob_hash(&other.texture_hash),
                 ..tcp::UserState::default()
             };
             actions.push(to_conn(inbound.conn, 9, state.encode_to_vec()));
@@ -834,8 +1038,20 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
     use tcp::reject::RejectType;
     match outcome {
         Outcome::WrongPassword => (RejectType::WrongUserPw, "wrong password"),
+        // `WrongUserPw`, not `UsernameInUse`, and the difference is a security
+        // property rather than a nicety. This outcome is murmur's `id == -1`:
+        // the name belongs to a registered account and the peer proved nothing
+        // (`Messages.cpp:381`, "Wrong certificate or password for existing
+        // user"). `UsernameInUse` says something else entirely — that somebody
+        // is *online* under the name — and a client told that reconnects under
+        // a suffixed name, quietly turning a failed impersonation into a
+        // successful login as a lookalike. It also leaks liveness: it answers
+        // "is this person connected right now" to anyone who asks.
+        //
+        // A genuine live duplicate never reaches here; `duplicate_of` refuses
+        // that case with `UsernameInUse` before authentication is consulted.
         Outcome::NameTaken => (
-            RejectType::UsernameInUse,
+            RejectType::WrongUserPw,
             "that name is registered to another certificate",
         ),
         Outcome::CertRequired => (
@@ -865,6 +1081,17 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
 /// string would answer that question the same way at more cost.
 fn hex_hash(cert_hash: &[u8]) -> Option<String> {
     (!cert_hash.is_empty()).then(|| cert_hash.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// A content hash as `UserState` carries it: the raw bytes, or absent.
+///
+/// Absent rather than empty, and the distinction is load-bearing in the client:
+/// a *present but empty* `texture_hash` is how a picture is **cleared**
+/// (`vendor/server/src/murmur/Messages.cpp:1517` sends one to do exactly that),
+/// so sending an empty hash for a user who never had an avatar would order
+/// every client to erase one it may already hold.
+fn blob_hash(hash: &[u8]) -> Option<Vec<u8>> {
+    (!hash.is_empty()).then(|| hash.to_vec())
 }
 
 /// A refusal the client can act on.
@@ -940,6 +1167,27 @@ mod tests {
         // registration is possible, so both answer the question the same way —
         // but only one of them costs a field on every `UserState`.
         assert_eq!(hex_hash(&[]), None);
+    }
+
+    #[test]
+    fn the_wire_epoch_is_announced_and_the_product_version_is_not() {
+        // Both halves matter and they pull in opposite directions.
+        //
+        // The epoch has to be present, or a client cannot tell Starling from a
+        // plain Mumble server and never offers a Fancy feature at all.
+        //
+        // `fancy_version` has to be absent, and that is the counter-intuitive
+        // one: it reads as "this server implements the Fancy features up to X",
+        // and a client acting on it sends those features on epoch 0's
+        // numbering, which this server routes nowhere. Claiming it would break
+        // clients that work today, because with it absent they fall back to
+        // `PluginDataTransmission` — epoch-independent, and relayed correctly.
+        let version = server_version();
+        assert_eq!(version.fancy_protocol, Some(FANCY_PROTOCOL));
+        assert_eq!(
+            version.fancy_version, None,
+            "announcing a product version would make clients speak the numbering we do not"
+        );
     }
 
     #[test]

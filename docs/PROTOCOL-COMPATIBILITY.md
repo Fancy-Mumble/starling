@@ -23,28 +23,44 @@ field retyped or renumbered. And no `required` field was added to any upstream
 message — all 15 new `required` fields live in new Fancy messages, where an
 upstream client never looks. So the fork is wire-compatible with upstream *today*.
 
-**What is not.** Seven of the nine extended upstream messages took upstream's
-*immediate next* field numbers:
+**What was not.** Seven of the nine extended upstream messages took upstream's
+*immediate next* field numbers. Upstream's next `TextMessage` field *will be* 6.
+When that happens two meanings share one number, and proto2 resolves by number
+and type — so if both are varint you get **silent misinterpretation**, not a
+parse error. That is the worst failure class available: no log line, wrong data.
 
-| message | upstream's max | Fancy took | |
+Fixed in this repo's copy (2026-07-29), by applying the rule below that
+`ChannelState` and `Authenticate` already followed:
+
+| message | upstream's max | was | now |
 |---|---|---|---|
-| `TextMessage` | 5 | 6, 7, 8, 9, 10 | squats |
-| `ACL` | 7 | 8, 9, 10, 11 | squats |
-| `UserList` | 4 | 5, 6, 7 | squats |
-| `ServerConfig` | 7 | 8, 9 | squats |
-| `UserState` | 23 | 24 | squats |
-| `RequestBlob` | 3 | 4 | squats |
-| `Version` | 5 | 6 | squats |
-| `Authenticate` | 6 | 100 | safe |
-| `ChannelState` | 13 | 100–111 | safe |
+| `TextMessage` | 5 | 6, 7, 8, 9, 10 | 100–104 |
+| `ACL.ChanGroup` | 7 | 8, 9, 10, 11 | 100–103 |
+| `UserList.User` | 4 | 5, 6, 7 | 100–102 |
+| `ServerConfig` | 7 | 8, 9 | 100, 101 |
+| `UserState` | 23 | 24 | 100 |
+| `RequestBlob` | 3 | 4 | 100 |
+| `Version` | 5 | 6 (+7) | 6 **pinned**, epoch at 100 |
+| `Authenticate` | 6 | 100 | unchanged |
+| `ChannelState` | 13 | 100–111 | unchanged |
 
-Upstream's next `TextMessage` field *will be* 6. When that happens two different
-meanings share one number, and proto2 resolves by number and type — so if both are
-varint you get **silent misinterpretation**, not a parse error. That is the worst
-failure class available: no log line, wrong data.
+Three things to know about that move:
 
-`ChannelState` and `Authenticate` show the discipline already exists. It was
-applied inconsistently.
+* **`Version.fancy_version = 6` stays where it is.** It is the field every
+  shipped Fancy peer reads to decide whether extensions exist at all. Moving it
+  would not break loudly — it would make this server look like plain Mumble to
+  all of them. It keeps its squat, and `fancy_protocol` (100) is what carries
+  the numbering forward.
+* **The vacated numbers are not `reserved`.** Reserving them would stop this
+  file adopting the upstream field that eventually lands there, which is the
+  entire point of vacating them. Upstream owns them now.
+* **This is part of epoch 1, not a separate break.** Epoch 1 has never shipped,
+  so redefining what it means costs nothing; §2a's number stays `1`. Epoch 0 —
+  `vendor/server` and every released client — still uses the old numbers, which
+  is exactly what an epoch is for. `vendor/client` and `vendor/server` therefore
+  keep the squatting layout until they migrate; a client generates one struct
+  set per proto and cannot speak both numberings at once, so renumbering them
+  now would break them against each other for no gain.
 
 ### The rule going forward
 
@@ -80,6 +96,52 @@ The real problem is that the existing Fancy range is **interleaved, not blocked*
 A range route such as `{ from = 100, to = 199 }` for pchat would capture
 `WebRtcSignal`, push, reactions and typing along with it. Range-based routing
 cannot be retrofitted onto this.
+
+## 2a. Epochs: how a peer says *which* numbering it speaks
+
+The numbering above is not something a peer can infer. `Version.fancy_version`
+is a **product** version — it answers "which features exist" — and there is no
+way to express "I renumbered the wire" in it. A client that reads only that
+field will happily send a type the peer routes nowhere, and the message
+disappears with nothing in any log. That is precisely what happened here:
+Starling kept the upstream types and moved every Fancy message to §3's scheme,
+and a client reading `fancy_version` would have gone on speaking §2's layout.
+
+So `Version.fancy_protocol` (field 7, `uint32`) names the numbering itself:
+
+| Epoch | Numbering |
+|---|---|
+| absent / `0` | The interleaved 100–999 layout in §2. Every Fancy build shipped to date, including `vendor/server`. |
+| `1` | §3: upstream 0–99 flat and frozen, every Fancy service behind one outer type ≥ 1000. What Starling speaks. |
+
+Three rules make it work:
+
+* **A peer speaks exactly one epoch**, and states it. `vendor/server` sets `0`
+  explicitly rather than relying on the default, so that "an old Fancy server"
+  is distinguishable from "a server that has not been taught about epochs".
+* **The epoch is read before the version.** A version only means something once
+  both sides agree what the numbers on the wire are.
+* **No agreement means plain Mumble**, plus anything relayable through
+  `PluginDataTransmission` — that path is epoch-independent and works through
+  any Mumble server, so typing, watch-sync, WebRTC signalling and pchat key
+  distribution survive a mismatch. Everything `ServerOnly` does not.
+
+**Starling therefore announces `fancy_protocol = 1` and no `fancy_version` at
+all.** Announcing a product version would be actively worse than silence: a
+client would take it as licence to send epoch-0 natives. With it absent, clients
+fall back to `PluginDataTransmission`, which Starling relays correctly.
+
+The client keeps the mirror of this in `mumble-protocol/src/fancy_codec.rs`
+(`FANCY_PROTOCOL_EPOCH`, `speaks_epoch`), and announces its own epoch in the
+`Version` it sends, so the judgement is symmetric.
+
+### What is still epoch 0 on the client
+
+The client can only *encode* epoch 0 today, so against Starling it degrades to
+the `PluginData` path. Moving it to epoch 1 means giving each Fancy message a
+home in a service envelope — the mapping in §3 — and is the remaining work.
+Until then the split is honest rather than silent: features whose fallback is
+`PluginData` work, and `ServerOnly` ones are visibly off.
 
 ## 3. The scheme: one outer type per service
 

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use starling_proto::proto::tcp;
 use starling_proto_fancy::identity;
-use starling_proto_fancy::permissions::{AclSet, Subject};
+use starling_proto_fancy::permissions::{AclEntry, AclSet, Group, Subject};
 
 use crate::perm::Perm;
 
@@ -202,17 +202,60 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
 }
 
 /// Whether an entry addresses this subject.
-fn matches(
-    entry: &starling_proto_fancy::permissions::AclEntry,
-    subject: &Subject,
-    groups: &[String],
-) -> bool {
+fn matches(entry: &AclEntry, subject: &Subject, groups: &[String]) -> bool {
     if let Some(account) = entry.account {
         return account == subject.account;
     }
     match &entry.group {
         Some(group) => groups.iter().any(|held| held == group),
         None => false,
+    }
+}
+
+/// Read a client's `ACL` message into the set this service stores.
+///
+/// The inverse of [`to_wire`], and deliberately **whole-set**: murmur clears a
+/// channel's groups and entries and applies what the message carries
+/// (`Messages.cpp:2735`), because the client's ACL editor sends the table it is
+/// showing rather than a diff. Merging instead would resurrect an entry the
+/// operator had just deleted.
+///
+/// `inherited` entries are dropped. They are what a *parent* contributes to the
+/// view the client was sent, so storing them here would copy a parent's rule
+/// into the child, where it would then survive the parent's rule being removed.
+#[must_use]
+pub fn from_wire(acl: &tcp::Acl) -> AclSet {
+    AclSet {
+        channel: acl.channel_id,
+        inherit: acl.inherit_acls.unwrap_or(true),
+        groups: acl
+            .groups
+            .iter()
+            .filter(|group| !group.inherited.unwrap_or(false))
+            .map(|group| Group {
+                name: group.name.clone(),
+                inherited: false,
+                inherit: group.inherit.unwrap_or(true),
+                inheritable: group.inheritable.unwrap_or(true),
+                add: group.add.iter().map(|id| u64::from(*id)).collect(),
+                remove: group.remove.iter().map(|id| u64::from(*id)).collect(),
+                inherited_members: Vec::new(),
+            })
+            .collect(),
+        acls: acl
+            .acls
+            .iter()
+            .filter(|entry| !entry.inherited.unwrap_or(false))
+            .map(|entry| AclEntry {
+                apply_here: entry.apply_here.unwrap_or(true),
+                apply_subs: entry.apply_subs.unwrap_or(true),
+                inherited: false,
+                account: entry.user_id.map(u64::from),
+                group: entry.group.clone(),
+                grant: entry.grant.unwrap_or_default(),
+                deny: entry.deny.unwrap_or_default(),
+            })
+            .collect(),
     }
 }
 

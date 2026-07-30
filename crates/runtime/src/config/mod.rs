@@ -19,7 +19,7 @@ pub use env::{apply_environment, env_key};
 pub use gateway::{GatewayConfig, LimitConfig, ResumeConfig, TlsConfig};
 pub use operator::{AuthMode, JwtAuth, MtlsAuth, OidcAuth, OperatorAuth, StaticToken, TokenAuth};
 pub use scalars::{ByteSize, HumanDuration};
-pub use service::{OperatorAudit, ServiceConfig, StorageConfig};
+pub use service::{OperatorAudit, ServiceConfig, StorageConfig, WebTransport};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

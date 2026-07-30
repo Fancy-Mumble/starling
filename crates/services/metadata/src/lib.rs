@@ -23,6 +23,7 @@ pub use tree_actor::Trees;
 
 use std::sync::Arc;
 
+use crate::tree_actor::FLAG_HIDDEN;
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::metadata::metadata_server::{Metadata, MetadataServer};
@@ -32,6 +33,7 @@ use starling_proto_fancy::metadata::{
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
@@ -75,6 +77,11 @@ pub struct MetadataService {
     /// state in which every check is skipped, and nothing at the call site
     /// would look different.
     permit: Permit,
+    /// How to reach `session-view`, to learn who is connected.
+    ///
+    /// Needed because announcing a *hidden* channel is addressed rather than
+    /// broadcast: the recipient list has to be built before it can be filtered.
+    resolver: Resolver,
 }
 
 impl MetadataService {
@@ -102,6 +109,8 @@ impl MetadataService {
 const CHANNEL_STATE: u16 = 7;
 /// Upstream `ChannelRemove`.
 const CHANNEL_REMOVE: u16 = 6;
+/// Upstream `UserState`, used to relocate an occupant of a reaped channel.
+const USER_STATE: u16 = 9;
 
 /// The gRPC surface, as a type this crate owns.
 #[derive(Debug, Clone)]
@@ -290,6 +299,197 @@ impl MetadataService {
         self.permit.allows(inbound, channel, needed.bits()).await
     }
 
+    /// Turn a freshly created channel into a private room for named invitees.
+    ///
+    /// murmur's rule (`Messages.cpp:1827`): deny `see|enter|traverse` to `@all`
+    /// and grant the same three to each invited **registered** user. The
+    /// creator keeps access through their own `Write`, which implies both.
+    ///
+    /// `apply_subs` is false on every entry, as upstream has it: the invitation
+    /// is to this room, and a sub-channel created inside it later is a separate
+    /// decision rather than something silently pre-shared with everyone on this
+    /// list.
+    ///
+    /// Creation only. Re-running it on an update would silently rewrite an ACL
+    /// an operator had since edited by hand.
+    ///
+    /// A failure is logged rather than swallowed, because the channel exists
+    /// either way: without the deny it is a *public* room that was asked to be
+    /// private, which is the one outcome nobody wants to discover later.
+    async fn invite(&self, scope: u32, channel: u32, invitees: &[u32]) {
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+        use starling_proto_fancy::permissions::{AclEntry, AclSet, SetAclRequest};
+
+        let gated = Perm::SEE_CHANNEL
+            .union(Perm::ENTER)
+            .union(Perm::TRAVERSE)
+            .bits();
+
+        let mut acls = vec![AclEntry {
+            apply_here: true,
+            apply_subs: false,
+            group: Some("all".to_owned()),
+            deny: gated,
+            ..AclEntry::default()
+        }];
+        acls.extend(invitees.iter().map(|id| AclEntry {
+            apply_here: true,
+            apply_subs: false,
+            account: Some(u64::from(*id)),
+            grant: gated,
+            ..AclEntry::default()
+        }));
+
+        let Ok(transport) = self.resolver.channel("permissions") else {
+            tracing::error!(channel, "permissions unreachable; room is NOT private");
+            return;
+        };
+        let result = PermissionsClient::new(transport)
+            .set_acl(SetAclRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: scope,
+                }),
+                actor: None,
+                acls: Some(AclSet {
+                    channel,
+                    inherit: true,
+                    acls,
+                    groups: Vec::new(),
+                }),
+            })
+            .await;
+
+        match result {
+            Ok(_) => self.logger.log(
+                LogEvent::notice(Category::Channel, "private room created")
+                    .with("channel", channel)
+                    .with("invitees", invitees.len())
+                    .with("scope", scope),
+            ),
+            Err(status) => {
+                tracing::error!(channel, %status, "could not write the invitee ACL");
+                self.logger.log(
+                    LogEvent::error(Category::Channel, "invitee acl not written")
+                        .with("channel", channel)
+                        .with("error", status.message().to_owned())
+                        .with("private", false),
+                );
+            }
+        }
+    }
+
+    /// One reap pass across every virtual server.
+    fn sweep_all(&self, scopes: &[u32]) {
+        for scope in scopes {
+            self.sweep(*scope);
+        }
+    }
+
+    /// One reap pass, and everything the clients must be told about it.
+    ///
+    /// Order matters: the **move is announced before the removal**. A client
+    /// told its channel is gone while it still believes it is inside would be
+    /// rendering itself in a room the server has forgotten, and there is no
+    /// way for it to leave a channel that no longer exists. Telling it where it
+    /// now is first leaves no such window.
+    fn sweep(&self, scope: u32) {
+        let reaped = self
+            .trees
+            .reap_expired(scope, starling_runtime::ids::now_ms());
+        if reaped.channels.is_empty() {
+            return;
+        }
+
+        for moved in &reaped.moved {
+            let state = starling_proto::proto::tcp::UserState {
+                session: Some(moved.session),
+                channel_id: Some(moved.to),
+                ..starling_proto::proto::tcp::UserState::default()
+            };
+            self.fanout
+                .push(to_sessions(Vec::new(), USER_STATE, state.encode_to_vec()));
+        }
+
+        for channel in &reaped.channels {
+            self.logger.log(
+                LogEvent::info(Category::Channel, "channel expired")
+                    .with("channel", *channel)
+                    .with("scope", scope),
+            );
+            let payload = starling_proto::proto::tcp::ChannelRemove {
+                channel_id: *channel,
+            }
+            .encode_to_vec();
+            self.fanout
+                .push(to_sessions(Vec::new(), CHANNEL_REMOVE, payload));
+            let _ = self.events.send(TreeEvent {
+                event: Some(starling_proto_fancy::metadata::tree_event::Event::Removed(
+                    *channel,
+                )),
+            });
+        }
+    }
+
+    /// How to announce a channel: to everyone, or only to those who may see it.
+    ///
+    /// murmur gates the same broadcast per recipient with `canSee`
+    /// (`Server.cpp:2100`, `sendProtoToChannelObserversExcept`), and notes that
+    /// for a non-hidden channel `canSee` is always true — so the ordinary case
+    /// is an ordinary broadcast. That shape is kept here: an empty session list
+    /// means "everyone", and only a hidden channel pays for the filtering.
+    ///
+    /// Without this, creating a hidden channel announced it to every connected
+    /// client. The login flood already filtered them, so the room was invisible
+    /// to anyone who connected *afterwards* and visible to everyone who was
+    /// already online — the kind of split that looks like a caching bug.
+    ///
+    /// A session that cannot be checked is left out. The cost of excluding
+    /// someone wrongly is a channel they must reconnect to see; the cost of
+    /// including someone wrongly is disclosing a private room.
+    async fn announce_to(&self, scope: u32, channel: u32, hidden: bool) -> Vec<u32> {
+        use starling_proto_fancy::sessionview::SubscribeRequest;
+        use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
+
+        if !hidden {
+            return Vec::new();
+        }
+
+        let Ok(transport) = self.resolver.channel("session-view") else {
+            tracing::warn!(channel, "session-view is unreachable; announcing to nobody");
+            return vec![u32::MAX];
+        };
+        let sessions = SessionViewClient::new(transport)
+            .list(SubscribeRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: scope,
+                }),
+                subscriber: "metadata".to_owned(),
+            })
+            .await;
+        let Ok(sessions) = sessions else {
+            tracing::warn!(channel, "cannot list sessions; announcing to nobody");
+            return vec![u32::MAX];
+        };
+
+        let mut allowed = Vec::new();
+        for session in sessions.into_inner().sessions {
+            if self
+                .permit
+                .allows_session(scope, session.session, channel, Perm::SEE_CHANNEL.bits())
+                .await
+            {
+                allowed.push(session.session);
+            }
+        }
+        // Never an empty list: that is the wire's "everyone", which would
+        // announce the hidden channel to precisely the clients it must not
+        // reach. A sentinel session nobody holds addresses it to no one.
+        if allowed.is_empty() {
+            allowed.push(u32::MAX);
+        }
+        allowed
+    }
+
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
     async fn on_channel_state(&self, inbound: &Inbound) -> Actions {
@@ -357,8 +557,15 @@ impl MetadataService {
                     .with("session", inbound.session)
                     .with("scope", inbound.scope),
                 );
+                if creating && !state.invitee_user_ids.is_empty() {
+                    self.invite(inbound.scope, channel.id, &state.invitee_user_ids)
+                        .await;
+                }
+                let recipients = self
+                    .announce_to(inbound.scope, channel.id, channel.flags & FLAG_HIDDEN != 0)
+                    .await;
                 vec![to_sessions(
-                    Vec::new(),
+                    recipients,
                     CHANNEL_STATE,
                     channel_state(&channel).encode_to_vec(),
                 )]
@@ -430,7 +637,34 @@ impl Serve for MetadataService {
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
             permit: Permit::new(ctx.resolver.clone()),
+            resolver: ctx.resolver.clone(),
         }))
+    }
+
+    /// Reap expired channels until shutdown.
+    ///
+    /// A timer rather than a per-channel alarm: expiry is a coarse deadline, a
+    /// scan of the tree is cheap next to the round trips it would take to
+    /// schedule one, and a missed alarm would leave a channel alive forever
+    /// while a missed tick only delays it by one interval.
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        /// Short enough that "8 seconds" reads as 8 seconds to a person
+        /// watching, since expiry is user-visible.
+        const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+        let scopes = ctx.virtual_servers();
+        let sweeper = tokio::spawn({
+            let service = Arc::clone(&self);
+            async move {
+                loop {
+                    tokio::time::sleep(TICK).await;
+                    service.sweep_all(&scopes);
+                }
+            }
+        });
+        ctx.shutdown.wait().await;
+        sweeper.abort();
+        Ok(())
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {

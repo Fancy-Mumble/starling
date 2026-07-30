@@ -122,7 +122,7 @@ end note
 note as COMPOSE #FFFFFF
   **docker compose** is the same picture with the load
   balancers replaced by published ports. `docker-compose.yml`
-  runs it: **twenty containers** from one image, started in
+  runs it: **twenty-one containers** from one image, started in
   tier order, each differing only in its `command`.
   voice does not need co-locating there — it publishes UDP
   64738 while the gateway publishes TCP 64738, so a legacy

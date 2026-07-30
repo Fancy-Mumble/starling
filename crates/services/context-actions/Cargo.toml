@@ -13,6 +13,8 @@ starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
 prost.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 tonic.workspace = true
 tracing.workspace = true
 

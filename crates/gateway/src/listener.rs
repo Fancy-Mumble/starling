@@ -16,6 +16,7 @@ use bytes::BytesMut;
 use starling_crypto::peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 use starling_proto::codec;
 use starling_proto_fancy::control::{ClientEvent, Frame, Opened, client_event};
+use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::config::Config;
 use starling_runtime::health::Health;
 use starling_runtime::ids::now_ms;
@@ -434,6 +435,17 @@ impl Gateway {
         frame: &codec::RawFrame,
         limiter: &mut Limiter,
     ) -> bool {
+        // Every inbound frame, at trace. The gateway is the only place that
+        // sees a client's traffic as it arrives, so when a UI action appears to
+        // do nothing this answers the first question — did anything reach the
+        // server at all — without guessing from downstream silence.
+        tracing::trace!(
+            conn = handle.conn,
+            session = handle.session(),
+            type_id = frame.type_id,
+            len = frame.payload.len(),
+            "frame in"
+        );
         let Some(route) = self.router.route(frame.type_id) else {
             // An unroutable type is dropped rather than fatal: a stale client
             // sending a burned type must not lose its session over it.
@@ -448,19 +460,48 @@ impl Gateway {
             return true;
         };
 
-        match limiter.check(&route.bucket, now_ms()) {
-            Verdict::Allow => {}
-            Verdict::Throttle { retry_after_ms } => {
-                tracing::debug!(
-                    conn = handle.conn,
-                    session = handle.session(),
-                    bucket = %route.bucket,
-                    retry_after_ms,
-                    "throttled"
-                );
-                self.metrics.counter("starling_gateway_throttled").inc();
-                self.notify_throttled(handle, frame.type_id, &route.bucket, retry_after_ms);
-                return true;
+        // Buckets are per *service*, so every type a service owns shares one —
+        // and `session-lifecycle` owns both `UserState`, which murmur does
+        // rate-limit, and `Ping`, which it does not. Charging keepalives to the
+        // same bucket as user actions means a client's own liveness traffic
+        // eats the allowance its messages need, and the symptom is a text
+        // message vanishing with no error: the gateway sheds it, the sender is
+        // never told, and nothing retries.
+        //
+        // murmur applies `RATELIMIT` in named handlers rather than to a
+        // connection wholesale (`Messages.cpp:47`), so the set below is that
+        // list. Anything outside it is delivered without being charged.
+        if is_rate_limited(frame.type_id) {
+            match limiter.check(&route.bucket, now_ms()) {
+                Verdict::Allow => {}
+                Verdict::Throttle { retry_after_ms } => {
+                    // On the operator's own record, not just `tracing`. This
+                    // discards something a user sent and believes was
+                    // delivered, and nothing retries it — the same class of
+                    // event as a permission denial, which is also logged here.
+                    // It was `tracing::debug!` alone, which on any normal
+                    // deployment is invisible: a shed text message looked
+                    // exactly like the server silently losing it.
+                    tracing::info!(
+                        conn = handle.conn,
+                        session = handle.session(),
+                        bucket = %route.bucket,
+                        type_id = frame.type_id,
+                        retry_after_ms,
+                        "throttled; frame dropped"
+                    );
+                    self.logger.log(
+                        LogEvent::notice(Category::Server, "frame dropped: rate limited")
+                            .with("conn", handle.conn)
+                            .with("session", handle.session())
+                            .with("bucket", route.bucket.clone())
+                            .with("type", frame.type_id)
+                            .with("retry_after_ms", retry_after_ms),
+                    );
+                    self.metrics.counter("starling_gateway_throttled").inc();
+                    self.notify_throttled(handle, frame.type_id, &route.bucket, retry_after_ms);
+                    return true;
+                }
             }
         }
 
@@ -521,7 +562,7 @@ impl Gateway {
             ),
         };
         let payload = envelope.encode_to_vec();
-        let outer = starling_proto_fancy::ServiceKind::SessionLifecycle.outer_type();
+        let outer = ServiceKind::SessionLifecycle.outer_type();
         let _ = handle.send(Lane::Control, codec::frame(outer, &payload));
     }
 
@@ -557,10 +598,89 @@ impl Gateway {
     }
 }
 
+/// Whether an inbound type is charged to its route's rate-limit bucket.
+///
+/// murmur does not rate-limit a connection wholesale. It applies `RATELIMIT`
+/// inside named handlers (`vendor/server/src/murmur/Messages.cpp:47`), and this
+/// is that list: `Version`(0), `ChannelState`(7), `UserState`(9),
+/// `TextMessage`(11) and `ACL`(13). Fancy adds its own charged types — WebRTC
+/// signalling, typing and watch-sync — which reach their services on the outer
+/// types below rather than upstream numbers.
+///
+/// **What is deliberately absent matters more than what is present.** `Ping`(3)
+/// is the one to notice: it is a keepalive a client emits on a timer, murmur
+/// never charges it, and because Starling's buckets are per *service* it shared
+/// one with `UserState`. A client's own liveness traffic therefore spent the
+/// allowance its text messages needed, and a shed frame is not retried or
+/// reported — so messages went missing with nothing in any log to say why.
+/// `Authenticate`(2), `CryptSetup`(15), `CodecVersion`(21) and `UserStats`(22)
+/// are absent for the same reason: handshake and diagnostics, unlimited
+/// upstream.
+///
+/// Audio is not here either, and must never be: it has its own bucket sized for
+/// speech, and `UDPTunnel`(1) is returned from before the rate check upstream
+/// (`Server.cpp:1905`).
+const fn is_rate_limited(type_id: u16) -> bool {
+    // Named rather than written as numbers: the outer types are assigned by
+    // `ServiceKind`, and a literal here would silently point at a different
+    // service the moment one is inserted before it.
+    const VOICE: u16 = ServiceKind::Voice.outer_type();
+    const SCREENSHARE: u16 = ServiceKind::Screenshare.outer_type();
+    const SOCIAL: u16 = ServiceKind::Social.outer_type();
+
+    matches!(
+        type_id,
+        0    // Version
+        | 7  // ChannelState
+        | 9  // UserState
+        | 11 // TextMessage
+        | 13 // ACL
+        | VOICE // carries WebRTC signalling
+        | SCREENSHARE // SDP offers, murmur's rate-limited path
+        | SOCIAL // typing and watch-sync
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_keepalive_is_not_charged_to_the_bucket_a_users_messages_need() {
+        // The bug this predicate exists for. Buckets are per service, so `Ping`
+        // and `UserState` share one; charging the keepalive meant a client's
+        // own liveness traffic could exhaust the allowance, and the gateway
+        // sheds a frame without retrying or telling the sender. A text message
+        // simply disappeared.
+        assert!(
+            !is_rate_limited(3),
+            "Ping is a keepalive; murmur never charges it"
+        );
+        assert!(!is_rate_limited(2), "Authenticate is the handshake");
+        assert!(!is_rate_limited(15), "CryptSetup is the handshake");
+        assert!(!is_rate_limited(22), "UserStats is diagnostics");
+    }
+
+    #[test]
+    fn the_types_murmur_rate_limits_are_still_charged() {
+        // Parity in the other direction: dropping the charge entirely would
+        // make the server trivially floodable, which is what the bucket is for.
+        for type_id in [0_u16, 7, 9, 11, 13] {
+            assert!(is_rate_limited(type_id), "murmur rate-limits {type_id}");
+        }
+    }
+
+    #[test]
+    fn audio_is_never_charged_to_a_message_bucket() {
+        // `UDPTunnel` is answered and returned from before upstream's rate
+        // check (`Server.cpp:1905`). Charging it once throttled a tunnelled
+        // client off the air mid-sentence.
+        assert!(
+            !is_rate_limited(1),
+            "UDPTunnel must never be message-limited"
+        );
+    }
 
     #[test]
     fn a_gateway_with_nothing_routed_refuses_to_start() {
@@ -568,16 +688,26 @@ mod tests {
         // is the hardest failure to attribute.
         let mut config = Config::with_defaults(Path::new("/run/starling"));
         config.services.clear();
-        let err = Gateway::new(Arc::new(config), Metrics::new(), Health::new(), Logger::null())
-            .expect_err("an empty table must be refused");
+        let err = Gateway::new(
+            Arc::new(config),
+            Metrics::new(),
+            Health::new(),
+            Logger::null(),
+        )
+        .expect_err("an empty table must be refused");
         assert!(matches!(err, GatewayError::NoRoutes));
     }
 
     #[test]
     fn a_gateway_over_the_shipped_defaults_routes_every_service() {
         let config = Config::with_defaults(Path::new("/run/starling"));
-        let gateway = Gateway::new(Arc::new(config), Metrics::new(), Health::new(), Logger::null())
-            .expect("the defaults must be servable");
+        let gateway = Gateway::new(
+            Arc::new(config),
+            Metrics::new(),
+            Health::new(),
+            Logger::null(),
+        )
+        .expect("the defaults must be servable");
         assert!(gateway.router.route(11).is_some());
         assert_eq!(gateway.router.services().len(), 18);
     }

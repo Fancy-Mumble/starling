@@ -27,11 +27,15 @@
 
 pub mod audit;
 pub mod auth;
+pub mod events;
+pub mod live;
 pub mod openapi;
 pub mod routes;
+pub mod webtransport;
 
 pub use audit::{AuditLog, AuditRecord};
 pub use auth::{Authenticator, Identity, Refusal, authenticator};
+pub use events::{Event, EventHub};
 pub use openapi::description;
 pub use routes::router;
 
@@ -46,6 +50,7 @@ pub struct OperatorApi {
     audit: AuditLog,
     listen: String,
     resolver: starling_runtime::channel::Resolver,
+    events: EventHub,
 }
 
 impl OperatorApi {
@@ -74,6 +79,57 @@ impl OperatorApi {
     pub fn resolver(&self) -> &starling_runtime::channel::Resolver {
         &self.resolver
     }
+
+    /// The live event channel: what changed, as it changes.
+    #[must_use]
+    pub const fn events(&self) -> &EventHub {
+        &self.events
+    }
+
+    /// Start the WebTransport listener, if this deployment configured one.
+    ///
+    /// Spawned rather than awaited, and a failure here is logged rather than
+    /// returned: a UDP port that will not bind must not take down the HTTP
+    /// surface, which serves the same channel over a WebSocket and is what a
+    /// proxied deployment uses anyway.
+    fn spawn_webtransport(self: &Arc<Self>, ctx: &ServiceContext) {
+        let Some(config) = ctx.service().webtransport else {
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+
+        let listen = match config.listen.parse() {
+            Ok(listen) => listen,
+            Err(error) => {
+                tracing::error!(
+                    listen = config.listen,
+                    %error,
+                    "the WebTransport listen address is not a socket address"
+                );
+                return;
+            }
+        };
+
+        // Alongside the gateway's own pair by default, in the data directory,
+        // so a first boot produces something rather than refusing to start.
+        let data_dir = ctx.config.runtime.data_dir.clone();
+        let cert = config
+            .cert
+            .unwrap_or_else(|| data_dir.join("webtransport-cert.pem"));
+        let key = config
+            .key
+            .unwrap_or_else(|| data_dir.join("webtransport-key.pem"));
+
+        let api = Arc::clone(self);
+        let shutdown = ctx.shutdown.clone();
+        drop(tokio::spawn(async move {
+            if let Err(error) = webtransport::serve(api, listen, &cert, &key, shutdown).await {
+                tracing::error!(%error, "the WebTransport listener stopped");
+            }
+        }));
+    }
 }
 
 impl Serve for OperatorApi {
@@ -96,6 +152,7 @@ impl Serve for OperatorApi {
                 .listen
                 .unwrap_or_else(|| "127.0.0.1:8081".to_owned()),
             resolver: ctx.resolver,
+            events: EventHub::new(),
         }))
     }
 
@@ -111,6 +168,12 @@ impl Serve for OperatorApi {
         }
         let listener = tokio::net::TcpListener::bind(&self.listen).await?;
         tracing::info!(listen = %self.listen, "operator API listening");
+
+        // Started before the listener accepts anything, so the first subscriber
+        // to connect is already behind a live bridge rather than behind one
+        // that starts when it asks.
+        self.events.spawn_bridges(self.resolver.clone());
+        self.spawn_webtransport(&ctx);
 
         let shutdown = ctx.shutdown.clone();
         axum::serve(listener, router(Arc::clone(&self)))

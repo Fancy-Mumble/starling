@@ -111,6 +111,40 @@ badly, not because it is recommended.
 tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
 ```
 
+### The live channel
+
+`GET /v1/events` is a WebSocket carrying what changed as it changes — users
+connecting and moving, channels being created and edited, messages as they are
+delivered, and context-menu entries being chosen. It needs no configuration and
+works through any reverse proxy.
+
+The same channel is available over **WebTransport (HTTP/3)**, and that one does
+need configuring, because a reverse proxy generally *cannot* forward it —
+WebTransport is Extended CONNECT over HTTP/3, and terminating it means
+terminating QUIC.
+
+```toml
+[services.operator-api.webtransport]
+enabled = false                    # off unless the deployment terminates QUIC
+listen  = "0.0.0.0:8443"           # UDP, and a different socket from `listen`
+cert    = "/etc/starling/wt/cert.pem"
+key     = "/etc/starling/wt/key.pem"
+```
+
+**The certificate is not optional in practice.** Every other surface here can
+sit behind a proxy holding the certificate; this listener is the one the proxy
+is not terminating, so it presents its own. A self-signed pair is generated on
+first boot if `cert` and `key` are absent, which a browser will refuse — that
+default exists so a first boot starts, not so a deployment ships on it.
+
+**One UDP port serves every endpoint, not every service.** A WebTransport
+session is addressed by `:path`, so more endpoints here cost no more ports. Two
+*independent* services are a different question: give each its own UDP port and
+point clients at it with `Alt-Svc: h3=":8443"` from your existing HTTPS
+endpoint, or put a QUIC-aware L4 proxy in front and steer on SNI. Note that
+QUIC connection migration means SNI steering also needs connection-ID-aware
+routing, or a client changing network drops its session.
+
 ### Audit is fail-closed
 
 ```toml

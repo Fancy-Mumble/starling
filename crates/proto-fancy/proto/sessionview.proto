@@ -62,6 +62,18 @@ message Session {
   // SuperUser's id. Interpret the pair through
   // `starling_proto_fancy::identity`, never by comparing `account` directly.
   bool registered = 20;
+  // The account's stored comment and avatar, as content hashes.
+  //
+  // Carried on the session because that is what the roster is built from: a
+  // client learns of everyone else through `Session`, and a hash that stops
+  // here is a profile picture nobody but its owner can see. The bodies stay in
+  // `userdata`'s blob store and are fetched with `RequestBlob`, so a session
+  // costs the same 20 bytes whether the avatar is 1 KiB or 500.
+  //
+  // Empty means the account has none — or that this is a guest, who has no
+  // account to have stored one on.
+  bytes comment_hash = 21;
+  bytes texture_hash = 22;
 }
 
 message Sessions {

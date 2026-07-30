@@ -10,6 +10,17 @@ import "common.proto";
 service Text {
   rpc History(HistoryRequest) returns (HistoryPage);
   rpc Purge(PurgeRequest) returns (starling.common.v1.Ack);
+  // A message from the server itself, with no client behind it: the only way
+  // an external system — operator-api, a bot, a user manager — reaches a
+  // connected user without holding a client connection.
+  rpc Announce(AnnounceRequest) returns (AnnounceResult);
+
+  // Every message as it is delivered. History is what was said; a watcher
+  // wants to be told as it happens rather than to poll for it.
+  //
+  // Observation only — a subscriber cannot refuse or alter a message, because
+  // by the time it is published the message has already been fanned out.
+  rpc Watch(WatchRequest) returns (stream MessageEvent);
 }
 
 message HistoryRequest {
@@ -39,4 +50,55 @@ message PurgeRequest {
   starling.common.v1.Actor actor = 2;
   uint32 channel = 3;
   uint64 older_than_ms = 4;
+}
+
+// A server-originated message.
+//
+// Addressed to sessions, to channels, or to both — the same shape upstream's
+// TextMessage(11) carries, because that is the frame this becomes. Empty on
+// both counts is refused rather than treated as a broadcast: a typo in a
+// session id must not become a message to the whole server.
+message AnnounceRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  repeated uint32 sessions = 3;
+  repeated uint32 channels = 4;
+  // Deliver to every subchannel of `channels` as well; murmur's `tree` flag.
+  bool tree = 5;
+  string body = 6;
+  // Whether the message joins the channel's history. A one-off notice to one
+  // user usually should not, and a channel announcement usually should.
+  bool store = 7;
+}
+
+message AnnounceResult {
+  bool applied = 1;
+  string refused = 2;
+}
+
+message WatchRequest {
+  starling.common.v1.Scope scope = 1;
+  // Named in logs, so a stalled subscriber can be identified rather than
+  // merely counted.
+  string subscriber = 2;
+}
+
+// One delivered message.
+//
+// Carries the sender's session and name rather than only the account, because
+// a watcher rendering "who said this" has to name an unregistered guest too,
+// and a guest has no account to look up.
+message MessageEvent {
+  uint32 sender_session = 1;
+  uint64 sender_account = 2;
+  string sender_name = 3;
+  bool sender_registered = 4;
+  repeated uint32 channels = 5;
+  repeated uint32 sessions = 6;
+  repeated uint32 tree = 7;
+  string body = 8;
+  uint64 sent_at_ms = 9;
+  // False when the server itself sent it — an Announce rather than a client's
+  // message.
+  bool from_client = 10;
 }

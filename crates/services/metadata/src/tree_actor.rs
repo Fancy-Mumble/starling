@@ -32,6 +32,14 @@ struct TreeState {
     next_id: u32,
     channels: HashMap<u32, Channel>,
     members: HashMap<u32, Membership>,
+    /// When a channel last saw somebody arrive or leave.
+    ///
+    /// Only sliding expiry (`EXPIRY_SLIDING`) reads it, and only in memory: an
+    /// idle window is about *recent* use, so a deadline restored from disk
+    /// after a restart would be measuring a period when nobody could have been
+    /// in the channel at all. A channel with no entry here falls back to its
+    /// creation time, which is what "no activity yet" means.
+    last_active_ms: HashMap<u32, u64>,
 }
 
 impl Trees {
@@ -299,6 +307,13 @@ impl Trees {
                 },
             );
             state.version += 1;
+            // Both ends of the move count as activity: arriving keeps the
+            // destination alive, and leaving is the moment a sliding window
+            // starts running on the channel just vacated.
+            let _ = state.last_active_ms.insert(channel, now_ms());
+            if let Some(old) = previous {
+                let _ = state.last_active_ms.insert(old, now_ms());
+            }
             let collected = previous.and_then(|old| collect_temporary(state, old));
             EnterResult {
                 applied: true,
@@ -314,6 +329,7 @@ impl Trees {
     pub fn leave(&self, scope: u32, session: u32) {
         let _ = self.mutate(scope, |state| {
             if let Some(member) = state.members.remove(&session) {
+                let _ = state.last_active_ms.insert(member.channel, now_ms());
                 let _ = collect_temporary(state, member.channel);
             }
             state.version += 1;
@@ -387,6 +403,127 @@ fn descendants(state: &TreeState, root: u32) -> Vec<u32> {
 }
 
 /// Delete `channel` if it is temporary and now empty, returning its id.
+/// `expiry_mode`: the channel lives until a fixed deadline from creation.
+pub const EXPIRY_ABSOLUTE: u32 = 1;
+/// `expiry_mode`: the channel lives until it has been idle for the duration.
+pub const EXPIRY_SLIDING: u32 = 2;
+
+/// One occupant of a channel that is being reaped, and where they end up.
+#[derive(Debug, Clone, Copy)]
+pub struct Relocated {
+    /// The occupant that was moved.
+    pub session: u32,
+    /// The channel they were moved into — the reaped channel's parent.
+    pub to: u32,
+}
+
+/// What a reap pass did, so the caller can tell clients.
+#[derive(Debug, Default)]
+pub struct Reaped {
+    /// Channels removed by this pass.
+    pub channels: Vec<u32>,
+    /// Occupants relocated out of them.
+    pub moved: Vec<Relocated>,
+}
+
+impl Trees {
+    /// Remove channels whose expiry has come, relocating anyone inside.
+    ///
+    /// Two modes, both from the client's `ChannelState`:
+    ///
+    /// * **absolute** — a deadline measured from creation. The channel goes at
+    ///   the deadline whether or not it is in use, which is what a scheduled
+    ///   room is for.
+    /// * **sliding** — an *idle* window. Every arrival and departure pushes the
+    ///   deadline out, so a room in use survives and only a quiet one is
+    ///   reaped.
+    ///
+    /// Occupants are **moved to the parent, not disconnected**. Removing the
+    /// channel underneath a client without relocating them leaves it rendering
+    /// a room the server has forgotten, and the user cannot leave a channel
+    /// that no longer exists.
+    ///
+    /// The root is never reaped, whatever it is flagged with: it is the parent
+    /// of last resort, and losing it would leave every remaining channel
+    /// orphaned.
+    pub fn reap_expired(&self, scope: u32, now: u64) -> Reaped {
+        let mut reaped = Reaped::default();
+        let _ = self.mutate(scope, |state| {
+            let due: Vec<u32> = state
+                .channels
+                .values()
+                .filter(|channel| channel.id != 0)
+                .filter(|channel| {
+                    let seconds = u64::from(channel.expiry_duration_s);
+                    if seconds == 0 {
+                        return false;
+                    }
+                    let window = seconds.saturating_mul(1_000);
+                    match channel.expiry_mode {
+                        EXPIRY_ABSOLUTE => now >= channel.created_at_ms.saturating_add(window),
+                        EXPIRY_SLIDING => {
+                            let since = state
+                                .last_active_ms
+                                .get(&channel.id)
+                                .copied()
+                                .unwrap_or(channel.created_at_ms);
+                            now >= since.saturating_add(window)
+                        }
+                        _ => false,
+                    }
+                })
+                .map(|channel| channel.id)
+                .collect();
+
+            for id in due {
+                reaped.moved.extend(evict(state, id));
+                reaped.channels.push(id);
+            }
+            if !reaped.channels.is_empty() {
+                state.version += 1;
+            }
+            ChannelResult::default()
+        });
+        reaped
+    }
+}
+
+/// Remove one channel, relocating whatever was hanging off it.
+///
+/// Occupants go to the parent rather than being disconnected, and so do child
+/// channels: a child left pointing at a removed parent is orphaned, and a
+/// client building a tree from parent ids never renders it again.
+fn evict(state: &mut TreeState, id: u32) -> Vec<Relocated> {
+    let parent = state
+        .channels
+        .get(&id)
+        .and_then(|channel| channel.parent)
+        .unwrap_or(0);
+
+    let moved: Vec<Relocated> = state
+        .members
+        .values_mut()
+        .filter(|member| member.channel == id)
+        .map(|member| {
+            member.channel = parent;
+            Relocated {
+                session: member.session,
+                to: parent,
+            }
+        })
+        .collect();
+
+    state
+        .channels
+        .values_mut()
+        .filter(|child| child.parent == Some(id))
+        .for_each(|child| child.parent = Some(parent));
+
+    let _ = state.channels.remove(&id);
+    let _ = state.last_active_ms.remove(&id);
+    moved
+}
+
 fn collect_temporary(state: &mut TreeState, channel: u32) -> Option<u32> {
     if channel == 0 {
         return None;
