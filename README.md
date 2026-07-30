@@ -15,6 +15,11 @@ bypass the gateway entirely.** Architecture:
 [`docs/STORAGE.md`](docs/STORAGE.md). Diagrams:
 [`docs/diagrams/`](docs/diagrams/).
 
+How far the port has got, measured twice and against two different targets:
+[`docs/GAP-ANALYSIS.md`](docs/GAP-ANALYSIS.md) against upstream murmur, and
+[`docs/FANCY-PARITY.md`](docs/FANCY-PARITY.md) against the Fancy fork. They
+answer differently and the difference is the point.
+
 ## Quick start
 
 ```sh

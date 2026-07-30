@@ -245,7 +245,7 @@ enforced; writing one is refused for everybody, including the SuperUser.
 | S3 | `zstd` on the Fancy control stream — a workspace dependency no source file uses | Fancy fork |
 | S4 | A session store that outlives a gateway pod. The resume ring is in-process, so RESUME cannot cross one | `ARCHITECTURE.md` §5 |
 | S5 | Sharding. Every shard key in `scaling.puml` is a design decision; nothing is sharded | |
-| S6 | Ice. Replaced by `operator-api`, which covers accounts, the ban list, config and the SuperUser password — not the whole Ice surface | `MumbleServerIce.cpp` |
+| S6 | Ice. Replaced by `operator-api`, which covers accounts, the ban list, config and the SuperUser password — not the whole Ice surface, which `FANCY-PARITY.md` §2 enumerates | `MumbleServerIce.cpp` |
 | S7 | `--all-in-one` uses local sockets, not in-process pipes: a service cannot resolve its own endpoint through the broker before registering, so it falls back | `runtime/src/channel.rs` |
 
 ## 8. What is built
