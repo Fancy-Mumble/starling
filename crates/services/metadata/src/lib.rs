@@ -39,6 +39,7 @@ use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::Migration;
+use starling_runtime::trail::{self, Record, Trail};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
@@ -82,6 +83,23 @@ pub struct MetadataService {
     /// Needed because announcing a *hidden* channel is addressed rather than
     /// broadcast: the recipient list has to be built before it can be filtered.
     resolver: Resolver,
+    /// The operator-facing record of channel edits.
+    ///
+    /// Separate from `logger`: that is the server's own diagnostic log, this is
+    /// what an operator queries and whose chain they verify. The same action
+    /// belongs in both, and neither is derivable from the other.
+    trail: Trail,
+}
+
+/// The client on `session`, as an audit actor.
+///
+/// A free function because the only alternative is spelling the nested `Who`
+/// out at every call site, and a two-level enum literal repeated is a two-level
+/// enum literal eventually built wrong.
+fn session_actor(session: u32) -> starling_proto_fancy::common::Actor {
+    starling_proto_fancy::common::Actor {
+        who: Some(starling_proto_fancy::common::actor::Who::Session(session)),
+    }
 }
 
 impl MetadataService {
@@ -557,6 +575,16 @@ impl MetadataService {
                     .with("session", inbound.session)
                     .with("scope", inbound.scope),
                 );
+                self.trail.record(
+                    inbound.scope,
+                    Record::new(
+                        trail::category::CHANNEL,
+                        if creating { "created" } else { "updated" },
+                    )
+                    .actor(session_actor(inbound.session), String::new())
+                    .target_channel(channel.id)
+                    .detail(channel.name.clone()),
+                );
                 if creating && !state.invitee_user_ids.is_empty() {
                     self.invite(inbound.scope, channel.id, &state.invitee_user_ids)
                         .await;
@@ -610,6 +638,12 @@ impl MetadataService {
                 .with("session", inbound.session)
                 .with("scope", inbound.scope),
         );
+        self.trail.record(
+            inbound.scope,
+            Record::new(trail::category::CHANNEL, "removed")
+                .actor(session_actor(inbound.session), String::new())
+                .target_channel(remove.channel_id),
+        );
         vec![to_sessions(
             Vec::new(),
             CHANNEL_REMOVE,
@@ -636,6 +670,7 @@ impl Serve for MetadataService {
             events,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            trail: Trail::new(ctx.resolver.clone()),
             permit: Permit::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
         }))

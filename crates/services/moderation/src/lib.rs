@@ -31,6 +31,7 @@ use starling_runtime::plane::{
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
+use starling_runtime::trail::{self, Record, Trail};
 use tonic::{Request, Response, Status};
 
 /// Upstream `UserRemove`: a kick, or a kick with a ban flag.
@@ -69,6 +70,19 @@ pub struct ModerationService {
     /// durable — the address and the certificate hash — and the session id
     /// alone carries neither.
     resolver: Resolver,
+    /// The operator-facing record of moderation actions.
+    ///
+    /// A ban or kick is the thing an operator is most often asked to justify
+    /// months later, so it belongs in the queryable, hash-chained trail and not
+    /// only in the server's own log.
+    trail: Trail,
+}
+
+/// The client on `session`, as an audit actor.
+fn session_actor(session: u32) -> starling_proto_fancy::common::Actor {
+    starling_proto_fancy::common::Actor {
+        who: Some(starling_proto_fancy::common::actor::Who::Session(session)),
+    }
 }
 
 impl ModerationService {
@@ -276,6 +290,16 @@ impl Moderation for ModerationRpc {
                 .with("permanent", ban.duration_s == 0)
                 .with("scope", scope),
         );
+        self.0.trail.record(
+            scope,
+            Record::new(trail::category::BAN, "issued")
+                .actor(req.actor.clone().unwrap_or_default(), ban.name.clone())
+                .detail(if ban.duration_s == 0 {
+                    format!("permanent: {}", ban.reason)
+                } else {
+                    format!("{}s: {}", ban.duration_s, ban.reason)
+                }),
+        );
 
         if req.session != 0 {
             self.0
@@ -302,6 +326,10 @@ impl Moderation for ModerationRpc {
                 .with("ban", req.id)
                 .with("scope", scope),
         );
+        self.0.trail.record(
+            scope,
+            Record::new(trail::category::BAN, "lifted").detail(format!("ban {}", req.id)),
+        );
         Ok(Response::new(BanResult {
             applied: true,
             refused: String::new(),
@@ -327,6 +355,12 @@ impl Moderation for ModerationRpc {
                 .with("session", req.session)
                 .with("actor", actor)
                 .with("reason", req.reason.clone()),
+        );
+        self.0.trail.record(
+            0,
+            Record::new(trail::category::KICK, "kicked")
+                .actor(req.actor.clone().unwrap_or_default(), String::new())
+                .detail(req.reason.clone()),
         );
         // A kick is a disconnect and nothing else: the client reconnects, and
         // that is the difference between a kick and a ban.
@@ -414,6 +448,20 @@ impl ModerationService {
             .with("name", target.name.clone())
             .with("reason", reason.clone())
             .with("scope", inbound.scope),
+        );
+        self.trail.record(
+            inbound.scope,
+            Record::new(
+                if banning {
+                    trail::category::BAN
+                } else {
+                    trail::category::KICK
+                },
+                if banning { "banned" } else { "kicked" },
+            )
+            .actor(session_actor(inbound.session), String::new())
+            .target_account(target.account)
+            .detail(format!("{}: {reason}", target.name)),
         );
 
         // Everyone is told, with the actor filled in as murmur does
@@ -587,6 +635,7 @@ impl Serve for ModerationService {
             logger: ctx.logger.clone(),
             permit: Permit::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
+            trail: Trail::new(ctx.resolver.clone()),
         }))
     }
 

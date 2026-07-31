@@ -41,6 +41,7 @@ pub mod shutdown;
 pub mod storage;
 pub mod telemetry;
 pub mod tier;
+pub mod trail;
 pub mod transport;
 
 pub use breaker::{Breaker, BreakerState};
@@ -57,4 +58,5 @@ pub use serve::{Serve, ServiceContext, ServiceError, context, run, serve, spawn}
 pub use shutdown::Shutdown;
 pub use storage::{Store, StoreError};
 pub use tier::Tier;
+pub use trail::{Record, Trail};
 pub use transport::{MalformedEndpoint, Transport};
