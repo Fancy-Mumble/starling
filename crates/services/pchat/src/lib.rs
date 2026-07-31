@@ -10,21 +10,40 @@
 //! are then one backwards range scan, which is what turns murmur's full scan of
 //! an unindexed `TEXT` UUID into an index seek (`docs/STORAGE.md` L3).
 
+mod limits;
+
 use std::sync::Arc;
 
 use prost::Message as _;
+use starling_proto_fancy::common::Scope;
+use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::pchat::{
     Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
 };
 use starling_proto_fancy::perm::Perm;
+use starling_proto_fancy::sessionview::SubscribeRequest;
+use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
+use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
+
+use crate::limits::{Limits, Op};
+
+/// How long to wait before re-subscribing to `session-view`.
+const VIEW_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The readiness gate that stays closed until the roster has a snapshot.
+///
+/// A pchat service that is up with a cold roster relays nothing, which looks
+/// exactly like a chat that has gone quiet. Gating readiness keeps traffic away
+/// until it can actually address a channel.
+const VIEW_GATE: &str = "session-view";
 
 /// The schema. `expires_at_ms` and its index are here from day one, because
 /// retention on a table that grows without bound is a schema property rather
@@ -59,6 +78,10 @@ pub struct PchatService {
     /// unreachable, so a broken dependency closes the archive rather than
     /// opening it.
     permit: Permit,
+    /// Who is in which channel, so a relay can be addressed at one.
+    roster: Arc<Roster>,
+    /// Per-connection budgets.
+    limits: Limits,
 }
 
 impl PchatService {
@@ -169,10 +192,63 @@ impl PchatService {
     }
 }
 
+/// What a relayed body is, for routing and authorisation.
+///
+/// Every body except `Ack` carries a channel. Reading that field is not
+/// "understanding the payload" -- it is the routing address, sitting beside the
+/// ciphertext rather than inside it -- so the verbatim relay can be both scoped
+/// and authorised without this service learning any crypto.
+struct Relay {
+    channel: u32,
+    /// What the sender must hold in that channel.
+    needs: Perm,
+    /// Deliver to this one session instead of the channel, when the body names
+    /// its recipient.
+    unicast: Option<u32>,
+}
+
+impl Relay {
+    /// How a client-originated body is routed, or `None` if a client has no
+    /// business sending it.
+    fn of(body: &pchat_envelope::Body) -> Option<Self> {
+        use pchat_envelope::Body;
+        let in_channel = |channel, needs| {
+            Some(Self {
+                channel,
+                needs,
+                unicast: None,
+            })
+        };
+        match body {
+            // Sealed key material naming exactly one recipient. Relaying it to
+            // the channel handed every member a copy of a message addressed to
+            // one of them.
+            Body::KeyDeliver(deliver) => Some(Self {
+                channel: deliver.channel,
+                needs: Perm::ENTER,
+                unicast: Some(deliver.recipient),
+            }),
+            Body::KeyAnnounce(announce) => in_channel(announce.channel, Perm::ENTER),
+            Body::KeyRequest(request) => in_channel(request.channel, Perm::ENTER),
+            Body::HolderReport(report) => in_channel(report.channel, Perm::ENTER),
+            Body::HolderQuery(query) => in_channel(query.channel, Perm::ENTER),
+            Body::Reaction(reaction) => in_channel(reaction.channel, Perm::TEXT_MESSAGE),
+            Body::Pin(pin) => in_channel(pin.channel, Perm::TEXT_MESSAGE),
+            Body::Receipt(receipt) => in_channel(receipt.channel, Perm::ENTER),
+            Body::Delete(delete) => in_channel(delete.channel, Perm::DELETE_MESSAGE),
+            // Server-to-client answers. A client that sends one is trying to
+            // forge somebody else's history or pin list, and the verbatim relay
+            // would have passed it on unaltered.
+            Body::FetchResponse(_) | Body::PinList(_) => None,
+            // Handled before this point.
+            Body::Message(_) | Body::Fetch(_) | Body::Ack(_) => None,
+        }
+    }
+}
+
 impl ClientService for PchatService {
     async fn frame(&self, inbound: Inbound) -> Actions {
-        let outer = ServiceKind::Pchat.outer_type();
-        if inbound.type_id != outer {
+        if inbound.type_id != ServiceKind::Pchat.outer_type() {
             return Actions::new();
         }
         let Ok(envelope) = PchatEnvelope::decode(inbound.payload.as_slice()) else {
@@ -189,97 +265,232 @@ impl ClientService for PchatService {
         };
 
         match envelope.body {
-            Some(pchat_envelope::Body::Message(mut message)) => {
-                // Checked before the message is stored, not just before it is
-                // relayed: an unauthorised write that is refused delivery still
-                // leaves a row in somebody else's channel archive, and the
-                // sender is the one who chose the channel id.
-                if !self
-                    .permit
-                    .allows(&inbound, message.channel, Perm::TEXT_MESSAGE.bits())
-                    .await
-                {
-                    return vec![permission_denied(
-                        &inbound,
-                        Perm::TEXT_MESSAGE,
-                        message.channel,
-                    )];
-                }
-
-                message.sender = inbound.session;
-                let Some(id) = self.store_message(inbound.scope, &message).await else {
-                    let refusal = PchatEnvelope {
-                        body: Some(pchat_envelope::Body::Ack(Ack {
-                            message_id: message.message_id.clone(),
-                            status: ack::Status::Refused as i32,
-                            detail: "the message could not be stored".to_owned(),
-                        })),
-                    };
-                    return vec![to_conn(inbound.conn, outer, refusal.encode_to_vec())];
-                };
-
-                message.message_id = id.to_string();
-                let acknowledgement = PchatEnvelope {
-                    body: Some(pchat_envelope::Body::Ack(Ack {
-                        message_id: message.message_id.clone(),
-                        status: ack::Status::Stored as i32,
-                        detail: String::new(),
-                    })),
-                };
-                let relay = PchatEnvelope {
-                    body: Some(pchat_envelope::Body::Message(message)),
-                };
-                // `broadcast_except` reaches every authenticated session on the
-                // server, not the channel: the gateway's `deliver` falls back
-                // to `registry.authenticated()` when a `Send` names no conns and
-                // no sessions. The ciphertext stays opaque, but who sent a
-                // message, when, and in which channel does not -- and the
-                // ciphertext is what an offline attack wants. Scoping this needs
-                // the channel roster from `session-view`, the way `voice`
-                // already addresses its `sessions`. Tracked as a finding rather
-                // than fixed here because `text` relays the same way, so the
-                // choice belongs at the plane, not in this one service.
-                vec![
-                    to_conn(inbound.conn, outer, acknowledgement.encode_to_vec()),
-                    broadcast_except(inbound.session, outer, relay.encode_to_vec()),
-                ]
+            Some(pchat_envelope::Body::Message(message)) => {
+                self.on_message(&inbound, message).await
             }
-            Some(pchat_envelope::Body::Fetch(request)) => {
-                // The channel id comes off the wire, so without this a client
-                // could page through the stored archive of any channel on the
-                // server -- including ones it cannot see. murmur gates the same
-                // read on Enter (`handlePchatFetch`).
-                if !self
-                    .permit
-                    .allows(&inbound, request.channel, Perm::ENTER.bits())
-                    .await
-                {
-                    return vec![permission_denied(&inbound, Perm::ENTER, request.channel)];
-                }
+            Some(pchat_envelope::Body::Fetch(request)) => self.on_fetch(&inbound, request).await,
+            // A client acknowledging its offline queue. Nothing to relay, and
+            // the old catch-all broadcast every one of these to the whole
+            // server.
+            Some(pchat_envelope::Body::Ack(_)) => Actions::new(),
+            Some(body) => self.on_relay(&inbound, &body).await,
+            None => Actions::new(),
+        }
+    }
 
-                let page = self.fetch(inbound.scope, &request).await;
-                let reply = PchatEnvelope {
-                    body: Some(pchat_envelope::Body::FetchResponse(page)),
-                };
-                vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+    async fn closed(&self, conn: u64, _reason: &str) -> Actions {
+        // Otherwise the map grows one entry per (connection, operation) for the
+        // life of the process.
+        self.limits.forget(conn);
+        Actions::new()
+    }
+}
+
+impl PchatService {
+    /// Address `payload` at everyone in `channel` except the sender.
+    ///
+    /// An empty roster produces no action at all rather than a broadcast. That
+    /// is the difference between "membership is unknown" and "everyone", and
+    /// conflating them is the leak this replaced.
+    fn to_channel(&self, inbound: &Inbound, channel: u32, payload: Vec<u8>) -> Actions {
+        let members = self.roster.in_channel(channel, inbound.session);
+        if members.is_empty() {
+            if !self.roster.is_warm() {
+                tracing::warn!(
+                    channel,
+                    "the session-view roster is cold; a pchat relay reached nobody"
+                );
             }
-            // Key distribution, pins, reactions and receipts are relayed
-            // verbatim: reading any of them would mean understanding a payload
-            // this service deliberately cannot decrypt.
-            //
-            // Unauthorised, and knowingly so. These bodies carry a channel id
-            // this arm never decodes, so there is nothing to check a permission
-            // against without teaching the service every body type -- which is
-            // the coupling the verbatim relay exists to avoid. It is also
-            // `broadcast_except`, which reaches every authenticated session on
-            // the server rather than the channel (see the note on the message
-            // relay below). Both are tracked in `SECURITY-AUDIT-pchat.md`.
-            Some(_) => vec![broadcast_except(
-                inbound.session,
-                outer,
+            return Actions::new();
+        }
+        vec![to_sessions(
+            members,
+            ServiceKind::Pchat.outer_type(),
+            payload,
+        )]
+    }
+
+    /// One acknowledgement, addressed at the connection that asked.
+    fn ack(
+        &self,
+        inbound: &Inbound,
+        message_id: &str,
+        status: ack::Status,
+        detail: &str,
+    ) -> ServerAction {
+        let envelope = PchatEnvelope {
+            body: Some(pchat_envelope::Body::Ack(Ack {
+                message_id: message_id.to_owned(),
+                status: status as i32,
+                detail: detail.to_owned(),
+            })),
+        };
+        to_conn(
+            inbound.conn,
+            ServiceKind::Pchat.outer_type(),
+            envelope.encode_to_vec(),
+        )
+    }
+
+    /// Follow `session-view`, so a relay knows who is in a channel.
+    ///
+    /// Re-subscribes on failure: a `session-view` restart is a rolling deploy,
+    /// not an incident. The stream is also dropped deliberately when this
+    /// subscriber falls behind, because a missed delta cannot be repaired from
+    /// the next one — reconnecting replaces the whole table, which is the only
+    /// way back to agreement.
+    fn follow_view(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            loop {
+                self.read_view(&ctx, scope).await;
+                tokio::time::sleep(VIEW_RETRY).await;
+            }
+        })
+    }
+
+    /// One subscription, from opening it to the stream ending.
+    async fn read_view(&self, ctx: &ServiceContext, scope: u32) {
+        let Ok(channel) = ctx.resolver.channel("session-view") else {
+            // Worth a line: with no roster, a relay is addressed at nobody, and
+            // that is indistinguishable from a channel where nobody is talking.
+            tracing::warn!("cannot reach session-view; no pchat relay will be delivered");
+            return;
+        };
+        let Ok(stream) = SessionViewClient::new(channel)
+            .subscribe(SubscribeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+                subscriber: Self::NAME.to_owned(),
+            })
+            .await
+        else {
+            return;
+        };
+
+        let mut events = stream.into_inner();
+        while let Ok(Some(event)) = events.message().await {
+            let _ = self.roster.apply(event);
+            // After the first event, not before: a subscription opens with a
+            // full snapshot, so this is the moment the roster stops being cold.
+            ctx.health.ready(VIEW_GATE);
+        }
+        tracing::warn!("the session-view subscription ended; pchat relays are now stale");
+    }
+
+    /// Store a message and relay it to its channel.
+    async fn on_message(&self, inbound: &Inbound, mut message: Message) -> Actions {
+        if !self.limits.allow(inbound.conn, Op::Message) {
+            return vec![self.ack(
+                inbound,
+                &message.message_id,
+                ack::Status::RateLimited,
+                "too many messages",
+            )];
+        }
+
+        // Checked before the message is stored, not just before it is relayed:
+        // an unauthorised write that is refused delivery still leaves a row in
+        // somebody else's channel archive, and the sender is the one who chose
+        // the channel id.
+        if !self
+            .permit
+            .allows(inbound, message.channel, Perm::TEXT_MESSAGE.bits())
+            .await
+        {
+            return vec![permission_denied(
+                inbound,
+                Perm::TEXT_MESSAGE,
+                message.channel,
+            )];
+        }
+
+        message.sender = inbound.session;
+        let Some(id) = self.store_message(inbound.scope, &message).await else {
+            return vec![self.ack(
+                inbound,
+                &message.message_id,
+                ack::Status::Refused,
+                "the message could not be stored",
+            )];
+        };
+
+        message.message_id = id.to_string();
+        let channel = message.channel;
+        let acknowledgement = self.ack(inbound, &message.message_id, ack::Status::Stored, "");
+        let relay = PchatEnvelope {
+            body: Some(pchat_envelope::Body::Message(message)),
+        };
+
+        let mut actions = vec![acknowledgement];
+        actions.extend(self.to_channel(inbound, channel, relay.encode_to_vec()));
+        actions
+    }
+
+    /// Serve a page of the archive to the asker alone.
+    async fn on_fetch(&self, inbound: &Inbound, request: Fetch) -> Actions {
+        if !self.limits.allow(inbound.conn, Op::Fetch) {
+            return Actions::new();
+        }
+
+        // The channel id comes off the wire, so without this a client could
+        // page through the stored archive of any channel on the server --
+        // including ones it cannot see. murmur gates the same read on Enter
+        // (`handlePchatFetch`).
+        if !self
+            .permit
+            .allows(inbound, request.channel, Perm::ENTER.bits())
+            .await
+        {
+            return vec![permission_denied(inbound, Perm::ENTER, request.channel)];
+        }
+
+        let page = self.fetch(inbound.scope, &request).await;
+        let reply = PchatEnvelope {
+            body: Some(pchat_envelope::Body::FetchResponse(page)),
+        };
+        vec![to_conn(
+            inbound.conn,
+            ServiceKind::Pchat.outer_type(),
+            reply.encode_to_vec(),
+        )]
+    }
+
+    /// Pass a body this service does not read on to whoever it is addressed to.
+    ///
+    /// Still verbatim: the bytes are re-sent unaltered, because re-encoding a
+    /// body whose meaning this service does not know is how a relay corrupts
+    /// things. What changed is that it is now addressed and authorised, both
+    /// decided from the channel field beside the payload.
+    async fn on_relay(&self, inbound: &Inbound, body: &pchat_envelope::Body) -> Actions {
+        let Some(relay) = Relay::of(body) else {
+            tracing::debug!(
+                session = inbound.session,
+                "refused a pchat body a client may not originate"
+            );
+            return Actions::new();
+        };
+
+        if !self.limits.allow(inbound.conn, Op::Manage) {
+            return Actions::new();
+        }
+
+        if !self
+            .permit
+            .allows(inbound, relay.channel, relay.needs.bits())
+            .await
+        {
+            return vec![permission_denied(inbound, relay.needs, relay.channel)];
+        }
+
+        match relay.unicast {
+            Some(recipient) => vec![to_sessions(
+                vec![recipient],
+                ServiceKind::Pchat.outer_type(),
                 inbound.payload.clone(),
             )],
-            None => Actions::new(),
+            None => self.to_channel(inbound, relay.channel, inbound.payload.clone()),
         }
     }
 }
@@ -290,10 +501,13 @@ impl Serve for PchatService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
             permit: Permit::new(ctx.resolver.clone()),
+            roster: Arc::new(Roster::new()),
+            limits: Limits::new(),
         }))
     }
 
@@ -303,10 +517,14 @@ impl Serve for PchatService {
     }
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let follower = Arc::clone(&self).follow_view(ctx.clone());
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             tokio::select! {
-                _ = ctx.shutdown.wait() => return Ok(()),
+                _ = ctx.shutdown.wait() => {
+                    follower.abort();
+                    return Ok(());
+                }
                 _ = ticker.tick() => self.sweep().await,
             }
         }
@@ -316,6 +534,7 @@ impl Serve for PchatService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_proto_fancy::fancy::pchat::{Delete, KeyAnnounce, KeyDeliver, PinList, Reaction};
 
     async fn service() -> Arc<PchatService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
@@ -345,7 +564,41 @@ mod tests {
             store,
             fanout: Fanout::default(),
             permit: Permit::new(resolver),
+            roster: Arc::new(Roster::new()),
+            limits: Limits::new(),
         })
+    }
+
+    /// The same service with a warm roster, so a relay has somewhere to go.
+    ///
+    /// Sessions 7, 8 are in channel 4 and session 9 is in channel 9 — enough to
+    /// tell "the channel" from "everyone".
+    async fn service_with_members() -> Arc<PchatService> {
+        use starling_proto_fancy::sessionview::{Session, Sessions, ViewEvent, view_event};
+        let service = service().await;
+        let _ = service.roster.apply(ViewEvent {
+            event: Some(view_event::Event::Snapshot(Sessions {
+                sessions: vec![
+                    Session {
+                        session: 7,
+                        channel: 4,
+                        ..Session::default()
+                    },
+                    Session {
+                        session: 8,
+                        channel: 4,
+                        ..Session::default()
+                    },
+                    Session {
+                        session: 9,
+                        channel: 9,
+                        ..Session::default()
+                    },
+                ],
+                ..Sessions::default()
+            })),
+        });
+        service
     }
 
     /// One decoded frame carrying `body`, from session 7 in channel 4.
@@ -431,6 +684,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_relay_is_ever_a_server_wide_broadcast() {
+        // The finding this replaced: a Send naming no conns and no sessions is
+        // delivered to every authenticated client on the server, so a message
+        // to one channel reached every other.
+        let service = service_with_members().await;
+
+        for body in [
+            pchat_envelope::Body::Message(message(4, b"x")),
+            pchat_envelope::Body::Reaction(Reaction {
+                message_id: "m".to_owned(),
+                channel: 4,
+                emoji: "x".to_owned(),
+                remove: false,
+            }),
+            pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+                channel: 4,
+                epoch: 1,
+                public_key: vec![1],
+                holder: 7,
+            }),
+            pchat_envelope::Body::Ack(Ack::default()),
+        ] {
+            for action in service.frame(frame(body)).await {
+                let (_, broadcast) = addressed(&action);
+                assert!(!broadcast, "a pchat action must never be server-wide");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_roster_relays_to_nobody_rather_than_everybody() {
+        // `service()` leaves the roster cold. Failing open here would be the
+        // original leak wearing a fallback.
+        let service = service().await;
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Reaction(Reaction {
+                message_id: "m".to_owned(),
+                channel: 4,
+                emoji: "x".to_owned(),
+                remove: false,
+            })))
+            .await;
+
+        for action in &actions {
+            let (sessions, broadcast) = addressed(action);
+            assert!(!broadcast);
+            assert!(sessions.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_body_from_a_client_is_refused_not_relayed() {
+        // FetchResponse and PinList are server-to-client. The verbatim relay
+        // passed them on unaltered, which let a client forge somebody else's
+        // history.
+        let service = service_with_members().await;
+
+        let actions = service
+            .frame(frame(pchat_envelope::Body::FetchResponse(FetchResponse {
+                channel: 4,
+                messages: vec![message(4, b"forged")],
+                more: false,
+                total_stored: 1,
+            })))
+            .await;
+
+        assert!(actions.is_empty(), "a forged response must reach nobody");
+    }
+
+    #[test]
+    fn sealed_key_material_is_addressed_to_its_recipient_alone() {
+        // KeyDeliver names one recipient; relaying it to the channel handed
+        // every member a copy of a message addressed to one of them.
+        //
+        // Asserted against `Relay::of` rather than through `frame`, because the
+        // test resolver denies every permission — a frame test would pass on
+        // the refusal and prove nothing about the addressing.
+        let relay = Relay::of(&pchat_envelope::Body::KeyDeliver(KeyDeliver {
+            channel: 4,
+            epoch: 1,
+            recipient: 8,
+            sealed_key: vec![9],
+            countersignature: Vec::new(),
+        }))
+        .expect("KeyDeliver is relayable");
+
+        assert_eq!(relay.unicast, Some(8));
+        assert_eq!(relay.channel, 4);
+    }
+
+    #[test]
+    fn every_relayable_body_names_the_channel_it_is_authorised_against() {
+        // The routing table in one assertion: a body whose channel this got
+        // wrong would be checked against the wrong ACL and delivered to the
+        // wrong people.
+        let cases: Vec<(pchat_envelope::Body, Option<(u32, Perm)>)> = vec![
+            (
+                pchat_envelope::Body::Reaction(Reaction {
+                    message_id: "m".to_owned(),
+                    channel: 4,
+                    emoji: "x".to_owned(),
+                    remove: false,
+                }),
+                Some((4, Perm::TEXT_MESSAGE)),
+            ),
+            (
+                pchat_envelope::Body::Delete(Delete {
+                    channel: 5,
+                    message_ids: vec!["m".to_owned()],
+                }),
+                Some((5, Perm::DELETE_MESSAGE)),
+            ),
+            (
+                pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+                    channel: 6,
+                    epoch: 1,
+                    public_key: vec![1],
+                    holder: 7,
+                }),
+                Some((6, Perm::ENTER)),
+            ),
+            // Server-to-client: a client may not originate these at all.
+            (
+                pchat_envelope::Body::FetchResponse(FetchResponse::default()),
+                None,
+            ),
+            (pchat_envelope::Body::PinList(PinList::default()), None),
+        ];
+
+        for (body, expected) in cases {
+            let got = Relay::of(&body).map(|relay| (relay.channel, relay.needs));
+            assert_eq!(got, expected, "routing for {body:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_message_the_client_may_not_send_is_never_stored() {
         // Refusing only the relay would still leave the row in somebody else's
         // channel archive.
@@ -445,12 +834,24 @@ mod tests {
     }
 
     /// The payload of a `Send` action, for asserting on what a refusal carries.
-    fn sent_payload(action: &starling_proto_fancy::control::ServerAction) -> Vec<u8> {
+    fn sent_payload(action: &ServerAction) -> Vec<u8> {
         match &action.action {
             Some(starling_proto_fancy::control::server_action::Action::Send(send)) => {
                 send.payload.clone()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The sessions a `Send` action is addressed at, and whether it is a
+    /// server-wide broadcast (no conns and no sessions named).
+    fn addressed(action: &ServerAction) -> (Vec<u32>, bool) {
+        match &action.action {
+            Some(starling_proto_fancy::control::server_action::Action::Send(send)) => (
+                send.sessions.clone(),
+                send.conns.is_empty() && send.sessions.is_empty(),
+            ),
+            _ => (Vec::new(), false),
         }
     }
 }
