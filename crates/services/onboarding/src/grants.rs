@@ -310,7 +310,6 @@ async fn edit(
     }
 }
 
-
 /// Put `account` in `group` on this channel's set. Returns whether it changed.
 ///
 /// Pure, and separate from the call that persists it, because this is where the

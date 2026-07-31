@@ -637,7 +637,12 @@ impl Accounts {
     /// # Errors
     ///
     /// A message when there is no such account.
-    pub async fn set_totp(&self, scope: u32, id: u64, secret: Option<Vec<u8>>) -> Result<(), String> {
+    pub async fn set_totp(
+        &self,
+        scope: u32,
+        id: u64,
+        secret: Option<Vec<u8>>,
+    ) -> Result<(), String> {
         let Some(mut record) = self
             .cache
             .lock()

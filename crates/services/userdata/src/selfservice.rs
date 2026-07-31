@@ -86,7 +86,13 @@ impl UserdataService {
             // dialog to an unregistered user should hear why.
             return match envelope.body {
                 Some(userdata_envelope::Body::Action(action)) => {
-                    vec![self.reply(inbound, refuse(action.kind, "this connection is not signed in to an account"))]
+                    vec![self.reply(
+                        inbound,
+                        refuse(
+                            action.kind,
+                            "this connection is not signed in to an account",
+                        ),
+                    )]
                 }
                 _ => Actions::new(),
             };
@@ -231,7 +237,12 @@ impl UserdataService {
         }
     }
 
-    async fn rename_self(&self, inbound: &Inbound, account: u64, action: &AccountAction) -> AccountAck {
+    async fn rename_self(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        action: &AccountAction,
+    ) -> AccountAck {
         // Through `rename` rather than `update(fields: ["name"])`, because only
         // one of the two checks that the name is free. Two accounts with one
         // name is not a cosmetic problem: a name is what a login resolves, so
@@ -363,7 +374,11 @@ impl UserdataService {
     }
 
     /// This account's stored settings, as a delivery.
-    fn settings_reply(&self, inbound: &Inbound, account: u64) -> starling_proto_fancy::control::ServerAction {
+    fn settings_reply(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+    ) -> starling_proto_fancy::control::ServerAction {
         let values = self
             .accounts
             .by_id(inbound.scope, account)
@@ -561,7 +576,9 @@ mod tests {
             .await;
         assert!(!ack.ok);
         assert!(
-            service.accounts.password_matches(1, account, "correct horse"),
+            service
+                .accounts
+                .password_matches(1, account, "correct horse"),
             "the password must be untouched"
         );
     }
@@ -575,7 +592,11 @@ mod tests {
         let ack = service.act(&inbound(), account, request).await;
         assert!(!ack.ok);
         assert_eq!(ack.detail, "the current password is wrong");
-        assert!(service.accounts.password_matches(1, account, "correct horse"));
+        assert!(
+            service
+                .accounts
+                .password_matches(1, account, "correct horse")
+        );
     }
 
     #[tokio::test]
@@ -600,7 +621,11 @@ mod tests {
             )
             .await;
         assert!(!ack.ok);
-        assert!(service.accounts.password_matches(1, account, "correct horse"));
+        assert!(
+            service
+                .accounts
+                .password_matches(1, account, "correct horse")
+        );
     }
 
     #[tokio::test]

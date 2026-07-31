@@ -379,7 +379,9 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
         // an offline user can be resolved and invited
         // (`vendor/server/src/ACL.cpp:147`). Seeded before this channel's own
         // entries, so a root ACL denying it can still take it away.
-        if *id == ROOT_CHANNEL && identity::account(subject.registered, subject.account).is_some() {
+        let at_root = *id == ROOT_CHANNEL;
+        let is_registered_user = identity::account(subject.registered, subject.account).is_some();
+        if at_root && is_registered_user {
             granted |= Perm::READ_REGISTER;
         }
         // Which channel the entry was written on, which is not the channel

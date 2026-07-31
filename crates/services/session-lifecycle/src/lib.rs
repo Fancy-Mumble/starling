@@ -86,11 +86,12 @@ fn announce_user_state(connections: &Connections, subject: u32, state: &tcp::Use
         .map_or(0, |pending| pending.channel);
     let (flood, subscribed) = connections.audience(channel);
 
-    // Nobody is subscribed and nobody is addressable, the roster is empty or a
-    // lock was lost. Fall back to the unaddressed broadcast, which is what this
-    // did before subscriptions existed: a state change that reaches nobody is a
-    // client rendering a world that has moved on.
-    if flood.is_empty() && subscribed.is_empty() {
+    // The roster is empty or a lock was lost. Falling back to the unaddressed
+    // broadcast is what this did before subscriptions existed, and it is the
+    // safe direction: a state change that reaches nobody leaves a client
+    // rendering a world that has moved on.
+    let nobody_is_reachable = flood.is_empty() && subscribed.is_empty();
+    if nobody_is_reachable {
         return vec![to_sessions(Vec::new(), USER_STATE, payload)];
     }
 
@@ -1132,10 +1133,11 @@ impl SessionLifecycleService {
             return self.on_listen(inbound, &state).await;
         }
 
-        // Clearing somebody else's comment or avatar is its own permission and
-        // its own handler, because it is the opposite of the path below: that
-        // one *stores* what arrived, and this one is only ever allowed to erase.
-        if elsewhere && is_user_content(&state) {
+        // Its own permission and its own handler, because it is the opposite
+        // of the path below: that one *stores* what arrived, this one is only
+        // ever allowed to erase.
+        let clearing_another_users_content = elsewhere && is_user_content(&state);
+        if clearing_another_users_content {
             return self.on_reset_content(inbound, &state).await;
         }
 

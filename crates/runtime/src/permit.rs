@@ -90,10 +90,11 @@ impl Permit {
         permission: u32,
         temporary_tokens: Vec<String>,
     ) -> bool {
-        // A session of zero is a client that has not finished its handshake.
-        // `permissions` would resolve it to nobody and deny; refusing here
-        // saves the round trip and says why.
-        if session == 0 || permission == 0 {
+        // Refused here to save a round trip: `permissions` would resolve
+        // either of these to nobody and deny anyway.
+        let before_handshake = session == 0;
+        let nothing_asked = permission == 0;
+        if before_handshake || nothing_asked {
             return false;
         }
 

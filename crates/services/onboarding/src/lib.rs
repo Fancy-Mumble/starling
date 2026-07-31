@@ -584,7 +584,10 @@ mod tests {
 
         let applied = service.apply_grants(1, 42).await;
         assert_eq!(applied.changed, 0);
-        assert!(!applied.complete, "an unreachable permissions service is not success");
+        assert!(
+            !applied.complete,
+            "an unreachable permissions service is not success"
+        );
     }
 
     #[tokio::test]

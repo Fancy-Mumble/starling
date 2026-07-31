@@ -358,7 +358,9 @@ fn in_named_group(subject: &Subject, context: &Context<'_>, channel: u32, name: 
         // `Group` to hang them on, and the constructed one carries the same
         // defaults this treats a missing declaration as: inheriting, and
         // inheritable.
-        if declared.is_none() && !context.acls.has_temporary(context.scope, *id, name) {
+        let has_no_declaration = declared.is_none();
+        let has_no_temporary_members = !context.acls.has_temporary(context.scope, *id, name);
+        if has_no_declaration && has_no_temporary_members {
             continue;
         }
         let (inherit, inheritable) = declared

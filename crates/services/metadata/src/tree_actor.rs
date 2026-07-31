@@ -277,10 +277,11 @@ impl Trees {
                 listening_volume: HashMap::new(),
             });
             for (channel, gain) in stored {
-                // A channel deleted while the user was away. The row is stale
-                // rather than wrong, and dropping it here is cheaper than a
-                // sweep nobody would remember to run.
-                if !known.contains(channel) || member.listening.contains(channel) {
+                // Dropping a stale row here is cheaper than a sweep nobody
+                // would remember to run.
+                let channel_is_gone = !known.contains(channel);
+                let already_listening = member.listening.contains(channel);
+                if channel_is_gone || already_listening {
                     continue;
                 }
                 member.listening.push(*channel);

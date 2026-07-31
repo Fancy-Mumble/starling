@@ -360,9 +360,10 @@ impl Text for TextRpc {
         if req.body.is_empty() {
             return Err(Status::invalid_argument("an announcement needs a body"));
         }
-        // Addressed at nobody is a mistake, not a broadcast. Treating it as one
-        // would turn a dropped session id into a message to the whole server.
-        if req.sessions.is_empty() && req.channels.is_empty() {
+        // A mistake, not a broadcast: treating it as one would turn a dropped
+        // session id into a message to the whole server.
+        let addressed_at_nobody = req.sessions.is_empty() && req.channels.is_empty();
+        if addressed_at_nobody {
             return Err(Status::invalid_argument(
                 "an announcement needs at least one session or channel",
             ));

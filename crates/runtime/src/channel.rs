@@ -74,10 +74,11 @@ impl Resolver {
     /// [`ChannelError::Unconfigured`] when no endpoint is configured, and
     /// [`ChannelError::Malformed`] when one is but cannot be parsed.
     pub fn transport(&self, service: &str) -> Result<Arc<dyn Transport>, ChannelError> {
-        // In all-in-one the configured endpoints are ignored on purpose: the
-        // file is the same one a multi-process deployment uses, and rewriting
-        // it for a single box is exactly the friction this mode removes.
-        if self.all_in_one && self.broker.has(service) {
+        // Configured endpoints are ignored on purpose here: the file is the
+        // same one a multi-process deployment uses, and rewriting it for a
+        // single box is exactly the friction this mode removes.
+        let served_in_this_process = self.all_in_one && self.broker.has(service);
+        if served_in_this_process {
             return Ok(transport::in_process(service));
         }
         let configured = self
