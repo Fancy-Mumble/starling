@@ -164,11 +164,9 @@ fn session_record(pending: &PendingConnection) -> Session {
         // connected, and recomputing it on every change would reset the uptime
         // the client shows each time somebody muted them.
         connected_at_ms: pending.connected_at_ms,
-        // The channels this peer listens to without being in them, and the gain
-        // it set on each. Carried on the session because `voice` composes its
-        // routing snapshot from this view and nothing else
-        // (`voice/src/view.rs:123`): a listener that stops here is one nobody
-        // ever routes audio to.
+        // `voice` composes its routing snapshot from this view and nothing
+        // else (`voice/src/view.rs:123`), so a listener missing here is one
+        // nobody ever routes audio to.
         listening: pending.listening.clone(),
         listening_volume: pending.listening_volume.clone(),
         // Nothing populates these yet, and saying so here is the point of
@@ -197,12 +195,11 @@ impl Handshake {
             return Actions::new();
         };
 
-        // A second `Authenticate` on a session that already has one is not a
-        // second login, murmur reads it as an access-token edit and nothing
-        // else (`vendor/server/src/murmur/Messages.cpp:367`). Letting it fall
-        // through would allocate another session for the same connection and
-        // announce the user twice.
-        if pending.session != 0 {
+        // murmur reads a second `Authenticate` as an access-token edit, never
+        // a second login (`vendor/server/src/murmur/Messages.cpp:367`). Falling
+        // through would allocate a second session and announce the user twice.
+        let already_authenticated = pending.session != 0;
+        if already_authenticated {
             return self.retoken(connections, inbound, &request).await;
         }
 
@@ -253,15 +250,14 @@ impl Handshake {
             return refusal;
         }
 
-        // Somebody is already here under this name or this account
-        // (`vendor/server/src/murmur/Messages.cpp:418`). murmur never lets two
-        // live sessions share a name: either this one is refused, or the older
-        // one is a ghost and gets kicked. Doing neither is how a server ends up
-        // with three of the same user in the tree.
+        // murmur never lets two live sessions share a name: refuse this one,
+        // or kick the older one as a ghost (`Messages.cpp:418`). Doing neither
+        // puts three of the same user in the tree.
         let ghost = connections.duplicate_of(inbound.conn, account, name);
-        if let Some(ghost) = &ghost
-            && !may_replace(&pending, ghost, account)
-        {
+        let older_session_may_stay = ghost
+            .as_ref()
+            .is_some_and(|ghost| !may_replace(&pending, ghost, account));
+        if older_session_may_stay {
             return self.refuse(
                 inbound.conn,
                 name,
@@ -279,11 +275,8 @@ impl Handshake {
             );
         };
 
-        // The line the operator asked for: somebody is now on the server.
-        //
-        // `registered` comes from the option itself rather than from `id != 0`.
-        // That comparison read the administrator as a guest, because its account
-        // id is 0.
+        // `registered` comes from the option, never from `id != 0`: that
+        // comparison read the administrator as a guest, its account id being 0.
         let (id, registered) = identity::wire(account);
         self.ctx.logger.log(
             LogEvent::info(Category::Session, "user authenticated")
@@ -503,27 +496,22 @@ impl Handshake {
             })),
         });
 
-        // Legacy clients get no subscription and no resync on demand, the
-        // flood is the only way they ever learn someone joined
-        // (`docs/ARCHITECTURE.md` §6). Excluding the new session is not an
-        // optimisation: it already received this exact `UserState` as its own
-        // in `user_states`, in handshake order, and a second copy arriving
-        // out of order would desync a client that keys off first-seen.
+        // The flood is the only way a legacy client learns someone joined
+        // (`docs/ARCHITECTURE.md` §6). The new session is excluded because it
+        // already had this exact `UserState` from `user_states` in handshake
+        // order, and a second copy out of order desyncs a client keying off
+        // first-seen.
         let joined = tcp::UserState {
             session: Some(session),
             name: Some(name.to_owned()),
             channel_id: Some(0),
             // Everyone else's user list is built from this one message, so it
-            // needs the registration marker (and the certificate hash) just
-            // as much as the client's own copy above does.
+            // needs the same markers as the copy above.
             user_id: account.map(|id| id as u32),
             hash: hex_hash(&pending.cert_hash),
-            // And the stored profile, for the same reason: this is the only
-            // message the already-connected clients get about the new arrival,
-            // so an avatar left out here is one nobody but its owner ever sees.
-            // The hashes, not the bodies, the client fetches those with
-            // `RequestBlob` if it wants them, which is what keeps a 500 KiB
-            // picture out of a broadcast to every session on the server.
+            // Hashes, not bodies: clients fetch those with `RequestBlob`,
+            // which keeps a 500 KiB picture out of a server-wide broadcast.
+            // Left out here, an avatar is one nobody but its owner ever sees.
             comment_hash: blob_hash(&identity.comment_hash),
             texture_hash: blob_hash(&identity.texture_hash),
             ..tcp::UserState::default()
@@ -595,10 +583,8 @@ impl Handshake {
         pending: &PendingConnection,
     ) -> Result<Identity, Actions> {
         let Ok(channel) = self.resolver.channel("userdata") else {
-            // Userdata is essential: without it a login cannot be decided, and
-            // guessing would either lock everyone out or let everyone in.
-            // Logged as an error, not a refusal: it is the server that is
-            // broken here, not the credentials.
+            // An error, not a refusal: the server is broken here, not the
+            // credentials, and guessing locks everyone out or lets everyone in.
             tracing::error!(
                 conn = pending.conn,
                 "userdata is unreachable; refusing login"
@@ -655,33 +641,24 @@ impl Handshake {
             .unwrap_or(auth_result::Outcome::UnknownAccount);
 
         if matches!(outcome, auth_result::Outcome::Ok) {
-            // `Option<Account>`, kept as an option. Flattening an absent account
-            // to 0 here is what made a guest indistinguishable from the
-            // SuperUser, whose account id *is* 0, see
-            // `starling_proto_fancy::identity`.
-            //
-            // `guest` is authoritative when the two disagree: userdata sets it
-            // for a name accepted without an account, and resolving the
-            // contradiction towards "no account" is the direction that grants
+            // Kept as an `Option`: 0 is the SuperUser's real account id, so
+            // flattening an absent account to 0 makes a guest the administrator.
+            // `guest` wins a disagreement, that being the direction that grants
             // nothing.
-            let account = if result.guest {
-                None
-            } else {
+            let holds_an_account = !result.guest;
+            let account = if holds_an_account {
                 result.account.as_ref().map(|account| account.id)
+            } else {
+                None
             };
             let name = result
                 .account
                 .as_ref()
                 .map_or_else(|| name.to_owned(), |account| account.name.clone());
 
-            // The stored profile arrives on the same answer, so it is taken
-            // here rather than looked up again in each of the three places that
-            // build a `UserState` from it.
-            //
-            // Only when the session really holds the account: `guest` above can
-            // strip an account id from a login that still carried an account
-            // record, and an anonymous session must not wear the avatar of the
-            // name it borrowed.
+            // Taken from this answer to save three later lookups, and only
+            // when the account is really held: an anonymous session must not
+            // wear the avatar of the name it borrowed.
             let (comment_hash, texture_hash) = match (account, result.account) {
                 (Some(_), Some(record)) => (record.comment_hash, record.texture_hash),
                 _ => (Vec::new(), Vec::new()),
@@ -861,19 +838,14 @@ impl Handshake {
         // exists, and murmur sends them in this order for the same reason.
         channels.sort_by_key(|channel| (channel.parent.unwrap_or(0), channel.id));
 
-        // A hidden channel is only sent to a client that holds `SeeChannel` on
-        // it. Without this the flag was decorative: `SEE_CHANNEL` was defined
-        // and never read, so every private room, and, because the client
-        // builds its tree from these messages, everyone sitting in one, was
-        // announced to every user who connected.
-        //
-        // Only hidden channels cost a permission check. The common case is a
-        // server with none, and a check per channel per login would put a
-        // round trip on the handshake for a question whose answer is almost
-        // always "it is not hidden".
+        // `SEE_CHANNEL` was defined and never read, so every private room and
+        // everyone sitting in one was announced to every user who connected.
+        // Only hidden channels cost a check: one per channel per login would
+        // put a round trip on the handshake to answer "no" almost every time.
         let mut visible = Vec::with_capacity(channels.len());
         for channel in channels {
-            if channel.flags & FLAG_HIDDEN != 0
+            let is_hidden = channel.flags & FLAG_HIDDEN != 0;
+            if is_hidden
                 && !self
                     .may_see(inbound.scope, inbound.session, channel.id)
                     .await
@@ -914,21 +886,16 @@ impl Handshake {
             session: Some(session),
             name: Some(identity.name.clone()),
             channel_id: Some(0),
-            // The certificate hash, hex-encoded as murmur sends it
-            // (`Server.cpp:1686`). A client will not offer "Register" for a
-            // user it believes has no certificate
-            // (`vendor/server/src/mumble/MainWindow.cpp:1817`), registration
-            // binds an account to a certificate, so without one there is
-            // nothing to bind. Omitting this greys the entry out for everybody,
-            // including the administrator.
+            // Hex-encoded as murmur sends it (`Server.cpp:1686`). Omitting it
+            // greys out "Register" for everybody, the administrator included:
+            // registration binds an account to a certificate, and a client
+            // will not offer it for a user it thinks has none
+            // (`vendor/server/src/mumble/MainWindow.cpp:1817`).
             hash: hex_hash(&pending.cert_hash),
-            // `user_id` is the *only* thing that marks a user as registered to
-            // a Mumble client: it is what draws the authenticated icon and what
-            // "Registered Users" is keyed by. Leaving it unset, which every
-            // `UserState` here used to do, renders the administrator as an
-            // anonymous guest, however carefully the server authenticated them.
-            //
-            // Absent for a guest rather than 0, because 0 is the SuperUser's id.
+            // The only thing marking a user as registered to a Mumble client:
+            // it draws the authenticated icon and keys "Registered Users".
+            // Unset renders the administrator as a guest; absent, not 0, for a
+            // real guest, because 0 is the SuperUser's id.
             user_id: identity.account.map(|id| id as u32),
             // The profile stored on the account, which is how a picture set
             // anywhere other than this client, the web user manager, another
@@ -1220,10 +1187,8 @@ impl Handshake {
         inbound: &Inbound,
         hello: &starling_proto_fancy::fancy::session::Hello,
     ) -> Actions {
-        // Recorded, not discarded. This used to drop the message on the
-        // floor, so a client announcing `zstd` had no way to learn
-        // whether anything heard it, and the three features these gate
-        // would each have had to invent their own way of asking.
+        // Recorded, not discarded: a client announcing `zstd` used to have no
+        // way to learn whether anything heard it.
         connections.touch(inbound.conn);
         connections.set_capabilities(
             inbound.conn,
@@ -1243,13 +1208,10 @@ impl Handshake {
         if !hello.resume && !hello.zstd {
             return Actions::new();
         }
-        // Sequencing starts here and not before. The gateway cannot
-        // decide it (the request is inside a payload it never parses)
-        // so this instructs it, and the `ResumeAck` afterwards is what
-        // tells the client to start expecting eight more bytes per
-        // frame. Both are queued in that order, and the gateway is the
-        // single writer to the socket, so the client cannot see a
-        // sequenced frame before the acknowledgement that explains it.
+        // The gateway never parses this payload, so it has to be told. The
+        // `ResumeAck` queued after it is what tells the client to expect eight
+        // more bytes per frame, and the gateway being the socket's single
+        // writer is what keeps those two in that order on the wire.
         vec![
             ServerAction {
                 action: Some(server_action::Action::Sequence(
@@ -1285,11 +1247,11 @@ impl Handshake {
         inbound: &Inbound,
         subscribe: &starling_proto_fancy::fancy::session::LazySubscribe,
     ) -> Actions {
-        // Only honoured from a peer that announced it can read deltas.
-        // Otherwise this would quietly stop sending a client state it
-        // still expects as the full flood, the failure mode being a
-        // roster that silently stops updating.
-        if !connections.capabilities(inbound.conn).lazy_subscribe {
+        // Honoured only from a peer that announced it reads deltas, or this
+        // quietly stops sending state a client still expects in full and its
+        // roster stops updating.
+        let announced_deltas = connections.capabilities(inbound.conn).lazy_subscribe;
+        if !announced_deltas {
             tracing::debug!(
                 conn = inbound.conn,
                 "subscription from a peer that did not announce \
@@ -1314,17 +1276,11 @@ impl Handshake {
         inbound: &Inbound,
         resume: starling_proto_fancy::fancy::session::ResumeRequest,
     ) -> Actions {
-        // The replay itself is the gateway's, and for a stronger reason
-        // than routing: only the pod holding the socket knows what it
-        // already wrote to it. This used to answer
-        // `full_resync_required` unconditionally, which made the whole
-        // feature a stub, the ring was filled on every frame and never
-        // read from.
-        //
-        // Whether the gap can actually be covered is the gateway's to
-        // discover, and the client does not need to be told: a replay
-        // that cannot reach back far enough simply leaves a jump in the
-        // sequence numbers, which the client sees for itself.
+        // The replay is the gateway's: only the pod holding the socket knows
+        // what it already wrote. Whether the gap can be covered is therefore
+        // its discovery to make, and the client needs no answer either way, a
+        // replay that cannot reach far enough just leaves a jump in the
+        // sequence numbers.
         let ack = SessionEnvelope {
             body: Some(session_envelope::Body::ResumeAck(
                 starling_proto_fancy::fancy::session::ResumeAck {
@@ -1550,17 +1506,10 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
     match outcome {
         Outcome::WrongPassword => (RejectType::WrongUserPw, "wrong password"),
         // `WrongUserPw`, not `UsernameInUse`, and the difference is a security
-        // property rather than a nicety. This outcome is murmur's `id == -1`:
-        // the name belongs to a registered account and the peer proved nothing
-        // (`Messages.cpp:381`, "Wrong certificate or password for existing
-        // user"). `UsernameInUse` says something else entirely, that somebody
-        // is *online* under the name, and a client told that reconnects under
-        // a suffixed name, quietly turning a failed impersonation into a
-        // successful login as a lookalike. It also leaks liveness: it answers
-        // "is this person connected right now" to anyone who asks.
-        //
-        // A genuine live duplicate never reaches here; `duplicate_of` refuses
-        // that case with `UsernameInUse` before authentication is consulted.
+        // property. A client told `UsernameInUse` reconnects under a suffixed
+        // name, turning a failed impersonation into a login as a lookalike,
+        // and the answer leaks whether that person is online. A genuine live
+        // duplicate never reaches here: `duplicate_of` refuses it earlier.
         Outcome::NameTaken => (
             RejectType::WrongUserPw,
             "that name is registered to another certificate",
