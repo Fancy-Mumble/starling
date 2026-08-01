@@ -15,14 +15,11 @@ mod limits;
 use std::sync::Arc;
 
 use prost::Message as _;
-use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::pchat::{
     Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
 };
 use starling_proto_fancy::perm::Perm;
-use starling_proto_fancy::sessionview::SubscribeRequest;
-use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::permit::{Permit, permission_denied};
@@ -34,9 +31,6 @@ use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 
 use crate::limits::{Limits, Op};
-
-/// How long to wait before re-subscribing to `session-view`.
-const VIEW_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The readiness gate that stays closed until the roster has a snapshot.
 ///
@@ -332,53 +326,6 @@ impl PchatService {
         )
     }
 
-    /// Follow `session-view`, so a relay knows who is in a channel.
-    ///
-    /// Re-subscribes on failure: a `session-view` restart is a rolling deploy,
-    /// not an incident. The stream is also dropped deliberately when this
-    /// subscriber falls behind, because a missed delta cannot be repaired from
-    /// the next one — reconnecting replaces the whole table, which is the only
-    /// way back to agreement.
-    fn follow_view(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
-            loop {
-                self.read_view(&ctx, scope).await;
-                tokio::time::sleep(VIEW_RETRY).await;
-            }
-        })
-    }
-
-    /// One subscription, from opening it to the stream ending.
-    async fn read_view(&self, ctx: &ServiceContext, scope: u32) {
-        let Ok(channel) = ctx.resolver.channel("session-view") else {
-            // Worth a line: with no roster, a relay is addressed at nobody, and
-            // that is indistinguishable from a channel where nobody is talking.
-            tracing::warn!("cannot reach session-view; no pchat relay will be delivered");
-            return;
-        };
-        let Ok(stream) = SessionViewClient::new(channel)
-            .subscribe(SubscribeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
-                subscriber: Self::NAME.to_owned(),
-            })
-            .await
-        else {
-            return;
-        };
-
-        let mut events = stream.into_inner();
-        while let Ok(Some(event)) = events.message().await {
-            let _ = self.roster.apply(event);
-            // After the first event, not before: a subscription opens with a
-            // full snapshot, so this is the moment the roster stops being cold.
-            ctx.health.ready(VIEW_GATE);
-        }
-        tracing::warn!("the session-view subscription ended; pchat relays are now stale");
-    }
-
     /// Store a message and relay it to its channel.
     async fn on_message(&self, inbound: &Inbound, mut message: Message) -> Actions {
         if !self.limits.allow(inbound.conn, Op::Message) {
@@ -517,7 +464,7 @@ impl Serve for PchatService {
     }
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
-        let follower = Arc::clone(&self).follow_view(ctx.clone());
+        let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             tokio::select! {

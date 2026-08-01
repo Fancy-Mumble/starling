@@ -29,10 +29,19 @@
 //! [`voice`]: https://docs.rs/starling-voice
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use starling_proto_fancy::sessionview::{Session, ViewEvent, view_event};
+use starling_proto_fancy::common::Scope;
+use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
+use starling_proto_fancy::sessionview::{Session, SubscribeRequest, ViewEvent, view_event};
+
+use crate::serve::ServiceContext;
+
+/// How long to wait before re-subscribing.
+const RETRY: Duration = Duration::from_secs(2);
 
 /// Every session on the server and the channel it is in, as `session-view` last
 /// described it.
@@ -151,6 +160,68 @@ impl Roster {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Keep this roster up to date from `session-view`, until aborted.
+    ///
+    /// Re-subscribes on failure: a `session-view` restart is a rolling deploy,
+    /// not an incident. The stream is also dropped deliberately when a
+    /// subscriber falls behind, because a missed delta cannot be repaired from
+    /// the next one — reconnecting replaces the whole table, which is the only
+    /// way back to agreement.
+    ///
+    /// `gate` is opened after the first event rather than before, because a
+    /// subscription opens with a full snapshot: that is the moment the roster
+    /// stops being cold, and declaring readiness any earlier is the race that
+    /// makes a cold roster look warm for one scrape interval.
+    pub fn follow(
+        self: Arc<Self>,
+        ctx: ServiceContext,
+        subscriber: &'static str,
+        gate: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            loop {
+                self.read(&ctx, scope, subscriber, gate).await;
+                tokio::time::sleep(RETRY).await;
+            }
+        })
+    }
+
+    /// One subscription, from opening it to the stream ending.
+    async fn read(&self, ctx: &ServiceContext, scope: u32, subscriber: &str, gate: &str) {
+        let Ok(channel) = ctx.resolver.channel("session-view") else {
+            // Worth a line: with no roster, every channel-scoped send is
+            // addressed at nobody, and that is indistinguishable from a server
+            // where nobody is talking.
+            tracing::warn!(
+                subscriber,
+                "cannot reach session-view; nothing will be delivered"
+            );
+            return;
+        };
+        let Ok(stream) = SessionViewClient::new(channel)
+            .subscribe(SubscribeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+                subscriber: subscriber.to_owned(),
+            })
+            .await
+        else {
+            return;
+        };
+
+        let mut events = stream.into_inner();
+        while let Ok(Some(event)) = events.message().await {
+            let _ = self.apply(event);
+            ctx.health.ready(gate);
+        }
+        tracing::warn!(
+            subscriber,
+            "the session-view subscription ended; membership is now stale"
+        );
     }
 }
 
