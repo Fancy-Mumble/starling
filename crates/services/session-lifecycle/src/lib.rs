@@ -1075,30 +1075,8 @@ impl SessionLifecycleService {
             return self.on_speak_state(inbound, &state).await;
         }
 
-        // A client announcing it has *started* recording, on a server that
-        // forbids it. `allow_recording` was advertised in `ServerConfig` and
-        // enforced nowhere (`docs/GAP-ANALYSIS.md` §5), so a client that
-        // ignored the flag recorded the channel and the server said nothing.
-        //
-        // murmur kicks (`Messages.cpp:1417`), and the severity is the point:
-        // the flag is the client's own voluntary disclosure, so the only
-        // client this can catch is an honest one, and the answer to an honest
-        // client doing a forbidden thing is to stop the session, not to drop
-        // the field and leave it recording in the belief that it may.
-        if state.recording == Some(true) {
-            let config = self.handshake.config(inbound.scope).await;
-            if !config.allow_recording {
-                self.handshake.context().logger.log(
-                    LogEvent::notice(Category::Session, "recording refused")
-                        .with("session", inbound.session)
-                        .with("conn", inbound.conn)
-                        .with("scope", inbound.scope),
-                );
-                return vec![disconnect(
-                    inbound.conn,
-                    "Recording is not allowed on this server",
-                )];
-            }
+        if let Some(refusal) = self.refuse_forbidden_recording(inbound, &state).await {
+            return refusal;
         }
 
         // A channel switch is a `UserState` carrying `channel_id`
@@ -1148,46 +1126,10 @@ impl SessionLifecycleService {
             return Actions::new();
         };
 
-        // Setting your *own* comment or avatar needs no permission, as in murmur
-        // only clearing somebody else's does, and this method already refused
-        // every cross-session edit above. What they do need is a size limit,
-        // because both are stored and then handed to every client that asks.
-        let mut comment_hash = None;
-        let mut texture_hash = None;
-        if state.comment.is_some() || state.texture.is_some() {
-            // Fetched only when there is something to measure. A `UserState` is
-            // also every self-mute toggle, and putting a round trip on that path
-            // would be a gRPC call per keypress on a push-to-mute binding.
-            let limits = self.handshake.config(inbound.scope).await;
-
-            if let Some(comment) = &state.comment {
-                if over(comment.len(), limits.text_message_length) {
-                    return vec![too_long(inbound)];
-                }
-                comment_hash = self
-                    .store_content(inbound, UserContent::Comment, comment.as_bytes())
-                    .await;
-            }
-            if let Some(texture) = &state.texture {
-                if over(texture.len(), limits.image_message_length) {
-                    return vec![too_long(inbound)];
-                }
-                texture_hash = self
-                    .store_content(inbound, UserContent::Texture, texture)
-                    .await;
-            }
-
-            // Before the announcement, and this is the line that makes the new
-            // picture visible to anybody but its owner. `session-view` is built
-            // from the connection record and nothing else (`handshake.rs:125`),
-            // so a hash written only to the account row reaches the people who
-            // reconnect after it and nobody who is here now.
-            let _ = self.connections.set_content(
-                inbound.conn,
-                comment_hash.clone(),
-                texture_hash.clone(),
-            );
-        }
+        let (comment_hash, texture_hash) = match self.store_self_content(inbound, &state).await {
+            Ok(hashes) => hashes,
+            Err(refusal) => return vec![refusal],
+        };
 
         self.handshake
             .announce_changed(&self.connections, inbound.conn)
@@ -1514,6 +1456,92 @@ impl SessionLifecycleService {
     /// A registered account additionally gets the hash written to it, so the
     /// content survives a reconnect. A guest's does not, which is murmur's
     /// behaviour too: there is no account to hang it on.
+    /// Disconnect a client that announced it started recording where the
+    /// server forbids it, or `None` to carry on.
+    ///
+    /// `allow_recording` was advertised in `ServerConfig` and enforced nowhere
+    /// (`docs/GAP-ANALYSIS.md` §5), so a client that ignored the flag recorded
+    /// the channel and the server said nothing.
+    ///
+    /// murmur kicks (`Messages.cpp:1417`), and the severity is the point. The
+    /// flag is the client's own voluntary disclosure, so the only client this
+    /// can catch is an honest one, and the answer to an honest client doing a
+    /// forbidden thing is to stop the session, not to drop the field and leave
+    /// it recording in the belief that it may.
+    async fn refuse_forbidden_recording(
+        &self,
+        inbound: &Inbound,
+        state: &tcp::UserState,
+    ) -> Option<Actions> {
+        if state.recording != Some(true) {
+            return None;
+        }
+        if self.handshake.config(inbound.scope).await.allow_recording {
+            return None;
+        }
+        self.handshake.context().logger.log(
+            LogEvent::notice(Category::Session, "recording refused")
+                .with("session", inbound.session)
+                .with("conn", inbound.conn)
+                .with("scope", inbound.scope),
+        );
+        Some(vec![disconnect(
+            inbound.conn,
+            "Recording is not allowed on this server",
+        )])
+    }
+
+    /// Store the sender's own comment and avatar, returning their hashes.
+    ///
+    /// Setting your *own* comment or avatar needs no permission, as in murmur:
+    /// only clearing somebody else's does, and [`Self::on_user_state`] has
+    /// already refused every cross-session edit by the time this runs. What
+    /// they do need is a size limit, because both are stored and then handed
+    /// to every client that asks, and `Err` is that refusal.
+    ///
+    /// The hashes also go onto the connection record before the announcement,
+    /// which is what makes a new picture visible to anybody but its owner:
+    /// `session-view` is built from the connection record and nothing else
+    /// (`handshake.rs:125`), so a hash written only to the account row reaches
+    /// the people who reconnect after it and nobody who is here now.
+    async fn store_self_content(
+        &self,
+        inbound: &Inbound,
+        state: &tcp::UserState,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), ServerAction> {
+        if state.comment.is_none() && state.texture.is_none() {
+            return Ok((None, None));
+        }
+        // Fetched only when there is something to measure. A `UserState` is
+        // also every self-mute toggle, and a round trip on that path would be
+        // a gRPC call per keypress on a push-to-mute binding.
+        let limits = self.handshake.config(inbound.scope).await;
+
+        let mut comment_hash = None;
+        let mut texture_hash = None;
+        if let Some(comment) = &state.comment {
+            if over(comment.len(), limits.text_message_length) {
+                return Err(too_long(inbound));
+            }
+            comment_hash = self
+                .store_content(inbound, UserContent::Comment, comment.as_bytes())
+                .await;
+        }
+        if let Some(texture) = &state.texture {
+            if over(texture.len(), limits.image_message_length) {
+                return Err(too_long(inbound));
+            }
+            texture_hash = self
+                .store_content(inbound, UserContent::Texture, texture)
+                .await;
+        }
+
+        let _ =
+            self.connections
+                .set_content(inbound.conn, comment_hash.clone(), texture_hash.clone());
+        Ok((comment_hash, texture_hash))
+    }
+
     async fn store_content(
         &self,
         inbound: &Inbound,
