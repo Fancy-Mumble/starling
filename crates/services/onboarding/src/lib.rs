@@ -298,102 +298,127 @@ impl ClientService for OnboardingService {
 
         match envelope.body {
             Some(onboarding_envelope::Body::Update(update)) => {
-                // Editing the flow is server-wide, so it takes Write on the
-                // root channel. Denied on any failure, including the
-                // permissions service being unreachable.
-                if !self
-                    .permit
-                    .allows(&inbound, ROOT_CHANNEL, Perm::WRITE.bits())
-                    .await
-                {
-                    tracing::warn!(
-                        session = inbound.session,
-                        "onboarding config update without root Write; refused"
-                    );
-                    return Actions::new();
-                }
-                let Some(config) = update.flow else {
-                    return Actions::new();
-                };
-                // The editor's account, not their session: a session id is
-                // reused by somebody else after they disconnect, so recording
-                // one would eventually attribute the edit to a stranger.
-                let by = self
-                    .roster
-                    .account_of(inbound.session)
-                    .map(|account| account.to_string())
-                    .unwrap_or_default();
-                let stored = self.store_config(inbound.scope, config, &by).await;
-                tracing::info!(
-                    session = inbound.session,
-                    version = stored.version,
-                    steps = stored.steps.len(),
-                    "onboarding flow updated"
-                );
-                // Everyone gets the new flow, the editor included: they are as
-                // subject to it as anybody, and a client that had to special
-                // case its own edit would drift from every other client.
-                vec![broadcast_except(
-                    0,
-                    Self::outer(),
-                    Self::envelope(onboarding_envelope::Body::Flow(stored)),
-                )]
+                self.on_flow_update(&inbound, update.flow).await
             }
-            Some(onboarding_envelope::Body::Response(mut response)) => {
-                let Some(account) = self.roster.account_of(inbound.session) else {
-                    // Nothing durable to key on. Accepting and discarding beats
-                    // storing it under a session id that will not survive the
-                    // connection and will later belong to somebody else.
-                    tracing::debug!(
-                        session = inbound.session,
-                        "onboarding response from an unregistered session; not stored"
-                    );
-                    return Actions::new();
-                };
-                // Stamped by the server, both of them. The client chooses its
-                // answers and nothing else: a submission claiming to have been
-                // made against a flow version it was not is how an edited
-                // questionnaire looks already-answered.
-                response.submitted_at_ms = now_ms();
-                response.flow_version = self.config(inbound.scope).await.map_or(0, |c| c.version);
-                self.record(inbound.scope, account, &response).await;
-                // Stored first, then granted, and never the other way round: a
-                // grant whose answers were not recorded cannot be re-derived,
-                // so it would survive as a permission nothing in the database
-                // explains.
-                let _ = self.apply_grants(inbound.scope, account).await;
-                // Echo it back: the client now knows its own answers are on
-                // record, from the same message it would have had to ask for.
-                vec![to_conn(
-                    inbound.conn,
-                    Self::outer(),
-                    Self::envelope(onboarding_envelope::Body::Response(response)),
-                )]
+            Some(onboarding_envelope::Body::Response(response)) => {
+                self.on_response(&inbound, response).await
             }
             Some(onboarding_envelope::Body::Query(query)) => {
-                // A client asking for the flow is a user arriving, which is
-                // when `Flow.default_channels` is owed ("granted to everyone
-                // who arrives, whatever they answer") and when a grant that
-                // failed last time gets its retry.
-                if let Some(account) = self.roster.account_of(inbound.session) {
-                    let _ = self.apply_grants(inbound.scope, account).await;
-                }
-                let mut actions = Actions::new();
-                if let Some(flow) = self.config(inbound.scope).await {
-                    actions.push(to_conn(
-                        inbound.conn,
-                        Self::outer(),
-                        Self::envelope(onboarding_envelope::Body::Flow(flow)),
-                    ));
-                }
-                if query.include_answers {
-                    actions.extend(self.deliver_answers(&inbound).await);
-                }
-                actions
+                self.on_query(&inbound, query.include_answers).await
             }
             // Server -> client only; a client sending one is ignored.
             Some(onboarding_envelope::Body::Flow(_)) | None => Actions::new(),
         }
+    }
+}
+
+impl OnboardingService {
+    /// Replace the questionnaire, and tell everybody the new one.
+    ///
+    /// Editing the flow is server-wide, so it takes Write on the root channel,
+    /// and it is denied on any failure, including the permissions service
+    /// being unreachable.
+    ///
+    /// The edit is recorded against the editor's account and never their
+    /// session: a session id is reused by somebody else after they disconnect,
+    /// so recording one would eventually attribute the edit to a stranger.
+    ///
+    /// Everyone gets the new flow, the editor included. They are as subject to
+    /// it as anybody, and a client that had to special-case its own edit would
+    /// drift from every other client.
+    async fn on_flow_update(&self, inbound: &Inbound, flow: Option<Flow>) -> Actions {
+        if !self
+            .permit
+            .allows(inbound, ROOT_CHANNEL, Perm::WRITE.bits())
+            .await
+        {
+            tracing::warn!(
+                session = inbound.session,
+                "onboarding config update without root Write; refused"
+            );
+            return Actions::new();
+        }
+        let Some(config) = flow else {
+            return Actions::new();
+        };
+        let by = self
+            .roster
+            .account_of(inbound.session)
+            .map(|account| account.to_string())
+            .unwrap_or_default();
+        let stored = self.store_config(inbound.scope, config, &by).await;
+        tracing::info!(
+            session = inbound.session,
+            version = stored.version,
+            steps = stored.steps.len(),
+            "onboarding flow updated"
+        );
+        vec![broadcast_except(
+            0,
+            Self::outer(),
+            Self::envelope(onboarding_envelope::Body::Flow(stored)),
+        )]
+    }
+
+    /// Record a user's answers, apply what they earn, and echo them back.
+    ///
+    /// A session with no account is answered with nothing: there is nothing
+    /// durable to key the answers on, and accepting and discarding beats
+    /// storing them under a session id that will not survive the connection
+    /// and will later belong to somebody else.
+    ///
+    /// Both stamps are the server's. The client chooses its answers and
+    /// nothing else, because a submission claiming to have been made against a
+    /// flow version it was not is how an edited questionnaire looks
+    /// already-answered.
+    ///
+    /// Stored first and granted second, never the other way round: a grant
+    /// whose answers were not recorded cannot be re-derived, so it would
+    /// survive as a permission nothing in the database explains.
+    ///
+    /// The echo carries the stamped copy, so the client learns its answers are
+    /// on record from the same message it would otherwise have had to ask for.
+    async fn on_response(&self, inbound: &Inbound, mut response: Response) -> Actions {
+        let Some(account) = self.roster.account_of(inbound.session) else {
+            tracing::debug!(
+                session = inbound.session,
+                "onboarding response from an unregistered session; not stored"
+            );
+            return Actions::new();
+        };
+        response.submitted_at_ms = now_ms();
+        response.flow_version = self.config(inbound.scope).await.map_or(0, |c| c.version);
+        self.record(inbound.scope, account, &response).await;
+        let _ = self.apply_grants(inbound.scope, account).await;
+        vec![to_conn(
+            inbound.conn,
+            Self::outer(),
+            Self::envelope(onboarding_envelope::Body::Response(response)),
+        )]
+    }
+
+    /// Send the questionnaire, and optionally the answers already given.
+    ///
+    /// Asking for the flow is what a user arriving looks like, which is when
+    /// `Flow.default_channels` is owed ("granted to everyone who arrives,
+    /// whatever they answer") and when a grant that failed last time gets its
+    /// retry.
+    async fn on_query(&self, inbound: &Inbound, include_answers: bool) -> Actions {
+        if let Some(account) = self.roster.account_of(inbound.session) {
+            let _ = self.apply_grants(inbound.scope, account).await;
+        }
+        let mut actions = Actions::new();
+        if let Some(flow) = self.config(inbound.scope).await {
+            actions.push(to_conn(
+                inbound.conn,
+                Self::outer(),
+                Self::envelope(onboarding_envelope::Body::Flow(flow)),
+            ));
+        }
+        if include_answers {
+            actions.extend(self.deliver_answers(inbound).await);
+        }
+        actions
     }
 }
 
