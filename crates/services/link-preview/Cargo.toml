@@ -11,9 +11,22 @@ publish.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 
+bytes.workspace = true
+# `client`, like `directory`: this is the second crate that makes an outbound
+# request rather than answering one, and it makes it to a host a stranger named.
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
 prost.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+# Mozilla's roots, bundled. Not the platform store: a preview that works for one
+# operator and fails for another because of what is in /etc/ssl is a bug report
+# nobody can act on.
+webpki-roots = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

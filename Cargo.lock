@@ -2407,12 +2407,19 @@ dependencies = [
 name = "starling-link-preview"
 version = "0.2.0"
 dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "prost",
+ "rustls",
  "starling-proto-fancy",
  "starling-runtime",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
