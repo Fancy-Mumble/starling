@@ -35,6 +35,7 @@
 //! logging must keep working while the runtime is saturated, which is exactly
 //! when the records matter most.
 
+pub mod address;
 pub mod event;
 pub mod logger;
 pub mod setup;
@@ -42,6 +43,7 @@ pub mod sink;
 pub mod sinks;
 pub mod timestamp;
 
+pub use address::obfuscate;
 pub use event::{
     Category, Field, FieldValue, IntoFieldValue, LogEvent, Severity, UnknownCategory,
     UnknownSeverity,

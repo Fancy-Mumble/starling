@@ -125,6 +125,26 @@ impl VoicePeer {
         self.cipher.seal(frame, &[])
     }
 
+    /// The nonce this peer's audio is sealed under, when its cipher has one.
+    ///
+    /// `None` for a cipher that cannot be resynchronised by swapping a nonce,
+    /// which is a real answer and not a failure — the caller's recovery for such
+    /// a peer is to re-key it. See [`VoiceCipher::send_nonce`].
+    #[must_use]
+    pub fn send_nonce(&self) -> Option<Vec<u8>> {
+        self.cipher.send_nonce()
+    }
+
+    /// Adopt the nonce this peer says it is sending under.
+    ///
+    /// Reports whether the cipher took it. A refusal means the peer must be
+    /// re-keyed instead, and both outcomes leave a working session — which is
+    /// why this returns a `bool` rather than an error nobody could act on
+    /// differently.
+    pub fn adopt_recv_nonce(&mut self, nonce: &[u8]) -> bool {
+        self.cipher.adopt_recv_nonce(nonce)
+    }
+
     /// Send a frame over the TLS connection, inside a `UDPTunnel`.
     ///
     /// Takes the **plaintext** encoding, not a sealed packet. The tunnel runs

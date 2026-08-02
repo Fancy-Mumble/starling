@@ -1,0 +1,18 @@
+[package]
+name = "starling-health"
+description = "collects every service's readiness into one view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+
+tokio = { workspace = true, features = ["rt", "time"] }
+tonic.workspace = true
+
+[lints]
+workspace = true

@@ -29,47 +29,58 @@ When that happens two meanings share one number, and proto2 resolves by number
 and type — so if both are varint you get **silent misinterpretation**, not a
 parse error. That is the worst failure class available: no log line, wrong data.
 
-Fixed in this repo's copy (2026-07-29), by applying the rule below that
-`ChannelState` and `Authenticate` already followed:
+Fixed in this repo's copy (2026-07-29) by moving the Fancy fields clear of
+upstream, and moved again (2026-08-02) from 100+ to 1000+ so the margin is one
+nobody has to re-check. All three trees hold the same numbers:
 
-| message | upstream's max | was | now |
+| message | upstream's max | originally | now |
 |---|---|---|---|
-| `TextMessage` | 5 | 6, 7, 8, 9, 10 | 100–104 |
-| `ACL.ChanGroup` | 7 | 8, 9, 10, 11 | 100–103 |
-| `UserList.User` | 4 | 5, 6, 7 | 100–102 |
-| `ServerConfig` | 7 | 8, 9 | 100, 101 |
-| `UserState` | 23 | 24 | 100 |
-| `RequestBlob` | 3 | 4 | 100 |
-| `Version` | 5 | 6 (+7) | 6 **pinned**, epoch at 100 |
-| `Authenticate` | 6 | 100 | unchanged |
-| `ChannelState` | 13 | 100–111 | unchanged |
+| `TextMessage` | 5 | 6, 7, 8, 9, 10 | 1000–1004 |
+| `ACL.ChanGroup` | 7 | 8, 9, 10, 11 | 1000–1003 |
+| `UserList.User` | 4 | 5, 6, 7 | 1000–1002 |
+| `ServerConfig` | 7 | 8, 9 | 1000, 1001 |
+| `UserState` | 23 | 24 | 1000 |
+| `RequestBlob` | 3 | 4 | 1000 |
+| `Version` | 5 | 6 (+7) | 6 **pinned**, epoch at 1000 |
+| `Authenticate` | 6 | 100 | 1000 |
+| `ChannelState` | 13 | 100–111 | 1000–1011 |
 
-Three things to know about that move:
+Four things to know about that move:
 
 * **`Version.fancy_version = 6` stays where it is.** It is the field every
   shipped Fancy peer reads to decide whether extensions exist at all. Moving it
   would not break loudly — it would make this server look like plain Mumble to
-  all of them. It keeps its squat, and `fancy_protocol` (100) is what carries
+  all of them. It keeps its squat, and `fancy_protocol` (1000) is what carries
   the numbering forward.
+* **`Version.fancy_protocol` moved with everything else, and that is the one
+  genuinely hard break here.** It is read *before* any epoch is known, so its
+  location cannot be negotiated — a peer built against the 100+ layout looks at
+  field 100, finds nothing, and concludes it is talking to plain Mumble. That is
+  the correct outcome (it would not have understood the rest either) but it is
+  silent, so all three trees have to move in one release. They did.
 * **The vacated numbers are not `reserved`.** Reserving them would stop this
   file adopting the upstream field that eventually lands there, which is the
   entire point of vacating them. Upstream owns them now.
 * **This is part of epoch 1, not a separate break.** Epoch 1 has never shipped,
-  so redefining what it means costs nothing; §2a's number stays `1`. Epoch 0 —
-  `vendor/server` and every released client — still uses the old numbers, which
-  is exactly what an epoch is for. `vendor/client` and `vendor/server` therefore
-  keep the squatting layout until they migrate; a client generates one struct
-  set per proto and cannot speak both numberings at once, so renumbering them
-  now would break them against each other for no gain.
+  so redefining what it means costs nothing; §2a's number stays `1`. Bumping it
+  to `2` would buy nothing anyone can read: a peer on the old layout cannot find
+  `fancy_protocol` at its new number to *see* the `2`, so the field's location
+  is already the discriminator.
 
 ### The rule going forward
 
-> **Upstream owns field numbers 1–99 in every upstream message. Fancy fields
-> start at 100.**
+> **Upstream owns field numbers 1–999 in every upstream message. Fancy fields
+> start at 1000.**
 
-Starling implements this from day one. `vendor/server` and `vendor/client` need
-the seven messages above renumbered — a coordinated break affecting Fancy clients
-only, which converts a permanent silent risk into one migration.
+1–99 would have been enough for any plausible upstream — `UserState`, the
+tightest message, was at 24 against a ceiling of 99. The larger margin is not
+about upstream running out; it is about never having to make this judgement
+again, and it is free: protobuf spends two tag bytes on everything from field
+16 to field 2047, so 100 and 1000 encode identically.
+
+All three trees — `starling`, `vendor/server` and `vendor/client` — implement
+this and hold identical numbers. `scripts/check-proto-drift.sh` is what keeps
+them that way.
 
 ## 2. Message types: today's numbering cannot be routed
 
@@ -203,6 +214,53 @@ the payload's first field, so tooling recovers the name with one nested read.
 | 1017 | context-actions |
 
 New service: take the next number, add a TOML block, ship. No gateway release.
+
+### The message mapping
+
+All 61 epoch-0 types have exactly one epoch-1 home. The **inner message keeps its
+epoch-0 shape** — `FancyOnboardingConfig` at inner tag 1 of 1014 is byte-for-byte
+the `FancyOnboardingConfig` that used to be outer type 136. Epoch 1 changes the
+*framing* only, so no feature has to be redesigned to cross the epoch, and the
+three implementations share one set of definitions in `Mumble.proto`.
+
+Ten services carry client-facing traffic; the other eight own messages Starling
+introduced natively and have no epoch-0 ancestor.
+
+| Outer | Service | Epoch-0 types folded in |
+|---|---|---|
+| 1006 | pchat | 100–116, 121, 128–130 — message/fetch/deliver, the key ladder, deletes, offline drain, pins |
+| 1015 | social | 117–119 (reactions), 124 (custom reactions), 126–127 (read receipts), 131 (typing), 134 (watch sync), 135 (draw stroke), 144–145 (polls) |
+| 1011 | push | 122–123, 125 |
+| 1008 | screenshare | 120 (`WebRtcSignal` — screen and camera share both ride it) |
+| 1016 | link-preview | 132–133 |
+| 1014 | onboarding | 136–140 |
+| 1010 | plugins | 146–151, plus the generic plugin relay at 200–201 |
+| 1013 | server-config | 152–153 |
+| 1003 | userdata | 154–156 (account settings + ack) |
+| 1012 | audit | 166–168, 170–171 |
+
+Two consequences worth stating, because both were live bugs before:
+
+* **Reactions and pins split from pchat.** `PchatReaction*` are named for pchat
+  but are reactions, which is the social service's job; `PchatPin*` stay in pchat
+  because a pin is a property of the stored message. The name is not the owner.
+* **`WebRtcSignal` is one type for two features.** It is screenshare's by
+  assignment; camera share shares the type rather than getting its own, exactly
+  as it did at 120.
+
+### What is dropped with epoch 0
+
+Fancy-to-Fancy backwards compatibility only. Specifically: the per-message
+`min_version` gate, which existed so a new client could talk to an older Fancy
+server — in epoch 1 both ends ship together and a Fancy peer speaks all of it or
+none of it.
+
+**Compatibility with upstream Mumble is untouched.** `PluginDataTransmission`
+relaying is epoch-independent, so a Fancy client keeps working against a vanilla
+server exactly as before, and every message keeps its `FallbackPolicy`. An
+epoch-0 Fancy server is simply not a peer any more: `speaks_epoch` already
+returns false for it, which selects that same plain-Mumble path. No compatibility
+code is written for it — the existing epoch check is the whole mechanism.
 
 ## 4. Enum and `oneof` hazards in proto2
 

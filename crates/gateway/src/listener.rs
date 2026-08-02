@@ -22,6 +22,7 @@ use starling_runtime::health::Health;
 use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::metrics::Metrics;
+use starling_runtime::pressure::{Gauge, Pressure};
 use starling_runtime::shutdown::Shutdown;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
@@ -29,7 +30,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::attach::{AttachContext, Attachments};
 use crate::connection::{self, ClientHandle, Lane, Registry};
-use crate::limiter::{Limiter, Verdict};
+use crate::limiter::{Limiter, MessageLimit, Verdict};
 use crate::resume::ResumeStore;
 use crate::router::Router;
 
@@ -65,10 +66,22 @@ pub struct Gateway {
     attachments: Attachments,
     resume: ResumeStore,
     metrics: Metrics,
+    /// Queue occupancy, handed to every connection.
+    ///
+    /// Beside `metrics` and not inside it: a counter says how many clients were
+    /// disconnected for control overflow, this says how close the next one is.
+    /// The first is only ever read after the damage.
+    control_pressure: Gauge,
     health: Health,
     logger: Logger,
     next_conn: AtomicU64,
     gateway_id: String,
+    /// murmur's `messagelimit`/`messageburst`, as the operator has them now.
+    ///
+    /// Shared with every connection's [`Limiter`]. Held here rather than
+    /// copied into each one because the whole point is that changing it
+    /// reaches clients that are already connected.
+    message_limit: Arc<MessageLimit>,
 }
 
 impl Gateway {
@@ -82,6 +95,7 @@ impl Gateway {
     pub fn new(
         config: Arc<Config>,
         metrics: Metrics,
+        pressure: &Pressure,
         health: Health,
         logger: Logger,
     ) -> Result<Self, GatewayError> {
@@ -96,10 +110,15 @@ impl Gateway {
             attachments: Attachments::new(),
             resume,
             metrics,
+            control_pressure: pressure.gauge(
+                connection::CONTROL_QUEUE_GAUGE,
+                connection::control_budget(),
+            ),
             health,
             logger,
             next_conn: AtomicU64::new(1),
             gateway_id: format!("gw-{}", std::process::id()),
+            message_limit: Arc::new(MessageLimit::default()),
             config,
         })
     }
@@ -114,6 +133,11 @@ impl Gateway {
         resolver: starling_runtime::channel::Resolver,
         shutdown: Shutdown,
     ) -> Result<(), GatewayError> {
+        // The operator's message limit, followed for as long as the gateway
+        // runs. Spawned before anything is accepted so the first client is
+        // already charged against the number in force rather than the TOML's.
+        let limits = self.follow_message_limit(&resolver);
+
         let ctx = AttachContext {
             gateway_id: self.gateway_id.clone(),
             virtual_server: self.virtual_server(),
@@ -187,11 +211,74 @@ impl Gateway {
             }
         }
 
+        limits.abort();
         self.logger.log(
             LogEvent::info(Category::Server, "gateway draining")
                 .with("connections", self.registry.len()),
         );
         Ok(())
+    }
+
+    /// Follow `server-config`'s `message_limit`/`message_burst` forever.
+    ///
+    /// The gateway is not a service and has no `ServiceContext`, so it does
+    /// its own subscription rather than going through the same `build` hook
+    /// every service uses — but it reads the same
+    /// [`Settings`](starling_runtime::Settings) the services do, so there is
+    /// still one definition of what these numbers are and one fallback when
+    /// `server-config` is down.
+    fn follow_message_limit(
+        &self,
+        resolver: &starling_runtime::channel::Resolver,
+    ) -> tokio::task::JoinHandle<()> {
+        let settings =
+            starling_runtime::Settings::new(resolver.clone()).logging_to(self.logger.clone());
+        let scope = self.virtual_server();
+        let live = Arc::clone(&self.message_limit);
+        let logger = self.logger.clone();
+        drop(settings.watch(&[scope]));
+
+        tokio::spawn(async move {
+            /// How often the published numbers are re-read. The subscription
+            /// keeps the snapshot current; this only moves it into the atomics,
+            /// so it is a poll of local memory rather than of the network.
+            const TICK: std::time::Duration = std::time::Duration::from_millis(500);
+            let mut last = None;
+            loop {
+                tokio::time::sleep(TICK).await;
+                let snapshot = settings.get(scope);
+                // **Only once an operator has configured this server.**
+                //
+                // `is_warm` was the wrong gate and this is the bug it hid: it
+                // asks whether a snapshot *arrived*, and one always does —
+                // carrying `server-config`'s own defaults. So a deployment that
+                // deliberately tuned `[gateway.limits.control]` had it silently
+                // reset to murmur's 1/s the moment `server-config` came up,
+                // which reads as the gateway ignoring its own configuration.
+                //
+                // `version` counts writes and starts at zero, so it is exactly
+                // "somebody has set something here". The residual case is
+                // narrow and worth stating: an operator who changed some
+                // *other* setting bumps the version, and this then applies a
+                // `message_limit` they never touched. Telling those apart needs
+                // `server-config` to record which fields were ever written,
+                // which the snapshot has no room for today.
+                if snapshot.version == 0 {
+                    continue;
+                }
+                let current = (snapshot.message_limit, snapshot.message_burst);
+                if last == Some(current) {
+                    continue;
+                }
+                last = Some(current);
+                live.set(f64::from(current.0), current.1);
+                logger.log(
+                    LogEvent::info(Category::Server, "message rate limit changed")
+                        .with("rate", current.0)
+                        .with("burst", current.1),
+                );
+            }
+        })
     }
 
     fn virtual_server(&self) -> u32 {
@@ -310,11 +397,12 @@ impl Gateway {
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let token = format!("{}-{conn}", self.gateway_id);
 
-        let (handle, mut outbound) = connection::channel(
+        let (handle, outbound) = connection::channel(
             conn,
             token,
             self.config.gateway.control_queue,
             self.config.gateway.audio_queue,
+            self.control_pressure.clone(),
         );
         self.registry.insert(Arc::clone(&handle));
         self.metrics.counter("starling_gateway_connections").inc();
@@ -338,30 +426,14 @@ impl Gateway {
             virtual_server: self.virtual_server(),
         });
 
-        let (mut reader, mut writer) = tokio::io::split(tls);
-        let writer_handle = Arc::clone(&handle);
-        let writer_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    frame = outbound.recv() => {
-                        let Some(frame) = frame else { break };
-                        if writer.write_all(&frame).await.is_err() {
-                            break;
-                        }
-                    }
-                    () = writer_handle.audio_ready() => {
-                        while let Some(frame) = writer_handle.pop_audio() {
-                            if writer.write_all(&frame).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = writer.shutdown().await;
-        });
+        let (mut reader, writer) = tokio::io::split(tls);
+        let writer_task = tokio::spawn(pump_writer(writer, outbound, Arc::clone(&handle)));
 
-        let mut limiter = Limiter::new(&self.config.gateway.limits, now_ms());
+        let mut limiter = Limiter::live(
+            &self.config.gateway.limits,
+            now_ms(),
+            Arc::clone(&self.message_limit),
+        );
         let mut buffer = BytesMut::with_capacity(8 * 1024);
         let mut scratch = vec![0_u8; 8 * 1024];
 
@@ -399,13 +471,13 @@ impl Gateway {
                 // hostile input is per-peer by construction.
                 Err(error) => {
                     tracing::debug!(conn, %error, "malformed frame");
-                    self.finish(conn, "protocol error", &writer_task);
+                    self.finish(conn, "protocol error", writer_task).await;
                     return Ok(());
                 }
             }
         };
 
-        self.finish(conn, reason, &writer_task);
+        self.finish(conn, reason, writer_task).await;
         Ok(())
     }
 
@@ -566,8 +638,31 @@ impl Gateway {
         let _ = handle.send(Lane::Control, codec::frame(outer, &payload));
     }
 
-    fn finish(&self, conn: u64, reason: &str, writer: &tokio::task::JoinHandle<()>) {
-        writer.abort();
+    /// Tear one connection down, giving the writer a moment to say why.
+    ///
+    /// The flush is bounded and then the writer is aborted regardless: a peer
+    /// that has stopped reading its socket must not be able to hold a
+    /// connection slot open by refusing to drain. `FLUSH_GRACE` is far longer
+    /// than a healthy client needs for the one queued frame and far shorter
+    /// than anything a user would notice.
+    async fn finish(&self, conn: u64, reason: &str, writer: tokio::task::JoinHandle<()>) {
+        /// How long the writer may spend flushing before it is cut off.
+        const FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+        if let Some(handle) = self.registry.by_conn(conn) {
+            handle.drain();
+        }
+        // Aborted only if it overran: on the ordinary path the writer has
+        // already flushed and returned, and awaiting it is what guarantees
+        // the refusal reached the wire before the socket closed.
+        let mut writer = writer;
+        if tokio::time::timeout(FLUSH_GRACE, &mut writer)
+            .await
+            .is_err()
+        {
+            tracing::debug!(conn, "writer did not flush in time; cutting it off");
+            writer.abort();
+        }
         // Read before the removal: afterwards there is no handle to ask, and
         // the session is the only id the rest of the log is keyed by.
         let handle = self.registry.by_conn(conn);
@@ -596,6 +691,65 @@ impl Gateway {
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
+}
+
+/// Write frames to one client until both lanes are done.
+///
+/// A free function rather than an inline `spawn` body, because it is the whole
+/// of the *outbound* half of a connection and `serve_client` is the inbound
+/// half: the two share nothing but the socket they split.
+///
+/// The two lanes are not interchangeable. Control frames are queued and must
+/// all arrive; audio is popped in a burst and a write failure there returns
+/// immediately, because a late voice frame is worthless and a peer whose socket
+/// is failing has nothing to gain from the rest of the queue.
+async fn pump_writer(
+    mut writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    mut outbound: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    handle: Arc<ClientHandle>,
+) {
+    loop {
+        tokio::select! {
+            frame = outbound.recv() => {
+                let Some(frame) = frame else { break };
+                // Credited back before the write, not after: the bytes have
+                // left the queue and are this task's business now, and a slow
+                // write must not make the queue look fuller than it is and
+                // disconnect a client for the writer's own backlog.
+                handle.control_sent(frame.len());
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+            () = handle.audio_ready() => {
+                while let Some(frame) = handle.pop_audio() {
+                    if writer.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // The connection is ending. Write out what is already queued
+            // before going, because the frame that explains *why* is queued
+            // immediately before the disconnect that follows it: `Reject` on
+            // a refused login, `UserRemove` on a kick or a ban. Stopping here
+            // instead delivers the disconnect and drops the reason, which
+            // leaves the user staring at a connection that closed itself.
+            //
+            // Only what is already queued — `try_recv` rather than `recv` —
+            // so a peer that has stopped reading cannot hold the teardown
+            // open by never draining its socket. `finish` bounds it as well.
+            () = handle.draining() => {
+                while let Ok(frame) = outbound.try_recv() {
+                    handle.control_sent(frame.len());
+                    if writer.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let _ = writer.shutdown().await;
 }
 
 /// Whether an inbound type is charged to its route's rate-limit bucket.
@@ -691,6 +845,7 @@ mod tests {
         let err = Gateway::new(
             Arc::new(config),
             Metrics::new(),
+            &Pressure::new(),
             Health::new(),
             Logger::null(),
         )
@@ -704,6 +859,7 @@ mod tests {
         let gateway = Gateway::new(
             Arc::new(config),
             Metrics::new(),
+            &Pressure::new(),
             Health::new(),
             Logger::null(),
         )

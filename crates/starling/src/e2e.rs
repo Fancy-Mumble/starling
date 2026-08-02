@@ -271,6 +271,92 @@ impl Deployment {
             .id
     }
 
+    /// Install a channel's ACL table over gRPC.
+    ///
+    /// Deployment set-up, not a user acting: `SetAcl` is the operator surface,
+    /// so it performs no permission check and is exactly what an administrator
+    /// configuring a server through `operator-api` reaches. What the tests below
+    /// then assert is what a **client** can do against the table this put there.
+    ///
+    /// Retried on the same grounds as [`Self::create_channel`]: a service that
+    /// has not finished binding reports a busy pipe, which is a race to wait out.
+    async fn set_acl(&self, acls: starling_proto_fancy::permissions::AclSet) {
+        use starling_proto_fancy::permissions::SetAclRequest;
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+
+        let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
+        let result = loop {
+            let attempt = async {
+                let transport = self.resolver.channel("permissions").ok()?;
+                PermissionsClient::new(transport)
+                    .set_acl(SetAclRequest {
+                        scope: None,
+                        actor: None,
+                        acls: Some(acls.clone()),
+                    })
+                    .await
+                    .ok()
+            }
+            .await;
+            if let Some(result) = attempt {
+                break result.into_inner();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permissions never accepted a connection"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(result.applied, "the ACL was refused: {}", result.refused);
+    }
+
+    /// Put a live session in a group, over the gRPC surface `operator-api`
+    /// calls.
+    ///
+    /// This is the external-authority action murmur exposes as Ice's
+    /// `addUserToGroup`, and it is deployment set-up here for the same reason
+    /// `set_acl` is: no client can perform it, which is precisely what makes it
+    /// the only way to put an *unregistered* user in a named group.
+    async fn add_temporary_group(&self, channel: u32, group: &str, session: u32) {
+        let result = self.temporary_group(channel, group, session, true).await;
+        assert!(result.applied, "refused: {}", result.refused);
+    }
+
+    /// The same, in either direction and without asserting the outcome.
+    ///
+    /// Returned rather than asserted because a *refusal* is the point of two of
+    /// the tests below: naming a session that has gone must not be recorded.
+    async fn temporary_group(
+        &self,
+        channel: u32,
+        group: &str,
+        session: u32,
+        add: bool,
+    ) -> starling_proto_fancy::permissions::AclResult {
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+        use starling_proto_fancy::permissions::{TemporaryGroupRequest, temporary_group_request};
+
+        let transport = self
+            .resolver
+            .channel("permissions")
+            .expect("permissions is reachable");
+        let request = TemporaryGroupRequest {
+            scope: None,
+            actor: None,
+            channel,
+            group: group.to_owned(),
+            member: Some(temporary_group_request::Member::Session(session)),
+        };
+        let mut client = PermissionsClient::new(transport);
+        if add {
+            client.add_temporary_group(request).await
+        } else {
+            client.remove_temporary_group(request).await
+        }
+        .expect("the call itself succeeds")
+        .into_inner()
+    }
+
     /// The records this deployment has written so far.
     fn records(&self) -> Vec<starling_runtime::log::LogEvent> {
         self.log
@@ -598,6 +684,33 @@ impl Client {
         }
     }
 
+    /// Whether the server hangs up within `within`.
+    ///
+    /// The fallible counterpart to [`Self::next_frame`], which asserts the
+    /// connection stays open — right for every test that expects to keep
+    /// talking, and useless for the one asserting the server rings off.
+    ///
+    /// Anything still arriving is consumed and discarded: a refusal is
+    /// followed by a close, but the close is the assertion, not what happens
+    /// to be in flight ahead of it.
+    async fn closed_by_server(&mut self, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut scratch = [0_u8; 8 * 1024];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match timeout(remaining, self.stream.read(&mut scratch)).await {
+                // EOF, or the TLS session ending: the server closed.
+                Ok(Ok(0) | Err(_)) => return true,
+                Ok(Ok(_)) => {}
+                // Still open and still quiet, which is the bug this guards.
+                Err(_) => return false,
+            }
+        }
+    }
+
     /// This connection's half of the voice cipher.
     ///
     /// OCB2, because this client announces no Fancy version — the same cipher
@@ -652,6 +765,30 @@ impl Client {
         }
     }
 
+    /// The next `UserState` about `session` that `carries` something.
+    ///
+    /// Skips everything else, for the same reason [`Self::next_move_of`] does: a
+    /// server broadcasting joins, pings and channel state does not stop because
+    /// a test is waiting for one field, and requiring it to be the very next
+    /// frame fails on whatever else was in flight.
+    async fn next_state_of(
+        &mut self,
+        session: u32,
+        carries: impl Fn(&tcp::UserState) -> Option<bool>,
+    ) -> tcp::UserState {
+        loop {
+            let (type_id, payload) = self.recv().await;
+            if type_id != 9 {
+                continue;
+            }
+            let state =
+                tcp::UserState::decode(payload.as_slice()).expect("a well-formed UserState");
+            if state.session == Some(session) && carries(&state).is_some() {
+                return state;
+            }
+        }
+    }
+
     /// The next tunnelled audio frame, or `None` if `within` elapses.
     ///
     /// Skips everything else: a server that is broadcasting joins, pings and
@@ -678,6 +815,47 @@ impl Client {
             .await
             .channel_id
             .expect("next_move_of yields only a state that carries one")
+    }
+
+    /// Hang up, and wait for the server to notice.
+    ///
+    /// Closing the socket is not the same as the server having processed the
+    /// disconnect, and a test that depends on the *consequences* of a departure
+    /// — a session id returning to the pool, a session-scoped grant being
+    /// dropped — has to wait for the second thing, not the first.
+    async fn close(mut self) {
+        let _ = self.stream.shutdown().await;
+        drop(self);
+        // Short: the gateway reports a closed connection as soon as its reader
+        // sees EOF, and everything downstream of that is in-process.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    /// The server's answer to a channel-switch request: the move, or the refusal.
+    ///
+    /// Both are legitimate answers and a test asserting one has to be able to
+    /// see the other — a locked channel that quietly moves nobody and a locked
+    /// channel that says so are the same timeout otherwise.
+    async fn next_entry_answer(&mut self, session: u32) -> Result<u32, tcp::PermissionDenied> {
+        loop {
+            let (type_id, payload) = self.recv().await;
+            match type_id {
+                9 => {
+                    let state = tcp::UserState::decode(payload.as_slice())
+                        .expect("a well-formed UserState");
+                    if state.session == Some(session)
+                        && let Some(channel) = state.channel_id
+                    {
+                        return Ok(channel);
+                    }
+                }
+                12 => {
+                    return Err(tcp::PermissionDenied::decode(payload.as_slice())
+                        .expect("a well-formed PermissionDenied"));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Frames up to and not including `target`, plus `target`'s own payload.
@@ -707,6 +885,15 @@ impl Client {
 /// `UserState` in any relative order but all before `ServerSync`, then
 /// `ServerConfig` immediately, then `SuggestConfig`.
 async fn handshake(client: &mut Client, username: &str) -> u32 {
+    handshake_with_tokens(client, username, Vec::new()).await
+}
+
+/// The same handshake, presenting access tokens.
+///
+/// `Authenticate` is the only message that carries them, and a client sends the
+/// ones it has stored for this server at login — which is how a channel
+/// password the user saved once opens the channel on every later connection.
+async fn handshake_with_tokens(client: &mut Client, username: &str, tokens: Vec<String>) -> u32 {
     let (greeting_type, greeting_payload) = client.recv().await;
     assert_eq!(
         greeting_type, 0,
@@ -730,6 +917,7 @@ async fn handshake(client: &mut Client, username: &str) -> u32 {
             2,
             &tcp::Authenticate {
                 username: Some(username.to_owned()),
+                tokens,
                 ..tcp::Authenticate::default()
             },
         )
@@ -932,11 +1120,322 @@ async fn a_datagram_on_the_voice_port_is_relayed_to_the_channel() {
     deployment.stop();
 }
 
+#[tokio::test]
+async fn a_client_whose_nonce_drifted_asks_for_a_resync_and_is_answered() {
+    // `CryptSetup`(15) inbound, which is the whole of the recovery a Mumble
+    // client has when its UDP cipher falls out of step. It asks once every five
+    // seconds while its audio is failing (`ServerHandler::message`) and does
+    // nothing else: it does not reconnect and it does not fall back to the
+    // tunnel. Unanswered, the client is deaf for the rest of its session with
+    // every counter at both ends looking healthy.
+    //
+    // Driven end to end because the failure this covers is entirely in the
+    // wiring. The classifier and the cipher's two halves are unit-tested; what
+    // nothing below this level can show is whether the gateway hands type 15 to
+    // session-lifecycle, whether that service asks voice, and whether what comes
+    // back is a message this client can act on.
+    let data_dir = TempDir::new("crypt-resync");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+
+    let mut cipher = alice.voice_cipher();
+    let voice = SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), deployment.voice_port));
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port is always available");
+
+    // A working UDP path first, or the rest of this proves nothing: a client
+    // that was never able to hear the server cannot demonstrate recovering.
+    assert_eq!(
+        loop_back(&socket, voice, &mut cipher).await,
+        b"probe",
+        "voice did not echo the loopback target"
+    );
+
+    // Now break exactly what packet loss breaks — this client's idea of where
+    // the server's counter has got to. Its *sending* half is untouched, which is
+    // what makes this the real failure rather than a dead connection: the server
+    // still hears alice perfectly while alice hears nothing.
+    cipher.resync_to(Block([0xAB; 16]));
+    assert!(
+        try_loop_back(&socket, voice, &mut cipher).await.is_none(),
+        "the client should now be unable to open the server's echo"
+    );
+
+    // The request, byte for byte what a Mumble client sends: a `CryptSetup` with
+    // nothing in it. The absence of `client_nonce` is the entire message.
+    alice.send(15, &tcp::CryptSetup::default()).await;
+    let (_, payload) = alice.recv_until(15).await;
+    let answer = tcp::CryptSetup::decode(payload.as_slice()).expect("a well-formed CryptSetup");
+
+    assert_eq!(
+        answer.key, None,
+        "a key here reads as a whole new session to a client that asked only where the counter was"
+    );
+    assert_eq!(answer.client_nonce, None);
+    let nonce = answer
+        .server_nonce
+        .expect("the answer is the nonce the server seals under");
+    assert_eq!(nonce.len(), 16, "an AES block, which is what OCB2 installs");
+
+    // And it is usable. This is the assertion the whole test exists for: an
+    // answer the client cannot act on is indistinguishable from no answer.
+    assert!(cipher.adopt_recv_nonce(&nonce));
+    assert_eq!(
+        loop_back(&socket, voice, &mut cipher).await,
+        b"probe",
+        "the resync was answered and the client is still deaf"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_refused_login_is_told_why_and_then_hung_up_on() {
+    // The reported bug, both halves of it.
+    //
+    // Starling sent the `Reject` and left the socket open. murmur sends it and
+    // calls `disconnectSocket()` immediately (`Messages.cpp:568`). What the
+    // difference looked like to a user: "Server connection rejected: Wrong
+    // certificate or password", then a client still sitting there rendering
+    // the root channel, still pinging, still switching to TCP when its UDP
+    // probe failed thirty seconds later. A session that is half present —
+    // no audio, no roster, nothing it can do, and no disconnect either.
+    //
+    // The idle sweep never rescued it: a connection that keeps pinging is
+    // never timed out, so the refused peer held its slot for as long as it
+    // felt like.
+    let data_dir = TempDir::new("refused-login");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut client = Client::connect(deployment.port).await;
+    let (greeting, _) = client.recv().await;
+    assert_eq!(greeting, 0, "the server speaks Version first");
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+
+    // SuperUser is registered on every deployment and has a password, so
+    // getting it wrong is a refusal that needs no set-up to arrange — and it
+    // is exactly the refusal in the report.
+    client
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some("SuperUser".to_owned()),
+                password: Some("not-the-password".to_owned()),
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+
+    let (_, payload) = client.recv_until(4).await;
+    let refusal = tcp::Reject::decode(payload.as_slice()).expect("a well-formed Reject");
+    assert_eq!(
+        refusal.r#type,
+        Some(tcp::reject::RejectType::WrongUserPw as i32),
+        "the client renders this as the reason; a generic refusal sends the user hunting"
+    );
+
+    // The half that was missing. Generous, because it must not be a race:
+    // the gateway flushes the queued `Reject` before closing, and this is
+    // asserting the close still arrives promptly afterwards.
+    assert!(
+        client.closed_by_server(Duration::from_secs(5)).await,
+        "the server refused the login and left the connection open; the client stays half \
+         connected, keeps pinging, and is never reaped"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_self_muted_speaker_stops_being_relayed() {
+    // Mute has to reach the *packet path*, not just the user list. A server that
+    // renders alice as muted while still forwarding her audio is the worst
+    // version of this bug: every client's UI says she is not being heard.
+    //
+    // Driven end to end because the enforcement and the fact are three services
+    // apart — session-lifecycle records the flag, session-view publishes it, and
+    // voice reads it off a subscription — and each of the three can be right on
+    // its own while the chain does nothing.
+    let data_dir = TempDir::new("self-mute");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    // Audible first, or a silent second half proves nothing: a test that only
+    // checks bob hears nothing after the mute passes on a server that never
+    // routed anything at all.
+    let deadline = tokio::time::Instant::now() + AUDIO_TIMEOUT;
+    let heard_before = loop {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(REGULAR_SPEECH, b"before"))
+            .await;
+        if bob.next_audio(AUDIO_ATTEMPT).await.is_some() {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(
+        heard_before,
+        "bob never heard alice, so the mute proves nothing"
+    );
+
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                self_mute: Some(true),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    // The echo every client is sent, which is also the point the server has
+    // finished applying it. Waiting on a timer instead would race the
+    // announcement to session-view and voice's subscription behind it.
+    let muted = bob
+        .next_state_of(alice_session, |state| state.self_mute)
+        .await;
+    assert_eq!(muted.self_mute, Some(true));
+
+    // Anything still in flight lands, then a clean window.
+    let _ = bob.next_audio(AUDIO_ATTEMPT).await;
+    for _ in 0..10 {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(REGULAR_SPEECH, b"after"))
+            .await;
+    }
+    assert!(
+        bob.next_audio(AUDIO_ATTEMPT).await.is_none(),
+        "a self-muted speaker was still relayed; mute is in the user list and not on the packet path"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_whisper_reaches_the_person_it_names_and_not_the_room() {
+    // `VoiceTarget`(19), which is what fills in one of the thirty slots Mumble's
+    // five-bit target field addresses. Without it a client can register a
+    // whisper, see no error, press the key, and reach nobody — the routing core
+    // resolves slots correctly and no slot was ever filled.
+    //
+    // Bob is the control. He shares alice's channel, so nothing but the target
+    // itself can keep him out of a frame she sends; carol is named personally,
+    // so nothing but the target can carry one to her.
+    let data_dir = TempDir::new("whisper");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+    let mut carol = Client::connect(deployment.port).await;
+    let carol_session = handshake(&mut carol, "carol").await;
+
+    // Slot 3 means "carol", and nothing else. Whispering takes `Whisper` in the
+    // target's channel, which the default ACL grants — so this is the ordinary
+    // case rather than one propped up by an ACL the test installed.
+    alice
+        .send(
+            19,
+            &tcp::VoiceTarget {
+                id: Some(3),
+                targets: vec![tcp::voice_target::Target {
+                    session: vec![carol_session],
+                    ..tcp::voice_target::Target::default()
+                }],
+            },
+        )
+        .await;
+
+    // Re-sent until it lands, as a real client transmitting fifty frames a
+    // second effectively does: the registration and the first frame travel on
+    // one connection but are handled by a service that awaits a permission check
+    // between them, so *which* frame is the first routable one is a race and not
+    // the behaviour under test.
+    let deadline = tokio::time::Instant::now() + AUDIO_TIMEOUT;
+    let received = loop {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(3, b"only for carol"))
+            .await;
+        if let Some(payload) = carol.next_audio(AUDIO_ATTEMPT).await {
+            break Some(payload);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+    };
+
+    let payload = received.expect("carol never heard the whisper aimed at her");
+    let audio = udp::Audio::decode(&payload[1..]).expect("a well-formed audio frame");
+    assert_eq!(audio.opus_data, b"only for carol");
+    assert_eq!(
+        audio.header,
+        Some(udp::audio::Header::Context(2)),
+        "somebody named personally must be told it is a whisper, not a shout"
+    );
+
+    // The other half, and the one that matters for privacy: bob is in the same
+    // channel and was not named, so a whisper that reached him would be a
+    // private conversation leaking into the room it was aimed away from.
+    assert!(
+        bob.next_audio(AUDIO_ATTEMPT).await.is_none(),
+        "a whisper reached somebody it did not name"
+    );
+
+    deployment.stop();
+}
+
 /// Send a loopback frame until the server echoes it, and return what came back.
 ///
 /// Also what binds this client's address server-side: an address is only
 /// believed once a packet from it has authenticated, so until this succeeds the
 /// server has no UDP path for this peer at all.
+/// One loopback attempt, tolerating a reply this client cannot open.
+///
+/// The fallible half of [`loop_back`], for the one caller that is *asserting*
+/// the client has gone deaf. `loop_back` panics on a reply it cannot decrypt,
+/// which is right for every other use and useless for proving a cipher is out
+/// of step.
+///
+/// Deliberately short: a negative assertion should not cost fifteen seconds, and
+/// a client whose nonce has drifted fails on the first packet rather than the
+/// fiftieth.
+async fn try_loop_back(
+    socket: &UdpSocket,
+    voice: SocketAddr,
+    cipher: &mut Ocb2,
+) -> Option<Vec<u8>> {
+    let mut scratch = [0_u8; 2048];
+    let sealed = cipher
+        .seal(&audio_frame(SERVER_LOOPBACK, b"probe"), &[])
+        .expect("the client seals its own audio");
+    let _ = socket.send_to(&sealed, voice).await;
+
+    let (read, _) = timeout(AUDIO_ATTEMPT, socket.recv_from(&mut scratch))
+        .await
+        .ok()?
+        .ok()?;
+    let plain = cipher.open(&scratch[..read], &[]).ok()?;
+    Some(heard(&plain).1)
+}
+
 async fn loop_back(socket: &UdpSocket, voice: SocketAddr, cipher: &mut Ocb2) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + AUDIO_TIMEOUT;
     let mut scratch = [0_u8; 2048];
@@ -1053,6 +1552,518 @@ async fn a_move_names_who_made_it_and_not_the_server() {
             "{who} was not told who moved alice, and an unset actor reads as the server"
         );
     }
+
+    deployment.stop();
+}
+
+/// An ACL entry addressing `group`, applying here and to everything below.
+fn entry(
+    group: &str,
+    grant: starling_proto_fancy::perm::Perm,
+    deny: starling_proto_fancy::perm::Perm,
+) -> starling_proto_fancy::permissions::AclEntry {
+    starling_proto_fancy::permissions::AclEntry {
+        apply_here: true,
+        apply_subs: true,
+        group: Some(group.to_owned()),
+        grant: grant.bits(),
+        deny: deny.bits(),
+        ..starling_proto_fancy::permissions::AclEntry::default()
+    }
+}
+
+#[tokio::test]
+async fn a_client_holding_write_can_save_an_acl_table_and_read_it_back() {
+    // `docs/GAP-ANALYSIS.md` G1, end to end and from outside. The ACL editor in
+    // every Mumble client is built on this one message: `ACL`(13) with `query`
+    // unset is a save. Starling refused every one of them for everybody,
+    // including the SuperUser, and said nothing — so a role was created in the
+    // editor, appeared to stick, and was gone on the next read.
+    //
+    // Asserted through a *second* read rather than only through the reply,
+    // because the reply is generated on the write path: a handler that echoed
+    // its input without storing it would satisfy the first assertion and fail
+    // the users of this feature in exactly the way it already had.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("acl-write");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("Moderated").await;
+
+    // What an operator does once so the editor is usable at all. Reading an ACL
+    // takes `Write` too, so without this the client cannot even open the dialog.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+
+    let submitted = tcp::Acl {
+        channel_id: target,
+        inherit_acls: Some(true),
+        query: Some(false),
+        groups: vec![tcp::acl::ChanGroup {
+            name: "moderators".to_owned(),
+            add: vec![4],
+            ..tcp::acl::ChanGroup::default()
+        }],
+        acls: vec![tcp::acl::ChanAcl {
+            apply_here: Some(true),
+            apply_subs: Some(true),
+            group: Some("moderators".to_owned()),
+            grant: Some(Perm::MUTE_DEAFEN.bits()),
+            ..tcp::acl::ChanAcl::default()
+        }],
+    };
+    alice.send(13, &submitted).await;
+
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(13))
+        .await
+        .expect("the save was never answered");
+    let saved = tcp::Acl::decode(payload.as_slice()).expect("a well-formed ACL");
+    assert_eq!(saved.channel_id, target);
+    assert_eq!(saved.acls.len(), 1, "the entry was not kept: {saved:?}");
+    assert_eq!(saved.acls[0].grant, Some(Perm::MUTE_DEAFEN.bits()));
+    assert_eq!(saved.groups.len(), 1);
+    assert_eq!(saved.groups[0].name, "moderators");
+
+    // The read the editor performs when it is next opened. This is the one that
+    // used to come back empty.
+    alice
+        .send(
+            13,
+            &tcp::Acl {
+                channel_id: target,
+                query: Some(true),
+                ..tcp::Acl::default()
+            },
+        )
+        .await;
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(13))
+        .await
+        .expect("the read was never answered");
+    let reread = tcp::Acl::decode(payload.as_slice()).expect("a well-formed ACL");
+    assert_eq!(
+        reread.acls.len(),
+        1,
+        "the saved table did not survive to the next read: {reread:?}"
+    );
+    assert_eq!(reread.groups[0].add, vec![4]);
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_channel_password_admits_whoever_presents_it_and_nobody_else() {
+    // G2 and G3 together, which is how a user meets them: a channel password is
+    // an `Enter` denied to `all` and granted back to `#token`, and it needs the
+    // grammar to parse `#hunter2` as a token *and* the token itself to reach the
+    // evaluator. Either half missing leaves the same symptom — a channel nobody
+    // can enter, including the people who were given the password.
+    //
+    // Both ways a client can present one are covered, because they are different
+    // paths: stored and sent at login, and typed into the dialog and sent with
+    // the request it authorises.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("acl-token");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("Private").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: target,
+            inherit: true,
+            acls: vec![
+                entry("all", Perm::empty(), Perm::ENTER),
+                // Deny first and grant second is not the reason this works —
+                // deny wins at the same level regardless of order. What admits
+                // the holder is that the second entry does not match anybody
+                // else at all.
+                entry("#hunter2", Perm::ENTER, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session =
+        handshake_with_tokens(&mut alice, "alice", vec!["hunter2".to_owned()]).await;
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let admitted = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never answered");
+    assert_eq!(
+        admitted,
+        Ok(target),
+        "the token presented at login must open the channel"
+    );
+
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+    bob.send(
+        9,
+        &tcp::UserState {
+            session: Some(bob_session),
+            channel_id: Some(target),
+            ..tcp::UserState::default()
+        },
+    )
+    .await;
+    let refusal = timeout(FRAME_TIMEOUT, bob.next_entry_answer(bob_session))
+        .await
+        .expect("bob was never answered");
+    let refusal = refusal.expect_err("a channel with no token must not admit bob");
+    assert_eq!(refusal.channel_id, Some(target));
+    assert_eq!(refusal.permission, Some(Perm::ENTER.bits()));
+
+    // Now bob types the password into the dialog. The client sends it *with*
+    // the request rather than storing it, and it must authorise this entry and
+    // leave nothing behind.
+    bob.send(
+        9,
+        &tcp::UserState {
+            session: Some(bob_session),
+            channel_id: Some(target),
+            temporary_access_tokens: vec!["HUNTER2".to_owned()],
+            ..tcp::UserState::default()
+        },
+    )
+    .await;
+    let admitted = timeout(FRAME_TIMEOUT, bob.next_entry_answer(bob_session))
+        .await
+        .expect("bob was never answered the second time");
+    assert_eq!(
+        admitted,
+        Ok(target),
+        "a token sent with the request must open the channel, in any case"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_second_authenticate_replaces_the_access_tokens_without_a_second_login() {
+    // How a stock Mumble client actually submits a password it has just been
+    // given: it re-sends `Authenticate` on the same connection with its whole
+    // token list (`vendor/server/src/murmur/Messages.cpp:367`). Starling read
+    // that as a fresh login, which would allocate a second session for one
+    // connection and announce the same user twice.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("acl-retoken");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("Private").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: target,
+            inherit: true,
+            acls: vec![
+                entry("all", Perm::empty(), Perm::ENTER),
+                entry("#hunter2", Perm::ENTER, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+
+    alice
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some("alice".to_owned()),
+                tokens: vec!["hunter2".to_owned()],
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+
+    // The edit is acknowledged with a fresh `PermissionQuery`, which is also
+    // what tells the client its menus have changed.
+    let (_, _) = timeout(FRAME_TIMEOUT, alice.recv_until(20))
+        .await
+        .expect("the token edit was never acknowledged");
+
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let admitted = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never answered");
+    assert_eq!(
+        admitted,
+        Ok(target),
+        "a token added mid-session must take effect"
+    );
+
+    // And she is still one user. A second `Authenticate` read as a login would
+    // have allocated another session and announced her again.
+    assert_eq!(
+        deployment
+            .records()
+            .iter()
+            .filter(|event| event.message == "user authenticated")
+            .count(),
+        1,
+        "a token edit must not log in a second time"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn an_external_authority_can_admit_a_guest_to_a_group_gated_channel() {
+    // Temporary group membership, end to end, and the case it exists for.
+    //
+    // A channel gated on a named group is shut to every unregistered visitor
+    // and cannot be opened to one by editing the ACL table: membership is
+    // recorded by *account* id, and a guest has no account — they go on the
+    // wire as account 0, which is the SuperUser's. A session-scoped grant is
+    // the only mechanism upstream has for it (`Group.cpp:242`, reading
+    // `qsTemporary` for `-session`), and it is what an external authenticator
+    // uses to map something the server cannot know — a game lobby, a rota —
+    // onto somebody who never registered.
+    //
+    // Asserted from outside because every part of this is wiring: the grant is
+    // made over gRPC, the subject is resolved through `session-view`, and the
+    // answer comes back as a `UserState` or a `PermissionDenied` on a socket.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("temp-groups");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("VIP").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: target,
+            inherit: true,
+            acls: vec![
+                entry("all", Perm::empty(), Perm::ENTER),
+                entry("vip", Perm::ENTER, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+
+    // Shut, as it is to everybody, before the grant.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let refusal = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never answered")
+        .expect_err("a channel gated on a group must not admit a guest");
+    assert_eq!(refusal.permission, Some(Perm::ENTER.bits()));
+
+    deployment
+        .add_temporary_group(target, "vip", alice_session)
+        .await;
+
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let admitted = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never answered after the grant");
+    assert_eq!(
+        admitted,
+        Ok(target),
+        "a session-scoped grant must admit an unregistered user"
+    );
+
+    // Revoked, and the door shuts again. Asserted here rather than in its own
+    // test because it needs a subject already inside the group, and because a
+    // grant that cannot be taken back is the more dangerous half of the pair.
+    assert!(
+        deployment
+            .temporary_group(target, "vip", alice_session, false)
+            .await
+            .applied
+    );
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(0),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let _ = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never moved back to the root");
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let after_revoke = timeout(FRAME_TIMEOUT, alice.next_entry_answer(alice_session))
+        .await
+        .expect("alice was never answered after the revocation");
+    assert!(
+        after_revoke.is_err(),
+        "a revoked membership must stop admitting"
+    );
+
+    // And it belongs to that session alone. Bob is the same kind of visitor and
+    // was granted nothing.
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+    bob.send(
+        9,
+        &tcp::UserState {
+            session: Some(bob_session),
+            channel_id: Some(target),
+            ..tcp::UserState::default()
+        },
+    )
+    .await;
+    let refusal = timeout(FRAME_TIMEOUT, bob.next_entry_answer(bob_session))
+        .await
+        .expect("bob was never answered")
+        .expect_err("the grant must not admit anybody else");
+    assert_eq!(refusal.channel_id, Some(target));
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_session_scoped_grant_does_not_pass_to_the_next_holder_of_that_session() {
+    // The hazard that makes clearing this on disconnect a requirement rather
+    // than tidiness: session ids are pooled and reissued — murmur re-queues
+    // them at `Server.cpp:1904` and Starling's allocator does the same — so a
+    // grant that outlived its holder would silently admit whoever is handed
+    // that id next.
+    //
+    // Driven by connecting, granting, disconnecting, and connecting again until
+    // the same id comes back round, because asserting on the id directly is the
+    // only way to know the reuse actually happened.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("temp-groups-reuse");
+    // A pool of exactly one id, so the reuse this is about happens on the very
+    // next connection instead of after two hundred. The pool is `max_users * 2`
+    // and FIFO — sized and ordered to *delay* reuse, which is the right default
+    // and the reason a test cannot wait for it.
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        if let Some(service) = config.services.get_mut("session-lifecycle") {
+            let _ = service
+                .options
+                .insert("max_users".to_owned(), "1".to_owned());
+        }
+    })
+    .await;
+    let target = deployment.create_channel("VIP").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: target,
+            inherit: true,
+            acls: vec![
+                entry("all", Perm::empty(), Perm::ENTER),
+                entry("vip", Perm::ENTER, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let granted_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(target, "vip", granted_session)
+        .await;
+    alice.close().await;
+
+    // Granting to an id that has already gone is refused, which is murmur's
+    // rule (`InvalidSessionException`, and the reason this test exists at all):
+    // a departure is what clears these grants, so one made *after* the
+    // departure has missed its only cleanup and would wait in the table for
+    // whoever is issued that id next.
+    let refused = deployment
+        .temporary_group(target, "vip", granted_session, true)
+        .await;
+    assert!(
+        !refused.applied,
+        "a grant naming a departed session must be refused, not recorded"
+    );
+
+    let mut mallory = Client::connect(deployment.port).await;
+    let reissued = handshake(&mut mallory, "mallory").await;
+    assert_eq!(
+        reissued, granted_session,
+        "the pool was meant to hand the same id straight back, so nothing is being proven"
+    );
+
+    mallory
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(granted_session),
+                channel_id: Some(target),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let answer = timeout(FRAME_TIMEOUT, mallory.next_entry_answer(granted_session))
+        .await
+        .expect("mallory was never answered");
+    assert!(
+        answer.is_err(),
+        "the new holder of session {granted_session} inherited a stranger's group membership"
+    );
 
     deployment.stop();
 }
@@ -1630,4 +2641,723 @@ async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
     );
 
     deployment.stop();
+}
+
+// -- The registered-user directory, moving somebody, and clearing their profile
+
+/// Register an account the way an operator does, over userdata's own gRPC.
+///
+/// Deployment set-up rather than the behaviour under test, on the same grounds
+/// as [`Deployment::create_channel`] — and for one more: registering *from a
+/// client* requires the target to have presented a certificate, and this
+/// harness dials with `with_no_client_auth`. What the tests below assert is
+/// what a client can then see and do about the accounts this put there.
+async fn register_account(deployment: &Deployment, name: &str) -> u64 {
+    use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+    use starling_proto_fancy::userdata::{Account, RegisterRequest};
+
+    let transport = deployment
+        .resolver
+        .channel("userdata")
+        .expect("userdata is reachable");
+    UserDataClient::new(transport)
+        .register(RegisterRequest {
+            scope: None,
+            actor: None,
+            account: Some(Account {
+                name: name.to_owned(),
+                cert_hash: name.as_bytes().to_vec(),
+                ..Account::default()
+            }),
+            password: String::new(),
+        })
+        .await
+        .expect("the account is registered")
+        .into_inner()
+        .id
+}
+
+/// The `UserList` the server sends back, or the refusal it sends instead.
+///
+/// Both are legitimate answers, and a test asserting one has to be able to see
+/// the other: a directory that is refused and a directory that is never
+/// answered are the same timeout otherwise, and the second was the bug.
+async fn next_directory(client: &mut Client) -> Result<tcp::UserList, tcp::PermissionDenied> {
+    loop {
+        let (type_id, payload) = client.recv().await;
+        match type_id {
+            18 => {
+                return Ok(
+                    tcp::UserList::decode(payload.as_slice()).expect("a well-formed UserList")
+                );
+            }
+            12 => {
+                return Err(tcp::PermissionDenied::decode(payload.as_slice())
+                    .expect("a well-formed PermissionDenied"));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_registered_user_directory_shows_an_operator_more_than_a_guest() {
+    // `docs/GAP-ANALYSIS.md` UserList(18)/A1. The message was routed to
+    // `userdata`, which had no arm for it, so an operator registered somebody
+    // successfully and found the dialog they would check it in empty — with
+    // nothing logged, because dropping an unhandled frame is normal and silent.
+    //
+    // Both views are asserted from one deployment because the *difference* is
+    // the rule (`Messages.cpp:3153`), and a server that answered everybody with
+    // the administrator's view would pass any test that looked at only one of
+    // them. `Register` manages the directory and comes with the whole record;
+    // `ReadRegister` is a lookup permission — enough to find somebody who is
+    // offline and invite them, not enough to learn when they were last here.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("user-list");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let fred = register_account(&deployment, "offline-fred").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![
+                // Everybody may look somebody up…
+                entry("all", Perm::READ_REGISTER, Perm::empty()),
+                // …and the operators may manage the directory.
+                entry("ops", Perm::REGISTER, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(0, "ops", alice_session)
+        .await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    for client in [&mut alice, &mut bob] {
+        client.send(18, &tcp::UserList::default()).await;
+    }
+
+    let operator = next_directory(&mut alice)
+        .await
+        .expect("an operator holding Register may read the directory");
+    let listed = operator
+        .users
+        .iter()
+        .find(|user| u64::from(user.user_id) == fred)
+        .expect("the account that was just registered is in the directory");
+    assert_eq!(listed.name.as_deref(), Some("offline-fred"));
+    assert!(
+        listed.last_seen.is_some(),
+        "an operator is shown when the account was last active"
+    );
+    assert!(
+        operator.users.iter().all(|user| user.user_id != 0),
+        "the SuperUser is not somebody to be renamed or unregistered, and murmur \
+         leaves it out of the dialog that offers both"
+    );
+
+    let guest = next_directory(&mut bob)
+        .await
+        .expect("ReadRegister is enough to look somebody up");
+    let seen = guest
+        .users
+        .iter()
+        .find(|user| u64::from(user.user_id) == fred)
+        .expect("the reduced view still names the account");
+    assert_eq!(seen.name.as_deref(), Some("offline-fred"));
+    assert_eq!(
+        seen.last_seen, None,
+        "presence is not part of a lookup: ReadRegister must not report when \
+         somebody was last on the server"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_guest_with_no_grant_at_all_is_refused_the_directory() {
+    // The other direction, and the one that matters: the account list of
+    // everyone who has ever been on this server is not public. Refused *out
+    // loud*, because a silent drop here is indistinguishable from the bug the
+    // handler was written to fix.
+    let data_dir = TempDir::new("user-list-refused");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_account(&deployment, "offline-fred").await;
+
+    // No ACL table at all. The default set grants `ReadRegister` to registered
+    // users only (`permissions/src/evaluate.rs:182`), and this client is a guest.
+    let mut mallory = Client::connect(deployment.port).await;
+    let _ = handshake(&mut mallory, "mallory").await;
+    mallory.send(18, &tcp::UserList::default()).await;
+
+    let refusal = next_directory(&mut mallory)
+        .await
+        .expect_err("a guest must not be handed the account directory");
+    assert_eq!(
+        refusal.permission,
+        Some(starling_proto_fancy::perm::Perm::READ_REGISTER.bits()),
+        "the refusal names the permission that was missing, or it is a support ticket"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_moderator_moves_another_user_by_either_half_of_murmurs_rule() {
+    // `docs/GAP-ANALYSIS.md` U2, and the shape of the gap is worth recording:
+    // `on_move` already held the whole rule — `Move` on the channel the user is
+    // being taken out of, then `Move` on the destination **or** the moved
+    // user's own `Enter` — and was unreachable for anybody but the sender,
+    // because the cross-session refusal above it dropped the message first.
+    // Nothing failed and nothing was logged; the user simply did not move.
+    //
+    // Both halves of the *or* are exercised, because implementing one of them
+    // is indistinguishable from implementing both until the day an operator
+    // drags somebody into a room that person cannot enter alone — which is the
+    // entire point of a `Move` permission.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::{AclEntry, AclSet};
+
+    let data_dir = TempDir::new("move-another");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let lobby = deployment.create_channel("Lobby").await;
+    let vault = deployment.create_channel("Vault").await;
+
+    // `apply_subs` off, so this grants Move in the **root only**: alice may take
+    // people out of the room they start in and nowhere else. Left on, the grant
+    // would inherit into every channel below and the destination half of the
+    // rule would pass for the wrong reason.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![AclEntry {
+                apply_here: true,
+                apply_subs: false,
+                group: Some("ops".to_owned()),
+                grant: Perm::MOVE.bits(),
+                ..AclEntry::default()
+            }],
+            groups: Vec::new(),
+        })
+        .await;
+    // A room nobody may walk into and an operator may still put people in.
+    deployment
+        .set_acl(AclSet {
+            channel: vault,
+            inherit: true,
+            acls: vec![
+                entry("all", Perm::empty(), Perm::ENTER),
+                entry("ops", Perm::MOVE, Perm::empty()),
+            ],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(0, "ops", alice_session)
+        .await;
+    deployment
+        .add_temporary_group(vault, "ops", alice_session)
+        .await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+
+    // Bob cannot get into the Vault on his own, which is what makes the first
+    // move below a real exercise of alice's `Move` rather than of bob's `Enter`.
+    bob.send(
+        9,
+        &tcp::UserState {
+            session: Some(bob_session),
+            channel_id: Some(vault),
+            ..tcp::UserState::default()
+        },
+    )
+    .await;
+    let refusal = bob
+        .next_entry_answer(bob_session)
+        .await
+        .expect_err("Enter is denied to everyone in the Vault");
+    assert_eq!(refusal.permission, Some(Perm::ENTER.bits()));
+
+    // Half one: the **mover's** `Move` on the destination, into a room the moved
+    // user was just refused. This is the case an operator reaches for, and the
+    // one a server implementing only the `Enter` branch would refuse.
+    //
+    // Bob starts in the root, where alice's grant applies, so the *source* half
+    // of the rule is satisfied and what is under test is the destination.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(bob_session),
+                channel_id: Some(vault),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let dragged = timeout(FRAME_TIMEOUT, bob.next_move_of(bob_session))
+        .await
+        .expect("an operator holding Move on the destination may put somebody there");
+    assert_eq!(
+        dragged.channel_id,
+        Some(vault),
+        "the mover's Move on the destination has to be enough on its own"
+    );
+    assert_eq!(
+        dragged.actor,
+        Some(alice_session),
+        "a move done *to* somebody has to name who did it, or the client reports \
+         it as the server acting on its own"
+    );
+
+    // Half two: the **moved user's** own `Enter`. Alice holds `Move` in the
+    // Vault, so she may take bob out of it — and holds none in the Lobby, so
+    // putting him *there* can only be allowed by bob's own default `Enter`.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(bob_session),
+                channel_id: Some(lobby),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let moved = timeout(FRAME_TIMEOUT, bob.next_move_of(bob_session))
+        .await
+        .expect("bob was never told he had been moved");
+    assert_eq!(
+        moved.channel_id,
+        Some(lobby),
+        "the moved user's own Enter has to be enough, with no Move on the mover"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn an_operator_clears_another_users_comment_but_cannot_write_one() {
+    // `docs/GAP-ANALYSIS.md` U6. Both halves are the feature: murmur's rule is
+    // `ResetUserContent` on the root **and** an empty value
+    // (`Messages.cpp:1236`), so a moderator can take down a comment nobody
+    // should have to read and cannot replace it with one of their own choosing.
+    // Enforcing only the permission would let an administrator put words into
+    // somebody else's profile, under that person's name, on every client.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("reset-content");
+    let deployment = Deployment::start(data_dir.path()).await;
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("ops", Perm::RESET_USER_CONTENT, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(0, "ops", alice_session)
+        .await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+
+    // Bob's own comment, which needs no permission at all.
+    bob.send(
+        9,
+        &tcp::UserState {
+            comment: Some("something regrettable".to_owned()),
+            ..tcp::UserState::default()
+        },
+    )
+    .await;
+    let posted = timeout(
+        FRAME_TIMEOUT,
+        alice.next_state_of(bob_session, |state| {
+            state.comment_hash.as_ref().map(|_| true)
+        }),
+    )
+    .await
+    .expect("everyone is told bob set a comment");
+    assert!(
+        posted.comment_hash.is_some_and(|hash| !hash.is_empty()),
+        "the hash is what a client fetches the body with"
+    );
+
+    // Bob may not be *given* a comment by somebody else, however privileged.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(bob_session),
+                comment: Some("words alice put in bob's mouth".to_owned()),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let (type_id, payload) = timeout(FRAME_TIMEOUT, alice.recv())
+        .await
+        .expect("the write is answered rather than dropped");
+    assert_eq!(
+        type_id, 12,
+        "writing another user's comment must be refused"
+    );
+    let refusal = tcp::PermissionDenied::decode(payload.as_slice()).expect("well-formed");
+    assert_eq!(
+        refusal.r#type,
+        Some(tcp::permission_denied::DenyType::TextTooLong as i32),
+        "the permitted length of somebody else's comment is zero, and murmur says \
+         so with TextTooLong rather than with a permission the operator does hold"
+    );
+
+    // Clearing it is exactly what the permission is for.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(bob_session),
+                comment: Some(String::new()),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let cleared = timeout(
+        FRAME_TIMEOUT,
+        bob.next_state_of(bob_session, |state| state.comment.as_ref().map(|_| true)),
+    )
+    .await
+    .expect("bob is told his comment was cleared");
+    assert_eq!(
+        cleared.comment.as_deref(),
+        Some(""),
+        "an empty body, not an empty hash: a client reads the first as blank and \
+         the second as something to go and fetch"
+    );
+    assert_eq!(
+        cleared.actor,
+        Some(alice_session),
+        "a reset done to somebody names who did it"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_peer_that_never_authenticated_reaches_nobody() {
+    // Defence in depth, asserted rather than assumed.
+    //
+    // The gateway has **no authentication gate**: `dispatch` routes any frame
+    // whose type has a route, and an unauthenticated connection simply carries
+    // `session = 0`. What actually stops it is the layer below — `Permit`
+    // refuses session 0 without even asking `permissions` — so the safety of
+    // the whole front door rests on every service failing closed.
+    //
+    // That is a real property and worth a test, because it is invisible: it
+    // holds by everything downstream being careful, not by anything at the
+    // door saying no. A service that grew a path acting on `conn` rather than
+    // `session` would open a hole with nothing to catch it.
+    //
+    // Companion to `a_refused_login_is_told_why_and_then_hung_up_on`, which
+    // covers the peer that *tried* and failed; this one never tries at all,
+    // so no `Reject` and no disconnect is due to it.
+    let data_dir = TempDir::new("unauthenticated");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    // Completes TLS and `Version`, then skips `Authenticate` entirely and
+    // starts talking — which a stock client cannot do and a hostile one can.
+    let mut intruder = Client::connect(deployment.port).await;
+    let _ = intruder.recv().await;
+    intruder
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    intruder
+        .send(
+            11,
+            &tcp::TextMessage {
+                // Claiming somebody else's session, because a peer with none
+                // of its own has nothing to lose by trying.
+                actor: Some(1),
+                channel_id: vec![0],
+                message: "INTRUDER".to_owned(),
+                ..tcp::TextMessage::default()
+            },
+        )
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let Some((type_id, payload)) = bob.next_frame(Duration::from_millis(500)).await else {
+            continue;
+        };
+        if type_id != 11 {
+            continue;
+        }
+        let message = tcp::TextMessage::decode(payload.as_slice()).expect("a well-formed message");
+        assert!(
+            !message.message.contains("INTRUDER"),
+            "a peer that never authenticated had its text delivered to a real user"
+        );
+    }
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn the_health_collector_reports_every_service_in_a_live_deployment() {
+    // The whole feature, against a real deployment. Each half is easy to get
+    // right on its own and worthless alone: a service reporting its own gates
+    // that nothing collects, or a collector that reaches nobody.
+    //
+    // What only this level can show is that the runtime's injected health RPC
+    // is actually *served* by every service — it is added in `serve`, so a
+    // service that composes its routes unusually could silently lack it, and
+    // the collector would report the healthiest service on the server as
+    // unreachable.
+    use starling_proto_fancy::health::health_overview_client::HealthOverviewClient;
+    use starling_proto_fancy::health::{OverviewRequest, State};
+
+    let data_dir = TempDir::new("health-overview");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // The first sweep runs immediately, but "immediately" is still after the
+    // services it asks have bound. Retried rather than slept on: how long a
+    // whole deployment takes to come up is not what this asserts.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let overview = loop {
+        let attempt = async {
+            let channel = deployment.resolver.channel("health").ok()?;
+            let overview = HealthOverviewClient::new(channel)
+                .get(OverviewRequest { scope: None })
+                .await
+                .ok()?
+                .into_inner();
+            (!overview.services.is_empty()).then_some(overview)
+        }
+        .await;
+        if let Some(overview) = attempt {
+            break overview;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the health collector never produced a sweep"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    // Every enabled service is in the sweep, including the ones with no wire
+    // type. A collector that only knew the client-facing services would miss
+    // session-view, which everything else reads through.
+    for expected in [
+        "voice",
+        "metadata",
+        "userdata",
+        "session-view",
+        "permissions",
+    ] {
+        let found = overview
+            .services
+            .iter()
+            .find(|service| service.service == expected)
+            .unwrap_or_else(|| panic!("{expected} is missing from the sweep"));
+        assert_ne!(
+            found.state,
+            i32::from(State::Unreachable),
+            "{expected} was unreachable: {}",
+            found.error
+        );
+    }
+
+    // The gates themselves survive, which is the difference between a
+    // dashboard that says "something is wrong" and one that says what.
+    let voice = overview
+        .services
+        .iter()
+        .find(|service| service.service == "voice")
+        .expect("voice is in the sweep");
+    assert!(
+        voice.gates.iter().any(|gate| gate.name == "session view"),
+        "voice's own readiness gates did not reach the collector: {:?}",
+        voice.gates
+    );
+
+    // And the snapshot says when it was taken, so a dashboard can show a
+    // stale picture as stale rather than as current.
+    assert!(overview.observed_at_ms > 0);
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_channel_listener_hears_a_room_without_being_in_it() {
+    // `docs/GAP-ANALYSIS.md` V5. The routing core could already fan out to a
+    // listener and the tree could already hold one, but `UserState`'s
+    // `listening_channel_add` was never read — so a user clicked "listen" in
+    // their client, the server parsed the message, ignored it, and answered
+    // nothing. Every piece worked and the feature did not exist.
+    //
+    // Driven end to end because that is exactly the shape of the bug: the wire
+    // handler, metadata's tree, the session view and voice's subscription are
+    // four services, and each was right on its own.
+    //
+    // Bob is the control. He is in the lobby with alice and must keep hearing
+    // her; carol never leaves the lobby either, but listens to the annex.
+    let data_dir = TempDir::new("channel-listener");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let annex = deployment.create_channel("Annex").await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut carol = Client::connect(deployment.port).await;
+    let carol_session = handshake(&mut carol, "carol").await;
+
+    // Alice moves to the annex, so that anything carol hears from her can only
+    // have arrived through the listener.
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(alice_session),
+                channel_id: Some(annex),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    assert_eq!(carol.next_channel_of(alice_session).await, annex);
+
+    // Silent first, or the second half proves nothing: a test that only checks
+    // carol hears alice after the listener passes on a server that routes every
+    // frame to everybody.
+    for _ in 0..10 {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(REGULAR_SPEECH, b"unheard"))
+            .await;
+    }
+    assert!(
+        carol.next_audio(AUDIO_ATTEMPT).await.is_none(),
+        "carol heard another channel before she listened to it; the annex is not isolated, \
+         so nothing below can be attributed to the listener"
+    );
+
+    carol
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(carol_session),
+                listening_channel_add: vec![annex],
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+
+    // The echo, which is also the point the server has finished applying it.
+    // Waiting on a timer would race the announcement to session-view and
+    // voice's subscription behind it.
+    let listening = carol
+        .next_state_of(carol_session, |state| {
+            (!state.listening_channel_add.is_empty()).then_some(true)
+        })
+        .await;
+    assert_eq!(
+        listening.listening_channel_add,
+        vec![annex],
+        "the client is told which listener was registered, or its own UI never lights up"
+    );
+
+    let deadline = tokio::time::Instant::now() + AUDIO_TIMEOUT;
+    let reached = loop {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(REGULAR_SPEECH, b"heard"))
+            .await;
+        if let Some(payload) = carol.next_audio(AUDIO_ATTEMPT).await {
+            break Some(payload);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+    };
+    let payload = reached.expect(
+        "carol registered a listener on the annex and never heard it; the wire handler, the \
+         tree, the session view and voice's snapshot are four places this can stop",
+    );
+    let (speaker, opus) = heard(&payload);
+    assert_eq!(speaker, alice_session);
+    assert_eq!(opus, b"heard");
+
+    // Context 3, and it is not cosmetic: a client renders a listener frame
+    // differently from someone in the room, and reporting it as normal speech
+    // tells carol that alice has joined her channel.
+    assert_eq!(
+        listener_context(&payload),
+        3,
+        "a frame reached through a channel listener must say so"
+    );
+
+    // And it stops when she says so — the half that a server which only ever
+    // adds listeners passes without implementing.
+    carol
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(carol_session),
+                listening_channel_remove: vec![annex],
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let _ = carol
+        .next_state_of(carol_session, |state| {
+            (!state.listening_channel_remove.is_empty()).then_some(true)
+        })
+        .await;
+
+    let _ = carol.next_audio(AUDIO_ATTEMPT).await;
+    for _ in 0..10 {
+        alice
+            .send_raw(UDP_TUNNEL, &audio_frame(REGULAR_SPEECH, b"after"))
+            .await;
+    }
+    assert!(
+        carol.next_audio(AUDIO_ATTEMPT).await.is_none(),
+        "carol stopped listening and still heard the annex; a listener that cannot be \
+         cancelled is a subscription the user is stuck with"
+    );
+
+    deployment.stop();
+}
+
+/// The `context` the server put on a frame — 0 normal, 1 shout, 2 whisper,
+/// 3 through a channel listener.
+fn listener_context(payload: &[u8]) -> u32 {
+    assert_eq!(payload.first(), Some(&0), "not an audio packet");
+    let audio = udp::Audio::decode(&payload[1..]).expect("a well-formed audio frame");
+    match audio.header {
+        Some(udp::audio::Header::Context(context)) => context,
+        // Outbound frames carry `context`; `target` is the inbound spelling of
+        // the same oneof, and the two are not interchangeable.
+        other => panic!("the server sent a frame with no context: {other:?}"),
+    }
 }

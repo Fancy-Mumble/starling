@@ -74,6 +74,31 @@ message Session {
   // account to have stored one on.
   bytes comment_hash = 21;
   bytes texture_hash = 22;
+  // The access tokens this client presented, for `#token` ACL groups.
+  //
+  // Here because `permissions` resolves a session through this view and nowhere
+  // else (`docs/ARCHITECTURE.md` §4), and a token nothing can read is a channel
+  // password that never opens anything.
+  //
+  // **These are secrets, and this is the one field of a `Session` that is.** A
+  // channel password is typed by a user and shared between the people who may
+  // enter. It travels to services and must never be composed into anything
+  // client- or operator-facing: `session-lifecycle` builds no `UserState` from
+  // it, and `operator-api`'s user JSON names its fields one by one so that
+  // adding one here cannot leak into an HTTP response by default.
+  repeated string tokens = 23;
+  // Whether the peer's certificate chained to a configured CA — murmur's
+  // `bVerified`, and the `strong` ACL group. Carried separately from
+  // `cert_hash` because the hash is an identifier and this is an assurance.
+  bool strong_cert = 24;
+  // Per-listener gain, keyed by the channel in `listening` it applies to.
+  //
+  // Sparse: a listener that never moved the slider has no entry here, and
+  // absent means unity. Separate from `listening` rather than a parallel array
+  // because the two are written by different messages — a client can adjust a
+  // volume without changing which channels it listens to, and a parallel array
+  // that fell out of step would silence the wrong room.
+  map<uint32, float> listening_volume = 25;
 }
 
 message Sessions {

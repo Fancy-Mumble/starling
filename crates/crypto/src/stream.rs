@@ -50,6 +50,33 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
     ///
     /// [`VoiceError`] if the packet is short, a replay, or not authentic.
     fn open(&mut self, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, VoiceError>;
+
+    /// The nonce this half seals under, for answering a peer's resync request.
+    ///
+    /// `None` means *this cipher cannot be resynchronised by swapping a nonce*,
+    /// and it is a real answer rather than a hole: `XChaCha20-Poly1305` folds its
+    /// salt into a derived subkey and reconstructs the counter's high bits from
+    /// the wire, so no value it could hand over would mean anything to the peer.
+    /// A peer on such a cipher is recovered by being re-keyed instead.
+    ///
+    /// Deliberately not a defaulted method. A cipher added later must *decide*
+    /// which of the two it is, and a default would let it inherit the wrong
+    /// answer silently — which is a peer that asks to resynchronise and is told
+    /// something it cannot use.
+    fn send_nonce(&self) -> Option<Vec<u8>>;
+
+    /// Adopt the nonce a peer says it is sending under, and report whether it was
+    /// taken.
+    ///
+    /// `false` for a cipher that cannot resynchronise this way, and for a nonce
+    /// of the wrong width — which is the implementation's own judgement to make,
+    /// because only it knows what width it expects. A refusal is not an error:
+    /// the caller's fallback is to re-key, which recovers the peer either way.
+    ///
+    /// Trusting the value is safe **only** because every packet still has to
+    /// authenticate afterwards. The nonce is a hint about where to look, not a
+    /// credential, and a wrong one costs the peer nothing but another resync.
+    fn adopt_recv_nonce(&mut self, nonce: &[u8]) -> bool;
 }
 
 /// The properties every [`VoiceCipher`] must have.
@@ -123,4 +150,29 @@ pub(crate) fn assert_voice_cipher_contract(
         first, second,
         "{name}: identical frames sealed identically, so the nonce repeated"
     );
+
+    // 8. The two halves of the resync answer agree with each other.
+    //
+    // Last, because it mutates the receiver. A cipher that offers a nonce must
+    // accept one of that width back, and one that offers nothing must accept
+    // nothing — the mixed answers are the ones that strand a peer: offering a
+    // nonce the peer cannot give back, or refusing to say what to send while
+    // accepting what arrives.
+    match sender.send_nonce() {
+        Some(nonce) => {
+            assert!(
+                !nonce.is_empty(),
+                "{name}: offered an empty nonce, which no peer can use"
+            );
+            assert!(
+                receiver.adopt_recv_nonce(&nonce),
+                "{name}: offers a {}-byte nonce and will not adopt one",
+                nonce.len()
+            );
+        }
+        None => assert!(
+            !receiver.adopt_recv_nonce(&[0; 16]),
+            "{name}: cannot say what it sends under, yet adopts what it is handed"
+        ),
+    }
 }

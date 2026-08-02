@@ -102,11 +102,46 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
                 burst: 15,
             },
         ),
+        // The ACL editor, and the reason this bucket exists: opening the
+        // channel tree issues one `ACL`(13) query **per channel**, so a server
+        // with thirty channels emits thirty queries in a second or two. On the
+        // shared control bucket the first five arrive and the rest are dropped
+        // in silence — an administrator sees a tree that renders empty
+        // permissions for most of it and no error anywhere.
+        //
+        // Measured, not guessed: a single e2e run dropped 120 `ACL` frames.
+        (
+            "acl".to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(20.0),
+                burst: 60,
+            },
+        ),
+        // Chat. A person typing several short messages in a row legitimately
+        // emits them faster than one a second, and the burst is shared with
+        // every other control message their client is sending — so a client
+        // that is also announcing a channel change or a mute can exhaust it
+        // between two sentences and lose one.
+        //
+        // Losing a message somebody typed is the worst failure in this table:
+        // it is silent, it is attributed to nothing, and the sender believes
+        // they were heard.
+        (
+            "chat".to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(5.0),
+                burst: 20,
+            },
+        ),
     ])
 }
 
 /// One named bucket.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+///
+/// `PartialEq` so a live change can be compared with what is already applied:
+/// the gateway re-reads the operator's `messagelimit` on the frame path, and
+/// re-tuning a bucket that has not changed would be work done per frame.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitConfig {
     /// Sustained rate.
@@ -183,6 +218,35 @@ mod tests {
             "a client sending 10 ms Opus frames emits a hundred a second"
         );
         assert!(audio.burst >= 100);
+    }
+
+    #[test]
+    fn an_acl_editor_is_not_charged_to_the_control_bucket() {
+        // Found in an e2e run, where 120 `ACL`(13) frames were dropped: the
+        // editor issues one query per channel when it opens the tree, so the
+        // shared 1/s bucket admits five and silently discards the rest. The
+        // administrator sees a tree with most of its permissions blank and
+        // nothing anywhere says why.
+        let limits = GatewayConfig::default().limits;
+        let acl = limits.get("acl").copied().expect("acl bucket");
+        assert!(
+            acl.burst >= 30,
+            "a server with thirty channels opens thirty queries at once"
+        );
+        assert!(acl.rate.as_per_second() > 1.0);
+    }
+
+    #[test]
+    fn chat_is_not_charged_to_the_control_bucket() {
+        // The failure this exists for is the worst kind in this table: a
+        // message somebody typed is dropped in silence, attributed to nothing,
+        // and the sender believes they were heard. A person sending several
+        // short messages in a row exceeds one a second easily, and shares the
+        // burst with every other control frame their client emits.
+        let limits = GatewayConfig::default().limits;
+        let chat = limits.get("chat").copied().expect("chat bucket");
+        assert!(chat.rate.as_per_second() >= 5.0);
+        assert!(chat.burst >= 10);
     }
 
     #[test]

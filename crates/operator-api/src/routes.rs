@@ -50,6 +50,9 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         )
         .route("/v1/bans", get(list_bans))
         .route("/v1/config", get(get_config).post(set_config))
+        // How the server is, collected by the `health` service. The route a
+        // dashboard polls; `/healthz` above stays a bare liveness probe.
+        .route("/v1/health", get(get_health))
         // The read side a channel viewer needs. Ice served this on the C++
         // server (`getChannels`, `getUsers`) and Starling has no Ice at all
         // (`docs/GAP-ANALYSIS.md` S6), so without these a viewer has no way to
@@ -63,6 +66,10 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         // gRPC and had no operator surface, so an ACL could be read from here
         // and changed only from a client that cannot write one either.
         .route("/v1/channels/{id}/acl", get(get_acl).put(set_acl))
+        .route(
+            "/v1/channels/{id}/groups/{group}/members",
+            post(add_temporary_group).delete(remove_temporary_group),
+        )
         // The server addressing a connected user, which is the one thing an
         // external system cannot do by holding a client connection of its own.
         .route("/v1/messages", post(send_message))
@@ -779,6 +786,129 @@ async fn list_bans(
     Ok(Json(serde_json::Value::Array(entries)))
 }
 
+/// The whole server's readiness, as the health collector last saw it.
+///
+/// The route a dashboard polls. It is deliberately a *read of a snapshot*
+/// rather than a sweep: the collector polls every service once every few
+/// seconds for everybody, so ten people watching cost the same as one, and the
+/// answer carries `observed_at_ms` so a stale picture is visibly stale rather
+/// than quietly presented as current.
+///
+/// Unreadable without a credential like every other route here. Readiness
+/// names internal services and the caches they are waiting on, which is a map
+/// of the deployment and not something to serve anonymously.
+async fn get_health(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::health::health_overview_client::HealthOverviewClient;
+    use starling_proto_fancy::health::{OverviewRequest, State as HealthState};
+
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/health")?;
+    let channel = api
+        .resolver()
+        .channel("health")
+        .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
+
+    let overview = HealthOverviewClient::new(channel)
+        .get(OverviewRequest {
+            scope: Some(Scope { virtual_server: 1 }),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
+        .into_inner();
+
+    /// The wire enum as the name a dashboard renders, rather than its number.
+    fn state_name(state: i32) -> &'static str {
+        match HealthState::try_from(state) {
+            Ok(HealthState::Ready) => "ready",
+            Ok(HealthState::Warming) => "warming",
+            Ok(HealthState::Warning) => "warning",
+            Ok(HealthState::Unreachable) => "unreachable",
+            _ => "unknown",
+        }
+    }
+
+    // The recent past in the same round trip. A dashboard needs both — the
+    // detail of now and the shape of the last hour — and two polls would
+    // double the traffic to show one page.
+    //
+    // Best effort: a collector that can answer `Get` and not `History` is odd
+    // but not a reason to fail the whole page, and an empty series renders as
+    // "no history yet" rather than as an error.
+    let history = HealthOverviewClient::new(
+        api.resolver()
+            .channel("health")
+            .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?,
+    )
+    .history(OverviewRequest {
+        scope: Some(Scope { virtual_server: 1 }),
+    })
+    .await
+    .map(tonic::Response::into_inner)
+    .unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "state": state_name(overview.state),
+        "observed_at_ms": overview.observed_at_ms,
+        "interval_ms": history.interval_ms,
+        "history": history
+            .samples
+            .iter()
+            .map(|sample| serde_json::json!({
+                "observed_at_ms": sample.observed_at_ms,
+                "state": state_name(sample.state),
+                "ready": sample.ready,
+                "warming": sample.warming,
+                "warning": sample.warning,
+                "unreachable": sample.unreachable,
+                // Microseconds. A dashboard divides for display; the API does
+                // not, because rounding at the source destroys the difference
+                // between "fast" and "not measured" — every in-process check
+                // truncated to 0ms before this.
+                "worst_latency_us": sample.worst_latency_us,
+                "slowest": sample.slowest,
+                "busiest_percent": sample.busiest_percent,
+                "busiest": sample.busiest,
+                "rejected": sample.rejected,
+            }))
+            .collect::<Vec<_>>(),
+        "disabled": overview.disabled,
+        "services": overview
+            .services
+            .iter()
+            .map(|service| serde_json::json!({
+                "service": service.service,
+                "state": state_name(service.state),
+                "latency_us": service.latency_us,
+                "error": service.error,
+                "gates": service
+                    .gates
+                    .iter()
+                    .map(|gate| serde_json::json!({
+                        "name": gate.name,
+                        "state": state_name(gate.state),
+                    }))
+                    .collect::<Vec<_>>(),
+                // What this service has queued. `capacity: 0` means nothing
+                // declares a limit, and a viewer must then show `used`/`peak`
+                // as counts rather than inventing a percentage.
+                "load": service
+                    .load
+                    .iter()
+                    .map(|load| serde_json::json!({
+                        "name": load.name,
+                        "used": load.used,
+                        "peak": load.peak,
+                        "capacity": load.capacity,
+                        "rejected": load.rejected,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
 async fn get_config(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
@@ -797,16 +927,11 @@ async fn get_config(
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
         .into_inner();
 
-    // The password is not read back, here or anywhere.
-    Ok(Json(serde_json::json!({
-        "version": snapshot.version,
-        "welcome_text": snapshot.welcome_text,
-        "max_users": snapshot.max_users,
-        "max_bandwidth": snapshot.max_bandwidth,
-        "message_limit": snapshot.message_limit,
-        "message_burst": snapshot.message_burst,
-        "allow_html": snapshot.allow_html,
-    })))
+    // Everything an operator may write, so the form they render next has the
+    // value they just set rather than a blank. Neither password is here — a
+    // credential read back is a credential in a log, a browser cache and
+    // whatever proxy sits in between.
+    Ok(Json(starling_runtime::settings::to_json(&snapshot)))
 }
 
 /// The channel tree.
@@ -1304,6 +1429,117 @@ async fn set_acl(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Who is being put in, or taken out of, a group.
+///
+/// Exactly one of the two, and the distinction is the whole point of the
+/// feature rather than a convenience. An `account` grant lasts until it is
+/// removed; a `session` grant is tied to one live connection and is the only
+/// way to put an **unregistered** user in a named group, since permanent
+/// membership is recorded by account id and a guest has none.
+#[derive(Debug, Deserialize)]
+struct TemporaryMember {
+    #[serde(default)]
+    account: Option<u64>,
+    #[serde(default)]
+    session: Option<u32>,
+}
+
+impl TemporaryMember {
+    /// The gRPC form, or the reason it is not a well-formed request.
+    fn resolve(
+        &self,
+    ) -> Result<starling_proto_fancy::permissions::temporary_group_request::Member, &'static str>
+    {
+        use starling_proto_fancy::permissions::temporary_group_request::Member;
+        match (self.account, self.session) {
+            (Some(_), Some(_)) => {
+                Err("name either an account or a session, not both: they are different grants")
+            }
+            (Some(account), None) => Ok(Member::Account(account)),
+            (None, Some(session)) => Ok(Member::Session(session)),
+            (None, None) => Err("name an account or a session"),
+        }
+    }
+}
+
+/// Put somebody in a group without editing the ACL table.
+///
+/// murmur's `addUserToGroup` (`MumbleServer.ice:728`), which Starling reaches
+/// here because it has no Ice and never will (`GAP-ANALYSIS.md` S6).
+///
+/// **Not durable, deliberately** — upstream says so of its own ("This state is
+/// not saved"), and a session-scoped grant that survived a restart would be
+/// attached to a session id belonging to whoever connects next. It is an
+/// external authority's live decision, not configuration.
+async fn add_temporary_group(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path((id, group)): Path<(u32, String)>,
+    Json(member): Json<TemporaryMember>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    temporary_group(api, headers, id, group, member, true).await
+}
+
+/// Take a temporary membership away again.
+async fn remove_temporary_group(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path((id, group)): Path<(u32, String)>,
+    Json(member): Json<TemporaryMember>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    temporary_group(api, headers, id, group, member, false).await
+}
+
+/// Both directions, which differ only in the call they end in.
+///
+/// Written once because the two drifting apart is how a grant comes to be
+/// validated differently from the revocation meant to undo it — and of the two,
+/// the revocation failing is the dangerous one.
+async fn temporary_group(
+    api: Arc<OperatorApi>,
+    headers: HeaderMap,
+    id: u32,
+    group: String,
+    member: TemporaryMember,
+    add: bool,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::permissions::TemporaryGroupRequest;
+    use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+
+    let verb = if add { "POST" } else { "DELETE" };
+    let subject = admit(
+        &api,
+        &headers,
+        "permissions:write",
+        &format!("{verb} /v1/channels/{id}/groups/{group}/members"),
+    )?;
+    let member = member
+        .resolve()
+        .map_err(|why| refuse(StatusCode::BAD_REQUEST, why))?;
+    let channel = dial(&api, "permissions")?;
+
+    let request = TemporaryGroupRequest {
+        scope: scope(),
+        actor: operator_actor(subject, "permissions:write"),
+        channel: id,
+        group,
+        member: Some(member),
+    };
+    let mut client = PermissionsClient::new(channel);
+    let result = if add {
+        client.add_temporary_group(request).await
+    } else {
+        client.remove_temporary_group(request).await
+    }
+    .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+    .into_inner();
+
+    if !result.applied {
+        return Err(refuse(StatusCode::CONFLICT, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// A message from the server to connected users.
 #[derive(Debug, Deserialize)]
 struct NewMessage {
@@ -1367,18 +1603,22 @@ async fn set_config(
         .channel("server-config")
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
-    let mut snapshot = starling_proto_fancy::serverconfig::Snapshot {
-        virtual_server: 1,
-        ..starling_proto_fancy::serverconfig::Snapshot::default()
-    };
-    let mut fields = Vec::new();
-    if let Some(text) = values.get("welcome_text").and_then(|v| v.as_str()) {
-        snapshot.welcome_text = text.to_owned();
-        fields.push("welcome_text".to_owned());
-    }
-    if let Some(users) = values.get("max_users").and_then(serde_json::Value::as_u64) {
-        snapshot.max_users = users as u32;
-        fields.push("max_users".to_owned());
+    // Every setting `server-config` accepts, not the two this used to know
+    // about. An operator could not write `messagelimit`, `certrequired`,
+    // `channelnestinglimit`, `logdays` or the obfuscation through the surface
+    // built for exactly that — so the whole of `GAP-ANALYSIS.md` §5 could be
+    // enforced by the server and still be unreachable.
+    //
+    // The mapping lives in `starling_runtime::settings` beside the defaults and
+    // the field-wise merge, so a setting added there is settable here without a
+    // second edit and the two cannot disagree about a name.
+    let (mut snapshot, fields) = starling_runtime::settings::from_json(&values);
+    snapshot.virtual_server = 1;
+    if fields.is_empty() {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "no settable configuration field was named",
+        ));
     }
 
     let _ = ServerConfigClient::new(channel)

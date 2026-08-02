@@ -34,6 +34,7 @@ members = [
     "crates/services/audit",
     "crates/services/onboarding",
     "crates/services/social",
+    "crates/services/health",
     "crates/services/link-preview",
     "crates/services/context-actions",
 
@@ -81,6 +82,7 @@ starling-push = { path = "crates/services/push" }
 starling-audit = { path = "crates/services/audit" }
 starling-onboarding = { path = "crates/services/onboarding" }
 starling-social = { path = "crates/services/social" }
+starling-health = { path = "crates/services/health" }
 starling-link-preview = { path = "crates/services/link-preview" }
 starling-context-actions = { path = "crates/services/context-actions" }
 starling-directory = { path = "crates/services/directory" }

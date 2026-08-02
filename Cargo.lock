@@ -2251,6 +2251,7 @@ dependencies = [
  "starling-directory",
  "starling-files",
  "starling-gateway",
+ "starling-health",
  "starling-link-preview",
  "starling-metadata",
  "starling-migrate",
@@ -2392,6 +2393,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-health"
+version = "0.2.0"
+dependencies = [
+ "starling-proto-fancy",
+ "starling-runtime",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "starling-link-preview"
 version = "0.2.0"
 dependencies = [
@@ -2449,6 +2460,7 @@ version = "0.2.0"
 dependencies = [
  "prost",
  "sqlx",
+ "starling-proto",
  "starling-proto-fancy",
  "starling-runtime",
  "tokio",
@@ -2560,8 +2572,11 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "hyper-util",
+ "pin-project-lite",
  "prost",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "starling-proto",
  "starling-proto-fancy",

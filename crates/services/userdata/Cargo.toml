@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The blocking pool, for the PBKDF2 verification that must not run on an
+# async worker (see `UserdataRpc::authenticate`).
+tokio = { workspace = true, features = ["rt"] }
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true

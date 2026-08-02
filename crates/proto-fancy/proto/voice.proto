@@ -13,6 +13,9 @@ service Voice {
   // service boundary in the clear: what comes back is the encoded CryptSetup
   // payload, ready to forward verbatim.
   rpc Mint(MintRequest) returns (CryptMaterial);
+  // CryptSetup (15) again, mid-session: a peer whose UDP nonce has drifted
+  // asking to be put back in step. The answer is a CryptSetup to forward, or
+  // nothing at all — see ResyncRequest.
   rpc Resync(ResyncRequest) returns (CryptMaterial);
   rpc Forget(ForgetRequest) returns (starling.common.v1.Ack);
   rpc Stats(StatsRequest) returns (PeerStats);
@@ -41,6 +44,14 @@ message MintRequest {
 message ResyncRequest {
   starling.common.v1.Scope scope = 1;
   uint32 session = 2;
+  // The nonce the peer says it is sending under, verbatim from CryptSetup.
+  //
+  // Absent and present mean opposite things, so this is `optional` and not a
+  // bare `bytes`: absent is "tell me yours" and is answered, present is "adopt
+  // mine" and is not. A zero-length nonce is a third thing again — a peer that
+  // meant to hand one over and sent nothing — and collapsing it into absent
+  // would answer a request nobody made.
+  optional bytes client_nonce = 3;
 }
 
 message ForgetRequest {
@@ -50,6 +61,11 @@ message ForgetRequest {
 
 message CryptMaterial {
   // An encoded Mumble CryptSetup message, forwarded to the client as-is.
+  //
+  // Empty means send the client nothing. A mint always fills this; a resync
+  // leaves it empty when the peer handed over its own nonce, because murmur
+  // adopts that silently and a reply would be a message the client does not
+  // expect.
   bytes crypt_setup = 1;
   string cipher = 2;
 }

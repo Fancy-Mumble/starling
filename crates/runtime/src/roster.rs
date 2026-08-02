@@ -54,6 +54,14 @@ pub struct Roster {
     /// users is cheaper than the bookkeeping a reverse index would cost on
     /// every move.
     channels: Mutex<HashMap<u32, u32>>,
+    /// Session id to the account behind it, absent for an unregistered guest.
+    ///
+    /// Session ids are per connection and get recycled; an account is the
+    /// person. Anything that has to outlive a connection — what a user
+    /// answered, what they were sent — must be keyed on this and never on the
+    /// session, or a reconnect looks like a stranger and a recycled id looks
+    /// like the wrong one.
+    accounts: Mutex<HashMap<u32, Option<u64>>>,
     warm: AtomicBool,
 }
 
@@ -94,6 +102,20 @@ impl Roster {
     /// sessions that went away while the stream was down are forgotten only
     /// because this replaces rather than merges.
     pub fn replace(&self, sessions: Vec<Session>) {
+        if let Ok(mut held) = self.accounts.lock() {
+            *held = sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.session,
+                        starling_proto_fancy::identity::account(
+                            session.registered,
+                            session.account,
+                        ),
+                    )
+                })
+                .collect();
+        }
         if let Ok(mut held) = self.channels.lock() {
             *held = sessions
                 .into_iter()
@@ -105,6 +127,12 @@ impl Roster {
 
     /// Add or move one session.
     pub fn upsert(&self, session: &Session) {
+        if let Ok(mut held) = self.accounts.lock() {
+            let _ = held.insert(
+                session.session,
+                starling_proto_fancy::identity::account(session.registered, session.account),
+            );
+        }
         if let Ok(mut held) = self.channels.lock() {
             let _ = held.insert(session.session, session.channel);
         }
@@ -115,9 +143,23 @@ impl Roster {
     /// Session ids are reused, so a stale entry is not merely a leak: it is a
     /// stranger inheriting somebody else's channel membership.
     pub fn remove(&self, session: u32) {
+        if let Ok(mut held) = self.accounts.lock() {
+            let _ = held.remove(&session);
+        }
         if let Ok(mut held) = self.channels.lock() {
             let _ = held.remove(&session);
         }
+    }
+
+    /// The account behind `session`, or `None` for an unregistered guest, an
+    /// unknown session, or a cold roster.
+    ///
+    /// All three answer "nothing durable to key on", which is the only
+    /// question a caller storing something per person needs answered. They
+    /// differ for diagnostics, not for the decision.
+    #[must_use]
+    pub fn account_of(&self, session: u32) -> Option<u64> {
+        self.accounts.lock().ok()?.get(&session).copied().flatten()
     }
 
     /// Everyone in `channel`, except `except`.

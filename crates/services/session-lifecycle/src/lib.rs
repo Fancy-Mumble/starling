@@ -25,6 +25,7 @@ pub use ids::SessionId;
 pub use session::{SessionAllocator, SessionSource};
 pub use state::{Connections, PendingConnection, ReportedStats};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -36,7 +37,7 @@ use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
 use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent};
-use starling_runtime::permit::{Permit, permission_denied};
+use starling_runtime::permit::{Permit, permission_denied, refused as refused_with};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn, to_sessions,
 };
@@ -50,6 +51,8 @@ const AUTHENTICATE: u16 = 2;
 const PING: u16 = 3;
 /// Upstream `UserState`, which carries self-mute and self-deafen.
 const USER_STATE: u16 = 9;
+/// Upstream `CryptSetup`, sent again mid-session to resynchronise the UDP nonce.
+const CRYPT_SETUP: u16 = 15;
 /// Upstream `UserStats`, behind a client's right-click → Information.
 const USER_STATS: u16 = 22;
 /// Upstream `CodecVersion`, which is where a client says whether it has Opus.
@@ -118,6 +121,7 @@ impl ClientService for SessionLifecycleService {
             // client as having no Opus. It is announced in `Authenticate`
             // instead, and read there.
             CODEC_VERSION => Actions::new(),
+            CRYPT_SETUP => self.on_crypt_setup(&inbound).await,
             USER_STATE => self.on_user_state(&inbound).await,
             id if id == ServiceKind::SessionLifecycle.outer_type() => {
                 self.handshake.fancy(&self.connections, &inbound)
@@ -233,6 +237,84 @@ impl SessionLifecycleService {
         vec![to_conn(inbound.conn, PING, reply.encode_to_vec())]
     }
 
+    /// `CryptSetup` arriving *from* a client: a request to resynchronise.
+    ///
+    /// The same wire type the handshake sends outbound, and the direction is the
+    /// whole difference. Outbound it is the key material; inbound it means the
+    /// peer's UDP nonce has drifted far enough that nothing decrypts, and it is
+    /// how a client recovers without reconnecting.
+    ///
+    /// # What silence here costs
+    ///
+    /// Everything, for the rest of the session. A Mumble client asks once every
+    /// five seconds while its audio is failing (`ServerHandler::message`), and it
+    /// has no other recovery: it does not reconnect, it does not fall back to the
+    /// tunnel, it simply keeps sending frames nobody can open and receiving
+    /// frames it cannot open. Both counters look healthy at both ends. This arm
+    /// costs one round trip and turns that into a two-second interruption.
+    ///
+    /// # Why it goes to voice
+    ///
+    /// The nonce belongs to the cipher, and the cipher lives on the packet path
+    /// — this service has never held one, and key material does not cross a
+    /// service boundary in a form anything else could read
+    /// (`docs/ARCHITECTURE.md` §4). What comes back is a ready-made payload, or
+    /// nothing when the peer handed over its own nonce and murmur would send no
+    /// reply.
+    async fn on_crypt_setup(&self, inbound: &Inbound) -> Actions {
+        use starling_proto_fancy::voice::ResyncRequest;
+        use starling_proto_fancy::voice::voice_client::VoiceClient;
+
+        let Ok(request) = tcp::CryptSetup::decode(inbound.payload.as_slice()) else {
+            tracing::debug!(conn = inbound.conn, "undecodable CryptSetup");
+            return Actions::new();
+        };
+
+        let Ok(channel) = self.handshake.resolver().channel("voice") else {
+            // Nothing to say. A refusal would be worse than silence here: the
+            // client is not being denied anything, and there is no `CryptSetup`
+            // that means "ask again later".
+            tracing::warn!(
+                session = inbound.session,
+                "voice is unreachable; a peer's crypt resync goes unanswered"
+            );
+            return Actions::new();
+        };
+
+        let answer = VoiceClient::new(channel)
+            .resync(ResyncRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: inbound.scope,
+                }),
+                session: inbound.session,
+                // Forwarded as it arrived, absence and all: whether this field is
+                // present is the entire request. Defaulting it to empty bytes
+                // would turn every "tell me yours" into "adopt this", and the
+                // peer would be answered with silence instead of a nonce.
+                client_nonce: request.client_nonce,
+            })
+            .await;
+
+        let payload = match answer {
+            Ok(material) => material.into_inner().crypt_setup,
+            Err(status) => {
+                tracing::warn!(
+                    session = inbound.session,
+                    %status,
+                    "voice refused a crypt resync"
+                );
+                return Actions::new();
+            }
+        };
+
+        // Empty is a decision, not a failure: the peer offered its own nonce,
+        // voice adopted it, and murmur sends nothing back for that case.
+        if payload.is_empty() {
+            return Actions::new();
+        }
+        vec![to_conn(inbound.conn, CRYPT_SETUP, payload)]
+    }
+
     /// `UserStats`: what a client shows under right-click → Information.
     ///
     /// This request used to be routed to `userdata`, which had no arm for it
@@ -326,8 +408,10 @@ impl SessionLifecycleService {
                     account,
                     name: asker.name.clone(),
                     registered,
-                    tokens: Vec::new(),
+                    tokens: asker.tokens.clone(),
                     cert_hash: asker.cert_hash.clone(),
+                    channel: asker.channel,
+                    strong_cert: asker.strong_cert,
                 }),
                 channel: ROOT_CHANNEL,
                 permission: BAN,
@@ -623,17 +707,41 @@ impl SessionLifecycleService {
         vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
     }
 
-    /// Move the caller into `target`.
+    /// Move `moved` into `target`, whether or not that is the caller.
     ///
-    /// murmur's rule (`Messages.cpp:1080`): the mover needs `Move` on the
-    /// destination, *or* the user being moved needs `Enter` on it. Moving
-    /// oneself — the only case this service handles — collapses to `Enter`,
-    /// which is the permission an operator revokes to make a channel private.
+    /// murmur asks three questions in two steps (`Messages.cpp:1075`, `:1080`):
+    ///
+    /// 1. dragging *somebody else* takes `Move` on the channel they are in now —
+    ///    the power is over the room they are being taken out of;
+    /// 2. and then, for the destination, either the mover holds `Move` there
+    ///    **or** the person being moved holds `Enter` there.
+    ///
+    /// The second is an *or*, asked as two calls, because [`Permit::allows`]
+    /// requires every bit it is given and a single two-bit request would demand
+    /// both. Moving oneself skips the first question and collapses the second to
+    /// `Enter`, which is the permission an operator revokes to make a channel
+    /// private.
     ///
     /// A refusal is *told to the client*. Silence is what made this look like a
     /// broken server rather than a locked channel: the user clicks, nothing
     /// moves, and no message says why.
-    async fn on_move(&self, inbound: &Inbound, moved: u32, target: u32) -> Actions {
+    ///
+    /// A refusal is *told to the client*. Silence is what made this look like a
+    /// broken server rather than a locked channel: the user clicks, nothing
+    /// moves, and no message says why.
+    ///
+    /// `tokens` are the channel's password, sent with the request rather than
+    /// stored on the session. They apply to the `Enter` check below and to
+    /// nothing else, which is what makes a password a key to one door: the
+    /// person moved may enter because they knew it, and the moment the request
+    /// is answered they hold nothing extra.
+    async fn on_move(
+        &self,
+        inbound: &Inbound,
+        moved: u32,
+        target: u32,
+        tokens: Vec<String>,
+    ) -> Actions {
         let Some(subject) = self.connections.by_session(moved) else {
             tracing::debug!(session = moved, "move for an unknown session");
             return Actions::new();
@@ -667,9 +775,14 @@ impl SessionLifecycleService {
         // hold `Move` there, or the person being moved may hold `Enter`. Asked
         // as two questions because `Permit::allows` requires every bit it is
         // given, so one two-bit request would demand both.
+        //
+        // The tokens ride on the `Enter` half only. `Move` is a moderator's
+        // authority over a room, and letting a password stand in for it would
+        // mean anyone who knows a channel's password can drag other people into
+        // it.
         let may_enter = self
             .permit
-            .allows_session(inbound.scope, moved, target, Perm::ENTER.bits())
+            .allows_session_with_tokens(inbound.scope, moved, target, Perm::ENTER.bits(), tokens)
             .await
             || self.permit.allows(inbound, target, Perm::MOVE.bits()).await;
         if !may_enter {
@@ -748,15 +861,14 @@ impl SessionLifecycleService {
             return self.on_register(inbound, &state).await;
         }
 
-        if state
+        let elsewhere = state
             .session
-            .is_some_and(|session| session != inbound.session)
-            && !is_speak_state(&state)
-        {
-            // Everything below this point acts on the sender's own session. The
-            // speak-state flags are the exception — moderating somebody else is
-            // the *usual* case for those — so they are let through to their own
-            // permission check rather than refused here.
+            .is_some_and(|session| session != inbound.session);
+        if elsewhere && !moderates(&state) {
+            // Everything below this point acts on the sender's own session.
+            // Moderation is the exception — acting on somebody else is the
+            // *usual* case for those fields — so they are let through to their
+            // own permission check rather than refused here.
             return Actions::new();
         }
 
@@ -768,6 +880,32 @@ impl SessionLifecycleService {
             return self.on_speak_state(inbound, &state).await;
         }
 
+        // A client announcing it has *started* recording, on a server that
+        // forbids it. `allow_recording` was advertised in `ServerConfig` and
+        // enforced nowhere (`docs/GAP-ANALYSIS.md` §5), so a client that
+        // ignored the flag recorded the channel and the server said nothing.
+        //
+        // murmur kicks (`Messages.cpp:1417`), and the severity is the point:
+        // the flag is the client's own voluntary disclosure, so the only
+        // client this can catch is an honest one — and the answer to an honest
+        // client doing a forbidden thing is to stop the session, not to drop
+        // the field and leave it recording in the belief that it may.
+        if state.recording == Some(true) {
+            let config = self.handshake.config(inbound.scope).await;
+            if !config.allow_recording {
+                self.handshake.context().logger.log(
+                    LogEvent::notice(Category::Session, "recording refused")
+                        .with("session", inbound.session)
+                        .with("conn", inbound.conn)
+                        .with("scope", inbound.scope),
+                );
+                return vec![disconnect(
+                    inbound.conn,
+                    "Recording is not allowed on this server",
+                )];
+            }
+        }
+
         // A channel switch is a `UserState` carrying `channel_id`
         // (`vendor/server/src/murmur/Messages.cpp:1070`). This was not read at
         // all, so clicking a channel sent a request the server parsed, ignored,
@@ -775,7 +913,36 @@ impl SessionLifecycleService {
         // success and moves nobody.
         if let Some(channel) = state.channel_id {
             let moved = state.session.unwrap_or(inbound.session);
-            return self.on_move(inbound, moved, channel).await;
+            // The password the user typed into the "this channel is locked"
+            // dialog, carried on the request that it authorises and stored
+            // nowhere (`vendor/server/src/murmur/Messages.cpp:1133`).
+            let mut actions = self
+                .on_move(
+                    inbound,
+                    moved,
+                    channel,
+                    state.temporary_access_tokens.clone(),
+                )
+                .await;
+            // After the move, never before, and murmur is explicit about it
+            // (`Messages.cpp:1468`): one `UserState` can both join a channel and
+            // start listening to another, and evaluating the listener first
+            // would check `Listen` against the room the user is leaving.
+            if is_listen_state(&state) {
+                actions.extend(self.on_listen(inbound, &state).await);
+            }
+            return actions;
+        }
+
+        if is_listen_state(&state) {
+            return self.on_listen(inbound, &state).await;
+        }
+
+        // Clearing somebody else's comment or avatar is its own permission and
+        // its own handler, because it is the opposite of the path below: that
+        // one *stores* what arrived, and this one is only ever allowed to erase.
+        if elsewhere && is_user_content(&state) {
+            return self.on_reset_content(inbound, &state).await;
         }
 
         let updated =
@@ -813,6 +980,17 @@ impl SessionLifecycleService {
                     .store_content(inbound, UserContent::Texture, texture)
                     .await;
             }
+
+            // Before the announcement, and this is the line that makes the new
+            // picture visible to anybody but its owner. `session-view` is built
+            // from the connection record and nothing else (`handshake.rs:125`),
+            // so a hash written only to the account row reaches the people who
+            // reconnect after it and nobody who is here now.
+            let _ = self.connections.set_content(
+                inbound.conn,
+                comment_hash.clone(),
+                texture_hash.clone(),
+            );
         }
 
         self.handshake
@@ -835,6 +1013,295 @@ impl SessionLifecycleService {
             ..tcp::UserState::default()
         };
         vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+    }
+
+    /// Start or stop listening to channels, and re-weight the ones already on.
+    ///
+    /// The feature murmur calls a `ChannelListener`: hearing a room without being
+    /// in it, chosen per user rather than configured by an operator the way a
+    /// channel link is.
+    ///
+    /// **Strictly the sender's own.** murmur refuses a `UserState` that names
+    /// somebody else and carries `listening_channel_add` or `_remove`
+    /// (`Messages.cpp:1285`), and this refuses the volume adjustments too —
+    /// upstream leaves those out of the same guard, which lets a moderator turn
+    /// down a room in another person's client. Subscribing or re-mixing
+    /// somebody else's audio is not a moderation power that exists.
+    async fn on_listen(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
+        if state
+            .session
+            .is_some_and(|session| session != inbound.session)
+        {
+            tracing::debug!(
+                actor = inbound.session,
+                target = state.session,
+                "refused a listener change aimed at another session"
+            );
+            return Actions::new();
+        }
+
+        // Who to persist this under. `None` for a guest, and metadata stores
+        // nothing for one: there is no identity for a later visit to match, so a
+        // guest's listeners last exactly as long as the session does.
+        let account = self
+            .connections
+            .get(inbound.conn)
+            .and_then(|pending| pending.account);
+
+        // `Listen` on each channel, and only on the ones being *added*: giving
+        // up a listener is not an exercise of a permission, and a user whose
+        // access was revoked while listening must still be able to stop.
+        let (listen, mut denials) = self.permitted_listens(inbound, state).await;
+
+        let volume: HashMap<u32, f32> = state
+            .listening_volume_adjustment
+            .iter()
+            .filter_map(|adjustment| {
+                Some((
+                    adjustment.listening_channel?,
+                    adjustment.volume_adjustment(),
+                ))
+            })
+            .collect();
+
+        let Some(outcome) = self
+            .handshake
+            .listen(
+                inbound.scope,
+                inbound.session,
+                account,
+                listen,
+                state.listening_channel_remove.clone(),
+                volume,
+            )
+            .await
+        else {
+            // metadata is unreachable. Not a refusal: telling the user they lack
+            // `Listen` would blame them for an outage.
+            tracing::error!(
+                session = inbound.session,
+                "metadata is unreachable; cannot change listeners"
+            );
+            return denials;
+        };
+
+        // A limit met is not a permission missing, and a client told the wrong
+        // one renders "you lack the Listen permission" for a room that is simply
+        // full — a condition an operator can lift and a user can wait out.
+        denials.extend(
+            outcome
+                .refused
+                .iter()
+                .map(|refusal| listener_limit_denied(inbound, refusal)),
+        );
+
+        if outcome.added.is_empty() && outcome.removed.is_empty() && outcome.volume.is_empty() {
+            return denials;
+        }
+
+        // This copy first, then the announcement that reads it: `voice` builds
+        // its routing snapshot from the session view and nothing else, so a
+        // listener that stops here is one no audio is ever routed to.
+        self.connections.apply_listeners(
+            inbound.conn,
+            &outcome.added,
+            &outcome.removed,
+            &outcome.volume,
+        );
+        self.handshake
+            .announce_changed(&self.connections, inbound.conn)
+            .await;
+
+        // Whether everyone hears the gains or only their owner. murmur's
+        // `broadcastlistenervolumeadjustments`, off by default.
+        let config = self.handshake.config(inbound.scope).await;
+        denials.extend(announce_listeners(
+            inbound,
+            &outcome,
+            config.broadcast_listener_volume_adjustments,
+        ));
+        denials
+    }
+
+    /// Split the requested additions into the ones this client may have and a
+    /// refusal for each of the rest.
+    ///
+    /// Per channel and carrying on, as murmur does (`Messages.cpp:1171`
+    /// continues rather than returning): a client that asks for everything it
+    /// can see should get what it may have, not lose the lot to one forbidden
+    /// room.
+    async fn permitted_listens(
+        &self,
+        inbound: &Inbound,
+        state: &tcp::UserState,
+    ) -> (Vec<u32>, Actions) {
+        let mut allowed = Vec::with_capacity(state.listening_channel_add.len());
+        let mut denials = Actions::new();
+        for channel in &state.listening_channel_add {
+            if self
+                .permit
+                .allows(inbound, *channel, Perm::LISTEN.bits())
+                .await
+            {
+                allowed.push(*channel);
+            } else {
+                denials.push(permission_denied(inbound, Perm::LISTEN, *channel));
+            }
+        }
+        (allowed, denials)
+    }
+
+    /// Clear another user's comment or avatar (`ResetUserContent`).
+    ///
+    /// murmur's rule, and both halves of it matter (`Messages.cpp:1236` for the
+    /// comment, `:1263` for the avatar):
+    ///
+    /// * `ResetUserContent` on the **root** channel — it is a server-wide power
+    ///   over people, not a power over a room, so it is not checked where the
+    ///   target happens to be standing;
+    /// * **the value must be empty.** It is a *reset*, not an edit. A moderator
+    ///   may take down a comment nobody should have to read; replacing it with
+    ///   one of their own choosing would be putting words in somebody else's
+    ///   profile, under that person's name, to every client on the server.
+    ///
+    /// A non-empty value is refused as `TextTooLong` rather than as a permission
+    /// failure, which is upstream's choice too and reads oddly until you notice
+    /// what it is saying: the *permitted* length for somebody else's content is
+    /// zero, so anything at all is over it.
+    async fn on_reset_content(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
+        let target_session = state.session.unwrap_or(inbound.session);
+        let Some(target) = self.connections.by_session(target_session) else {
+            tracing::debug!(
+                session = target_session,
+                "content reset for an unknown session"
+            );
+            return Actions::new();
+        };
+
+        let setting = state.comment.as_ref().is_some_and(|text| !text.is_empty())
+            || state
+                .texture
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty());
+        if setting {
+            tracing::info!(
+                actor = inbound.session,
+                session = target_session,
+                "refusing to write content into another user's profile"
+            );
+            return vec![too_long(inbound)];
+        }
+
+        if !self
+            .permit
+            .allows(inbound, ROOT_CHANNEL, Perm::RESET_USER_CONTENT.bits())
+            .await
+        {
+            tracing::info!(
+                actor = inbound.session,
+                session = target_session,
+                "content reset refused"
+            );
+            return vec![permission_denied(
+                inbound,
+                Perm::RESET_USER_CONTENT,
+                ROOT_CHANNEL,
+            )];
+        }
+
+        // Cleared in both places, because they answer different questions. The
+        // connection record is what every connected client's view is rebuilt
+        // from; the account row is what the target gets back when they
+        // reconnect. Clearing only one leaves the content gone until the next
+        // login, or back again after it.
+        let cleared_comment = state.comment.is_some();
+        let cleared_texture = state.texture.is_some();
+        let _ = self.connections.set_content(
+            target.conn,
+            cleared_comment.then(Vec::new),
+            cleared_texture.then(Vec::new),
+        );
+        if let Some(account) = target.account {
+            self.clear_stored_content(inbound, account, cleared_comment, cleared_texture)
+                .await;
+        }
+
+        self.handshake.context().logger.log(
+            LogEvent::notice(Category::Admin, "user content reset")
+                .with("actor", inbound.session)
+                .with("session", target_session)
+                .with("name", target.name.clone())
+                .with("comment", cleared_comment)
+                .with("texture", cleared_texture),
+        );
+        self.handshake
+            .announce_changed(&self.connections, target.conn)
+            .await;
+
+        // The empty **body**, not an empty hash. murmur only swaps a body for
+        // its hash when the hash is non-empty (`Messages.cpp:1591`), and after a
+        // reset it is not — so what travels is `comment = ""`, which is the one
+        // form every client reads as "this is now blank" rather than as "fetch
+        // it yourself".
+        let echo = tcp::UserState {
+            session: Some(target_session),
+            actor: Some(inbound.session),
+            comment: cleared_comment.then(String::new),
+            texture: cleared_texture.then(Vec::new),
+            ..tcp::UserState::default()
+        };
+        vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())]
+    }
+
+    /// Clear the stored comment or avatar on a registered account.
+    ///
+    /// Best-effort, and reported rather than propagated: the reset has already
+    /// happened everywhere a client can see it, and failing the whole action
+    /// here would leave the operator being told nothing worked when most of it
+    /// did. What the log records is the part that will come back on reconnect.
+    async fn clear_stored_content(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        comment: bool,
+        texture: bool,
+    ) {
+        use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+        use starling_proto_fancy::userdata::{Account, UpdateRequest};
+
+        let mut fields = Vec::new();
+        if comment {
+            fields.push(UserContent::Comment.field().to_owned());
+        }
+        if texture {
+            fields.push(UserContent::Texture.field().to_owned());
+        }
+        let Ok(channel) = self.handshake.resolver().channel("userdata") else {
+            tracing::warn!(account, "userdata is unreachable; the reset is not durable");
+            return;
+        };
+        // `Account::default()` is the point: every hash on it is empty, and
+        // `update` writes exactly the named fields from it.
+        let update = UserDataClient::new(channel)
+            .update(UpdateRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    virtual_server: inbound.scope,
+                }),
+                actor: None,
+                id: account,
+                fields,
+                values: Some(Account::default()),
+                password: String::new(),
+                current_password: String::new(),
+            })
+            .await;
+        if let Err(status) = update {
+            tracing::warn!(
+                %status,
+                account,
+                "could not clear stored user content; it will return on reconnect"
+            );
+        }
     }
 
     /// Store one piece of a user's own content, and return its hash.
@@ -1097,6 +1564,132 @@ fn is_speak_state(state: &tcp::UserState) -> bool {
         || state.deaf.is_some()
         || state.suppress.is_some()
         || state.priority_speaker.is_some()
+}
+
+/// Whether this `UserState` is about channel listeners.
+///
+/// All three fields together, because they are one feature and one handler: a
+/// volume adjustment on its own is still a listener change, and routing it
+/// anywhere else would leave the slider working only when the user happened to
+/// toggle a channel in the same message.
+fn is_listen_state(state: &tcp::UserState) -> bool {
+    !state.listening_channel_add.is_empty()
+        || !state.listening_channel_remove.is_empty()
+        || !state.listening_volume_adjustment.is_empty()
+}
+
+/// Tell everyone what changed about a session's listeners.
+///
+/// Two shapes, decided by `broadcast_volume`:
+///
+/// * **on** — one message to everybody, gains included.
+/// * **off** (the default) — the channels to everybody and the gains to their
+///   owner alone, which takes two messages because one message cannot have two
+///   audiences. murmur sends the same `UserState` twice, appending the
+///   adjustments before the second send (`Messages.cpp:1599`).
+fn announce_listeners(
+    inbound: &Inbound,
+    outcome: &starling_proto_fancy::metadata::ListenResult,
+    broadcast_volume: bool,
+) -> Actions {
+    // Sorted, because the source is a `HashMap`: an unstable order would make
+    // the same change produce different bytes each time, which is invisible in
+    // production and turns any test that reads the message into a coin flip.
+    let mut adjustments: Vec<tcp::user_state::VolumeAdjustment> = outcome
+        .volume
+        .iter()
+        .map(|(channel, gain)| tcp::user_state::VolumeAdjustment {
+            listening_channel: Some(*channel),
+            volume_adjustment: Some(*gain),
+        })
+        .collect();
+    adjustments.sort_by_key(|adjustment| adjustment.listening_channel);
+
+    let mut echo = tcp::UserState {
+        session: Some(inbound.session),
+        actor: Some(inbound.session),
+        listening_channel_add: outcome.added.clone(),
+        listening_channel_remove: outcome.removed.clone(),
+        ..tcp::UserState::default()
+    };
+
+    if broadcast_volume {
+        echo.listening_volume_adjustment = adjustments;
+        return vec![to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec())];
+    }
+
+    let mut actions = Actions::new();
+    if !echo.listening_channel_add.is_empty() || !echo.listening_channel_remove.is_empty() {
+        actions.push(to_sessions(Vec::new(), USER_STATE, echo.encode_to_vec()));
+    }
+    if !adjustments.is_empty() {
+        let mine = tcp::UserState {
+            session: Some(inbound.session),
+            actor: Some(inbound.session),
+            listening_volume_adjustment: adjustments,
+            ..tcp::UserState::default()
+        };
+        actions.push(to_conn(inbound.conn, USER_STATE, mine.encode_to_vec()));
+    }
+    actions
+}
+
+/// Tell the client which listener ceiling refused it.
+///
+/// `PERM_DENIED_FALLBACK` in murmur (`Messages.cpp:1179`): the typed refusal for
+/// a client that knows the enum, and a sentence for one that does not. Both are
+/// sent, because the two deny types post-date Mumble 1.4 and an older client
+/// shows the text.
+fn listener_limit_denied(
+    inbound: &Inbound,
+    refusal: &starling_proto_fancy::metadata::ListenRefusal,
+) -> ServerAction {
+    use starling_proto::proto::tcp::permission_denied::DenyType;
+    use starling_proto_fancy::metadata::listen_refusal::Limit;
+
+    let (kind, reason) = match refusal.limit() {
+        Limit::ChannelFull => (
+            DenyType::ChannelListenerLimit,
+            "No more listeners allowed in this channel",
+        ),
+        Limit::UserFull => (
+            DenyType::UserListenerLimit,
+            "No more listeners allowed for this user",
+        ),
+    };
+    refused_with(inbound, kind, refusal.channel, reason)
+}
+
+/// Whether this `UserState` carries a comment or an avatar.
+///
+/// Aimed at the sender it is a profile edit; aimed at anybody else it is a
+/// reset, and the two are different permissions and different handlers.
+fn is_user_content(state: &tcp::UserState) -> bool {
+    state.comment.is_some() || state.texture.is_some()
+}
+
+/// Whether this `UserState` is an action a client may aim at somebody else.
+///
+/// The **one** list of them, because the cross-session refusal in
+/// [`SessionLifecycleService::on_user_state`] is written as its negation: an
+/// action missing from here is not refused loudly, it is dropped in silence, and
+/// a dropped `UserState` looks exactly like a server that is working. That is
+/// how moving another user (`docs/GAP-ANALYSIS.md` U2) came to be fully
+/// implemented in [`SessionLifecycleService::on_move`], permission checks and
+/// all, and unreachable — the dispatch above it dropped the message before the
+/// handler was ever asked.
+///
+/// Every one of these is checked against a permission by the handler it reaches.
+/// This decides only *which question gets asked*, never the answer.
+fn moderates(state: &tcp::UserState) -> bool {
+    // Mute, deafen, suppress, priority speaker — `MuteDeafen` on the target's
+    // channel.
+    is_speak_state(state)
+        // A move — `Move` on the source, and `Move` on the destination or the
+        // moved user's own `Enter`.
+        || state.channel_id.is_some()
+        // A reset — `ResetUserContent` on the root, and only ever to empty.
+        || is_user_content(state)
 }
 
 /// Whether this `UserState` would take something away from the user it names.
@@ -1535,6 +2128,63 @@ mod tests {
             !is_speak_state(&registering),
             "a registration is not a speak-state change and must not be read as one"
         );
+    }
+
+    #[test]
+    fn dragging_somebody_into_a_channel_reaches_its_handler() {
+        // The U2 regression, and the shape of it is worth keeping: `on_move`
+        // had the whole rule — `Move` on the source, `Move` or the target's own
+        // `Enter` on the destination — and was unreachable for anyone but the
+        // sender, because the cross-session refusal above it dropped the
+        // message first. Nothing failed and nothing was logged; the user simply
+        // did not move.
+        let drag = tcp::UserState {
+            session: Some(9),
+            channel_id: Some(4),
+            ..tcp::UserState::default()
+        };
+        assert!(
+            moderates(&drag),
+            "a move must survive the cross-session guard"
+        );
+        assert!(
+            !is_speak_state(&drag),
+            "and must not be mistaken for a mute, which checks a different permission"
+        );
+    }
+
+    #[test]
+    fn clearing_somebody_elses_profile_reaches_its_handler() {
+        for state in [
+            tcp::UserState {
+                session: Some(9),
+                comment: Some(String::new()),
+                ..tcp::UserState::default()
+            },
+            tcp::UserState {
+                session: Some(9),
+                texture: Some(Vec::new()),
+                ..tcp::UserState::default()
+            },
+        ] {
+            assert!(is_user_content(&state));
+            assert!(moderates(&state), "{state:?} is a ResetUserContent");
+        }
+    }
+
+    #[test]
+    fn a_bare_self_mute_is_not_moderation() {
+        // The other direction: the guard still has to refuse a message that
+        // names somebody else and carries only fields a user sets on themselves.
+        // Letting those through would make self-mute a way to mute anybody.
+        let selfish = tcp::UserState {
+            session: Some(9),
+            self_mute: Some(true),
+            self_deaf: Some(true),
+            ..tcp::UserState::default()
+        };
+        assert!(!moderates(&selfish));
+        assert!(!is_user_content(&selfish));
     }
 
     #[test]

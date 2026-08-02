@@ -66,6 +66,42 @@ impl Target {
     }
 }
 
+/// What a recipient is told about why it is hearing a frame.
+///
+/// The wire field is `target` inbound and `context` outbound, and they are not
+/// the same numbers (`MumbleUDP.proto`). Ordered by directness, which is what
+/// makes [`Audience::add`] able to fold two ways of being reached with `min`.
+pub mod context {
+    /// Someone in the speaker's own channel.
+    pub const NORMAL: u8 = 0;
+    /// Reached because the speaker shouted into their channel.
+    pub const SHOUT: u8 = 1;
+    /// Named personally by a whisper target.
+    pub const WHISPER: u8 = 2;
+    /// Reached through a channel listener rather than by being anywhere near it.
+    pub const LISTEN: u8 = 3;
+}
+
+/// One recipient of a frame, and how they hear it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reception {
+    /// Who receives it.
+    pub session: SessionId,
+
+    /// The `context` value to put on the wire for this recipient — see
+    /// [`context`]. Per recipient and not per frame, because one registered
+    /// target can whisper to a person and shout into a room at once, and one
+    /// channel can be both stood in and listened to.
+    pub context: u8,
+
+    /// The gain the server asks this client to apply, when it is not unity.
+    ///
+    /// `None` rather than `1.0` so the common path puts nothing on the wire:
+    /// protobuf 3 cannot tell an absent float from zero, and the field's own
+    /// documentation makes zero mean unset.
+    pub gain: Option<f32>,
+}
+
 /// Who can hear whom, as of one moment.
 ///
 /// Published by the state service whenever membership changes; never mutated by
@@ -75,6 +111,11 @@ pub struct RoutingSnapshot {
     channel_of: HashMap<SessionId, ChannelId>,
     members: HashMap<ChannelId, Vec<SessionId>>,
     listeners: HashMap<ChannelId, Vec<SessionId>>,
+    /// Per-listener gain, keyed by the listener it belongs to.
+    ///
+    /// Sparse: a listener that never touched the slider has no entry, and unity
+    /// is the answer for every session absent from here.
+    listener_gain: HashMap<(SessionId, ChannelId), f32>,
     /// Cannot receive: deafened, by themselves or by a moderator.
     deaf: HashSet<SessionId>,
     /// Cannot send: muted, self-muted, or suppressed.
@@ -110,6 +151,18 @@ impl RoutingSnapshot {
     #[must_use]
     pub fn with_listener(mut self, session: SessionId, channel: ChannelId) -> Self {
         self.listeners.entry(channel).or_default().push(session);
+        self
+    }
+
+    /// Set the gain a listener has asked for on one of its channels.
+    ///
+    /// Recorded even for a session that is not (yet) a listener of that channel:
+    /// murmur keeps the adjustment alive across the listener being removed and
+    /// re-added, so that turning a channel off and on again does not silently
+    /// reset a slider the user set deliberately.
+    #[must_use]
+    pub fn with_listener_gain(mut self, session: SessionId, channel: ChannelId, gain: f32) -> Self {
+        let _ = self.listener_gain.insert((session, channel), gain);
         self
     }
 
@@ -189,6 +242,22 @@ impl RoutingSnapshot {
     /// packet.
     #[must_use]
     pub fn recipients(&self, speaker: SessionId, target: Target) -> Vec<SessionId> {
+        self.fan_out(speaker, target)
+            .into_iter()
+            .map(|reception| reception.session)
+            .collect()
+    }
+
+    /// Everyone who should receive the frame, each with the context and gain
+    /// their copy carries.
+    ///
+    /// The same question as [`Self::recipients`] and the one the packet path
+    /// actually asks, because a recipient's context is not a property of the
+    /// frame: being in the channel *and* listening to it are two ways to be
+    /// reached, and murmur folds them (`AudioReceiverBuffer.cpp:88`) rather than
+    /// sending two copies.
+    #[must_use]
+    pub fn fan_out(&self, speaker: SessionId, target: Target) -> Vec<Reception> {
         if !self.may_speak(speaker) {
             return Vec::new();
         }
@@ -196,49 +265,62 @@ impl RoutingSnapshot {
         match target {
             // The echo is deliberately exempt from the deaf check: it is a
             // connectivity test, and a deafened client still needs to know
-            // whether its UDP path works.
-            Target::Loopback => vec![speaker],
+            // whether its UDP path works. It is also exempt from `Audience`,
+            // which would drop it for being addressed to the speaker.
+            Target::Loopback => vec![Reception {
+                session: speaker,
+                context: context::NORMAL,
+                gain: None,
+            }],
 
             Target::Normal => {
                 let Some(channel) = self.channel_of(speaker) else {
                     return Vec::new();
                 };
-                self.audience_of(channel)
-                    .filter(|s| *s != speaker && !self.deaf.contains(s))
-                    .collect()
+                let mut audience = Audience::new(speaker, &self.deaf);
+                self.gather_channel(&mut audience, channel, context::NORMAL);
+                audience.finish()
             }
 
             // A slot the speaker filled in advance with `VoiceTarget`. An
             // unregistered slot reaches nobody: falling back to the speaker's
             // channel would send a whisper to exactly the people they excluded.
-            Target::Whisper(slot) => self.whisper_recipients(speaker, slot),
+            Target::Whisper(slot) => self.whisper_fan_out(speaker, slot),
         }
     }
 
     /// Everyone a registered target reaches.
     ///
     /// The union of the users it names and the channels it shouts into, minus
-    /// the speaker and anyone deafened. Deduplicated: a listener named both
-    /// directly and by channel must hear the frame once, not twice.
-    fn whisper_recipients(&self, speaker: SessionId, slot: u8) -> Vec<SessionId> {
+    /// the speaker and anyone deafened. Deduplicated by [`Audience`]: a session
+    /// named both directly and by channel must hear the frame once, not twice.
+    ///
+    /// The users it names get [`context::WHISPER`] and the channels it shouts
+    /// into get [`context::SHOUT`], which is a distinction the client shows:
+    /// murmur sends `SpeechFlags::Whisper` and `SpeechFlags::Shout`, and a
+    /// Mumble client renders and logs the two differently. Telling someone being
+    /// whispered to that they are hearing a room is the failure this avoids.
+    fn whisper_fan_out(&self, speaker: SessionId, slot: u8) -> Vec<Reception> {
         let Some(target) = self.targets.get(speaker, slot) else {
             return Vec::new();
         };
 
-        let mut reached = HashSet::new();
-        reached.extend(target.users().iter().copied());
-        for shout in target.channels() {
-            reached.extend(self.shout_audience(*shout));
+        let mut audience = Audience::new(speaker, &self.deaf);
+        for named in target.users() {
+            // A target outlives the sessions it names, so whispering at somebody
+            // who has since disconnected is routine rather than exceptional.
+            if self.channel_of(*named).is_some() {
+                audience.add(*named, context::WHISPER, None);
+            }
         }
-
-        reached
-            .into_iter()
-            .filter(|s| *s != speaker && !self.deaf.contains(s) && self.channel_of(*s).is_some())
-            .collect()
+        for shout in target.channels() {
+            self.gather_shout(&mut audience, *shout);
+        }
+        audience.finish()
     }
 
     /// Everyone a single shout reaches.
-    fn shout_audience(&self, shout: ShoutTarget) -> Vec<SessionId> {
+    fn gather_shout(&self, audience: &mut Audience, shout: ShoutTarget) {
         let mut channels = vec![shout.channel];
 
         if shout.include_links {
@@ -263,10 +345,9 @@ impl RoutingSnapshot {
             );
         }
 
-        channels
-            .into_iter()
-            .flat_map(|channel| self.audience_of(channel))
-            .collect()
+        for channel in channels {
+            self.gather_channel(audience, channel, context::SHOUT);
+        }
     }
 
     /// Whether `channel` is anywhere below `ancestor`.
@@ -289,13 +370,87 @@ impl RoutingSnapshot {
     }
 
     /// Members of a channel plus anyone listening to it.
-    fn audience_of(&self, channel: ChannelId) -> impl Iterator<Item = SessionId> + '_ {
-        self.members
-            .get(&channel)
-            .into_iter()
-            .flatten()
-            .chain(self.listeners.get(&channel).into_iter().flatten())
-            .copied()
+    ///
+    /// `standing` is the context for people actually in the channel — normal
+    /// speech or a shout, depending on how the channel was reached. Listeners
+    /// always get [`context::LISTEN`] and their own gain, whichever way the
+    /// audio arrived at the channel they are listening to.
+    fn gather_channel(&self, audience: &mut Audience, channel: ChannelId, standing: u8) {
+        for session in self.members.get(&channel).into_iter().flatten() {
+            audience.add(*session, standing, None);
+        }
+        for session in self.listeners.get(&channel).into_iter().flatten() {
+            let gain = self.listener_gain.get(&(*session, channel)).copied();
+            audience.add(*session, context::LISTEN, gain);
+        }
+    }
+}
+
+/// The recipients of one frame, being accumulated.
+///
+/// murmur's `AudioReceiverBuffer`: an ordered list with an index beside it, so
+/// that reaching the same person twice updates their entry instead of appending
+/// a second one. Two copies of a frame is not a wasted packet, it is an audible
+/// echo.
+struct Audience<'a> {
+    /// Excluded from their own fan-out — normal speech echoed back would double
+    /// every speaker's own audio.
+    speaker: SessionId,
+    /// Excluded because they receive nothing at all.
+    deaf: &'a HashSet<SessionId>,
+    order: Vec<Reception>,
+    index: HashMap<SessionId, usize>,
+}
+
+impl<'a> Audience<'a> {
+    fn new(speaker: SessionId, deaf: &'a HashSet<SessionId>) -> Self {
+        Self {
+            speaker,
+            deaf,
+            order: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Record one way of reaching `session`, folding it with any other.
+    ///
+    /// Both folds are murmur's (`AudioReceiverBuffer.cpp:87-90`) and neither is
+    /// arbitrary:
+    ///
+    /// * **context takes the minimum** — the most direct way of being reached
+    ///   wins, so somebody standing in the channel they also listen to is told
+    ///   they are hearing their own room rather than a remote one.
+    /// * **gain takes the maximum** — a listener gain must never quieten audio
+    ///   the session was going to receive anyway at full volume. Being in the
+    ///   channel is unity, so a listener who turned that channel down to 0.2 and
+    ///   then walked into it hears it at 1.0.
+    fn add(&mut self, session: SessionId, context: u8, gain: Option<f32>) {
+        if session == self.speaker || self.deaf.contains(&session) {
+            return;
+        }
+        match self.index.get(&session).copied() {
+            None => {
+                let _ = self.index.insert(session, self.order.len());
+                self.order.push(Reception {
+                    session,
+                    context,
+                    gain,
+                });
+            }
+            Some(at) => {
+                let existing = &mut self.order[at];
+                existing.context = existing.context.min(context);
+                // `None` is unity, and unity beats any attenuation.
+                existing.gain = match (existing.gain, gain) {
+                    (Some(held), Some(new)) => Some(held.max(new)),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<Reception> {
+        self.order
     }
 }
 
@@ -392,6 +547,107 @@ mod tests {
                 .recipients(ALICE, Target::Normal)
                 .contains(&SessionId(9))
         );
+    }
+
+    /// How `session` hears the frame, or `None` if they do not.
+    fn heard_by(
+        snapshot: &RoutingSnapshot,
+        session: SessionId,
+        target: Target,
+    ) -> Option<Reception> {
+        snapshot
+            .fan_out(ALICE, target)
+            .into_iter()
+            .find(|reception| reception.session == session)
+    }
+
+    #[test]
+    fn a_listener_is_told_it_is_hearing_a_channel_it_is_not_in() {
+        // Context 3, which is what makes a client render it as a listener rather
+        // than as somebody in the room.
+        let listener = SessionId(9);
+        let snapshot = lobby_with_three().with_listener(listener, LOBBY);
+        let reception =
+            heard_by(&snapshot, listener, Target::Normal).expect("the listener heard nothing");
+        assert_eq!(reception.context, context::LISTEN);
+        assert_eq!(reception.gain, None, "an untouched slider is not a gain");
+    }
+
+    #[test]
+    fn a_listener_gain_rides_along_with_the_frame() {
+        let listener = SessionId(9);
+        let snapshot = lobby_with_three()
+            .with_listener(listener, LOBBY)
+            .with_listener_gain(listener, LOBBY, 0.25);
+        assert_eq!(
+            heard_by(&snapshot, listener, Target::Normal).and_then(|r| r.gain),
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn standing_in_a_channel_you_also_listen_to_is_heard_once_and_plainly() {
+        // murmur folds the two ways of being reached rather than sending two
+        // copies, and takes the *minimum* context: Bob is in the lobby, so he is
+        // told he is hearing his own room, not a remote one.
+        let snapshot = lobby_with_three().with_listener(BOB, LOBBY);
+        let heard = snapshot.fan_out(ALICE, Target::Normal);
+        assert_eq!(
+            heard.iter().filter(|r| r.session == BOB).count(),
+            1,
+            "two copies of a frame is an audible echo, not a wasted packet"
+        );
+        assert_eq!(
+            heard_by(&snapshot, BOB, Target::Normal).map(|r| r.context),
+            Some(context::NORMAL)
+        );
+    }
+
+    #[test]
+    fn a_listener_gain_never_quietens_audio_that_was_already_unity() {
+        // Bob turned the lobby down to a fifth and then walked into it. Being in
+        // the channel is unity, and murmur takes the louder of the two — the
+        // slider is for a room you are listening to from elsewhere.
+        let snapshot = lobby_with_three()
+            .with_listener(BOB, LOBBY)
+            .with_listener_gain(BOB, LOBBY, 0.2);
+        assert_eq!(
+            heard_by(&snapshot, BOB, Target::Normal).and_then(|r| r.gain),
+            None
+        );
+    }
+
+    #[test]
+    fn a_listener_hears_a_shout_into_the_channel_it_listens_to() {
+        // The shout reaches the channel; the listener is attached to the
+        // channel, so it reaches them too — but as a listener, with their gain.
+        let listener = SessionId(9);
+        let snapshot = lobby_with_three()
+            .with_member(SessionId(4), ANNEX)
+            .with_listener(listener, ANNEX)
+            .with_listener_gain(listener, ANNEX, 0.5)
+            .with_target(ALICE, 4, VoiceTarget::new().shouting_to(shout(ANNEX)));
+        let reception =
+            heard_by(&snapshot, listener, Target::Whisper(4)).expect("the listener heard nothing");
+        assert_eq!(reception.context, context::LISTEN);
+        assert_eq!(reception.gain, Some(0.5));
+    }
+
+    #[test]
+    fn a_deafened_listener_hears_nothing() {
+        let listener = SessionId(9);
+        let snapshot = lobby_with_three()
+            .with_listener(listener, LOBBY)
+            .with_deaf(listener);
+        assert!(heard_by(&snapshot, listener, Target::Normal).is_none());
+    }
+
+    #[test]
+    fn listening_to_your_own_channel_does_not_echo_you_back() {
+        // A client that listens to the room it is standing in must not start
+        // hearing its own voice.
+        let snapshot = lobby_with_three().with_listener(ALICE, LOBBY);
+        assert!(heard_by(&snapshot, ALICE, Target::Normal).is_none());
     }
 
     #[test]

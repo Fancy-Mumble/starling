@@ -24,6 +24,19 @@ service Permissions {
   rpc CheckSession(SessionCheckRequest) returns (starling.common.v1.Decision);
   rpc GetAcl(AclRequest) returns (AclSet);
   rpc SetAcl(SetAclRequest) returns (AclResult);
+  // Put somebody in a group without editing the ACL table.
+  //
+  // murmur's `addUserToGroup`/`removeUserFromGroup` (`MumbleServer.ice:728`),
+  // whose whole point is what it is keyed on. Permanent membership is recorded
+  // by *account* id, so an unregistered guest can never be in a named group by
+  // any other means; a temporary membership may name a **session**, and that is
+  // the only mechanism upstream has for the case.
+  //
+  // Deliberately not durable, exactly as upstream ("This state is not saved").
+  // A session-scoped grant that survived a restart would be a grant attached to
+  // a session id that now belongs to somebody else.
+  rpc AddTemporaryGroup(TemporaryGroupRequest) returns (AclResult);
+  rpc RemoveTemporaryGroup(TemporaryGroupRequest) returns (AclResult);
   // A revocation invalidates before it is acknowledged; a grant may arrive
   // lazily. A stale deny is safe, a stale grant is a security bug.
   rpc WatchInvalidations(starling.common.v1.Scope) returns (stream Invalidation);
@@ -56,8 +69,28 @@ message Subject {
   // client — which put anonymous guests in `@auth` alongside registered users.
   // The field number is unchanged; only the name and its meaning are.
   bool registered = 4;
+  // The access tokens the client presented, for `#token` group specifications.
+  //
+  // murmur's `ServerUser::qslAccessTokens`, matched **case-insensitively**
+  // (`vendor/server/src/Group.cpp:16`) — a channel password typed with the
+  // wrong capitalisation still opens the channel, and an operator who cased
+  // the ACL entry differently from the password has not locked anybody out.
   repeated string tokens = 5;
   bytes cert_hash = 6;
+  // The channel the subject is *in*, which is not the channel being evaluated.
+  //
+  // `in`, `out` and `sub` are the whole reason this is here: they compare where
+  // the user is standing against the channel the ACL is being evaluated for, so
+  // an evaluator that knows only the target cannot answer any of them
+  // (`vendor/server/src/Group.cpp:158`).
+  uint32 channel = 7;
+  // Whether the subject's certificate chained to a configured CA.
+  //
+  // murmur's `bVerified`, and the `strong` group. False for the self-signed
+  // certificate a stock Mumble client generates, which is the ordinary case —
+  // so `strong` is the one predicate here that means "an authority vouched for
+  // this", and it must never be inferred from merely *having* a certificate.
+  bool strong_cert = 8;
 }
 
 message EffectiveResponse {
@@ -84,6 +117,15 @@ message SessionCheckRequest {
   uint32 channel = 3;
   // The bit being asked for. More than one bit means all of them are required.
   uint32 permission = 4;
+  // Tokens that apply to **this check only**.
+  //
+  // murmur's `UserState.temporary_access_tokens` (`Messages.cpp:1133`): a
+  // client sends the channel's password along with the request to enter it,
+  // rather than storing it. Upstream adds them to the user for the duration of
+  // one message and takes them away again in a destructor; carried on the
+  // request here for the same reason, since writing them onto the session would
+  // make a password typed once outlive the door it opened.
+  repeated string temporary_tokens = 5;
 }
 
 message AclRequest {
@@ -127,6 +169,34 @@ message SetAclRequest {
 message AclResult {
   bool applied = 1;
   string refused = 2;
+}
+
+// One temporary group membership, added or removed.
+message TemporaryGroupRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  // The channel the group is declared on. The membership is scoped to it, and
+  // reaches sub-channels only as far as the group's own `inheritable` allows.
+  uint32 channel = 3;
+  // The group name, without any of the `!~#$` prefixes — this names a group,
+  // it is not a specification to be parsed.
+  string group = 4;
+  // Who holds it.
+  //
+  // A `oneof` rather than upstream's single integer set, where an account is a
+  // positive number and a session is stored as its negation
+  // (`vendor/server/src/Group.cpp:242`). That encoding has a real collision: an
+  // unregistered user's account reads as `-1`, so upstream's own `session 1`
+  // is indistinguishable from "any guest". Naming the two cases costs nothing
+  // and cannot be got wrong.
+  oneof member {
+    // A registered account. Held until it is removed or the server restarts.
+    uint64 account = 5;
+    // A live session. Dropped the moment that session goes, because session ids
+    // are reused (`vendor/server/src/murmur/Server.cpp:1904` re-queues them) and
+    // a grant outliving its holder would be inherited by the next arrival.
+    uint32 session = 6;
+  }
 }
 
 // Which cached decisions a subscriber must throw away.

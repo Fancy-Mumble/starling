@@ -23,6 +23,7 @@ const SERVICES: &[&str] = &[
     "push.proto",
     "plugins.proto",
     "contextactions.proto",
+    "health.proto",
 ];
 
 /// Client-facing envelopes: message types only, never an RPC surface.

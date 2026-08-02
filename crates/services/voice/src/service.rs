@@ -17,6 +17,9 @@ use starling_gate::{Gate, MumbleVersion, UdpFormat};
 use starling_proto::MUMBLE_VERSION;
 use starling_proto::proto::tcp;
 use starling_proto_fancy::common::{Ack, Scope};
+use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+use starling_proto_fancy::metadata::{TreeEvent, TreeRequest, tree_event};
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::serverconfig::GetRequest as ConfigRequest;
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
@@ -27,15 +30,19 @@ use starling_proto_fancy::voice::{
     CryptMaterial, EndpointRequest, ForgetRequest, MintRequest, PeerStats, ResyncRequest,
     StatsRequest, VoiceEndpoint,
 };
+use starling_runtime::channel::Resolver;
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use tonic::{Request, Response, Status};
 
 use crate::packet::ServerDetails;
 use crate::peer::VoicePeer;
-use crate::ports::{AudioSource, SessionId};
+use crate::ports::{AudioSource, ChannelId, SessionId};
 use crate::router::Router;
 use crate::socket::{NoDatagrams, VoiceSocket};
+use crate::targets::{ShoutTarget, TargetRegistry};
+use crate::tree::ChannelTree;
 use crate::tunnel::GatewayTunnel;
 use crate::view::SessionCache;
 
@@ -94,6 +101,17 @@ pub struct VoiceService {
     router: Mutex<Router>,
     /// Who is in which channel, and who may be heard.
     view: SessionCache,
+    /// How the channels relate, for a shout that carries into links or children.
+    tree: ChannelTree,
+    /// Every session's registered whisper and shout slots.
+    ///
+    /// Held here rather than inside the snapshot because the two have different
+    /// lifetimes: a snapshot is rebuilt from scratch on every membership change,
+    /// and targets registered minutes ago must survive that. Composing them in
+    /// on each publish is what makes a whisper outlive somebody else joining.
+    targets: Mutex<TargetRegistry>,
+    /// Asks `permissions` before a client may whisper or shout somewhere.
+    permit: Permit,
 }
 
 impl VoiceService {
@@ -225,6 +243,11 @@ impl VoiceService {
         if let Some(socket) = &self.socket {
             socket.forget(SessionId(session));
         }
+        // The slots go with the session. Left behind they are a leak of one
+        // entry per disconnect — and worse, a recycled session id would inherit
+        // whoever last held it as its whisper list.
+        drop(sessions);
+        self.forget_targets(SessionId(session));
     }
 
     /// Follow `session-view`, so the packet path knows who hears whom.
@@ -282,13 +305,108 @@ impl VoiceService {
         match event.event {
             Some(view_event::Event::Snapshot(list)) => self.view.replace(list.sessions),
             Some(view_event::Event::Upsert(session)) => self.view.upsert(session),
-            Some(view_event::Event::Gone(gone)) => self.view.remove(gone.session),
+            Some(view_event::Event::Gone(gone)) => {
+                self.view.remove(gone.session);
+                // A session that has gone takes its slots with it. Skipping this
+                // leaks one entry per disconnect for the life of the process —
+                // and a recycled session id would inherit a stranger's whisper
+                // list, which is the same leak wearing a much worse face.
+                self.forget_targets(SessionId(gone.session));
+            }
             // A config change composes nothing here: the numbers a ping reports
             // are refreshed on their own timer, and membership is unaffected.
             Some(view_event::Event::ConfigVersion(_)) | None => return,
         }
-        let snapshot = self.view.snapshot();
+        self.publish();
+    }
+
+    /// Fold one tree event into the snapshot.
+    ///
+    /// Separate from the view because they come from different authorities:
+    /// `metadata` owns how channels relate and `session-view` owns who is in
+    /// them. Both write into the same snapshot, and each writes only its own
+    /// fields.
+    fn apply_tree_event(&self, event: TreeEvent) {
+        match event.event {
+            Some(tree_event::Event::Snapshot(tree)) => self.tree.replace(tree.channels),
+            Some(tree_event::Event::Upsert(channel)) => self.tree.upsert(&channel),
+            Some(tree_event::Event::Removed(channel)) => self.tree.remove(channel),
+            // Membership, which `session-view` already publishes and this
+            // service already reads. Folding it in here as well would give the
+            // snapshot two sources for one fact, and the one that fell behind
+            // would be invisible.
+            Some(tree_event::Event::Moved(_)) | None => return,
+        }
+        self.publish();
+    }
+
+    /// Rebuild the view the packet path routes against, from all three sources.
+    ///
+    /// Membership, then the tree, then the registered targets — in that order
+    /// because each is a layer over the last, and because a snapshot rebuilt
+    /// from membership alone silently drops every whisper anyone had registered.
+    /// That was the shape of the bug this ordering exists to prevent: a shout
+    /// that worked until the next person joined.
+    fn publish(&self) {
+        let snapshot = self.tree.apply(self.view.snapshot());
+        let snapshot = match self.targets.lock() {
+            Ok(targets) => snapshot.with_targets(targets.clone()),
+            // A poisoned lock costs whispers, not speech. Publishing without
+            // them beats not publishing at all, which would freeze membership.
+            Err(poisoned) => snapshot.with_targets(poisoned.into_inner().clone()),
+        };
         self.router().publish(snapshot);
+    }
+
+    /// Drop every slot a session registered.
+    fn forget_targets(&self, session: SessionId) {
+        match self.targets.lock() {
+            Ok(mut targets) => targets.forget(session),
+            Err(poisoned) => poisoned.into_inner().forget(session),
+        }
+    }
+
+    /// Follow `metadata`, so a shout knows which channels are linked.
+    ///
+    /// Re-subscribes on failure, like the view. Readiness deliberately does
+    /// **not** gate on this: a cold tree costs a shout its links, while a cold
+    /// membership table costs the server all of its audio, and refusing to
+    /// serve either until both are warm would trade the second failure for the
+    /// first.
+    fn follow_tree(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            loop {
+                self.read_tree(&ctx, scope).await;
+                tokio::time::sleep(VIEW_RETRY).await;
+            }
+        })
+    }
+
+    /// One tree subscription, from opening it to the stream ending.
+    async fn read_tree(&self, ctx: &ServiceContext, scope: u32) {
+        let Ok(channel) = ctx.resolver.channel("metadata") else {
+            // Worth a line, but not a warning: every shout still reaches the
+            // channel it named, and normal speech is untouched.
+            tracing::debug!("cannot reach metadata; a shout will not carry into links");
+            return;
+        };
+        let Ok(stream) = MetadataClient::new(channel)
+            .watch(TreeRequest {
+                scope: Some(Scope {
+                    virtual_server: scope,
+                }),
+            })
+            .await
+        else {
+            return;
+        };
+
+        let mut events = stream.into_inner();
+        while let Ok(Some(event)) = events.message().await {
+            self.apply_tree_event(event);
+        }
+        tracing::debug!("the metadata subscription ended; channel links are now stale");
     }
 
     /// Keep the numbers a ping is answered with current, until aborted.
@@ -378,20 +496,90 @@ impl Voice for VoiceRpc {
         Ok(Response::new(self.0.mint(&request.into_inner())))
     }
 
+    /// Put a peer whose UDP nonce has drifted back in step.
+    ///
+    /// murmur's `Server::msgCryptSetup` (`Messages.cpp:2117`), with one
+    /// divergence that the cipher axis forces. Upstream has exactly one cipher
+    /// and so exactly one answer — swap an IV — while here the answer depends on
+    /// whether the peer's cipher *has* an IV to swap:
+    ///
+    /// | asked | OCB2 | `XChaCha20-Poly1305` |
+    /// |---|---|---|
+    /// | *tell me yours* | the nonce we seal under | fresh key material |
+    /// | *adopt mine* | adopted, no reply | fresh key material |
+    ///
+    /// The right-hand column is not a shortcut. That cipher folds its salt into
+    /// a derived subkey and reconstructs the counter from the wire, so there is
+    /// no nonce either side could hand over; re-keying is the only recovery it
+    /// has, and it is the one thing that always works.
+    ///
+    /// **A re-key is the fallback and never the first answer.** It throws away a
+    /// working key and drops the peer back to tunnelling until its next datagram
+    /// authenticates, which is a real cost to pay on a peer that only needed to
+    /// be told where the counter had got to.
     async fn resync(
         &self,
         request: Request<ResyncRequest>,
     ) -> Result<Response<CryptMaterial>, Status> {
         let req = request.into_inner();
-        // Repeated resyncs for one session mean the client's audio never
-        // decrypts, which the user experiences as silence with a connection
-        // that looks fine — worth a line, because nothing else reports it.
-        tracing::info!(session = req.session, "voice crypt resync requested");
+        let session = SessionId(req.session);
 
-        // Everything but the key material is carried across from the original
-        // mint. Re-deriving the cipher from a fresh guess would hand a stock
-        // client the modern cipher on its second try — a silent, one-sided
-        // upgrade halfway through a call.
+        match starling_crypto::ResyncRequest::classify(req.client_nonce.as_deref()) {
+            // The peer says where it is. Believing it is safe only because every
+            // packet still has to authenticate afterwards — the nonce is a hint
+            // about where to look, not a credential.
+            starling_crypto::ResyncRequest::AdoptTheirs { nonce } => {
+                if self.0.router().adopt_recv_nonce(session, nonce) {
+                    tracing::info!(
+                        session = req.session,
+                        "adopted a peer's voice nonce; its audio should decrypt again"
+                    );
+                    // Nothing goes back, as in murmur. A client that sent its own
+                    // nonce is not waiting for an answer, and a `CryptSetup` it
+                    // did not ask for is one it may act on.
+                    return Ok(Response::new(CryptMaterial::default()));
+                }
+                tracing::info!(
+                    session = req.session,
+                    len = nonce.len(),
+                    "this peer's cipher cannot adopt a nonce; re-keying instead"
+                );
+            }
+
+            // The peer is lost and wants ours. Answering with the nonce we seal
+            // under — never the one we expect from it — is what makes this
+            // recoverable: the client installs it as what to *expect*, and
+            // handing over the receive half would tell it to look for its own
+            // packets coming back.
+            starling_crypto::ResyncRequest::SendMine => {
+                if let Some(nonce) = self.0.router().send_nonce(session) {
+                    tracing::info!(
+                        session = req.session,
+                        "answering a voice resync with the current send nonce"
+                    );
+                    let payload = tcp::CryptSetup {
+                        // The nonce alone. A key here would be read as a whole
+                        // new session by a client that only asked where the
+                        // counter was, and murmur sends none either.
+                        key: None,
+                        client_nonce: None,
+                        server_nonce: Some(nonce),
+                    }
+                    .encode_to_vec();
+                    return Ok(Response::new(CryptMaterial {
+                        crypt_setup: payload,
+                        // Unchanged, and said so: this path re-keys nothing.
+                        cipher: String::new(),
+                    }));
+                }
+            }
+        }
+
+        // Re-keying, because the peer's cipher has no nonce to trade. Everything
+        // but the key material is carried across from the original mint:
+        // re-deriving the profile from a fresh guess would hand a stock client
+        // the modern cipher on its second try, or protobuf framing to a 1.4
+        // client — a silent, one-sided upgrade halfway through a call.
         let Some(previous) = self
             .0
             .sessions
@@ -404,6 +592,10 @@ impl Voice for VoiceRpc {
             tracing::warn!(session = req.session, "resync for an unknown session");
             return Ok(Response::new(CryptMaterial::default()));
         };
+        tracing::info!(
+            session = req.session,
+            "re-keying a peer that asked to resync"
+        );
         Ok(Response::new(self.0.mint(&MintRequest {
             session: req.session,
             scope: req.scope,
@@ -478,7 +670,7 @@ impl ClientService for VoiceService {
                 // who is the one person who must not hear it.
                 Actions::new()
             }
-            VOICE_TARGET => Actions::new(),
+            VOICE_TARGET => self.on_voice_target(&inbound).await,
             _ => Actions::new(),
         }
     }
@@ -489,6 +681,160 @@ impl ClientService for VoiceService {
         // per connection, for the life of the process.
         self.detach(conn);
         Actions::new()
+    }
+}
+
+impl VoiceService {
+    /// `VoiceTarget`(19): a client filling in one of its thirty target slots.
+    ///
+    /// Mumble's audio header has five bits of target. Zero is normal speech and
+    /// 31 is the loopback; the thirty in between mean nothing until a client
+    /// says what they mean, which is what this message does. Afterwards the
+    /// client sends audio at that number and the routing core resolves it
+    /// ([`crate::targets`]).
+    ///
+    /// # Why the permission check is here and not on the packet path
+    ///
+    /// Shouting into a channel takes `Whisper` there, and whispering to a person
+    /// takes `Whisper` in *their* channel (`Messages.cpp`, murmur's
+    /// `Server::processMsg`). Asking `permissions` per packet is out of the
+    /// question — **nothing on the packet path may make a request**
+    /// (`docs/ARCHITECTURE.md` §3) — so it is asked once, here, and the slot
+    /// stores only what was allowed. murmur reaches the same place from the
+    /// other direction: it checks at cache-build time and reuses the answer.
+    ///
+    /// The divergence that leaves is worth stating plainly: **a right revoked
+    /// after registration is not noticed until the client registers again.**
+    /// murmur invalidates its whisper cache when an ACL changes and this does
+    /// not, so a user who loses `Whisper` keeps a slot that still resolves.
+    /// Narrowing that means an invalidation signal voice does not currently
+    /// receive, not a check in a different place.
+    ///
+    /// # What is refused rather than trimmed
+    ///
+    /// A refused *channel* is told to the client as a `PermissionDenied`. murmur
+    /// answers `VoiceTarget` with nothing at all, but a shout key that silently
+    /// does nothing is precisely the failure this whole file is about: the user
+    /// presses it, hears their own sidetone, and has no way to learn they lack
+    /// the permission.
+    async fn on_voice_target(&self, inbound: &Inbound) -> Actions {
+        let Ok(request) = tcp::VoiceTarget::decode(inbound.payload.as_slice()) else {
+            tracing::debug!(conn = inbound.conn, "undecodable VoiceTarget");
+            return Actions::new();
+        };
+
+        // Five bits on the wire, so anything wider cannot arrive honestly — but
+        // this is a TCP message and a hostile peer writes what it likes.
+        let Some(slot) = request.id.and_then(|id| u8::try_from(id).ok()) else {
+            tracing::debug!(
+                session = inbound.session,
+                id = request.id,
+                "VoiceTarget for a slot that cannot exist"
+            );
+            return Actions::new();
+        };
+
+        let mut target = crate::targets::VoiceTarget::new();
+        let mut refused = None;
+
+        for entry in &request.targets {
+            // An ACL group narrows a shout to that group's members, and murmur
+            // takes `Speak` rather than `Whisper` for it. Voice knows nobody's
+            // group membership — it is `permissions`' to resolve, and there is
+            // no per-packet route to it — so this is dropped rather than widened
+            // to the whole channel. Widening would send a shout meant for one
+            // group to everyone in the room, which is the unsafe direction.
+            if entry.group.as_deref().is_some_and(|g| !g.is_empty()) {
+                tracing::info!(
+                    session = inbound.session,
+                    slot,
+                    group = entry.group.as_deref().unwrap_or_default(),
+                    "group-scoped shout targets are not resolved; this entry reaches nobody"
+                );
+                continue;
+            }
+
+            for whispered in &entry.session {
+                // The permission is on the channel the *recipient* is in, not
+                // the speaker's: whispering is a right to reach into a room.
+                let Some(channel) = self.view.channel_of(*whispered) else {
+                    tracing::debug!(
+                        session = inbound.session,
+                        target = *whispered,
+                        "whisper target is not on this server"
+                    );
+                    continue;
+                };
+                if self.may_whisper_into(inbound, channel).await {
+                    target = target.whispering_to(SessionId(*whispered));
+                } else {
+                    tracing::info!(
+                        session = inbound.session,
+                        target = *whispered,
+                        channel,
+                        "whisper refused: no Whisper in the target's channel"
+                    );
+                    refused = refused.or(Some(channel));
+                }
+            }
+
+            let Some(channel) = entry.channel_id else {
+                continue;
+            };
+            if self.may_whisper_into(inbound, channel).await {
+                target = target.shouting_to(ShoutTarget {
+                    channel: ChannelId(channel),
+                    include_links: entry.links.unwrap_or(false),
+                    include_children: entry.children.unwrap_or(false),
+                });
+            } else {
+                tracing::info!(
+                    session = inbound.session,
+                    slot,
+                    channel,
+                    "shout refused: no Whisper in that channel"
+                );
+                refused = refused.or(Some(channel));
+            }
+        }
+
+        let stored = self.register(SessionId(inbound.session), slot, target);
+        if let Err(error) = stored {
+            tracing::info!(session = inbound.session, slot, %error, "VoiceTarget refused");
+            return Actions::new();
+        }
+        self.publish();
+
+        match refused {
+            // Told, not dropped. A shout key that does nothing and says nothing
+            // is indistinguishable from a broken server.
+            Some(channel) => vec![permission_denied(inbound, Perm::WHISPER, channel)],
+            None => Actions::new(),
+        }
+    }
+
+    /// Whether this client may whisper or shout into `channel`.
+    ///
+    /// One permission for both, as upstream has it: `Whisper` is the right to
+    /// put audio into a room you are not in, and how you addressed it does not
+    /// change what you are doing.
+    async fn may_whisper_into(&self, inbound: &Inbound, channel: u32) -> bool {
+        self.permit
+            .allows(inbound, channel, Perm::WHISPER.bits())
+            .await
+    }
+
+    /// Store one slot, whatever state a previous caller left the registry in.
+    fn register(
+        &self,
+        session: SessionId,
+        slot: u8,
+        target: crate::targets::VoiceTarget,
+    ) -> Result<(), crate::targets::TargetError> {
+        match self.targets.lock() {
+            Ok(mut targets) => targets.set(session, slot, target),
+            Err(poisoned) => poisoned.into_inner().set(session, slot, target),
+        }
     }
 }
 
@@ -552,6 +898,9 @@ impl Serve for VoiceService {
             fanout: Fanout::default(),
             router,
             view: SessionCache::new(),
+            tree: ChannelTree::new(),
+            targets: Mutex::new(TargetRegistry::new()),
+            permit: Permit::new(Resolver::clone(&ctx.resolver)),
         }))
     }
 
@@ -565,6 +914,7 @@ impl Serve for VoiceService {
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let refresher = self.clone().refresh_details(ctx.clone());
         let follower = self.clone().follow_view(ctx.clone());
+        let tree = self.clone().follow_tree(ctx.clone());
 
         match self.socket.clone() {
             Some(socket) => self.udp_loop(&ctx, &socket).await,
@@ -576,6 +926,7 @@ impl Serve for VoiceService {
 
         refresher.abort();
         follower.abort();
+        tree.abort();
         Ok(())
     }
 }
@@ -672,7 +1023,7 @@ impl Minted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{as_client_hears, as_client_sends};
+    use crate::testing::{as_client_hears, as_client_sends, as_client_sends_to};
     use bytes::Bytes;
     use starling_crypto::{LegacyKeys, Ocb2, VoiceCipher, VoiceKeys, XChaCha20Voice, ocb2::Block};
     use starling_gate::{Capability, CipherChoice, FancyVersion};
@@ -702,6 +1053,19 @@ mod tests {
                 },
             )),
             view: SessionCache::new(),
+            tree: ChannelTree::new(),
+            targets: Mutex::new(TargetRegistry::new()),
+            // Points at a socket nothing is serving, so every permission check
+            // denies. That is the right default for a test double: a whisper
+            // that works here works because it was allowed, not because nobody
+            // asked — and `Permit` failing closed is itself asserted in
+            // `starling-runtime`.
+            permit: Permit::new(Resolver::new(
+                Arc::new(starling_runtime::config::Config::with_defaults(
+                    std::path::Path::new("/run/starling"),
+                )),
+                starling_runtime::inproc::Broker::new(),
+            )),
         })
     }
 
@@ -842,6 +1206,331 @@ mod tests {
         assert_ne!(first.crypt_setup, second.crypt_setup, "fresh material");
         let _ = FancyVersion::from_wire(0);
         let _ = CipherChoice::Ocb2Aes128;
+    }
+
+    /// A `CryptSetup` a peer would send to ask for a resync.
+    fn resync_of(session: u32, client_nonce: Option<Vec<u8>>) -> ResyncRequest {
+        ResyncRequest {
+            scope: None,
+            session,
+            client_nonce,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_asking_where_the_counter_is_gets_the_nonce_and_keeps_its_key() {
+        // murmur's answer (`Messages.cpp:2117`): the nonce the server seals
+        // under, and nothing else. Re-keying instead would work — the client
+        // accepts a full `CryptSetup` — but it throws away a good key and drops
+        // the peer back to tunnelling until its next datagram authenticates, for
+        // a peer that only needed telling where the counter had got to.
+        let service = service();
+        // Fancy version 0 is a stock client, so OCB2: the cipher that has a
+        // nonce to trade. This whole path does not exist for the other one.
+        let minted = service.mint(&mint_request(1, 42, 0, MUMBLE_1_6));
+        let rpc = VoiceRpc(Arc::clone(&service));
+
+        let answer = rpc
+            .resync(Request::new(resync_of(42, None)))
+            .await
+            .expect("resync is answered")
+            .into_inner();
+
+        let reply = tcp::CryptSetup::decode(answer.crypt_setup.as_slice())
+            .expect("the answer is a CryptSetup");
+        assert!(
+            reply.server_nonce.is_some_and(|nonce| nonce.len() == 16),
+            "the client sets its decrypt IV from this; anything else is silence"
+        );
+        assert_eq!(
+            reply.key, None,
+            "a key here reads as a whole new session to a peer that only asked where the counter was"
+        );
+        assert_eq!(reply.client_nonce, None);
+
+        // The session was not re-minted, which is the point of the branch.
+        let after = service
+            .sessions
+            .lock()
+            .expect("lock")
+            .get(&42)
+            .expect("still here")
+            .remint();
+        assert_eq!(after.conn, 1);
+        assert!(!minted.crypt_setup.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_peer_offering_its_own_nonce_is_adopted_and_told_nothing() {
+        // The other direction, and murmur sends no reply for it. A `CryptSetup`
+        // the client did not ask for is one it may act on — installing a nonce
+        // it never requested, from a message it read as an answer.
+        let service = service();
+        let _ = service.mint(&mint_request(1, 43, 0, MUMBLE_1_6));
+        let rpc = VoiceRpc(Arc::clone(&service));
+
+        let answer = rpc
+            .resync(Request::new(resync_of(43, Some(vec![0x5A; 16]))))
+            .await
+            .expect("resync is answered")
+            .into_inner();
+
+        assert!(
+            answer.crypt_setup.is_empty(),
+            "an adopted nonce is answered with silence, as upstream answers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nonce_the_cipher_cannot_use_falls_back_to_re_keying() {
+        // The peer meant to hand one over and the cipher refused the width. Left
+        // there it would be a resync that reported success and changed nothing —
+        // so the fallback that always works is taken instead.
+        let service = service();
+        let first = service.mint(&mint_request(1, 44, 0, MUMBLE_1_6));
+        let rpc = VoiceRpc(Arc::clone(&service));
+
+        let answer = rpc
+            .resync(Request::new(resync_of(44, Some(vec![0x11; 8]))))
+            .await
+            .expect("resync is answered")
+            .into_inner();
+
+        let reply = tcp::CryptSetup::decode(answer.crypt_setup.as_slice())
+            .expect("the answer is a CryptSetup");
+        assert!(reply.key.is_some(), "a re-key carries the whole material");
+        assert_ne!(answer.crypt_setup, first.crypt_setup, "fresh material");
+    }
+
+    #[tokio::test]
+    async fn a_resync_for_a_session_nobody_minted_is_answered_with_nothing() {
+        // Not a panic and not an error: a peer that has just gone can have a
+        // frame still in flight behind it.
+        let rpc = VoiceRpc(service());
+        let answer = rpc
+            .resync(Request::new(resync_of(999, None)))
+            .await
+            .expect("resync is answered")
+            .into_inner();
+        assert!(answer.crypt_setup.is_empty());
+    }
+
+    /// What a client sends to fill in one of its target slots.
+    fn voice_target(slot: u32, entry: tcp::voice_target::Target) -> Vec<u8> {
+        tcp::VoiceTarget {
+            id: Some(slot),
+            targets: vec![entry],
+        }
+        .encode_to_vec()
+    }
+
+    /// Deliver a `VoiceTarget` as the gateway would.
+    async fn register(service: &VoiceService, session: u32, payload: Vec<u8>) -> Actions {
+        service
+            .frame(Inbound {
+                conn: 1,
+                session,
+                type_id: VOICE_TARGET,
+                payload,
+                gateway: String::new(),
+                scope: 1,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_shout_nobody_authorised_is_refused_and_the_client_is_told() {
+        // `permissions` is unreachable in this double, so every check denies —
+        // which is the property being asserted. A voice service that let a
+        // shout through because it could not reach the permission service would
+        // put audio into a channel on the strength of an outage.
+        //
+        // And the refusal is *sent*. murmur answers `VoiceTarget` with nothing
+        // at all, but a shout key that silently does nothing is the failure this
+        // whole path exists to remove: the user presses it, hears their own
+        // sidetone, and never learns they lack the permission.
+        let service = service();
+        let _ = service.mint(&mint_request(1, 100, 0, MUMBLE_1_6));
+        all_in_the_lobby(&service, &[100, 200]);
+
+        let actions = register(
+            &service,
+            100,
+            voice_target(
+                3,
+                tcp::voice_target::Target {
+                    channel_id: Some(0),
+                    ..tcp::voice_target::Target::default()
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "the client must be told why nothing works"
+        );
+        assert!(
+            service
+                .targets
+                .lock()
+                .expect("lock")
+                .get(SessionId(100), 3)
+                .is_none(),
+            "a refused channel was stored anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_slot_is_refused_rather_than_clamped() {
+        // Slot 0 is normal speech and 31 is the client's own connectivity probe.
+        // Silently rewriting either breaks the client, not the request.
+        let service = service();
+        all_in_the_lobby(&service, &[100]);
+
+        for slot in [0, 31, 40] {
+            let actions = register(
+                &service,
+                100,
+                voice_target(slot, tcp::voice_target::Target::default()),
+            )
+            .await;
+            assert!(actions.is_empty(), "slot {slot}");
+            assert!(
+                service
+                    .targets
+                    .lock()
+                    .expect("lock")
+                    .get(SessionId(100), 0)
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_scoped_shout_reaches_nobody_rather_than_everybody() {
+        // murmur narrows such a target to that ACL group's members. Voice cannot
+        // resolve group membership — it is `permissions`' to answer and there is
+        // no per-packet route to it — so the entry is dropped. Widening it to
+        // the whole channel would send audio meant for one group to the room,
+        // which is the unsafe direction to be wrong in.
+        let service = service();
+        all_in_the_lobby(&service, &[100]);
+
+        let actions = register(
+            &service,
+            100,
+            voice_target(
+                4,
+                tcp::voice_target::Target {
+                    channel_id: Some(0),
+                    group: Some("admins".to_owned()),
+                    ..tcp::voice_target::Target::default()
+                },
+            ),
+        )
+        .await;
+
+        assert!(actions.is_empty(), "the entry was dropped, not refused");
+        assert!(
+            service
+                .targets
+                .lock()
+                .expect("lock")
+                .get(SessionId(100), 4)
+                .is_none(),
+            "a group-scoped shout was stored as a whole-channel one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registered_whisper_survives_somebody_else_joining() {
+        // The bug this ordering exists to prevent, and the one that would be
+        // hardest to find: the snapshot is rebuilt from scratch whenever anyone
+        // joins or moves, so targets living only inside it would vanish the
+        // moment somebody else connected. A whisper that works until the next
+        // person joins is not a whisper that works.
+        //
+        // Asserted by sending a frame at the slot rather than by reading the
+        // snapshot, because the frame is what the user is complaining about.
+        let service = service();
+        let mut gateway = service.fanout.subscribe();
+        let _ = service.mint(&mint_request(1, 100, 0, MUMBLE_1_6));
+        let _ = service.mint(&mint_request(2, 200, 0, MUMBLE_1_6));
+        all_in_the_lobby(&service, &[100, 200]);
+
+        service
+            .targets
+            .lock()
+            .expect("lock")
+            .set(
+                SessionId(100),
+                3,
+                crate::targets::VoiceTarget::new().whispering_to(SessionId(200)),
+            )
+            .expect("set");
+        service.publish();
+
+        // Somebody else arrives, which rebuilds the snapshot from membership.
+        all_in_the_lobby(&service, &[100, 200, 300]);
+        let _ = pushed(&mut gateway);
+
+        let _ = service
+            .frame(Inbound {
+                conn: 1,
+                session: 100,
+                type_id: UDP_TUNNEL,
+                payload: as_client_sends_to(UdpFormat::Protobuf, 3, b"still private").to_vec(),
+                gateway: String::new(),
+                scope: 1,
+            })
+            .await;
+
+        let sends = pushed(&mut gateway);
+        assert_eq!(
+            sends.len(),
+            1,
+            "the registered whisper did not survive somebody joining"
+        );
+        let (sessions, payload) = sends.into_iter().next().expect("checked above");
+        assert_eq!(sessions, vec![200]);
+        let heard = as_client_hears(UdpFormat::Protobuf, &payload);
+        assert_eq!(heard.opus, Bytes::from_static(b"still private"));
+        assert_eq!(
+            heard.target, 2,
+            "somebody named personally must be told it is a whisper, not a shout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_departed_session_takes_its_slots_with_it() {
+        // A leak here is one entry per disconnect for the life of the process —
+        // and a recycled session id would inherit a stranger's whisper list,
+        // which is the same leak wearing a much worse face.
+        let service = service();
+        all_in_the_lobby(&service, &[100, 200]);
+        service
+            .targets
+            .lock()
+            .expect("lock")
+            .set(
+                SessionId(100),
+                3,
+                crate::targets::VoiceTarget::new().whispering_to(SessionId(200)),
+            )
+            .expect("set");
+
+        service.apply_view_event(ViewEvent {
+            event: Some(view_event::Event::Gone(
+                starling_proto_fancy::sessionview::Gone {
+                    session: 100,
+                    reason: "left".to_owned(),
+                },
+            )),
+        });
+
+        assert_eq!(service.targets.lock().expect("lock").sessions(), 0);
     }
 
     #[tokio::test]

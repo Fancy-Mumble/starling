@@ -98,6 +98,19 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "permissions:write",
     ),
     (
+        "/v1/channels/{id}/groups/{group}/members",
+        "post",
+        "Put an account or a live session in a group without editing the ACL table; \
+         not durable, and a session grant ends with the session",
+        "permissions:write",
+    ),
+    (
+        "/v1/channels/{id}/groups/{group}/members",
+        "delete",
+        "Take a temporary group membership away",
+        "permissions:write",
+    ),
+    (
         "/v1/config",
         "get",
         "Read operational settings",

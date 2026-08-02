@@ -22,6 +22,7 @@ use crate::inproc::Broker;
 use crate::listen::{ListenError, serve_routes};
 use crate::log::{Category, LogEvent, Logger};
 use crate::metrics::Metrics;
+use crate::pressure::Pressure;
 use crate::shutdown::Shutdown;
 use crate::storage::{Store, StoreError};
 use crate::telemetry;
@@ -39,6 +40,14 @@ pub struct ServiceContext {
     pub health: Health,
     /// Counters. Everything lost is counted.
     pub metrics: Metrics,
+    /// Queue occupancy. Everything bounded says how full it is.
+    ///
+    /// The companion to `metrics` and not a duplicate of it: a counter says
+    /// how many requests were refused, this says how close the next one is to
+    /// being refused. The runtime fills in one gauge for every service by
+    /// itself (`inflight`), so a service that registers nothing still reports
+    /// its concurrency.
+    pub pressure: Pressure,
     /// The operator event log.
     ///
     /// Every service holds the same one: the writer is process-wide, and a
@@ -205,6 +214,7 @@ pub fn context(
         resolver: Resolver::new(Arc::clone(&config), broker.clone()),
         health: Health::new(),
         metrics: Metrics::new(),
+        pressure: Pressure::new(),
         logger,
         shutdown,
         broker,
@@ -269,7 +279,15 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         &ctx.name,
         transport.as_ref(),
         &ctx.broker,
-        service.routes(),
+        // Every service answers for its own readiness and load, wired in here
+        // rather than by each service's `routes()` — a health surface a
+        // service can forget to implement is one the least-instrumented
+        // service lacks, which is the service most worth asking about.
+        crate::health_rpc::with_health(service.routes(), &ctx.name, &ctx.health, &ctx.pressure),
+        // Counts requests this service has not finished. Same argument as
+        // above and the same place to make it: measured for everyone, opted
+        // into by no one.
+        &ctx.pressure,
         ctx.shutdown.clone(),
     )
     .await;

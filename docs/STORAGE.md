@@ -201,6 +201,23 @@ CREATE INDEX ix_channel_parent ON channel(server_id, parent_id);
 
 channel_link(server_id, channel_id, linked_id, PRIMARY KEY (server_id, channel_id, linked_id));
 
+-- Channel listeners: hearing a room without being in it ---------------------
+-- Keyed by *account*, not session: the point of the table is that the listener
+-- survives the visit. Guests therefore have none, and temporary channels are
+-- never written here — the id is reused when the channel is collected, so a
+-- restored row would subscribe the user to whatever room got the number next.
+--
+-- `enabled` rather than deleting the row, because the volume has to outlive
+-- un-listening: a user who turns a room off and back on gets the level they
+-- chose. No secondary index — the only query is "every listener of one account
+-- on one server", and the primary key is a left prefix of exactly that.
+channel_listener(
+  server_id INTEGER, account_id INTEGER, channel_id INTEGER,
+  volume_adjustment REAL NOT NULL,                    -- 1.0 is no adjustment
+  enabled INTEGER NOT NULL,
+  PRIMARY KEY (server_id, account_id, channel_id)
+);
+
 -- Accounts -----------------------------------------------------------------
 account(
   server_id INTEGER, id INTEGER,

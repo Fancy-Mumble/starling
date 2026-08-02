@@ -11,7 +11,9 @@
 use tonic::service::Routes;
 use tonic::transport::Server;
 
+use crate::inflight::InFlightLayer;
 use crate::inproc::Broker;
+use crate::pressure::Pressure;
 use crate::shutdown::Shutdown;
 use crate::transport::Transport;
 
@@ -48,6 +50,7 @@ pub async fn serve_routes(
     transport: &dyn Transport,
     broker: &Broker,
     routes: Routes,
+    pressure: &Pressure,
     shutdown: Shutdown,
 ) -> Result<(), ListenError> {
     let signal = {
@@ -58,6 +61,11 @@ pub async fn serve_routes(
 
     let incoming = transport.bind(broker).await?;
     Server::builder()
+        // Wraps every RPC this service serves, including the health surface
+        // itself. That is intentional: the collector's own call is a request
+        // like any other, and a gauge that excluded it would under-report a
+        // service by exactly the traffic the dashboard generates.
+        .layer(InFlightLayer::new(pressure))
         .add_routes(routes)
         .serve_with_incoming_shutdown(incoming, signal)
         .await?;

@@ -4,6 +4,6 @@ mod entity;
 mod store;
 mod tree;
 
-pub use entity::Channel;
+pub use entity::{Channel, is_full};
 pub use store::ChannelStore;
 pub use tree::ChannelTree;

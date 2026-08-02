@@ -1,7 +1,7 @@
 //! Non-blocking dispatch to a sink.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -27,6 +27,13 @@ enum Message {
 pub struct Logger {
     tx: SyncSender<Message>,
     dropped: Arc<AtomicU64>,
+    /// murmur's `obfuscate`: whether addresses are written as pseudonyms.
+    ///
+    /// Shared with the writer thread, and with every clone of this logger. An
+    /// operator turning it on means the *next* record, not the next restart —
+    /// which is the whole reason it is an atomic here rather than an argument
+    /// to `spawn`.
+    obfuscate: Arc<AtomicBool>,
 }
 
 /// Stops the writer, flushing what is queued.
@@ -46,12 +53,13 @@ impl Logger {
     pub fn spawn(sink: Box<dyn LogSink>, capacity: usize) -> (Self, LoggerShutdown) {
         let (tx, rx) = sync_channel(capacity.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
+        let obfuscate = Arc::new(AtomicBool::new(false));
 
         let thread = std::thread::Builder::new()
             .name("starling-log".into())
             .spawn({
                 let dropped = Arc::clone(&dropped);
-                let writer = Writer::new(sink, dropped);
+                let writer = Writer::new(sink, dropped, Arc::clone(&obfuscate));
                 move || writer.run(&rx)
             })
             .ok();
@@ -59,6 +67,7 @@ impl Logger {
         let logger = Self {
             tx: tx.clone(),
             dropped,
+            obfuscate,
         };
         (logger, LoggerShutdown { tx, thread })
     }
@@ -104,6 +113,20 @@ impl Logger {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether addresses are written as pseudonyms — murmur's `obfuscate`.
+    ///
+    /// Set from `server-config`'s `obfuscate_ips` by whichever service watches
+    /// it; every clone of this logger, in this process, follows.
+    pub fn set_obfuscate_addresses(&self, obfuscate: bool) {
+        self.obfuscate.store(obfuscate, Ordering::Relaxed);
+    }
+
+    /// Whether addresses are currently being obfuscated.
+    #[must_use]
+    pub fn obfuscates_addresses(&self) -> bool {
+        self.obfuscate.load(Ordering::Relaxed)
     }
 
     /// Ask the writer to make everything queued so far durable.
@@ -154,6 +177,13 @@ struct Writer {
     sink: Box<dyn LogSink>,
     /// Shared with every [`Logger`] clone, which increments it on a full queue.
     dropped: Arc<AtomicU64>,
+    /// Whether to replace addresses with pseudonyms before writing.
+    ///
+    /// Applied here, at the one point every operator-facing record passes
+    /// through, rather than at the call sites: a rule written out per call site
+    /// is a rule missing from the call site somebody adds next month, and the
+    /// missing one looks exactly like the others.
+    obfuscate: Arc<AtomicBool>,
     /// Drops already reported, so each overflow is reported once.
     reported: u64,
     /// Whether records have been written but not yet made durable.
@@ -161,10 +191,11 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(sink: Box<dyn LogSink>, dropped: Arc<AtomicU64>) -> Self {
+    fn new(sink: Box<dyn LogSink>, dropped: Arc<AtomicU64>, obfuscate: Arc<AtomicBool>) -> Self {
         Self {
             sink,
             dropped,
+            obfuscate,
             reported: 0,
             unflushed: false,
         }
@@ -204,7 +235,15 @@ impl Writer {
     /// A failing sink must not take the writer thread down; there is nowhere left
     /// to report it to.
     fn emit(&mut self, event: &LogEvent) {
-        let _ = self.sink.write(event);
+        if self.obfuscate.load(Ordering::Relaxed) {
+            // Cloned only when the setting is on, so a deployment that does not
+            // obfuscate pays one atomic load per record and nothing else.
+            let mut hidden = event.clone();
+            crate::log::address::obfuscate_event(&mut hidden);
+            let _ = self.sink.write(&hidden);
+        } else {
+            let _ = self.sink.write(event);
+        }
         self.unflushed = true;
     }
 
@@ -268,6 +307,76 @@ mod tests {
         let messages: Vec<_> = handle.recent(100).into_iter().map(|e| e.message).collect();
         assert!(messages.contains(&"event 1".to_owned()));
         assert!(messages.contains(&"event 2".to_owned()));
+    }
+
+    #[test]
+    fn obfuscate_ips_decides_whether_an_address_reaches_the_sink() {
+        // §5's `obfuscate_ips`: it existed, it was settable, and addresses were
+        // written out in full regardless. The same record, logged twice, with
+        // only the setting different — an assertion that it round-trips through
+        // the API would have passed before any of this existed.
+        let (logger, shutdown, handle) = logger_with_memory(64);
+        let record = || {
+            LogEvent::info(Category::Session, "user authenticated")
+                .with("address", "198.51.100.9:64738")
+                .with("name", "someone")
+        };
+
+        logger.log(record());
+        // The writer is a separate thread, so the first record has to have been
+        // *written* before the setting changes — otherwise the test is racing
+        // the queue and would occasionally obfuscate both. A flush is ordered
+        // behind the record in the same channel, so observing the flush
+        // observes the write.
+        let flushed = handle.flushes();
+        logger.request_flush();
+        while handle.flushes() == flushed {
+            std::thread::yield_now();
+        }
+
+        logger.set_obfuscate_addresses(true);
+        logger.log(record());
+        shutdown.shutdown();
+
+        let addresses: Vec<String> = handle
+            .recent(100)
+            .into_iter()
+            .filter(|event| event.message == "user authenticated")
+            .filter_map(|event| {
+                event
+                    .fields
+                    .iter()
+                    .find(|field| field.key == "address")
+                    .map(|field| field.value.to_string())
+            })
+            .collect();
+
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0], "198.51.100.9:64738", "off means unchanged");
+        assert!(
+            addresses[1].starts_with("<<") && !addresses[1].contains("198.51.100.9"),
+            "on must not leave the address in the record: {}",
+            addresses[1]
+        );
+    }
+
+    #[test]
+    fn turning_obfuscation_off_again_restores_the_address() {
+        // An operator investigating an incident turns it off, and the next
+        // record has to be the readable one — not the next restart's.
+        let (logger, shutdown, handle) = logger_with_memory(64);
+        logger.set_obfuscate_addresses(true);
+        logger.set_obfuscate_addresses(false);
+        logger.log(LogEvent::info(Category::Session, "back on").with("address", "198.51.100.9"));
+        shutdown.shutdown();
+
+        assert!(
+            handle
+                .recent(10)
+                .iter()
+                .flat_map(|event| event.fields.iter())
+                .any(|field| field.value.to_string() == "198.51.100.9")
+        );
     }
 
     #[test]

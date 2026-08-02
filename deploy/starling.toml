@@ -71,6 +71,16 @@ burst = 15
 # Opus frames emits a hundred a second, so the control bucket would cut it off
 # mid-sentence with silence as the only symptom. murmur does not limit this path
 # at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
+[gateway.limits.acl]
+# The ACL editor opens the channel tree with one query per channel, so an
+# administrator on a thirty-channel server emits thirty in a second or two.
+rate = "20/s"
+burst = 60
+[gateway.limits.chat]
+# A person typing. Losing a message somebody wrote is the worst failure here:
+# silent, unattributed, and the sender believes they were heard.
+rate = "5/s"
+burst = 20
 [gateway.limits.audio]
 rate = "200/s"
 burst = 400
@@ -124,6 +134,7 @@ tier = "essential"
 types = []                   # no client-facing type: internal by construction
 
 [services.permissions]
+limits = "acl"                # not the 1/s control bucket: an editor opens N at once
 endpoint = "http://permissions:50051"
 tier = "essential"
 types = [12, 13, 20, 1001]
@@ -157,6 +168,7 @@ limits = "audio" # never the 1/s control bucket: this is speech
 # somewhere other than the gateway's address.
 
 [services.text]
+limits = "chat"               # not the 1/s control bucket: a person typing
 endpoint = "http://text:50051"
 tier = "core"
 types = [11, 1005]
@@ -225,6 +237,22 @@ endpoint = "http://context-actions:50051"
 tier = "optional"
 types = [16, 17, 1017]
 
+# The gateway's own block.
+#
+# It owns no wire types — it is the process that *routes* them — and nothing
+# dials it to do work. It needs an endpoint anyway, because the `health`
+# collector below dials every service to ask how it is, and without one the
+# gateway is the single component missing from the health dashboard: the
+# process every client connects to, holding every control queue in the server.
+[services.gateway]
+enabled = true
+endpoint = "http://gateway:50051"
+# `core`, the default. The tier says what the *gateway* does while a service is
+# unhealthy, so the gateway's own tier is a value it would only ever consult
+# about itself — there is no answer for it to act on.
+tier = "core"
+types = []
+
 # The one service with no `endpoint`, because nothing dials it — it dials the
 # public Mumble server list, hourly, and has no gRPC surface to reach. It does
 # nothing at all until `registry_name`, `registry_password` and `registry_url`
@@ -239,6 +267,21 @@ types = []
 # elsewhere. A missing bundle is a startup error for the announcement rather
 # than a silent unverified POST — the document carries a shared secret.
 trust_store = "/etc/ssl/certs/ca-certificates.crt"
+
+# Asks every other service how it is, once every few seconds, and holds the
+# answers so `operator-api` can serve `/v1/health` from one place instead of
+# fanning out across twenty endpoints per page load.
+#
+# Unlike the announcer above this one *is* dialled, so it needs a real
+# endpoint. Without this block the collector is simply absent — `--config`
+# replaces `Config::with_defaults` rather than merging with it — and
+# `/v1/health` answers 502 "health is unreachable": the admin plane up,
+# reachable, and with nothing behind the one route a dashboard opens on.
+[services.health]
+enabled = true
+endpoint = "http://health:50051"
+tier = "optional"
+types = []
 
 # -- Storage, per service ---------------------------------------------------
 #

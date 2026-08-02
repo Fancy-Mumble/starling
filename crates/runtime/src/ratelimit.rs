@@ -115,6 +115,23 @@ impl TokenBucket {
         }
     }
 
+    /// Change the rate and burst of a bucket that is already running.
+    ///
+    /// The tokens in hand are **kept**, clamped to the new burst. An operator
+    /// lowering `messagelimit` is throttling what happens next, not confiscating
+    /// the allowance a client has already accrued — and refilling to the new
+    /// burst instead would make *lowering* the limit hand out a fresh burst.
+    ///
+    /// This exists because murmur's message limit is live (`setLiveConf`): it
+    /// applies to the connections that are already open, so a bucket built at
+    /// connect time has to be able to change under a client that never
+    /// reconnects.
+    pub fn retune(&mut self, rate: Rate, burst: u32) {
+        self.rate = rate;
+        self.burst = f64::from(burst);
+        self.tokens = self.tokens.min(self.burst);
+    }
+
     /// Spend one token, or say how long to wait.
     ///
     /// # Errors
@@ -123,12 +140,33 @@ impl TokenBucket {
     /// is what a Fancy client is told, and what makes the refusal actionable
     /// rather than a mystery.
     pub fn take(&mut self, now_ms: u64) -> Result<(), Throttled> {
+        self.take_many(1.0, now_ms)
+    }
+
+    /// Spend `count` tokens, or say how long to wait.
+    ///
+    /// For the callers whose unit is not "one message": a bandwidth cap counts
+    /// **bytes**, so one packet costs its own size. Written as the general case
+    /// with [`Self::take`] on top of it, rather than a second bucket type that
+    /// would have to be kept in step with this one.
+    ///
+    /// # Errors
+    ///
+    /// [`Throttled`], carrying the wait.
+    pub fn take_many(&mut self, count: f64, now_ms: u64) -> Result<(), Throttled> {
         self.refill(now_ms);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= count {
+            self.tokens -= count;
             return Ok(());
         }
-        let deficit = 1.0 - self.tokens;
+        // A cost larger than the bucket could ever hold would otherwise be
+        // refused forever, with a retry hint that never comes true.
+        if count > self.burst {
+            return Err(Throttled {
+                retry_after: Duration::MAX,
+            });
+        }
+        let deficit = count - self.tokens;
         let seconds = if self.rate.per_second > 0.0 {
             deficit / self.rate.per_second
         } else {
@@ -193,6 +231,51 @@ mod tests {
             assert!(bucket.take(60_000).is_ok());
         }
         assert!(bucket.take(60_000).is_err());
+    }
+
+    #[test]
+    fn a_cost_of_many_tokens_is_charged_in_full() {
+        // The bandwidth case: one packet costs its own size in bytes.
+        let mut bucket = TokenBucket::new(Rate::per_second(1_000.0), 1_000, 0);
+        assert!(bucket.take_many(600.0, 0).is_ok());
+        assert!(bucket.take_many(600.0, 0).is_err(), "only 400 left");
+        assert!(bucket.take_many(600.0, 1_000).is_ok(), "refilled");
+    }
+
+    #[test]
+    fn a_cost_larger_than_the_bucket_is_refused_without_a_hint_that_never_comes() {
+        // Otherwise a frame that can never fit is handed a retry time, and the
+        // sender waits for a moment that does not arrive.
+        let mut bucket = TokenBucket::new(Rate::per_second(10.0), 10, 0);
+        let refused = bucket.take_many(100.0, 0).expect_err("cannot ever fit");
+        assert_eq!(refused.retry_after, Duration::MAX);
+    }
+
+    #[test]
+    fn retuning_keeps_the_tokens_already_accrued() {
+        // Lowering the limit must not hand out a fresh burst, and must not
+        // confiscate what a well-behaved client has already earned.
+        let mut bucket = TokenBucket::new(Rate::per_second(1.0), 5, 0);
+        assert!(bucket.take(0).is_ok());
+        bucket.retune(Rate::per_second(1.0), 2);
+        assert!(bucket.take(0).is_ok());
+        assert!(bucket.take(0).is_ok());
+        assert!(bucket.take(0).is_err(), "clamped to the new burst of 2");
+    }
+
+    #[test]
+    fn retuning_upwards_takes_effect_without_a_reconnect() {
+        // The property murmur's live `messagelimit` has and a bucket built at
+        // connect time does not.
+        let mut bucket = TokenBucket::new(Rate::per_second(1.0), 1, 0);
+        assert!(bucket.take(0).is_ok());
+        assert!(bucket.take(0).is_err());
+        bucket.retune(Rate::per_second(100.0), 10);
+        // One second of the new rate, which the old one would have refused.
+        assert!(bucket.take(1_000).is_ok());
+        for _ in 0..9 {
+            assert!(bucket.take(1_000).is_ok());
+        }
     }
 
     #[test]

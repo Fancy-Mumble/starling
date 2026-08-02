@@ -81,6 +81,21 @@ impl SessionViewService {
             return None;
         };
         let session = self.sessions.get(scope, acl.session)?;
+        // Written out field by field, with **no `..Subject::default()`**. That
+        // fill-in is what made this wrong: it silently supplied `tokens: []`,
+        // `channel: 0` and `strong_cert: false`, so a `#password` group matched
+        // nobody on this path — the surviving half of `GAP-ANALYSIS.md` G2,
+        // whose other call site was fixed — and every `in`/`out`/`sub` rule
+        // read the user as standing in the root.
+        //
+        // `out` is the one that does not merely fail closed. It is
+        // `subject.channel != channel`, so a user *standing in* the channel
+        // being evaluated was judged to be outside it, and an entry written to
+        // grant something to outsiders granted it to the people it excluded.
+        //
+        // A new field on `Subject` should therefore fail to compile here and
+        // make somebody choose, exactly as `session_record` in the handshake
+        // spells out its own fields for the same reason.
         Some(Subject {
             session: session.session,
             // Carried as the pair, never re-derived: `account` alone cannot say
@@ -89,7 +104,13 @@ impl SessionViewService {
             registered: session.registered,
             name: session.name,
             cert_hash: session.cert_hash,
-            ..Subject::default()
+            // The channel the session is standing in, which `in`, `out` and
+            // `sub` compare against the channel being evaluated.
+            channel: session.channel,
+            // The access tokens, so `#password` groups can match at all.
+            tokens: session.tokens,
+            // An assurance rather than an identifier, and the `@strong` group.
+            strong_cert: session.strong_cert,
         })
     }
 }
@@ -325,5 +346,53 @@ mod tests {
             .expect("list")
             .into_inner();
         assert!(other.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_subject_a_cold_query_is_about_carries_everything_the_acl_reads() {
+        // `SECURITY-AUDIT-identity.md` I3. This was built with
+        // `..Subject::default()`, which supplied `tokens: []`, `channel: 0` and
+        // `strong_cert: false` — so a channel password opened nothing on this
+        // path, and `in`/`out`/`sub` read every user as standing in the root.
+        //
+        // The channel is the one that could fail *open* rather than closed:
+        // `out` is `subject.channel != channel`, so a user standing in the
+        // channel being evaluated was judged to be outside it.
+        let service = service();
+        service.sessions.upsert(
+            1,
+            Session {
+                session: 7,
+                name: "someone".to_owned(),
+                channel: 5,
+                tokens: vec!["the-channel-password".to_owned()],
+                strong_cert: true,
+                ..Session::default()
+            },
+        );
+
+        let subject = service
+            .asker(&ColdQuery {
+                scope: Some(Scope { virtual_server: 1 }),
+                query: Some(cold_query::Query::Acl(
+                    starling_proto_fancy::sessionview::AclQuery {
+                        session: 7,
+                        channel: 5,
+                        permission: 0,
+                    },
+                )),
+            })
+            .expect("the session is known");
+
+        assert_eq!(
+            subject.channel, 5,
+            "a user standing in channel 5 must not be evaluated as standing in the root"
+        );
+        assert_eq!(
+            subject.tokens,
+            vec!["the-channel-password".to_owned()],
+            "a #password group cannot match a subject whose tokens were dropped"
+        );
+        assert!(subject.strong_cert);
     }
 }

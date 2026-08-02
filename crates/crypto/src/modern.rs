@@ -96,6 +96,30 @@ impl VoiceCipher for XChaCha20Voice {
     fn open(&mut self, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, VoiceError> {
         self.receiving.open(packet, aad)
     }
+
+    /// Nothing, and that is the honest answer rather than an omission.
+    ///
+    /// murmur's resynchronisation swaps an IV, which works because OCB2's nonce
+    /// *is* its counter. Here the salt is folded into the subkey by `HChaCha20`
+    /// at derivation and never travels again, and the counter's high bits are
+    /// reconstructed by the receiver from the two bytes on the wire — so there is
+    /// no value this half could hand over that the peer could install.
+    ///
+    /// Saying so is what lets the caller pick the recovery that does work: a peer
+    /// on this cipher is re-keyed. Returning some plausible-looking bytes instead
+    /// would be answered, accepted, and inert.
+    fn send_nonce(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Refused, for the same reason.
+    ///
+    /// The counter reconstruction is already self-healing across the wire wrap,
+    /// so there is nothing a peer's claim could repair — and installing one would
+    /// mean rebuilding both sessions from key material this type no longer holds.
+    fn adopt_recv_nonce(&mut self, _nonce: &[u8]) -> bool {
+        false
+    }
 }
 
 impl std::fmt::Debug for XChaCha20Voice {

@@ -28,9 +28,11 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::bandwidth::Bandwidth;
 use crate::ports::SessionId;
 use crate::ports::{AudioSource, ConnId, Datagrams};
 use bytes::Bytes;
+use starling_runtime::ids::now_ms;
 use tracing::debug;
 
 use crate::packet::{AudioCodec as _, AudioPacket, Datagram, ProtobufCodec, ServerDetails};
@@ -68,6 +70,12 @@ pub struct RouterStats {
     pub unattributed: u64,
     /// Frames refused because the speaker is muted or suppressed.
     pub silenced: u64,
+    /// Frames refused because the speaker was over `max_bandwidth`.
+    ///
+    /// Counted separately from `silenced`: one is a moderation decision about a
+    /// person and the other is a ceiling on a socket, and an operator looking
+    /// at "why is this user choppy" needs to know which.
+    pub over_bandwidth: u64,
     /// Frames that decrypted but did not parse.
     pub malformed: u64,
     /// Frames delivered to at least one listener.
@@ -114,6 +122,13 @@ pub struct Router {
     stats: RouterStats,
     /// Frames received from each session.
     heard_from: HashMap<SessionId, u64>,
+    /// What each peer is allowed to send, per second.
+    ///
+    /// Charged against `details.max_bandwidth`, which is already refreshed from
+    /// `server-config` on a timer for the server-browser ping — so the cap an
+    /// operator sets is enforced with the same number a browser is told, and
+    /// there is no second path for the two to disagree along.
+    bandwidth: Bandwidth,
 }
 
 impl Router {
@@ -133,6 +148,7 @@ impl Router {
             allow_ping: true,
             stats: RouterStats::default(),
             heard_from: HashMap::new(),
+            bandwidth: Bandwidth::default(),
         }
     }
 
@@ -206,6 +222,7 @@ impl Router {
         };
         let _ = self.by_session.remove(&peer.session());
         let _ = self.heard_from.remove(&peer.session());
+        self.bandwidth.forget(conn);
         self.by_addr.retain(|_, bound| *bound != conn);
         self.by_host.retain(|_, known| {
             known.retain(|bound| *bound != conn);
@@ -237,6 +254,32 @@ impl Router {
             .get(&session)
             .and_then(|conn| self.peers.get(conn))
             .is_some_and(|peer| peer.udp_addr().is_some())
+    }
+
+    /// The nonce a session's audio is sealed under, for answering its resync.
+    ///
+    /// `None` covers two different things on purpose — no such session, and a
+    /// cipher with no nonce to offer — because the caller does the same thing
+    /// for both: re-key the peer, which is the recovery that works either way.
+    #[must_use]
+    pub fn send_nonce(&self, session: SessionId) -> Option<Vec<u8>> {
+        self.by_session
+            .get(&session)
+            .and_then(|conn| self.peers.get(conn))
+            .and_then(VoicePeer::send_nonce)
+    }
+
+    /// Install the nonce a session says it is sending under.
+    ///
+    /// Reports whether it was taken. A `false` here is not an error: it means
+    /// this peer resynchronises by being re-keyed instead, and the caller has
+    /// that path.
+    pub fn adopt_recv_nonce(&mut self, session: SessionId, nonce: &[u8]) -> bool {
+        self.by_session
+            .get(&session)
+            .copied()
+            .and_then(|conn| self.peers.get_mut(&conn))
+            .is_some_and(|peer| peer.adopt_recv_nonce(nonce))
     }
 
     /// Counters, for the admin surface.
@@ -516,27 +559,46 @@ impl Router {
         // you nowhere" and "we never hear you" need different fixes.
         *self.heard_from.entry(speaker).or_default() += 1;
 
+        // murmur charges the frame here too (`Server.cpp:1334`): after the
+        // speaker is known and before anyone is worked out to send it to, so a
+        // peer over its budget costs one bucket update rather than a fan-out.
+        // Dropped in silence, as upstream drops it — there is no field in the
+        // audio protocol to say "slow down", and the client's own bandwidth
+        // negotiation is what is supposed to have prevented this.
+        if !self.bandwidth.admit(
+            from,
+            packet.opus.len(),
+            self.details.max_bandwidth,
+            now_ms(),
+        ) {
+            self.stats.over_bandwidth = self.stats.over_bandwidth.saturating_add(1);
+            return;
+        }
+
         let target = Target::decode(packet.target);
         // Overwriting rather than trusting: the sender field arrived from a peer
         // that could have written anyone's id in it.
         packet.sender = speaker;
 
-        let listeners = self.snapshot.recipients(speaker, target);
-        if listeners.is_empty() {
+        // Each recipient with the context and gain their own copy carries: one
+        // frame can arrive as a whisper for one person, a shout for another and
+        // a channel listener for a third.
+        let receptions = self.snapshot.fan_out(speaker, target);
+        if receptions.is_empty() {
             if !self.snapshot.may_speak(speaker) {
                 self.stats.silenced = self.stats.silenced.saturating_add(1);
             }
             return;
         }
 
-        // The context a listener sees, which is not the target the speaker set.
-        packet.target = context_for(target);
         self.stats.routed = self.stats.routed.saturating_add(1);
 
-        for session in listeners {
-            let Some(conn) = self.by_session.get(&session).copied() else {
+        for reception in receptions {
+            let Some(conn) = self.by_session.get(&reception.session).copied() else {
                 continue;
             };
+            packet.target = reception.context;
+            packet.volume_adjustment = reception.gain;
             self.send_to_peer(conn, &packet);
         }
     }
@@ -601,19 +663,6 @@ impl Router {
                 let _ = peer.tunnel(frame);
             }
         }
-    }
-}
-
-/// What the listener is told about why it is hearing this.
-///
-/// The protobuf field is `target` inbound and `context` outbound, and they are
-/// not the same numbers: 0 normal, 1 shout, 2 whisper, 3 via a listener.
-const fn context_for(target: Target) -> u8 {
-    match target {
-        Target::Normal | Target::Loopback => 0,
-        // Every registered target is reported as a shout until `VoiceTarget`
-        // exists to say which kind it was.
-        Target::Whisper(_) => 1,
     }
 }
 
@@ -929,6 +978,86 @@ mod tests {
     }
 
     #[test]
+    fn max_bandwidth_decides_how_much_of_a_talkspurt_is_relayed() {
+        // §5's `max_bandwidth`: advertised in `ServerSync`, in `ServerConfig`
+        // and in the server-browser ping, and enforced by nothing. A client
+        // that ignored the number transmitted at whatever rate the network
+        // carried, and every other client in the channel paid for it.
+        //
+        // The same peer sends the same fifty frames twice, and the only
+        // difference is the cap — which is the assertion §5 needs, because a
+        // test that read the value back would have passed before this existed.
+        const FRAME: &[u8] = b"0123456789";
+        let cost = (FRAME.len() + crate::bandwidth::PACKET_OVERHEAD) as u32;
+
+        let relayed_under_a_tight_cap = {
+            let (mut router, _sent, mut alice, bob) = lobby();
+            router.set_details(ServerDetails {
+                // Ten frames a second, in bits.
+                max_bandwidth: cost * 10 * 8,
+                ..details()
+            });
+            for _ in 0..50 {
+                router.accept(AudioSource::Tunnel(1), &alice.speak_tunnelled(FRAME));
+            }
+            bob.tunnelled().len()
+        };
+
+        let (mut router, _sent, mut alice, bob) = lobby();
+        router.set_details(ServerDetails {
+            max_bandwidth: cost * 100 * 8,
+            ..details()
+        });
+        for _ in 0..50 {
+            router.accept(AudioSource::Tunnel(1), &alice.speak_tunnelled(FRAME));
+        }
+
+        assert_eq!(bob.tunnelled().len(), 50, "a generous cap relays them all");
+        assert!(
+            relayed_under_a_tight_cap < 50,
+            "the cap relayed all {relayed_under_a_tight_cap} frames anyway"
+        );
+        assert!(
+            relayed_under_a_tight_cap >= 10,
+            "one second of budget must get through: {relayed_under_a_tight_cap}"
+        );
+    }
+
+    #[test]
+    fn a_bandwidth_of_zero_relays_everything_rather_than_nothing() {
+        // What a voice service holds before `server-config` has answered, and
+        // the reading that would otherwise silence a whole server while it
+        // starts up.
+        let (mut router, _sent, mut alice, bob) = lobby();
+        router.set_details(ServerDetails {
+            max_bandwidth: 0,
+            ..details()
+        });
+        for _ in 0..200 {
+            router.accept(AudioSource::Tunnel(1), &alice.speak_tunnelled(b"unbounded"));
+        }
+        assert_eq!(bob.tunnelled().len(), 200);
+    }
+
+    #[test]
+    fn a_speaker_over_the_cap_is_counted_apart_from_a_silenced_one() {
+        // "Why is this user choppy" has two very different answers — a
+        // moderator muted them, or they are over a ceiling — and one counter
+        // for both would not distinguish them.
+        let (mut router, _sent, mut alice, _bob) = lobby();
+        router.set_details(ServerDetails {
+            max_bandwidth: 8 * 8,
+            ..details()
+        });
+        for _ in 0..50 {
+            router.accept(AudioSource::Tunnel(1), &alice.speak_tunnelled(b"loud"));
+        }
+        let stats = router.stats();
+        assert!(stats.over_bandwidth > 0, "nothing was charged");
+        assert_eq!(stats.silenced, 0, "nobody was muted");
+    }
+
+    #[test]
     fn a_peer_with_no_udp_path_is_tunnelled() {
         // Everyone behind a restrictive firewall depends on this.
         let (mut router, sent, mut alice, bob) = lobby();
@@ -1001,6 +1130,124 @@ mod tests {
         let heard = bob.hear_tunnelled();
         assert_eq!(heard.opus, Bytes::from_static(b"crossformat"));
         assert_eq!(heard.sender, ALICE);
+    }
+
+    /// Three peers, Carol in her own channel, all tunnelled.
+    ///
+    /// Carol elsewhere is what makes a whisper provable: a target that reached
+    /// her because she happened to share the lobby would prove nothing about
+    /// targets at all.
+    fn three_peers() -> (Router, TestPeer, TestPeer, TestPeer) {
+        const ANNEX: ChannelId = ChannelId(1);
+        const CAROL: SessionId = SessionId(3);
+
+        let mut router = Router::new(Box::new(RecordingDatagrams::new()), details());
+        let alice = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
+        let bob = TestPeer::new(2, BOB, UdpFormat::Protobuf);
+        let carol = TestPeer::new(3, CAROL, UdpFormat::Protobuf);
+        router.attach(alice.attach(), addr(0).ip());
+        router.attach(bob.attach(), addr(0).ip());
+        router.attach(carol.attach(), addr(0).ip());
+        router.publish(
+            RoutingSnapshot::new()
+                .with_member(ALICE, LOBBY)
+                .with_member(BOB, LOBBY)
+                .with_member(CAROL, ANNEX),
+        );
+        (router, alice, bob, carol)
+    }
+
+    /// The snapshot `three_peers` publishes, with one target registered on it.
+    fn with_slot(target: crate::targets::VoiceTarget) -> RoutingSnapshot {
+        const ANNEX: ChannelId = ChannelId(1);
+        const CAROL: SessionId = SessionId(3);
+        RoutingSnapshot::new()
+            .with_member(ALICE, LOBBY)
+            .with_member(BOB, LOBBY)
+            .with_member(CAROL, ANNEX)
+            .with_target(ALICE, 3, target)
+    }
+
+    #[test]
+    fn a_whisper_reaches_the_person_it_names_and_nobody_else() {
+        // The feature, at the level the router is responsible for. Carol is in
+        // another channel, so nothing but the registered target can carry to
+        // her — and Bob shares the lobby, so nothing but the target *not*
+        // carrying to him can keep him out of it.
+        const CAROL: SessionId = SessionId(3);
+        let (mut router, mut alice, bob, mut carol) = three_peers();
+        router.publish(with_slot(
+            crate::targets::VoiceTarget::new().whispering_to(CAROL),
+        ));
+
+        let frame = alice.speak_tunnelled_to(3, b"just for you");
+        router.accept(AudioSource::Tunnel(1), &frame);
+
+        let heard = carol.hear_tunnelled();
+        assert_eq!(heard.opus, Bytes::from_static(b"just for you"));
+        assert_eq!(heard.sender, ALICE);
+        assert!(
+            bob.tunnelled().is_empty(),
+            "a whisper reached somebody it did not name"
+        );
+    }
+
+    #[test]
+    fn a_whispered_listener_is_told_it_is_a_whisper_and_a_shouted_one_a_shout() {
+        // murmur's `SpeechFlags`, and a client renders and logs the two
+        // differently: 1 is Shout, 2 is Whisper. Reporting a whisper as a shout
+        // tells somebody being spoken to privately that they are hearing a room.
+        //
+        // One target doing both at once, because that is the case a per-frame
+        // context gets wrong: Carol is named personally and Bob is reached
+        // through the lobby, and they must be told different things about the
+        // same frame.
+        const CAROL: SessionId = SessionId(3);
+        let (mut router, mut alice, mut bob, mut carol) = three_peers();
+        router.publish(with_slot(
+            crate::targets::VoiceTarget::new()
+                .whispering_to(CAROL)
+                .shouting_to(crate::targets::ShoutTarget {
+                    channel: LOBBY,
+                    include_links: false,
+                    include_children: false,
+                }),
+        ));
+
+        let frame = alice.speak_tunnelled_to(3, b"both at once");
+        router.accept(AudioSource::Tunnel(1), &frame);
+
+        assert_eq!(
+            carol.hear_tunnelled().target,
+            2,
+            "the person named personally must be told it is a whisper"
+        );
+        assert_eq!(
+            bob.hear_tunnelled().target,
+            1,
+            "the person reached through a channel must be told it is a shout"
+        );
+    }
+
+    #[test]
+    fn normal_speech_is_still_reported_as_normal() {
+        // The context split must not leak into the path every frame takes.
+        let (mut router, mut alice, mut bob, _) = three_peers();
+        let frame = alice.speak_tunnelled(b"ordinary");
+        router.accept(AudioSource::Tunnel(1), &frame);
+        assert_eq!(bob.hear_tunnelled().target, 0);
+    }
+
+    #[test]
+    fn an_unregistered_slot_reaches_nobody() {
+        // Falling back to the speaker's channel would send a whisper to exactly
+        // the people it was aimed away from — the worst available default.
+        let (mut router, mut alice, bob, carol) = three_peers();
+        let frame = alice.speak_tunnelled_to(7, b"nowhere");
+        router.accept(AudioSource::Tunnel(1), &frame);
+
+        assert!(bob.tunnelled().is_empty());
+        assert!(carol.tunnelled().is_empty());
     }
 
     #[test]

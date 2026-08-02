@@ -63,6 +63,16 @@ burst = 15
 # Opus frames emits a hundred a second, so the control bucket would cut it off
 # mid-sentence with silence as the only symptom. murmur does not limit this path
 # at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
+[gateway.limits.acl]
+# The ACL editor opens the channel tree with one query per channel, so an
+# administrator on a thirty-channel server emits thirty in a second or two.
+rate = "20/s"
+burst = 60
+[gateway.limits.chat]
+# A person typing. Losing a message somebody wrote is the worst failure here:
+# silent, unattributed, and the sender believes they were heard.
+rate = "5/s"
+burst = 20
 [gateway.limits.audio]
 rate = "200/s"
 burst = 400
@@ -132,6 +142,7 @@ tier = "essential"
 types = []                   # no client-facing type: internal by construction
 
 [services.permissions]
+limits = "acl"                # not the 1/s control bucket: an editor opens N at once
 endpoint = "unix:/run/starling/permissions.sock"
 tier = "essential"
 types = [12, 13, 20, 1001]
@@ -159,6 +170,7 @@ udp_listen = "0.0.0.0:64738" # voice's OWN socket — audio skips the gateway
 limits = "audio"             # never the 1/s control bucket: this is speech
 
 [services.text]
+limits = "chat"               # not the 1/s control bucket: a person typing
 endpoint = "unix:/run/starling/text.sock"
 tier = "core"
 types = [11, 1005]
@@ -232,6 +244,51 @@ types = [16, 17, 1017]
 # [services.pchat.storage]
 # url = "postgres://starling:@db/starling_pchat"
 # max_connections = 16
+
+# The gateway's own block.
+#
+# It owns no wire types — it is the process that *routes* them — and nothing
+# dials it to do work. It needs an endpoint anyway, because the `health`
+# collector dials every service to ask how it is, and without one the gateway
+# is the single component missing from the health dashboard: the process every
+# client connects to, holding every control queue in the server.
+[services.gateway]
+enabled = true
+endpoint = "unix:/run/starling/gateway.sock"
+# `core`, the default. The tier says what the *gateway* does while a service is
+# unhealthy, so the gateway's own tier is a value it would only ever consult
+# about itself — there is no answer for it to act on.
+tier = "core"
+types = []
+
+# -- The collectors ---------------------------------------------------------
+#
+# Neither owns a wire type, because no client addresses them: they are things
+# the server does rather than things a client asks for. `Config::with_defaults`
+# has always created both, so a server started with no `--config` runs them —
+# but `--config` **replaces** the defaults outright, so a file that omits them
+# is a file that turns them off. That is why they are written out here.
+
+# Announces this server to the public list. Calls out, is never called, and so
+# needs no endpoint at all.
+[services.directory]
+enabled = false
+tier = "optional"
+types = []
+
+# Asks every other service how it is, once every few seconds, and holds the
+# answers so `operator-api` can serve `/v1/health` from one place instead of
+# fanning out across twenty endpoints per page load.
+#
+# Unlike the announcer this one *is* dialled, so it needs a real endpoint.
+# Without it the service fails at startup with "has no endpoint in the
+# configuration" and `/v1/health` answers 502 — up, reachable, and with nothing
+# behind it.
+[services.health]
+enabled = true
+endpoint = "unix:/run/starling/health.sock"
+tier = "optional"
+types = []
 
 # -- The admin plane --------------------------------------------------------
 #
