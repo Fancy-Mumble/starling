@@ -91,13 +91,10 @@ pub struct Handshake {
 
 /// The `Version` Starling sends first, before the client has said anything.
 ///
-/// **`fancy_version` is deliberately absent.** It is a product version, and a
-/// client reads it as "this server implements the Fancy features up to X",
-/// then sends those features on epoch 0's numbering, which Starling routes
-/// nowhere. Claiming it would therefore *break* clients that work today: with
-/// the field absent they fall back to `PluginDataTransmission`, which is
-/// epoch-independent and which Starling relays correctly. The epoch below is
-/// how a client learns there are Fancy extensions here at all.
+/// `fancy_version` is deliberately absent: a client reads it as "Fancy features
+/// up to X" and then sends them on epoch 0's numbering, which routes nowhere.
+/// Absent, clients fall back to `PluginDataTransmission`, which is
+/// epoch-independent and relayed correctly.
 #[must_use]
 pub fn server_version() -> tcp::Version {
     tcp::Version {
@@ -112,22 +109,11 @@ pub fn server_version() -> tcp::Version {
 
 /// The whole of what a connection is, in the shape `session-view` stores.
 ///
-/// **`Upsert` replaces; it does not merge** (`session-view/src/lib.rs:181`).
-/// session-view keeps exactly the `Session` it is handed, so a field omitted
-/// here is not left alone; it is written as `false`, `0` or empty. Proto3
-/// cannot tell "unset" from "false" for a `bool`, so there is no partial
-/// update to send even in principle.
-///
-/// That is not a hypothetical. `announce_changed` used to rebuild the session
-/// without `mute`, `deaf` or `suppress`, and `voice` reads a speaker's silence
-/// **only** from session-view (`voice/src/view.rs:146`). So a moderator's mute
-/// was applied to the connection record, broadcast to every client, rendered in
-/// every user list, and then un-applied in the one place that decides whether
-/// the packets are forwarded. The user showed as muted and stayed audible.
-///
-/// Written out field by field with no `..Session::default()`, which is what hid
-/// the omission: a new field on the message should fail to compile here and
-/// make somebody choose, instead of silently defaulting on every announcement.
+/// `Upsert` replaces and does not merge (`session-view/src/lib.rs:181`), so a
+/// field omitted here is written as `false`, `0` or empty. Omitting `mute` once
+/// left a moderator's mute rendered everywhere and un-applied in `voice`, which
+/// reads silence only from this view. Written out field by field so a new field
+/// fails to compile here instead of silently defaulting.
 fn session_record(pending: &PendingConnection) -> Session {
     let (account, registered) = identity::wire(pending.account);
     Session {
@@ -323,11 +309,8 @@ impl Handshake {
     /// Decode the message, and find the connection it arrived on.
     ///
     /// Split out of [`Self::authenticate`] because neither failure is about
-    /// authentication: one is a peer speaking some other protocol at a Mumble
-    /// port, the other a frame that outran its own connection's teardown.
-    /// Neither can be answered (a `Reject` needs a connection to address) so
-    /// both are recorded and dropped, and keeping them here leaves the login
-    /// itself as a single readable sequence.
+    /// authentication, and neither can be answered: a `Reject` needs a
+    /// connection to address. Both are recorded and dropped.
     fn opening(
         &self,
         connections: &Connections,
@@ -357,24 +340,11 @@ impl Handshake {
 
     /// A second `Authenticate`: an access-token edit, and nothing else.
     ///
-    /// This is how a Mumble client submits a channel password. The user is
-    /// refused entry, types the password into the dialog, and the client sends
-    /// its whole token list again on the same connection
-    /// (`vendor/server/src/murmur/Messages.cpp:367`), no reconnection, and no
-    /// second login. Every other field of the message is ignored here, as it is
-    /// upstream: the name and password were settled at the handshake, and
-    /// honouring them again would be a way to change identity mid-session.
-    ///
-    /// The announcement is what makes the edit take effect at all. `permissions`
-    /// reads a session through `session-view` and nowhere else, so a token that
-    /// stops at this service's own record is a password the evaluator never
-    /// sees.
-    ///
-    /// **Not done here, deliberately:** murmur also re-sends every `ChannelState`
-    /// so a client can re-render which channels it may now enter
-    /// (`Messages.cpp:385`). That tree belongs to `metadata`, and the entry
-    /// itself works without it; the client simply learns the door is open by
-    /// walking through it, not by seeing it un-greyed.
+    /// How a client submits a channel password, on the same connection
+    /// (`Messages.cpp:367`). Every other field is ignored as upstream ignores
+    /// them, or the message becomes a way to change identity mid-session. The
+    /// announcement is what makes it take effect: `permissions` reads a session
+    /// through `session-view` and nowhere else.
     async fn retoken(
         &self,
         connections: &Connections,
@@ -405,15 +375,10 @@ impl Handshake {
 
     /// Disconnect the older session a reconnecting user left behind.
     ///
-    /// Pushed through the fan-out, not returned with this connection's
-    /// actions, because the ghost may be held by a different gateway pod
-    /// entirely, the pod that does not have it ignores the frame, which is
-    /// exactly the broadcast contract the plane already relies on.
-    ///
-    /// The `UserRemove` every other client needs is not sent here: closing the
-    /// connection makes the gateway report it closed, and the ordinary
-    /// disconnect path already broadcasts that. Sending one here too would
-    /// remove the user twice.
+    /// Through the fan-out, because the ghost may be held by another gateway
+    /// pod and the pods without it ignore the frame. No `UserRemove` here: the
+    /// ordinary disconnect path broadcasts one, and a second removes the user
+    /// twice.
     fn kick_ghost(&self, ghost: &PendingConnection) {
         tracing::info!(
             conn = ghost.conn,
@@ -522,35 +487,11 @@ impl Handshake {
 
     /// Refuse a certificate-less peer when the deployment requires one.
     ///
-    /// `cert_required` was a setting an operator could set and nothing read
-    /// (`docs/GAP-ANALYSIS.md` A3), which is worse than a missing feature: the
-    /// server accepted the change, persisted it, reported it back through
-    /// `operator-api`, and went on admitting certificate-less clients.
-    ///
-    /// Asked *after* the identity is known, as upstream asks it
-    /// (`Messages.cpp:508`), because the answer depends on who this is. That
-    /// placement is the whole of the rule and not a detail: an earlier version
-    /// of this check sat before [`Self::identify`], where there is no identity
-    /// to consult, and so refused everybody.
-    ///
-    /// **The SuperUser is exempt**, and upstream exempts it the same way, that
-    /// line guards on `id != 0`. The administrator account deliberately carries
-    /// no certificate: [`Accounts::write_superuser`][w] leaves `cert_hash` empty
-    /// so that the one login which can repair a broken server is always
-    /// something you *know*. Enforcing this against it locks the owner out the
-    /// moment they switch the setting on and leaves no account anywhere that
-    /// can switch it back off, a server bricked by a checkbox.
-    ///
-    /// The *presence* of a certificate, not its strength: murmur admits a
-    /// self-signed one here and that is a Mumble client's default, so requiring
-    /// `strong_cert` would refuse nearly every real client and read to the
-    /// operator as the setting being broken.
-    ///
-    /// `NoCertificate` rather than a generic refusal, because it is the one
-    /// rejection a Mumble client answers by offering to generate a certificate
-    /// which is exactly what this peer needs to do next.
-    ///
-    /// [w]: https://docs.rs/starling-userdata
+    /// After [`Self::identify`], because the answer depends on who this is
+    /// (`Messages.cpp:508`). The SuperUser is exempt as upstream exempts it, or
+    /// switching the setting on locks out the only account that could switch it
+    /// back off. Presence, not strength, and `NoCertificate` because that is the
+    /// refusal a client answers by offering to generate one.
     fn certificate_gate(
         &self,
         config: &Snapshot,
@@ -710,24 +651,11 @@ impl Handshake {
 
     /// Tell a client what it may do in a channel, without being asked.
     ///
-    /// murmur pushes this on every channel entry, the channel and its parent
-    /// (`Server.cpp:2319`), and a client builds its UI from it: an action it
-    /// holds no permission for is not greyed out, it is *absent*. Starling only
-    /// ever answered an explicit `PermissionQuery`, so a client that did not
-    /// ask (or asked before the tree it wanted to ask about existed) rendered
-    /// as though the user could do nothing at all. Every admin action was
-    /// missing from the menus with nothing in any log to explain it.
-    ///
-    /// Best-effort: a client that never learns its permissions shows fewer
-    /// actions than it holds, which is the safe direction, and every action it
-    /// does attempt is authorised again on its own path.
-    /// The identity is taken from the connection record, not asserted blank.
-    /// `effective` trusts the `Subject` it is handed, and a default one is an
-    /// unregistered guest, so asking with only a session id would report the
-    /// administrator's own permissions as a stranger's and hide every action
-    /// from them. This service is the authority on who just authenticated, so
-    /// it is entitled to state it, through `identity` rather than by comparing
-    /// `account` to zero.
+    /// murmur pushes this on every entry (`Server.cpp:2319`) and a client builds
+    /// its menus from it: an action it holds no permission for is absent, not
+    /// greyed out. Best-effort, which is the safe direction. The identity comes
+    /// from the connection record, because a default `Subject` is a guest and
+    /// would hide every action from the administrator.
     async fn push_permissions(&self, pending: &PendingConnection, channel: u32) -> Actions {
         use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
         use starling_proto_fancy::permissions::{EffectiveRequest, Subject};
@@ -784,13 +712,9 @@ impl Handshake {
 
     /// Whether this session may see a hidden channel.
     ///
-    /// Asked of `permissions` through `CheckSession`, which resolves who the
-    /// session is server-side, the identity is never the caller's to state.
-    ///
-    /// **Denies on any failure**, including `permissions` being unreachable.
-    /// The alternative is that an outage reveals every private room on the
-    /// server, and a channel briefly missing from a tree is recoverable where
-    /// that is not.
+    /// Through `CheckSession`, which resolves the identity server-side; it is
+    /// never the caller's to state. Denies on any failure, because the
+    /// alternative is an outage revealing every private room on the server.
     async fn may_see(&self, scope: u32, session: u32, channel: u32) -> bool {
         use starling_proto_fancy::permissions::SessionCheckRequest;
         use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
@@ -1122,13 +1046,9 @@ impl Handshake {
 
     /// Add, remove and re-weight `session`'s channel listeners.
     ///
-    /// `None` when metadata could not be reached, the same distinction
-    /// [`Self::enter`] draws, and for the same reason: an unreachable authority
-    /// must not be reported to a user as a permission they lack.
-    ///
-    /// The ceilings are applied *there*, not here: they are properties of the
-    /// tree, and a check on this side would be a second copy of a rule that has
-    /// to agree with the first one forever.
+    /// `None` when metadata is unreachable, as [`Self::enter`] draws it: an
+    /// unreachable authority must not read to a user as a permission they lack.
+    /// The ceilings are applied there, being properties of the tree.
     pub async fn listen(
         &self,
         scope: u32,
@@ -1381,32 +1301,10 @@ impl Handshake {
 
     /// Refuse a login: tell the client why, then hang up.
     ///
-    /// Every refusal in the handshake goes through here, which is what makes
-    /// "nobody can log in" answerable from the log alone; the client is told a
-    /// `Reject` type it usually renders as one generic sentence, and without
-    /// this the server's own reason existed only as the argument to a function
-    /// that discarded it.
-    ///
-    /// # The disconnect is half the refusal
-    ///
-    /// It returns **two** actions, and that is why it returns a list rather
-    /// than one: murmur sends the `Reject` and immediately calls
-    /// `disconnectSocket()` (`vendor/server/src/murmur/Messages.cpp:568`), and
-    /// for a long time this sent only the first of those.
-    ///
-    /// The result was a connection that had been refused and was still open.
-    /// The client showed "Server connection rejected", drew the root channel it
-    /// had already been sent, and went on pinging, so the idle sweep never
-    /// reaped it either, because a connection that keeps talking is never
-    /// timed out. What the user saw was a session that was half there: no
-    /// audio, no roster, no way to act, and no disconnect.
-    ///
-    /// Returning both together is deliberate over pushing the disconnect
-    /// separately: they travel in one ordered list, so the `Reject` is always
-    /// queued before the socket is asked to close, and the gateway flushes what
-    /// is queued before tearing the connection down. Emitting the disconnect
-    /// from anywhere else would make that ordering a race, and the frame that
-    /// would lose it is the one that says why.
+    /// Two actions in one ordered list, because murmur sends the `Reject` and
+    /// then disconnects (`Messages.cpp:568`). Sending only the first left a
+    /// refused connection open and pinging, which the idle sweep never reaps;
+    /// emitting the disconnect elsewhere would make the order a race.
     fn refuse(
         &self,
         conn: u64,
@@ -1449,20 +1347,10 @@ const fn refuse_for_certificate(required: bool, has_certificate: bool, superuser
 
 /// Whether `arriving` may take over from the `ghost` already using the name.
 ///
-/// murmur's rule, transcribed from `Messages.cpp:429`. Three ways in:
-///
-/// * **A registered account.** The account has already been proved by password
-///   or certificate, so the arriving peer *is* that user and the older session
-///   is a leftover.
-/// * **The same address.** This is murmur's "allow reuse of name from same IP",
-///   and it is the case that matters in practice: a client whose connection
-///   dropped reconnects before the server has noticed, and refusing would lock
-///   somebody out of their own name until a timeout they cannot see.
-/// * **The same certificate.** Identity without registration, proof enough
-///   that this is the same person on a different network.
-///
-/// Anything else is a stranger taking a name that is in use, which is the case
-/// `UsernameInUse` exists for.
+/// murmur's rule (`Messages.cpp:429`): a proved account, the same address, or
+/// the same certificate. The address case is the one that matters in practice,
+/// a dropped client reconnecting before the server noticed. Anything else is a
+/// stranger taking a name in use, which is what `UsernameInUse` is for.
 fn may_replace(
     arriving: &PendingConnection,
     ghost: &PendingConnection,
@@ -1588,15 +1476,10 @@ const LISTENERS_SINCE: u64 = 0x0001_0004_0000;
 
 /// Warn a client too old to know it can be listened to.
 ///
-/// murmur's, and it is a privacy notice rather than a compatibility note
-/// (`Messages.cpp:907`): a pre-1.4 client cannot render a `ChannelListener`, so
-/// its user has no way to see that somebody outside the room is hearing them.
-/// The server is the only thing in a position to say so.
-///
-/// Sent only when the feature is actually reachable, both ceilings non-zero,
-/// exactly as upstream gates it. A deployment that has not configured listeners
-/// has nothing to warn about, and a warning nobody can act on is noise that
-/// teaches users to ignore server messages.
+/// A privacy notice, not a compatibility one (`Messages.cpp:907`): a pre-1.4
+/// client cannot render a `ChannelListener`, so its user cannot see that
+/// somebody outside the room is hearing them. Sent only when both ceilings are
+/// non-zero, as upstream gates it, or the warning is noise nobody can act on.
 fn listener_warning(conn: u64, mumble_version: u64, config: &Snapshot) -> Actions {
     if mumble_version >= LISTENERS_SINCE
         || config.listeners_per_channel == 0
