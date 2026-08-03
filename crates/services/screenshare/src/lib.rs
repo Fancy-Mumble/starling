@@ -29,13 +29,21 @@
 //! share called "Quarterly numbers — draft" exists in a channel they cannot
 //! see. A title is content.
 //!
-//! # The SDP answer is empty, and that is the honest state
+//! # The SDP answer is empty, and the SFU that should fill it already exists
 //!
-//! There is no SFU in this tree. The answer carries the endpoint a client
-//! should negotiate with and an **empty `sdp`**, because inventing one here
-//! would be inventing an answer on behalf of a media server that does not
-//! exist. When the SFU lands, the answer is where its real SDP goes; until
-//! then a client can see it has been given an endpoint and no session.
+//! The answer carries the endpoint and an **empty `sdp`**, because this
+//! service does not talk to a media server. It is not that there is none:
+//! `vendor/server/3rdparty/webrtc-sfu` is a str0m SFU with the exact API this
+//! wants — `SfuHandle::start`, `broadcaster_offer`, `viewer_offer`, answers
+//! collected through `poll_event` — written for the C++ fork and reached
+//! through its C FFI.
+//!
+//! What is missing is the *wiring*, and it is a build-topology decision rather
+//! than a coding one: that crate lives in another repository's `3rdparty`
+//! directory, so a path dependency would tie Starling's build to the C++
+//! fork's layout. Vendoring it here, or running it as a service of its own
+//! (it already owns its runtime and its UDP sockets, which is most of what
+//! makes a service), are the two shapes that do not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
