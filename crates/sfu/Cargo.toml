@@ -1,0 +1,17 @@
+[package]
+name = "starling-sfu"
+description = "the WebRTC SFU: one broadcaster in, N viewers out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+str0m = "0.18"
+socket2 = "0.5"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

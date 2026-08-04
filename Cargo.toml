@@ -10,6 +10,11 @@ members = [
     "crates/gate",
     "crates/crypto",
 
+    # The media plane: one broadcaster in, N viewers out. Standalone, because
+    # it owns its own runtime and sockets and knows nothing about the control
+    # plane that drives it.
+    "crates/sfu",
+
     # The one common standalone crate every service is built on.
     "crates/runtime",
 
