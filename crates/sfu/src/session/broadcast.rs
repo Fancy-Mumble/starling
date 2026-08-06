@@ -11,8 +11,8 @@ use str0m::{Event, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
-use super::helpers::{generate_ice_creds, SessionStats};
-use super::{SfuConfig, REMB_BITRATE_BPS, REMB_INTERVAL, STATS_INTERVAL};
+use super::helpers::{SessionStats, generate_ice_creds};
+use super::{REMB_BITRATE_BPS, REMB_INTERVAL, STATS_INTERVAL, SfuConfig};
 
 // ---------------------------------------------------------------------------
 // BroadcastSession
@@ -84,7 +84,9 @@ impl BroadcastSession {
         destination: SocketAddr,
         data: &[u8],
     ) -> bool {
-        let Some(rtc) = &mut self.inbound else { return false };
+        let Some(rtc) = &mut self.inbound else {
+            return false;
+        };
         // Skipped, never unwrapped. `try_into` fails on a datagram str0m cannot
         // classify, this runs once per packet on a public UDP port, and a panic
         // here would take down every live share on the server. Anyone who can
@@ -92,18 +94,24 @@ impl BroadcastSession {
         let Ok(contents) = data.try_into() else {
             return false;
         };
-        let input = Input::Receive(now, Receive {
-            proto: Protocol::Udp,
-            source,
-            destination,
-            contents,
-        });
+        let input = Input::Receive(
+            now,
+            Receive {
+                proto: Protocol::Udp,
+                source,
+                destination,
+                contents,
+            },
+        );
         if !rtc.accepts(&input) {
             return false;
         }
         self.stats.raw_udp_rx += 1;
         if let Err(e) = rtc.handle_input(input) {
-            warn!("SFU: inbound handle_input error for broadcaster {}: {e}", self.broadcaster_session);
+            warn!(
+                "SFU: inbound handle_input error for broadcaster {}: {e}",
+                self.broadcaster_session
+            );
         }
         true
     }
@@ -122,12 +130,15 @@ impl BroadcastSession {
             let Ok(contents) = data.try_into() else {
                 return false;
             };
-            let input = Input::Receive(now, Receive {
-                proto: Protocol::Udp,
-                source,
-                destination,
-                contents,
-            });
+            let input = Input::Receive(
+                now,
+                Receive {
+                    proto: Protocol::Udp,
+                    source,
+                    destination,
+                    contents,
+                },
+            );
             if rtc.accepts(&input) {
                 if let Err(e) = rtc.handle_input(input) {
                     warn!("SFU: outbound handle_input error for viewer {viewer_id}: {e}");
@@ -160,7 +171,9 @@ impl BroadcastSession {
 
     async fn poll_inbound(&mut self, socket: &UdpSocket) -> Vec<str0m::media::MediaData> {
         let mut media = Vec::new();
-        let Some(rtc) = &mut self.inbound else { return media };
+        let Some(rtc) = &mut self.inbound else {
+            return media;
+        };
 
         loop {
             match rtc.poll_output() {
@@ -172,12 +185,18 @@ impl BroadcastSession {
                     self.stats.inbound_rtp_rx += 1;
                     trace!(
                         "SFU: broadcaster {} media: mid={} pt={} len={}",
-                        self.broadcaster_session, data.mid, data.pt, data.data.len(),
+                        self.broadcaster_session,
+                        data.mid,
+                        data.pt,
+                        data.data.len(),
                     );
                     media.push(data);
                 }
                 Ok(Output::Event(ev)) => {
-                    trace!("SFU: broadcaster {} event: {ev:?}", self.broadcaster_session);
+                    trace!(
+                        "SFU: broadcaster {} event: {ev:?}",
+                        self.broadcaster_session
+                    );
                 }
                 Ok(Output::Timeout(_)) => break,
                 Err(e) => {
@@ -197,7 +216,9 @@ impl BroadcastSession {
                 self.inbound_mids.push(frame.mid);
                 debug!(
                     "SFU: discovered inbound mid={} for broadcaster {} ({} total)",
-                    frame.mid, self.broadcaster_session, self.inbound_mids.len(),
+                    frame.mid,
+                    self.broadcaster_session,
+                    self.inbound_mids.len(),
                 );
             }
         }
@@ -213,7 +234,8 @@ impl BroadcastSession {
         }
         let Some(rtc) = &mut self.inbound else { return };
 
-        let due = self.last_remb_sent
+        let due = self
+            .last_remb_sent
             .map(|t| Instant::now().duration_since(t) >= REMB_INTERVAL)
             .unwrap_or(true);
         if !due {
@@ -290,10 +312,7 @@ impl BroadcastSession {
         sdp: &str,
     ) -> Result<(Rtc, String), Box<dyn std::error::Error>> {
         let mut rtc = rtc_config.build(Instant::now());
-        let public_addr = SocketAddr::new(
-            config.public_ip,
-            socket.local_addr()?.port(),
-        );
+        let public_addr = SocketAddr::new(config.public_ip, socket.local_addr()?.port());
         // The one candidate an ICE-lite server has, and the reason no
         // trickling happens anywhere: it rides in the answer below.
         let _ = rtc.add_local_candidate(str0m::Candidate::host(public_addr, Protocol::Udp)?);

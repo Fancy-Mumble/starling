@@ -362,7 +362,11 @@ mod tests {
             "http://[::ffff:169.254.169.254]/latest/meta-data/",
             "http://[::ffff:10.0.0.1]/",
         ] {
-            assert_eq!(vet(url), Err(Refusal::PrivateAddress), "{url} must be refused");
+            assert_eq!(
+                vet(url),
+                Err(Refusal::PrivateAddress),
+                "{url} must be refused"
+            );
         }
     }
 
@@ -371,7 +375,11 @@ mod tests {
         // fc00::/7 is where a deployment's own machines live on v6, and
         // fe80::/10 is the link. Neither was checked.
         for url in ["http://[fd00::1]/", "http://[fe80::1]/"] {
-            assert_eq!(vet(url), Err(Refusal::PrivateAddress), "{url} must be refused");
+            assert_eq!(
+                vet(url),
+                Err(Refusal::PrivateAddress),
+                "{url} must be refused"
+            );
         }
     }
 

@@ -95,11 +95,24 @@ pub struct SfuConfig {
 
 #[derive(Debug)]
 enum SfuCommand {
-    CreateSession { broadcaster_session: u32 },
-    BroadcasterOffer { broadcaster_session: u32, sdp: String },
-    ViewerOffer { broadcaster_session: u32, viewer_session: u32, sdp: String },
-    AddIceCandidate { client_session: u32 },
-    DestroySession { broadcaster_session: u32 },
+    CreateSession {
+        broadcaster_session: u32,
+    },
+    BroadcasterOffer {
+        broadcaster_session: u32,
+        sdp: String,
+    },
+    ViewerOffer {
+        broadcaster_session: u32,
+        viewer_session: u32,
+        sdp: String,
+    },
+    AddIceCandidate {
+        client_session: u32,
+    },
+    DestroySession {
+        broadcaster_session: u32,
+    },
     Shutdown,
 }
 
@@ -157,17 +170,26 @@ impl SfuHandle {
 
     /// Open a broadcast, before any offer arrives for it.
     pub fn create_session(&self, broadcaster_session: u32) {
-        let _r = self.cmd_tx.send(SfuCommand::CreateSession { broadcaster_session });
+        let _r = self.cmd_tx.send(SfuCommand::CreateSession {
+            broadcaster_session,
+        });
     }
 
     /// The broadcaster's own offer: the stream coming *in*.
     pub fn broadcaster_offer(&self, broadcaster_session: u32, sdp: String) {
-        let _r = self.cmd_tx.send(SfuCommand::BroadcasterOffer { broadcaster_session, sdp });
+        let _r = self.cmd_tx.send(SfuCommand::BroadcasterOffer {
+            broadcaster_session,
+            sdp,
+        });
     }
 
     /// A viewer's offer: one of the streams going *out*.
     pub fn viewer_offer(&self, broadcaster_session: u32, viewer_session: u32, sdp: String) {
-        let _r = self.cmd_tx.send(SfuCommand::ViewerOffer { broadcaster_session, viewer_session, sdp });
+        let _r = self.cmd_tx.send(SfuCommand::ViewerOffer {
+            broadcaster_session,
+            viewer_session,
+            sdp,
+        });
     }
 
     /// Accepted and ignored, because this server is ICE-lite.
@@ -175,13 +197,22 @@ impl SfuHandle {
     /// Kept rather than removed: a peer that trickles anyway is not an
     /// error, and dropping the candidate is the correct behaviour for a
     /// server whose own candidate already rode in the answer.
-    pub fn add_ice_candidate(&self, _broadcaster_session: u32, client_session: u32, _candidate_json: String) {
-        let _r = self.cmd_tx.send(SfuCommand::AddIceCandidate { client_session });
+    pub fn add_ice_candidate(
+        &self,
+        _broadcaster_session: u32,
+        client_session: u32,
+        _candidate_json: String,
+    ) {
+        let _r = self
+            .cmd_tx
+            .send(SfuCommand::AddIceCandidate { client_session });
     }
 
     /// End a broadcast and drop every peer attached to it.
     pub fn destroy_session(&self, broadcaster_session: u32) {
-        let _r = self.cmd_tx.send(SfuCommand::DestroySession { broadcaster_session });
+        let _r = self.cmd_tx.send(SfuCommand::DestroySession {
+            broadcaster_session,
+        });
     }
 
     /// The next event, if one is waiting. Never blocks.

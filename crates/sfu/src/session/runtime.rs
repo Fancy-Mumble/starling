@@ -9,8 +9,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::broadcast::BroadcastSession;
 use super::helpers::classify_packet;
 use super::{
-    SfuCommand, SfuConfig, SfuEvent,
-    MAX_BATCH_DRAIN, SOCKET_BUF_SIZE, TICK_INTERVAL, UDP_BUF_SIZE,
+    MAX_BATCH_DRAIN, SOCKET_BUF_SIZE, SfuCommand, SfuConfig, SfuEvent, TICK_INTERVAL, UDP_BUF_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -154,7 +153,9 @@ impl SfuRuntime {
 
     fn handle_command(&mut self, cmd: SfuCommand, event_tx: &mpsc::UnboundedSender<SfuEvent>) {
         match cmd {
-            SfuCommand::CreateSession { broadcaster_session } => {
+            SfuCommand::CreateSession {
+                broadcaster_session,
+            } => {
                 if self.sessions.contains_key(&broadcaster_session) {
                     debug!("SFU: session for broadcaster {broadcaster_session} already exists");
                     return;
@@ -165,7 +166,10 @@ impl SfuRuntime {
                     BroadcastSession::new(broadcaster_session),
                 );
             }
-            SfuCommand::BroadcasterOffer { broadcaster_session, sdp } => {
+            SfuCommand::BroadcasterOffer {
+                broadcaster_session,
+                sdp,
+            } => {
                 let Some(session) = self.sessions.get_mut(&broadcaster_session) else {
                     warn!("SFU: no session for broadcaster {broadcaster_session}");
                     return;
@@ -186,30 +190,43 @@ impl SfuRuntime {
                     Err(e) => error!("SFU: failed to create receiving peer: {e}"),
                 }
             }
-            SfuCommand::ViewerOffer { broadcaster_session, viewer_session, sdp } => {
+            SfuCommand::ViewerOffer {
+                broadcaster_session,
+                viewer_session,
+                sdp,
+            } => {
                 let Some(session) = self.sessions.get_mut(&broadcaster_session) else {
                     warn!("SFU: no session for broadcaster {broadcaster_session}");
                     return;
                 };
-                match session.accept_viewer_offer(&self.config, &self.socket, viewer_session, &sdp) {
+                match session.accept_viewer_offer(&self.config, &self.socket, viewer_session, &sdp)
+                {
                     Ok(answer_sdp) => {
-                        info!("SFU: viewer {viewer_session} connected to broadcaster {broadcaster_session}");
+                        info!(
+                            "SFU: viewer {viewer_session} connected to broadcaster {broadcaster_session}"
+                        );
                         let _r = event_tx.send(SfuEvent::SdpAnswer {
                             target_session: viewer_session,
                             broadcaster_session,
                             sdp: answer_sdp,
                         });
                     }
-                    Err(e) => error!("SFU: failed to create sending peer for viewer {viewer_session}: {e}"),
+                    Err(e) => error!(
+                        "SFU: failed to create sending peer for viewer {viewer_session}: {e}"
+                    ),
                 }
             }
             SfuCommand::AddIceCandidate { client_session, .. } => {
                 trace!("SFU: ICE candidate from session {client_session} (handled via UDP)");
             }
-            SfuCommand::DestroySession { broadcaster_session } => {
+            SfuCommand::DestroySession {
+                broadcaster_session,
+            } => {
                 info!("SFU: destroying session for broadcaster {broadcaster_session}");
                 let _ = self.sessions.remove(&broadcaster_session);
-                let _r = event_tx.send(SfuEvent::SessionEnded { broadcaster_session });
+                let _r = event_tx.send(SfuEvent::SessionEnded {
+                    broadcaster_session,
+                });
             }
             SfuCommand::Shutdown => {}
         }

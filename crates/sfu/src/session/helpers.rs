@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::{ICE_UFRAG_LEN, ICE_PASS_LEN, STATS_LOG_INTERVAL};
+use super::{ICE_PASS_LEN, ICE_UFRAG_LEN, STATS_LOG_INTERVAL};
 
 // ---------------------------------------------------------------------------
 // SessionStats

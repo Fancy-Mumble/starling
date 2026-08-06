@@ -5,9 +5,9 @@ use str0m::{Event, Output, Rtc};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
+use super::PLI_MIN_INTERVAL;
 use super::broadcast::BroadcastSession;
 use super::helpers::SessionStats;
-use super::PLI_MIN_INTERVAL;
 
 impl BroadcastSession {
     pub(super) async fn forward_to_viewers(
@@ -18,7 +18,9 @@ impl BroadcastSession {
         if !media.is_empty() && !self.outbound.is_empty() {
             trace!(
                 "SFU: forwarding {} frames from broadcaster {} to {} viewer(s)",
-                media.len(), self.broadcaster_session, self.outbound.len(),
+                media.len(),
+                self.broadcaster_session,
+                self.outbound.len(),
             );
         }
 
@@ -32,17 +34,14 @@ impl BroadcastSession {
                 socket,
                 &mut self.stats,
                 &mut keyframe_requests,
-            ).await;
+            )
+            .await;
         }
 
         keyframe_requests
     }
 
-    fn write_media_to_viewer(
-        viewer_id: u32,
-        rtc: &mut Rtc,
-        media: &[str0m::media::MediaData],
-    ) {
+    fn write_media_to_viewer(viewer_id: u32, rtc: &mut Rtc, media: &[str0m::media::MediaData]) {
         let mut write_err = 0u32;
         let mut no_writer = 0u32;
         let mut no_pt_match = 0u32;
@@ -65,7 +64,9 @@ impl BroadcastSession {
         }
 
         if write_err > 0 || no_writer > 0 || no_pt_match > 0 {
-            debug!("SFU: viewer {viewer_id} write issues: err={write_err} no_writer={no_writer} no_pt={no_pt_match}");
+            debug!(
+                "SFU: viewer {viewer_id} write issues: err={write_err} no_writer={no_writer} no_pt={no_pt_match}"
+            );
         }
     }
 
@@ -86,7 +87,10 @@ impl BroadcastSession {
                     trace!("SFU: viewer {viewer_id} ICE state: {state:?}");
                 }
                 Ok(Output::Event(Event::KeyframeRequest(req))) => {
-                    trace!("SFU: viewer {viewer_id} requests keyframe: mid={} kind={:?}", req.mid, req.kind);
+                    trace!(
+                        "SFU: viewer {viewer_id} requests keyframe: mid={} kind={:?}",
+                        req.mid, req.kind
+                    );
                     keyframe_requests.push(req);
                 }
                 Ok(Output::Event(ev)) => {
@@ -115,7 +119,11 @@ impl BroadcastSession {
         // All known track mids; before any media flowed, fall back to the
         // mids named by the viewers' own keyframe requests.
         let mut mids: Vec<_> = self.inbound_mids.clone();
-        for source in media.iter().map(|m| m.mid).chain(keyframe_requests.iter().map(|r| r.mid)) {
+        for source in media
+            .iter()
+            .map(|m| m.mid)
+            .chain(keyframe_requests.iter().map(|r| r.mid))
+        {
             if !mids.contains(&source) {
                 mids.push(source);
             }
@@ -127,7 +135,9 @@ impl BroadcastSession {
 
         let mut requested = false;
         for mid in mids {
-            let Some(mut writer) = rtc.writer(mid) else { continue };
+            let Some(mut writer) = rtc.writer(mid) else {
+                continue;
+            };
             match writer.request_keyframe(None, KeyframeRequestKind::Pli) {
                 Ok(()) => {
                     debug!(
@@ -151,7 +161,10 @@ impl BroadcastSession {
     /// Forward viewer PLIs to the broadcaster, rate-limited PER TRACK so a
     /// lossy camera track cannot starve the screen track of keyframes (and
     /// vice versa).
-    pub(super) fn forward_rate_limited_pli(&mut self, keyframe_requests: &[str0m::media::KeyframeRequest]) {
+    pub(super) fn forward_rate_limited_pli(
+        &mut self,
+        keyframe_requests: &[str0m::media::KeyframeRequest],
+    ) {
         if keyframe_requests.is_empty() {
             return;
         }
@@ -165,7 +178,8 @@ impl BroadcastSession {
             }
             handled.push(req.mid);
 
-            let allowed = self.last_pli_forwarded
+            let allowed = self
+                .last_pli_forwarded
                 .get(&req.mid)
                 .map(|t| now.duration_since(*t) >= PLI_MIN_INTERVAL)
                 .unwrap_or(true);
@@ -204,8 +218,10 @@ impl BroadcastSession {
         trace!(
             "SFU stats [broadcaster {}]: raw_rx={} media_in={} rtcp_out={} fwd={} viewer_tx={}",
             self.broadcaster_session,
-            self.stats.raw_udp_rx, self.stats.inbound_rtp_rx,
-            self.stats.inbound_tx, self.stats.frames_forwarded,
+            self.stats.raw_udp_rx,
+            self.stats.inbound_rtp_rx,
+            self.stats.inbound_tx,
+            self.stats.frames_forwarded,
             self.stats.outbound_tx,
         );
         self.stats.reset();

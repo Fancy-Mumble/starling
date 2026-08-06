@@ -56,7 +56,9 @@ use starling_proto_fancy::fancy::screenshare::{
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::permit::Permit;
-use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions};
+use starling_runtime::plane::{
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+};
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_sfu::{SfuConfig, SfuEvent, SfuHandle};
@@ -139,7 +141,9 @@ impl ScreenshareService {
         if self.permits_everything {
             return true;
         }
-        self.permit.allows(inbound, channel, permission.bits()).await
+        self.permit
+            .allows(inbound, channel, permission.bits())
+            .await
     }
 
     /// Carry the SFU's answers back to the clients waiting for them.
@@ -461,7 +465,9 @@ impl ClientService for ScreenshareService {
             Some(screenshare_envelope::Body::Start(start)) => self.on_start(&inbound, start).await,
             Some(screenshare_envelope::Body::Offer(offer)) => self.on_offer(&inbound, &offer),
             Some(screenshare_envelope::Body::Stop(stop)) => self.on_stop(&inbound, &stop).await,
-            Some(screenshare_envelope::Body::Viewers(request)) => self.on_viewers(&inbound, &request),
+            Some(screenshare_envelope::Body::Viewers(request)) => {
+                self.on_viewers(&inbound, &request)
+            }
             Some(screenshare_envelope::Body::Health(health)) => {
                 // Recorded rather than dropped. It was falling into a catch-all
                 // arm, so a client dutifully reporting that it is dropping half
@@ -854,7 +860,11 @@ mod tests {
             broadcaster_session: 4,
             sdp: "v=0 answer".to_owned(),
         });
-        assert_eq!(addressed(&actions[0]), vec![5], "the viewer, not the channel");
+        assert_eq!(
+            addressed(&actions[0]),
+            vec![5],
+            "the viewer, not the channel"
+        );
     }
 
     #[tokio::test]

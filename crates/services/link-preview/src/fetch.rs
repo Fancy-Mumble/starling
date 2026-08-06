@@ -241,7 +241,10 @@ impl Fetcher {
             .method("GET")
             .uri(&path)
             .header("host", &host)
-            .header("user-agent", concat!("Starling/", env!("CARGO_PKG_VERSION")))
+            .header(
+                "user-agent",
+                concat!("Starling/", env!("CARGO_PKG_VERSION")),
+            )
             // Asked for by name, so a server that has both a page and an API at
             // one URL sends the page.
             .header("accept", "text/html,application/xhtml+xml")
@@ -483,7 +486,10 @@ fn join(base: &str, location: &str) -> String {
         return format!("{origin}{location}");
     }
     let path = base.get(authority_end..).unwrap_or("/");
-    let directory = path.rfind('/').and_then(|at| path.get(..=at)).unwrap_or("/");
+    let directory = path
+        .rfind('/')
+        .and_then(|at| path.get(..=at))
+        .unwrap_or("/");
     format!("{origin}{directory}{location}")
 }
 
@@ -529,7 +535,10 @@ mod tests {
             join("https://example.org/a/b", "https://other.example/c"),
             "https://other.example/c"
         );
-        assert_eq!(join("https://example.org/a/b", "/c"), "https://example.org/c");
+        assert_eq!(
+            join("https://example.org/a/b", "/c"),
+            "https://example.org/c"
+        );
         assert_eq!(
             join("https://example.org/a/b", "c"),
             "https://example.org/a/c"
