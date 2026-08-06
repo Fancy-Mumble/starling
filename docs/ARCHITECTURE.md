@@ -195,7 +195,7 @@ is required for it, see `PORTING-PLAN.md` R1 and §6.
 |---|---|---|
 | **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config | reject logins |
 | **core** | voice, text, pchat, moderation | that feature is dead; server runs |
-| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, **directory**, **operator-api** | nobody notices |
+| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, health, **directory**, **operator-api** | nobody notices |
 
 ### The outward-facing plane is one service, and it is optional
 
