@@ -20,7 +20,7 @@ migration (2026-08-03). The first is the one that corrupts data.
 **D1, epoch 1 is defined twice, incompatibly.** `Mumble.proto` (identical in
 all three trees) defines proto2 envelopes, `PchatEnvelope`, `SocialEnvelope`,
 ..., whose arms are the epoch-0 messages byte-for-byte. Starling's
-`crates/proto-fancy/proto/fancy/` defines proto3 envelopes of the same names
+`crates/proto/fancy/proto/fancy/` defines proto3 envelopes of the same names
 with redesigned, minimal messages. **Both claim outer types 1000+ and epoch 1.**
 The client's `NativeCodec` encodes the proto2 cut; Starling's pchat and social
 services decode the proto3 cut. On a pchat message, inner field 3 is a
@@ -69,7 +69,7 @@ on it, Starling's says it does not). Wire-neutral, but it hides real drift:
 
 | # | Layer | File(s) | Syntax | Who compiles it |
 |---|---|---|---|---|
-| L0 | **Frozen Mumble surface** | `crates/proto/proto/Mumble.proto`, `MumbleUDP.proto` | proto2 | all three trees |
+| L0 | **Frozen Mumble surface** | `crates/proto/classic/proto/Mumble.proto`, `MumbleUDP.proto` | proto2 | all three trees |
 | L1 | **Mesh primitives** | `proto-fancy/proto/common.proto` (`starling.common.v1`) | proto3 | Starling only |
 | L2 | **Client wire, epoch 1** | `proto-fancy/proto/fancy/*.proto` (`starling.fancy.*.v1`) | proto3 | Starling **and** the client |
 | L3 | **Inter-service gRPC** | `proto-fancy/proto/*.proto` (`starling.*.v1`) | proto3 | Starling only |

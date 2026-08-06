@@ -61,7 +61,7 @@ struct Fixture {
 fn fixtures() -> Vec<Fixture> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/canon-fixtures.json"
+        "/../../../scripts/canon-fixtures.json"
     );
     let Ok(text) = std::fs::read_to_string(path) else {
         panic!("the fixture file is checked in, and this test is the reason: {path}")

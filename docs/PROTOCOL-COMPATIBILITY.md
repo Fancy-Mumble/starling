@@ -158,7 +158,7 @@ no degradation and no honest split.
 
 What it frames is the problem: the *payloads* are the proto2 envelope shapes
 from this file's `Mumble.proto`, while Starling decodes the proto3 sets in
-`crates/proto-fancy/proto/fancy/`. Same epoch, same outer types, different
+`crates/proto/fancy/proto/fancy/`. Same epoch, same outer types, different
 inner schemas, the silent break documented as D1 in `PROTOCOL-REDESIGN.md`
 §0, fixed by its migration step M2c (the client codec moves to the canon).
 Until M2c lands, Fancy traffic between the client and Starling corrupts or

@@ -5,8 +5,8 @@
 resolver = "3"
 members = [
     # Wire and security primitives, no I/O, no state.
-    "crates/proto",
-    "crates/proto-fancy",
+    "crates/proto/classic",
+    "crates/proto/fancy",
     "crates/gate",
     "crates/crypto",
 
@@ -64,8 +64,8 @@ publish = false
 
 [workspace.dependencies]
 # -- internal ---------------------------------------------------------------
-starling-proto = { path = "crates/proto" }
-starling-proto-fancy = { path = "crates/proto-fancy" }
+starling-proto = { path = "crates/proto/classic" }
+starling-proto-fancy = { path = "crates/proto/fancy" }
 starling-gate = { path = "crates/gate" }
 starling-crypto = { path = "crates/crypto" }
 starling-runtime = { path = "crates/runtime" }

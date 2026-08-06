@@ -183,7 +183,7 @@ def check_frozen(here: pathlib.Path, update: bool) -> list[str]:
 
     recorded_path = here / MANIFEST
     current = {
-        name: field_tags(here / "crates/proto-fancy/proto" / name) for name in sorted(FROZEN)
+        name: field_tags(here / "crates/proto/fancy/proto" / name) for name in sorted(FROZEN)
     }
     if update:
         recorded_path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", "utf-8")
@@ -223,7 +223,7 @@ CLIENT_OUTER = "crates/mumble-protocol/src/canon.rs"
 
 def check_outer_types(here: pathlib.Path, root: pathlib.Path) -> list[str]:
     """The client's outer-type constants must match `ServiceKind`."""
-    table = here / "crates/proto-fancy/src/types.rs"
+    table = here / "crates/proto/fancy/src/types.rs"
     client = root / "vendor/client" / CLIENT_OUTER
     if not client.is_file():
         print(f"skip: no client canon module at {client}", file=sys.stderr)
@@ -271,7 +271,7 @@ def main() -> int:
     # Every tree's copy, not just ours: the rule is broken identically in all
     # three or not at all, which is precisely why the drift check cannot see it.
     copies = [
-        here / "crates/proto/proto/Mumble.proto",
+        here / "crates/proto/classic/proto/Mumble.proto",
         root / "vendor/server/src/Mumble.proto",
         root / "vendor/client/crates/mumble-protocol/proto/Mumble.proto",
     ]

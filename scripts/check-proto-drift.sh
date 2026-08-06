@@ -31,7 +31,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Default layout: vendor/starling, vendor/server, vendor/client are siblings.
 root="${1:-$(cd "$here/../.." && pwd)}"
 
-ours="$here/crates/proto/proto"
+ours="$here/crates/proto/classic/proto"
 server="$root/vendor/server/src"
 client="$root/vendor/client/crates/mumble-protocol/proto"
 
@@ -92,7 +92,7 @@ check MumbleUDP.proto "$client/MumbleUDP.proto" "client"
 #
 # `vendor/server` is not checked: it speaks epoch 0 and has no L2 copy at all.
 # ---------------------------------------------------------------------------
-fancy_ours="$here/crates/proto-fancy/proto/fancy"
+fancy_ours="$here/crates/proto/fancy/proto/fancy"
 fancy_client="$client/fancy"
 
 if [[ -d "$fancy_client" ]]; then

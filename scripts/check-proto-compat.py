@@ -45,7 +45,7 @@ FORK = "vendor/server"
 UPSTREAM_PATH = "src/Mumble.proto"
 
 # Ours, which must be a superset of upstream's surface.
-OURS = "crates/proto/proto/Mumble.proto"
+OURS = "crates/proto/classic/proto/Mumble.proto"
 
 # Everything at or above this is a Fancy addition and none of upstream's
 # business (`PROTOCOL-COMPATIBILITY.md` §1).
