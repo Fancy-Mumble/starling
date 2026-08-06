@@ -176,54 +176,78 @@ impl ClientService for LinkPreviewService {
             return Actions::new();
         };
 
-        let reply = match vet(&request.url) {
-            Err(refusal) => {
-                // A client asking the server to fetch a loopback or metadata
-                // address is an SSRF attempt, whether or not it knows it. The
-                // guard already refuses; this is what makes it visible, and it
-                // records the session so a repeat offender is attributable.
-                if matches!(refusal, Refusal::PrivateAddress) {
-                    tracing::warn!(
-                        session = inbound.session,
-                        url = %request.url,
-                        "link preview refused: the target is inside the deployment"
-                    );
-                    self.logger.log(
-                        LogEvent::warning(
-                            Category::Security,
-                            "link preview refused: private address",
-                        )
-                        .with("session", inbound.session)
-                        .with("url", request.url.clone()),
-                    );
-                } else {
-                    tracing::debug!(
-                        session = inbound.session,
-                        reason = refusal.reason(),
-                        "link preview refused"
+        // One answer per URL, and the caps are per request: a message with
+        // forty links is forty fetches, and a client that sends one is not
+        // doing anything a client is not allowed to do.
+        let mut actions = Actions::new();
+        for url in &request.urls {
+            match vet(url) {
+                Err(refusal) => actions.push(self.refuse(&inbound, &request.request_id, url, refusal)),
+                Ok(()) => {
+                    // The fetch happens off this handler and the answer arrives
+                    // through the fanout. A preview is a request to a host
+                    // somebody else chose: it takes as long as that host takes,
+                    // and awaiting it here would hold this connection's frame
+                    // handler for seconds while a stranger's server decides.
+                    self.spawn_fetch(
+                        inbound.conn,
+                        PreviewRequest {
+                            request_id: request.request_id.clone(),
+                            urls: vec![url.clone()],
+                        },
                     );
                 }
-                LinkPreviewEnvelope {
-                    body: Some(link_preview_envelope::Body::Error(PreviewError {
-                        request_id: request.request_id,
-                        reason: refusal.reason().to_owned(),
-                    })),
-                }
             }
-            Ok(()) => {
-                // The fetch happens off this handler, and the answer arrives
-                // later through the fanout. A preview is a request to a host
-                // somebody else chose: it takes as long as that host takes, and
-                // awaiting it here would hold this connection's frame handler
-                // for seconds while a stranger's slow server decides.
-                //
-                // `request_id` is what pairs the answer with the question, and
-                // is the reason the canon carries one.
-                self.spawn_fetch(inbound.conn, request);
-                return Actions::new();
+        }
+        actions
+    }
+}
+
+impl LinkPreviewService {
+    /// Tell the client why a URL will not be fetched, and the operator when it
+    /// is the kind of refusal worth knowing about.
+    fn refuse(
+        &self,
+        inbound: &Inbound,
+        request_id: &str,
+        url: &str,
+        refusal: Refusal,
+    ) -> starling_proto_fancy::control::ServerAction {
+        // A client asking the server to fetch a loopback or metadata address is
+        // an SSRF attempt, whether or not it knows it. The guard already
+        // refuses; this is what makes it visible, and it records the session so
+        // a repeat offender is attributable.
+        if matches!(refusal, Refusal::PrivateAddress) {
+            tracing::warn!(
+                session = inbound.session,
+                url = %url,
+                "link preview refused: the target is inside the deployment"
+            );
+            self.logger.log(
+                LogEvent::warning(Category::Security, "link preview refused: private address")
+                    .with("session", inbound.session)
+                    .with("url", url.to_owned()),
+            );
+        } else {
+            tracing::debug!(
+                session = inbound.session,
+                reason = refusal.reason(),
+                "link preview refused"
+            );
+        }
+        to_conn(
+            inbound.conn,
+            ServiceKind::LinkPreview.outer_type(),
+            LinkPreviewEnvelope {
+                body: Some(link_preview_envelope::Body::Error(PreviewError {
+                    request_id: request_id.to_owned(),
+                    // Named, so a client with several links in one message can
+                    // say which of them it could not preview.
+                    reason: format!("{url}: {}", refusal.reason()),
+                })),
             }
-        };
-        vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+            .encode_to_vec(),
+        )
     }
 }
 
@@ -235,7 +259,8 @@ impl LinkPreviewService {
         let logger = self.logger.clone();
         let outer = ServiceKind::LinkPreview.outer_type();
         drop(tokio::spawn(async move {
-            let body = match fetcher.fetch(&request.url).await {
+            let url = request.urls.first().cloned().unwrap_or_default();
+            let body = match fetcher.fetch(&url).await {
                 Ok(page) => {
                     let card = parse::card(&page.html);
                     link_preview_envelope::Body::Preview(Preview {
@@ -267,13 +292,13 @@ impl LinkPreviewService {
                                 Category::Security,
                                 "link preview refused: the name resolves inside the deployment",
                             )
-                            .with("url", request.url.clone()),
+                            .with("url", url.clone()),
                         );
                     }
-                    tracing::debug!(url = %request.url, ?error, "link preview failed");
+                    tracing::debug!(url = %url, ?error, "link preview failed");
                     link_preview_envelope::Body::Error(PreviewError {
                         request_id: request.request_id,
-                        reason: error.reason().to_owned(),
+                        reason: format!("{url}: {}", error.reason()),
                     })
                 }
             };

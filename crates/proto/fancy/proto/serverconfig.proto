@@ -51,7 +51,7 @@ message Snapshot {
   bool cert_required = 22;
   uint32 log_days = 23;
   // murmur's leaky bucket, which silently drops when it is wrong
-  // (PORTING-PLAN.md R5). Carried here so the gateway can size its buckets.
+  // (docs/PORTING-PLAN.md R5). Carried here so the gateway can size its buckets.
   uint32 message_limit = 24;
   uint32 message_burst = 25;
   uint32 plugin_message_limit = 26;

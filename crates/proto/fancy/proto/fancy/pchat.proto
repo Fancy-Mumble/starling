@@ -5,7 +5,7 @@ syntax = "proto3";
 // The server is a relay and a store. The end-to-end crypto lives in the
 // client, so nothing here decrypts anything: payloads are opaque ciphertext,
 // and the service's job is storage, fan-out, offline queues, key-holder
-// bookkeeping and rate limiting (PORTING-PLAN.md §4, persistent chat).
+// bookkeeping and rate limiting (docs/PORTING-PLAN.md §4, persistent chat).
 package starling.fancy.pchat.v1;
 
 import "fancy/wire.proto";

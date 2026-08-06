@@ -384,9 +384,19 @@ message LinkPreviewEnvelope {
   }
 }
 
+// "Preview these links for me."
+//
+// **Several URLs, one request.** A chat message carries as many links as
+// somebody typed, and a canon that took one per request would have the client
+// either send N frames — through a rate limiter that counts frames — or drop
+// all but the first, which is what the epoch-0 translation did.
+//
+// The answers come back one `Preview` (or `PreviewError`) per URL, each
+// carrying the `request_id` and its own `url`, so a client can render them as
+// they arrive rather than waiting for the slowest host in the message.
 message PreviewRequest {
   string request_id = 1;
-  string url = 2;
+  repeated string urls = 2;
 }
 
 // Fetched by the server, never by the client, so a chat link cannot be used to
