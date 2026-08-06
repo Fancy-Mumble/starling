@@ -11,7 +11,9 @@ import re
 import sys
 
 bad = 0
-for path in sorted(glob.glob("*.puml")):
+# `.iuml` too: shape.puml is a wrapper whose every note lives in an included
+# body, so globbing only `*.puml` would walk right past the text this checks.
+for path in sorted(glob.glob("*.puml") + glob.glob("*.iuml")):
     lines = open(path, encoding="utf-8").read().splitlines()
     in_note = False
     for n, line in enumerate(lines, 1):

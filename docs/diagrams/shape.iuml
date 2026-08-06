@@ -1,0 +1,71 @@
+' The body of shape.puml / shape-dark.puml. Not a diagram on its own: it carries
+' no start marker, so PlantUML will not render this file directly.
+'
+' Careful: the start and end markers must not appear in this file *at all*, not
+' even inside a comment like this one. PlantUML scans for them lexically, so a
+' comment that merely names one opens a second diagram here and the include
+' fails with a line number pointing at neither. That cost a bisect to find.
+'
+' Split out because the README ships a light and a dark render and they must not
+' drift. Everything that is the same in both lives here; each wrapper adds only
+' the handful of colours that differ. A global switch cannot do this job:
+' `-darkmode`, `-S<param>` and the env lookup were all tried and all lose to the
+' `!theme` and the explicit fills below, which is why the split exists.
+'
+' The cards keep their light fills and dark text in both renders. Only the
+' canvas and the text floating on it change, so the dark variant is the same
+' picture on a dark page rather than a differently-coloured picture.
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 14
+skinparam ranksep 45
+skinparam defaultTextAlignment center
+
+title The shape of it: four ways in, one of them through the gateway
+
+header
+<b>THE TOP-LEVEL PICTURE, AND NOTHING ELSE.</b>  Every service and every message type: <b>services.puml</b>.
+Only the <b>control</b> path is brokered. Realtime, bulk and admin traffic reach their service directly,
+so the gateway is never in the media path and cannot be its bottleneck.
+Rationale: <b>ARCHITECTURE.md</b>.   Shard keys: <b>scaling.puml</b>.   Gateway parts: <b>gateway-internals.puml</b>.
+endheader
+
+actor "Mumble client\n«legacy or Fancy»" as client #E3F2FD
+actor "**operator**" as oper #F3E5F5
+
+component "**gateway**\nTLS · framing · limits\n**single writer per client socket**" as gw #FFE9D6
+
+component "**21 services**, tiered\nessential · core · optional\n«gRPC, no client reaches them directly»" as svc #FAFAFA
+
+component "**voice**\nits own UDP socket" as voice #E8F5E9
+component "**files**\nsigned URL, out of band" as files #E8F5E9
+component "**operator-api**\nREST + OpenAPI\n**off by default**" as opapi #EDE7F6
+
+client --> gw : **control** · Mumble over TCP+TLS
+gw --> svc : gRPC, routed by the\n**16-bit type in the frame header**
+
+client --> voice : **realtime** · UDP, no hop
+client --> files : **bulk** · HTTPS
+oper --> opapi : **admin** · HTTPS, loopback
+
+note right of gw
+  Two facts carry the rest of the design.
+  **Single writer per client socket**, so
+  per-client ordering holds by construction.
+  The wire type is in the **framing**, never
+  in the protobuf, so routing is two bytes
+  and a lookup.
+  --
+  So the gateway parses no payload, links no
+  service's stubs, and never recompiles when
+  a service is added.
+  **A new service is a TOML block**, not a release.
+end note
+
+note bottom of voice
+  `voice`, `files` and `operator-api` are three
+  of the 21. They are drawn outside only because
+  a client reaches them **without the gateway**,
+  which is what this diagram is about.
+end note
