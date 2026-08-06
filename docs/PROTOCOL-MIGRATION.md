@@ -205,6 +205,19 @@ see M2b.
   noticed, because a tombstone comment stops readers and not compilers. The
   types no longer exist, so nothing can quietly speak them.
 
+  **Since superseded for Starling's copy only:** the third category is gone
+  there too, 95 messages and enums. M3 kept them because `vendor/server` speaks
+  them, which is a reason to keep them *in `vendor/server`*. Starling's
+  `TcpMessageType` stops at upstream's 26 and carries every Fancy id as
+  `ControlMessage::Opaque`, so it never decoded one, and a workspace build
+  confirms no Rust named any of them. The fork and the client still carry the
+  block and still need it. `check-proto-drift.sh` therefore compares
+  `Mumble.proto` as a subset — every type Starling declares must match the other
+  trees; types it does not declare it cannot mis-decode. This is the first step
+  of the larger goal: Starling's `Mumble.proto` becomes upstream's file
+  verbatim, so adopting an upstream release is a copy rather than a merge. The
+  Fancy *fields* inside upstream messages are what remains in the way.
+
   It removed a live defect as well as dead text. The client's codec fell back to
   the proto2 envelopes whenever the canon did not recognise a payload, which
   meant **a canon frame at a service the canon does not cover**, server-config
