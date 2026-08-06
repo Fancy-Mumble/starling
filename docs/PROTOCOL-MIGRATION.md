@@ -21,10 +21,10 @@ entries below are kept as the record of what each one changed and why — the
 reasoning is the part that outlives the step.
 
 What remains is not a milestone but a list: the services still relaying because
-the fixture coverage that follows each service as it gains a canon, and
-**wiring screenshare to the SFU** that already exists in
-`vendor/server/3rdparty/webrtc-sfu` — until then the SDP answer is empty and
-says so. userdata, link-preview and screenshare all came off the deferred list;
+the fixture coverage that follows each service as it gains a canon. The SFU is
+**wired**: ported into `crates/sfu` and driven by `screenshare`, so an offer is
+answered with a real SDP whenever an operator has configured a public address
+for media. userdata, link-preview and screenshare all came off the deferred list;
 see M2b.
 
 * **M1, canon markers. Done.** Tombstone the proto2 envelope block in

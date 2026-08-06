@@ -29,21 +29,22 @@
 //! share called "Quarterly numbers — draft" exists in a channel they cannot
 //! see. A title is content.
 //!
-//! # The SDP answer is empty, and the SFU that should fill it already exists
+//! # Where the SDP answer comes from
 //!
-//! The answer carries the endpoint and an **empty `sdp`**, because this
-//! service does not talk to a media server. It is not that there is none:
-//! `vendor/server/3rdparty/webrtc-sfu` is a str0m SFU with the exact API this
-//! wants — `SfuHandle::start`, `broadcaster_offer`, `viewer_offer`, answers
-//! collected through `poll_event` — written for the C++ fork and reached
-//! through its C FFI.
+//! `starling-sfu`, in this workspace, ported from the crate the C++ fork loads
+//! through a C FFI. It is called directly: an offer goes in, and the answer
+//! comes back as an event, because the SFU has no way to reach a client and
+//! this service does.
 //!
-//! What is missing is the *wiring*, and it is a build-topology decision rather
-//! than a coding one: that crate lives in another repository's `3rdparty`
-//! directory, so a path dependency would tie Starling's build to the C++
-//! fork's layout. Vendoring it here, or running it as a service of its own
-//! (it already owns its runtime and its UDP sockets, which is most of what
-//! makes a service), are the two shapes that do not.
+//! **Which offer is which is decided here, not on the wire.** An offer from the
+//! presenter is the stream coming in; an offer from anybody else is a viewer
+//! asking for it to go out. The canon has no field saying which, and it should
+//! not: a client that could declare itself the broadcaster of somebody else's
+//! share would be doing exactly that.
+//!
+//! A server with no SFU configured still signals. The answer then carries the
+//! endpoint and an empty `sdp`, which is what it always did, and a client can
+//! tell it has been given an endpoint and no session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,7 @@ use starling_runtime::permit::Permit;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions};
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_sfu::{SfuConfig, SfuEvent, SfuHandle};
 
 /// One live share.
 #[derive(Debug, Clone)]
@@ -74,6 +76,29 @@ struct Share {
     viewers: Vec<u32>,
 }
 
+/// What an offer means, which depends entirely on who sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The stream coming in.
+    Broadcaster,
+    /// One of the streams going out.
+    Viewer,
+}
+
+/// Which of the two an offer from `session` is.
+///
+/// Decided from the share the server holds, never from a field on the wire.
+/// A client that could declare itself the broadcaster would be declaring
+/// itself the broadcaster of somebody else's share — and the SFU would then
+/// replace the real inbound stream with theirs.
+const fn role_of(session: u32, share: &Share) -> Role {
+    if session == share.presenter {
+        Role::Broadcaster
+    } else {
+        Role::Viewer
+    }
+}
+
 /// The readiness gate that stays closed until the roster has a snapshot.
 ///
 /// A cold roster names nobody, so a share would be announced to an empty
@@ -84,10 +109,17 @@ const VIEW_GATE: &str = "screenshare_roster_warm";
 #[derive(Debug)]
 pub struct ScreenshareService {
     shares: Mutex<HashMap<String, Share>>,
-    sfu: (String, u32),
+    endpoint: (String, u32),
     fanout: Fanout,
     permit: Permit,
     roster: Arc<Roster>,
+    /// The media plane, when one is configured.
+    ///
+    /// `None` is a supported deployment and not a failure: a server that has
+    /// not been given a public address for media still signals, and its answers
+    /// carry an endpoint with no session, exactly as they did before there was
+    /// an SFU at all.
+    sfu: Option<Arc<SfuHandle>>,
     /// Test-only: treat every permission check as granted.
     ///
     /// `cfg(test)`, so it is not configuration and no operator can turn the
@@ -108,6 +140,92 @@ impl ScreenshareService {
             return true;
         }
         self.permit.allows(inbound, channel, permission.bits()).await
+    }
+
+    /// Carry the SFU's answers back to the clients waiting for them.
+    ///
+    /// The SFU produces an answer whenever it finishes with an offer, and has
+    /// no way to reach a client; this service does. Without this task every
+    /// offer is accepted and no answer ever arrives, which on the wire is
+    /// indistinguishable from an SFU that is not running.
+    ///
+    /// Polled rather than awaited because the handle exposes a non-blocking
+    /// `poll_event` — the same shape the C++ fork drives with a `QTimer`. The
+    /// interval is short enough not to be felt in a handshake and long enough
+    /// not to spin a core.
+    fn pump(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let sfu = Arc::clone(self.sfu.as_ref()?);
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+            loop {
+                let _ = tick.tick().await;
+                self.drain(&sfu);
+            }
+        }))
+    }
+
+    /// Everything the media plane has to say right now.
+    fn drain(&self, sfu: &SfuHandle) {
+        while let Some(event) = sfu.poll_event() {
+            self.fanout.push_all(self.on_sfu_event(event));
+        }
+    }
+
+    /// One event from the media plane, as something to send.
+    fn on_sfu_event(&self, event: SfuEvent) -> Actions {
+        match event {
+            SfuEvent::SdpAnswer {
+                target_session,
+                broadcaster_session,
+                sdp,
+            } => {
+                let Some((share_id, share)) = self.share_of(broadcaster_session) else {
+                    // The share ended between the offer and the answer. The
+                    // answer is worthless now, and sending it would have a
+                    // client negotiate against a session that is gone.
+                    return Actions::new();
+                };
+                let answer = ScreenshareEnvelope {
+                    body: Some(screenshare_envelope::Body::Answer(Answer {
+                        share_id,
+                        sdp,
+                        sfu_host: self.endpoint.0.clone(),
+                        sfu_port: self.endpoint.1,
+                    })),
+                };
+                let _ = share;
+                vec![to_sessions(
+                    vec![target_session],
+                    ServiceKind::Screenshare.outer_type(),
+                    answer.encode_to_vec(),
+                )]
+            }
+            SfuEvent::SessionEnded {
+                broadcaster_session,
+            } => {
+                // The media plane gave up on it — a peer that never connected,
+                // or one that went away. The channel is told, or viewers keep
+                // watching a share the server has already forgotten.
+                let Some((share_id, share)) = self.share_of(broadcaster_session) else {
+                    return Actions::new();
+                };
+                tracing::info!(share = %share_id, "share ended: the media session did");
+                self.end(&share_id, &share, broadcaster_session)
+            }
+        }
+    }
+
+    /// The share a broadcaster is presenting, by session.
+    ///
+    /// The SFU knows sessions; this service keys shares by id, so one of the
+    /// two has to do the lookup, and only this one has the table.
+    fn share_of(&self, presenter: u32) -> Option<(String, Share)> {
+        self.shares.lock().ok().and_then(|shares| {
+            shares
+                .iter()
+                .find(|(_, share)| share.presenter == presenter)
+                .map(|(id, share)| (id.clone(), share.clone()))
+        })
     }
 
     /// Everyone in `channel` except `except`, as an audience.
@@ -163,6 +281,12 @@ impl ScreenshareService {
                 },
             );
         }
+        if let Some(sfu) = self.sfu.as_ref() {
+            // Opened before anything is announced: a viewer that sees the
+            // announcement may offer immediately, and an offer for a session
+            // the SFU has not been told about is an offer it drops.
+            sfu.create_session(inbound.session);
+        }
         let channel = start.channel;
         let announcement = ScreenshareEnvelope {
             body: Some(screenshare_envelope::Body::Start(Start {
@@ -175,23 +299,48 @@ impl ScreenshareService {
         self.audience(channel, inbound.session, announcement.encode_to_vec())
     }
 
-    /// An SDP offer, answered with the endpoint to negotiate against.
+    /// An SDP offer, handed to the SFU.
+    ///
+    /// The answer does not come back here: the SFU produces it asynchronously
+    /// and `pump` delivers it. What comes back from this is nothing at all,
+    /// which is why the canon says offers retry until answered.
     fn on_offer(&self, inbound: &Inbound, offer: &Offer) -> Actions {
-        // The answer carries the SFU's own candidates, which is why nothing
-        // here waits for a trickle that will never come.
-        let answer = ScreenshareEnvelope {
-            body: Some(screenshare_envelope::Body::Answer(Answer {
-                share_id: offer.share_id.clone(),
-                sdp: String::new(),
-                sfu_host: self.sfu.0.clone(),
-                sfu_port: self.sfu.1,
-            })),
+        let Some(sfu) = self.sfu.as_ref() else {
+            // No media plane configured. The endpoint-only answer, as before.
+            return vec![to_conn(
+                inbound.conn,
+                ServiceKind::Screenshare.outer_type(),
+                ScreenshareEnvelope {
+                    body: Some(screenshare_envelope::Body::Answer(Answer {
+                        share_id: offer.share_id.clone(),
+                        sdp: String::new(),
+                        sfu_host: self.endpoint.0.clone(),
+                        sfu_port: self.endpoint.1,
+                    })),
+                }
+                .encode_to_vec(),
+            )];
         };
-        vec![to_conn(
-            inbound.conn,
-            ServiceKind::Screenshare.outer_type(),
-            answer.encode_to_vec(),
-        )]
+
+        let Some(share) = self.share(&offer.share_id) else {
+            // An offer for a share nobody started. Dropped rather than
+            // answered: creating a session here would let any client allocate
+            // media resources without ever announcing a share.
+            tracing::debug!(
+                session = inbound.session,
+                share = %offer.share_id,
+                "offer for a share that does not exist"
+            );
+            return Actions::new();
+        };
+
+        match role_of(inbound.session, &share) {
+            Role::Broadcaster => sfu.broadcaster_offer(share.presenter, offer.sdp.clone()),
+            Role::Viewer => {
+                sfu.viewer_offer(share.presenter, inbound.session, offer.sdp.clone());
+            }
+        }
+        Actions::new()
     }
 
     /// Somebody ending a share.
@@ -270,6 +419,12 @@ impl ScreenshareService {
     fn end(&self, share_id: &str, share: &Share, actor: u32) -> Actions {
         if let Ok(mut shares) = self.shares.lock() {
             let _ = shares.remove(share_id);
+        }
+        if let Some(sfu) = self.sfu.as_ref() {
+            // Every peer attached to it goes with it. Without this a presenter
+            // who stops sharing leaves their inbound peer and every viewer's
+            // outbound peer holding sockets for the life of the process.
+            sfu.destroy_session(share.presenter);
         }
         let stopped = ScreenshareEnvelope {
             body: Some(screenshare_envelope::Body::Stop(Stop {
@@ -367,14 +522,44 @@ impl Serve for ScreenshareService {
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let service = ctx.service();
-        let sfu = service
+        let endpoint = service
             .public_url
             .as_deref()
             .and_then(|url| url.rsplit_once(':'))
             .map(|(host, port)| (host.to_owned(), port.parse().unwrap_or(0)))
             .unwrap_or_else(|| (String::new(), 0));
+
+        // The media plane starts only when an operator has said where clients
+        // can reach it. An SFU that put its own private address in every SDP
+        // answer would hand every viewer a candidate that cannot be dialled,
+        // and the symptom is a share that connects and never shows a frame.
+        let sfu = match endpoint.0.parse() {
+            Ok(public_ip) => {
+                let config = SfuConfig {
+                    udp_port: service.option::<u16>("media_port").unwrap_or(0),
+                    public_ip,
+                };
+                match SfuHandle::start(config) {
+                    Ok(handle) => Some(Arc::new(handle)),
+                    Err(error) => {
+                        // Not fatal. Signalling without media is a degraded
+                        // screen share; a server that refuses to boot over it
+                        // is a degraded server.
+                        tracing::error!(%error, "the SFU did not start; signalling only");
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::info!(
+                    "no public address for media; screen share signals but does not forward"
+                );
+                None
+            }
+        };
         Ok(Arc::new(Self {
             shares: Mutex::new(HashMap::new()),
+            endpoint,
             sfu,
             fanout: Fanout::default(),
             permit: Permit::new(ctx.resolver),
@@ -388,8 +573,15 @@ impl Serve for ScreenshareService {
         // Without this the roster is empty forever and every share is announced
         // to nobody: the audience is the feature.
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        let pump = Arc::clone(&self).pump();
         ctx.shutdown.wait().await;
         follower.abort();
+        if let Some(pump) = pump {
+            pump.abort();
+        }
+        if let Some(sfu) = self.sfu.as_ref() {
+            sfu.shutdown();
+        }
         Ok(())
     }
 
@@ -424,7 +616,10 @@ mod tests {
         );
         Arc::new(ScreenshareService {
             shares: Mutex::new(HashMap::new()),
-            sfu: ("sfu.example.org".to_owned(), 7000),
+            endpoint: ("sfu.example.org".to_owned(), 7000),
+            // No media plane in these tests: they are about signalling, and an
+            // SFU would bind a UDP port per test.
+            sfu: None,
             fanout: Fanout::default(),
             permit: Permit::new(nowhere),
             roster: Arc::new(Roster::new()),
@@ -612,6 +807,84 @@ mod tests {
 
         assert!(service.closed(78, "gone").await.is_empty());
         assert!(service.share("s7").is_some(), "somebody else left");
+    }
+
+    #[tokio::test]
+    async fn an_offer_is_read_as_the_role_the_server_knows_the_sender_by() {
+        // The decision that keeps a viewer from replacing the broadcast: the
+        // SFU is told "this is the inbound stream" only for the session the
+        // share says is presenting.
+        let service = permissive();
+        seat(&service, &[(4, 3), (5, 3)]);
+        let _ = service.frame(frame(4, &start_of("s9", 3))).await;
+        let share = service.share("s9").expect("live");
+
+        assert_eq!(role_of(4, &share), Role::Broadcaster);
+        assert_eq!(role_of(5, &share), Role::Viewer);
+        assert_eq!(role_of(0, &share), Role::Viewer, "and nobody is a viewer");
+    }
+
+    #[tokio::test]
+    async fn an_offer_for_a_share_nobody_started_is_dropped() {
+        // Answering it would let any client allocate media resources without
+        // ever announcing a share.
+        let service = permissive();
+        let offer = ScreenshareEnvelope {
+            body: Some(screenshare_envelope::Body::Offer(Offer {
+                share_id: "ghost".to_owned(),
+                channel: 3,
+                sdp: "v=0".to_owned(),
+                attempt: 1,
+            })),
+        };
+        // With no SFU configured the endpoint-only answer still goes out; with
+        // one, the share has to exist. Both are asserted where they apply.
+        assert_eq!(service.frame(frame(4, &offer)).await.len(), 1);
+        assert!(service.share("ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_the_media_plane_reaches_the_session_it_is_for() {
+        let service = permissive();
+        seat(&service, &[(4, 3), (5, 3)]);
+        let _ = service.frame(frame(4, &start_of("s10", 3))).await;
+
+        let actions = service.on_sfu_event(SfuEvent::SdpAnswer {
+            target_session: 5,
+            broadcaster_session: 4,
+            sdp: "v=0 answer".to_owned(),
+        });
+        assert_eq!(addressed(&actions[0]), vec![5], "the viewer, not the channel");
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_a_share_that_ended_is_not_sent() {
+        // The share ended between the offer and the answer. Sending it would
+        // have a client negotiate against a session that is gone.
+        let service = permissive();
+        assert!(
+            service
+                .on_sfu_event(SfuEvent::SdpAnswer {
+                    target_session: 5,
+                    broadcaster_session: 4,
+                    sdp: "v=0".to_owned(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_session_that_ends_ends_the_share() {
+        // Otherwise viewers keep watching a share the server has forgotten.
+        let service = permissive();
+        seat(&service, &[(1, 3), (4, 3)]);
+        let _ = service.frame(frame(4, &start_of("s11", 3))).await;
+
+        let actions = service.on_sfu_event(SfuEvent::SessionEnded {
+            broadcaster_session: 4,
+        });
+        assert!(service.share("s11").is_none());
+        assert!(addressed(&actions[0]).contains(&1));
     }
 
     #[tokio::test]

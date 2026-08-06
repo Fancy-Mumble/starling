@@ -2789,6 +2789,7 @@ dependencies = [
  "prost",
  "starling-proto-fancy",
  "starling-runtime",
+ "starling-sfu",
  "tokio",
  "tonic",
  "tracing",

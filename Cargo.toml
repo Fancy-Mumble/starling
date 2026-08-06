@@ -69,6 +69,7 @@ starling-proto-fancy = { path = "crates/proto-fancy" }
 starling-gate = { path = "crates/gate" }
 starling-crypto = { path = "crates/crypto" }
 starling-runtime = { path = "crates/runtime" }
+starling-sfu = { path = "crates/sfu" }
 starling-gateway = { path = "crates/gateway" }
 starling-session-lifecycle = { path = "crates/services/session-lifecycle" }
 starling-session-view = { path = "crates/services/session-view" }

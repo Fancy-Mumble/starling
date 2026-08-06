@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+# The media plane. Signalling is this service's half of screen sharing; the
+# other half is a crate, not a process, so it is called rather than dialled.
+starling-sfu.workspace = true
+tokio.workspace = true
 
 tracing.workspace = true
 prost.workspace = true
