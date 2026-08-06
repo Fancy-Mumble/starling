@@ -2,6 +2,7 @@
 
 | File | Shows |
 |---|---|
+| `shape.puml` | The top-level picture: four ways in, and only one through the gateway |
 | `services.puml` | **Start here.** Every service, the four planes, and how they talk |
 | `scaling.puml` | The shard key per service, what scales out, what cannot, and why |
 | `gateway-internals.puml` | The gateway's parts, and what it deliberately does not know |
@@ -25,7 +26,7 @@ before trusting the rest.
 
 **Built and exercised end to end.** The gateway: TLS, framing, the type-keyed
 routing table, the per-route limiter, the circuit breaker, the resume ring. All
-twenty services exist and serve gRPC. The handshake carries a real client from
+twenty-one services exist and serve gRPC. The handshake carries a real client from
 `Version` to `SuggestConfig`, and the `starling` binary's own e2e test drives it
 over a real TCP+TLS socket. Storage is real, `sqlx` over SQLite, MySQL or
 PostgreSQL, one schema per service. Permissions evaluates ACLs. Voice binds its

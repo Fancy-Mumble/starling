@@ -79,17 +79,11 @@ warm.
 
 ## The shape of it
 
-```text
-              ┌──────────┐   gRPC    ┌─────────────────────────────┐
- client ─TCP─►│ gateway  │──────────►│ 21 services, tiered         │
-              │  TLS     │           │ essential · core · optional │
-              │ framing  │           └─────────────────────────────┘
-              │ limits   │
-              └──────────┘
- client ─UDP──────────────────────► voice        (its own socket, no hop)
- client ─HTTPS────────────────────► files        (signed URL, out of band)
- operator ─HTTPS──────────────────► operator-api (REST + OpenAPI, off by default)
-```
+[`docs/diagrams/shape.puml`](docs/diagrams/shape.puml) — four ways in, and only
+one of them through the gateway. Control is Mumble-over-TCP and is brokered;
+realtime, bulk and admin traffic reach their service directly, so the gateway is
+never in the media path and cannot be its bottleneck. Rendering:
+[`docs/diagrams/`](docs/diagrams/README.md#rendering).
 
 Two facts carry the rest of the gateway's design. It is the **single writer to
 each client socket**, so per-client ordering holds by construction. And the wire
