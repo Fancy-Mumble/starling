@@ -906,7 +906,7 @@ impl Client {
 
 /// Drive one client through the full handshake and return its session id.
 ///
-/// Order asserted here is `PORTING-PLAN.md` §4's murmur-derived contract:
+/// Order asserted here is `docs/PORTING-PLAN.md` §4's murmur-derived contract:
 /// server `Version` first, then `CryptSetup`/`CodecVersion`/`ChannelState`/
 /// `UserState` in any relative order but all before `ServerSync`, then
 /// `ServerConfig` immediately, then `SuggestConfig`.

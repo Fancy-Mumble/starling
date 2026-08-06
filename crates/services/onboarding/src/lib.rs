@@ -18,7 +18,7 @@
 //! Each `Step.Choice` names the channels it reveals and the ACL groups it joins
 //! the user to. That is the feature: the questionnaire is a way of asking which
 //! grants somebody wants, not a survey. [`grants`] applies them, on submission
-//! and again whenever a client asks for the flow — see there for why they are
+//! and again whenever a client asks for the flow, see there for why they are
 //! read out of the operator's `Flow` and never off the wire.
 //!
 //! # What answers are keyed on
@@ -200,14 +200,14 @@ impl OnboardingService {
     /// Called on submission *and* on every query, which is what makes the
     /// grant self-healing. A permissions service that was down when the
     /// questionnaire was answered would otherwise leave the account short of
-    /// what it was promised for good, and the user has no way to ask again —
+    /// what it was promised for good, and the user has no way to ask again,
     /// their answers are already on record, so a client has nothing to
     /// re-submit.
     ///
     /// Idempotent all the way down: when nothing is missing, no ACL is written
     /// and no invalidation reaches any connected client.
     ///
-    /// Returns what was done, which is how a caller — and a test — tells
+    /// Returns what was done, which is how a caller, and a test, tells
     /// "there was nothing to grant" from "we tried and could not".
     async fn apply_grants(&self, scope: u32, account: u64) -> grants::Applied {
         let nothing = grants::Applied {
@@ -220,7 +220,7 @@ impl OnboardingService {
         if !flow.enabled {
             // The operator's off switch, and it has to mean something beyond
             // "clients stop rendering it": a flow that is off hands out no new
-            // permissions. Existing ones are left alone — turning a flow off
+            // permissions. Existing ones are left alone, turning a flow off
             // is not the same act as taking away what it granted, and guessing
             // that it was would revoke access an operator never asked to
             // revoke.
@@ -473,7 +473,7 @@ mod tests {
         // A resolver that reaches nothing. These tests exercise storage, and a
         // Permit that cannot ask denies, which is the safe way for it to be
         // wrong if a test ever does reach the ACL path. `Grants` shares it, so
-        // applying one here writes nothing and reports itself incomplete —
+        // applying one here writes nothing and reports itself incomplete,
         // which is the behaviour worth having under test anyway.
         let nowhere = starling_runtime::channel::Resolver::new(
             Arc::new(starling_runtime::config::Config::default()),
@@ -639,7 +639,7 @@ mod tests {
     async fn grants_follow_the_stored_answers_not_the_message() {
         // `apply_grants` re-reads what was recorded rather than taking the
         // submission's word for it, which is what makes the retry on the next
-        // connection possible at all — by then the message is long gone.
+        // connection possible at all, by then the message is long gone.
         let service = service().await;
         let _ = service
             .store_config(

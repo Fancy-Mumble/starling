@@ -579,7 +579,7 @@ impl Accounts {
     /// Whether `password` is this account's current password.
     ///
     /// **Blocking**, 210 000 PBKDF2 rounds, and the caller is responsible for
-    /// running it somewhere that may block — the same rule
+    /// running it somewhere that may block, the same rule
     /// [`Accounts::authenticate`] carries, and for the same reason: 30 ms in
     /// release and 1.45 s in a debug build, on a runtime worker that serves
     /// every other client meanwhile.

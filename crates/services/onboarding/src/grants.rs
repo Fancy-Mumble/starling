@@ -21,7 +21,7 @@
 //! users are ten thousand entries the evaluator walks on every permission check
 //! in that channel, and an operator opening the ACL editor cannot read it any
 //! more. Instead each revealed channel gets **one** entry granting
-//! [`REVEALED`], and onboarding adds accounts to that group — an integer per
+//! [`REVEALED`], and onboarding adds accounts to that group, an integer per
 //! user in a list, and one line an operator can see and understand.
 //!
 //! # What it deliberately does not do
@@ -35,7 +35,7 @@
 //! operator's to grant.
 //!
 //! **It does not overrule a removal.** An account an operator has put in a
-//! group's `remove` list stays out — a closer `remove` beats an `add` when the
+//! group's `remove` list stays out, a closer `remove` beats an `add` when the
 //! group is resolved (`permissions::group`), so re-adding would look applied
 //! and do nothing. It is logged instead, because a grant that cannot take
 //! effect and says so is the opposite of the bug this module exists to fix.
@@ -86,7 +86,7 @@ impl Wanted {
 /// What `flow` says `response` earns.
 ///
 /// Sorted sets rather than vectors, so answering the same choice twice, or two
-/// choices that reveal the same channel, is one grant — and so the log line is
+/// choices that reveal the same channel, is one grant, and so the log line is
 /// stable enough to compare between two connections.
 #[must_use]
 pub fn wanted(flow: &Flow, response: &Response) -> Wanted {
@@ -135,8 +135,8 @@ pub struct Applied {
     ///
     /// False means the permissions service refused or could not be reached, so
     /// the user is short of what they were promised. The caller does not fail
-    /// the submission over it — the answers are stored and the grant is
-    /// re-attempted on the next connection — but nothing may report success.
+    /// the submission over it, the answers are stored and the grant is
+    /// re-attempted on the next connection, but nothing may report success.
     pub complete: bool,
 }
 
@@ -151,7 +151,7 @@ impl Grants {
     ///
     /// Idempotent: a user who already holds every grant causes no write and no
     /// invalidation. That is what makes it safe to call on every connection,
-    /// which is in turn what heals an account whose grant was lost — to a failed
+    /// which is in turn what heals an account whose grant was lost, to a failed
     /// call here, or to an operator pruning a group.
     pub async fn apply(&self, scope: u32, account: u64, wanted: &Wanted) -> Applied {
         if wanted.is_empty() {
@@ -209,7 +209,7 @@ impl Grants {
 /// One channel's worth of grant: what to add, where, and for whom.
 ///
 /// A struct because the alternative is eight positional arguments, and among
-/// them are two `u32`s and a `bool` — `edit(scope, channel, ...)` transposed
+/// them are two `u32`s and a `bool`, `edit(scope, channel, ...)` transposed
 /// would compile, run, and write the grant to the wrong channel of the wrong
 /// virtual server. Named fields make that transposition impossible to write.
 #[derive(Debug)]
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn a_client_cannot_invent_a_grant() {
         // The property the module exists to hold. Ids that name nothing in the
-        // flow are worth nothing, however many are sent — the only thing left
+        // flow are worth nothing, however many are sent, the only thing left
         // is what everybody gets.
         let found = wanted(
             &flow(),
@@ -593,7 +593,7 @@ mod tests {
     fn a_revealed_channel_is_one_the_evaluator_lets_the_account_into() {
         // The whole feature, end to end through the real ACL evaluator: the
         // channel is hidden from everyone, onboarding names one account, and
-        // that account — and only that account — gets in.
+        // that account, and only that account, gets in.
         //
         // Worth this much ceremony because every part of it is a way to be
         // wrong that no unit assertion on the fields would catch: an entry

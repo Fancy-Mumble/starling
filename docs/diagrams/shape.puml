@@ -1,5 +1,14 @@
 @startuml shape
-' Light render. The body is shape.iuml, shared with shape-dark.puml.
+' Light render. The body is shape.iuml, shared with shape-dark.puml, which
+' supplies the same variables in dark values.
 !theme plain
+
+!$c_client = "#E3F2FD"
+!$c_oper   = "#F3E5F5"
+!$c_gw     = "#FFE9D6"
+!$c_svc    = "#FAFAFA"
+!$c_media  = "#E8F5E9"
+!$c_opapi  = "#EDE7F6"
+
 !include shape.iuml
 @enduml

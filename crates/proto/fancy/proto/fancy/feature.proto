@@ -388,7 +388,7 @@ message LinkPreviewEnvelope {
 //
 // **Several URLs, one request.** A chat message carries as many links as
 // somebody typed, and a canon that took one per request would have the client
-// either send N frames — through a rate limiter that counts frames — or drop
+// either send N frames (through a rate limiter that counts frames) or drop
 // all but the first, which is what the epoch-0 translation did.
 //
 // The answers come back one `Preview` (or `PreviewError`) per URL, each

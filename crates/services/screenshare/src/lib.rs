@@ -14,7 +14,7 @@
 //!
 //! Sharing a screen into a channel is a broadcast into that channel, so it
 //! takes the permission that broadcasting takes: `Speak`. Stopping a share
-//! takes being the presenter, or holding the moderator power in that channel —
+//! takes being the presenter, or holding the moderator power in that channel,
 //! murmur has no "stop that stream" permission, and `MuteDeafen` is the closest
 //! true analogue, since it is already "silence somebody in this room".
 //!
@@ -26,7 +26,7 @@
 //!
 //! The channel it is in, and nothing wider. It used to be broadcast to every
 //! connected session, which tells a user on the other side of the server that a
-//! share called "Quarterly numbers — draft" exists in a channel they cannot
+//! share called "Quarterly numbers, draft" exists in a channel they cannot
 //! see. A title is content.
 //!
 //! # Where the SDP answer comes from
@@ -71,7 +71,7 @@ struct Share {
     ///
     /// Kept beside the session because `closed` names a *connection*, and by
     /// the time it runs the roster may already have forgotten the session it
-    /// belonged to — looking it up then is a race whose losing side is a share
+    /// belonged to, looking it up then is a race whose losing side is a share
     /// that never ends.
     conn: u64,
     channel: u32,
@@ -91,7 +91,7 @@ enum Role {
 ///
 /// Decided from the share the server holds, never from a field on the wire.
 /// A client that could declare itself the broadcaster would be declaring
-/// itself the broadcaster of somebody else's share — and the SFU would then
+/// itself the broadcaster of somebody else's share, and the SFU would then
 /// replace the real inbound stream with theirs.
 const fn role_of(session: u32, share: &Share) -> Role {
     if session == share.presenter {
@@ -126,7 +126,7 @@ pub struct ScreenshareService {
     ///
     /// `cfg(test)`, so it is not configuration and no operator can turn the
     /// checks off. Without it the tests below could only ever exercise the
-    /// refusal path — a `Permit` with no `permissions` behind it denies — and
+    /// refusal path, a `Permit` with no `permissions` behind it denies, and
     /// an assertion on "one action came back" would pass for a refusal exactly
     /// as it passes for an announcement, which is how the test this replaced
     /// was green while testing nothing.
@@ -154,7 +154,7 @@ impl ScreenshareService {
     /// indistinguishable from an SFU that is not running.
     ///
     /// Polled rather than awaited because the handle exposes a non-blocking
-    /// `poll_event` — the same shape the C++ fork drives with a `QTimer`. The
+    /// `poll_event`, the same shape the C++ fork drives with a `QTimer`. The
     /// interval is short enough not to be felt in a handshake and long enough
     /// not to spin a core.
     fn pump(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
@@ -207,7 +207,7 @@ impl ScreenshareService {
             SfuEvent::SessionEnded {
                 broadcaster_session,
             } => {
-                // The media plane gave up on it — a peer that never connected,
+                // The media plane gave up on it, a peer that never connected,
                 // or one that went away. The channel is told, or viewers keep
                 // watching a share the server has already forgotten.
                 let Some((share_id, share)) = self.share_of(broadcaster_session) else {
@@ -235,7 +235,7 @@ impl ScreenshareService {
     /// Everyone in `channel` except `except`, as an audience.
     ///
     /// The share's channel, never the whole server: a title is content, and
-    /// "Quarterly numbers — draft" announced server-wide is that content
+    /// "Quarterly numbers, draft" announced server-wide is that content
     /// leaving the room it belongs to.
     fn audience(&self, channel: u32, except: u32, payload: Vec<u8>) -> Actions {
         let sessions = self.roster.in_channel(channel, except);
@@ -714,7 +714,7 @@ mod tests {
     async fn a_share_is_announced_to_its_channel_and_to_nobody_else() {
         // It used to be broadcast to every connected session, which tells
         // somebody on the other side of the server that a share titled
-        // "Quarterly numbers — draft" exists in a room they cannot see.
+        // "Quarterly numbers, draft" exists in a room they cannot see.
         let service = permissive();
         seat(&service, &[(1, 3), (2, 3), (9, 7), (4, 3)]);
 

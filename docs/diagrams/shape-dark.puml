@@ -1,19 +1,34 @@
 @startuml shape-dark
-' Dark render. The body is shape.iuml, shared with shape.puml; only the canvas
-' and the text that floats on it are overridden here. The cards keep their light
-' fills and dark text, so this is the same picture on a dark page.
+' Dark render. The body is shape.iuml, shared with shape.puml.
 '
-' These sit after !theme, which would otherwise reset them, and before the
-' include, which sets none of them.
+' Dark throughout, not a dark border around a white picture: the cards, the
+' notes and the canvas are all dark and every glyph is light. Overriding only
+' the canvas leaves the cards white, which on a dark page is worse than no dark
+' render at all.
+'
+' These sit after !theme, which would otherwise reset them.
 !theme plain
 
+!$c_client = "#17293D"
+!$c_oper   = "#2E1F33"
+!$c_gw     = "#3D2A17"
+!$c_svc    = "#161B22"
+!$c_media  = "#16301C"
+!$c_opapi  = "#241E33"
+
 skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
 skinparam titleFontColor #E6EDF3
 skinparam headerFontColor #9198A1
 skinparam ArrowColor #8B949E
 skinparam ArrowFontColor #E6EDF3
 skinparam actorFontColor #E6EDF3
 skinparam actorBorderColor #8B949E
+skinparam componentFontColor #E6EDF3
+skinparam componentBorderColor #30363D
+skinparam noteBackgroundColor #161B22
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
 
 !include shape.iuml
 @enduml

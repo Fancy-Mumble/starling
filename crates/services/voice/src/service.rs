@@ -3,7 +3,7 @@
 //! **A restarted service has cold caches and no way to say so**, voice holds
 //! ciphers and membership, and audio arriving before it has re-subscribed is
 //! dropped silently. That is the failure mode with no log line
-//! (`PORTING-PLAN.md` R11), so readiness gates on the subscription being warm
+//! (`docs/PORTING-PLAN.md` R11), so readiness gates on the subscription being warm
 //! rather than on the process being alive.
 
 use std::collections::HashMap;
@@ -847,7 +847,7 @@ impl Serve for VoiceService {
         // cannot report itself ready before it has said what it is waiting for.
         // A voice service that is up with a cold membership cache routes every
         // frame to nobody, which is the failure mode with no log line
-        // (`PORTING-PLAN.md` R11).
+        // (`docs/PORTING-PLAN.md` R11).
         ctx.health.gate(VIEW_GATE);
         let service = ctx.service();
         let socket = match service.udp_listen.as_deref() {

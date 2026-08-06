@@ -2,7 +2,7 @@
 //!
 //! Outer type 1003, `UserdataEnvelope`. Until this existed the envelope was
 //! decoded by nothing at all: a client could send every message in it and the
-//! server would drop each one without a line in any log — a whole surface that
+//! server would drop each one without a line in any log, a whole surface that
 //! silently did nothing.
 //!
 //! # The account is never on the wire
@@ -26,7 +26,7 @@
 //!
 //! `ENABLE_TOTP` with no code returns a fresh secret and stores it **in
 //! memory**; `ENABLE_TOTP` carrying a code confirms it and only then does it
-//! reach the database. The one-shot alternative — generate, store, enable —
+//! reach the database. The one-shot alternative, generate, store, enable,
 //! locks out any user whose authenticator never got the secret, and they cannot
 //! fix it themselves, because logging in is what now needs the code. Held in
 //! memory because an enrolment nobody finished should evaporate: a restart
@@ -493,7 +493,7 @@ mod tests {
     /// Every test here is about what happens *before* either is consulted: the
     /// proof, the verb, and what ends up stored. The only thing an unreachable
     /// session-view changes is that `account_of` finds nobody, so these call the
-    /// verbs with the account already resolved — which is exactly the split the
+    /// verbs with the account already resolved, which is exactly the split the
     /// module is written around.
     async fn service() -> (UserdataService, u64) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -563,8 +563,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_zero_value_is_not_an_action() {
-        // It used to be SET_PASSWORD, so a client that left the field unset —
-        // or a decode of the wrong bytes — asked to set the password to the
+        // It used to be SET_PASSWORD, so a client that left the field unset,
+        // or a decode of the wrong bytes, asked to set the password to the
         // empty string, and would have got it.
         let (service, account) = service().await;
         let ack = service
@@ -611,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_new_password_is_refused() {
-        // Not "no password set" — a password every guess matches.
+        // Not "no password set", a password every guess matches.
         let (service, account) = service().await;
         let ack = service
             .act(

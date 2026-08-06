@@ -123,7 +123,7 @@ pub(crate) fn is_private_addr(address: std::net::IpAddr) -> bool {
                 // Carrier-grade NAT (100.64.0.0/10) and the benchmarking range
                 // (198.18.0.0/15): neither is the public internet, and both are
                 // routable inside a deployment. Both are written as the ranges
-                // they are — 198.18.0.0/15 spans 198.18 *and* 198.19, and
+                // they are, 198.18.0.0/15 spans 198.18 *and* 198.19, and
                 // reading it as a /16 leaves half of it fetchable.
                 || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])
                 || v4.octets()[0] == 198 && (18..20).contains(&v4.octets()[1])
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(vet("http://100.64.0.1/"), Err(Refusal::PrivateAddress));
         assert_eq!(vet("http://198.18.0.1/"), Err(Refusal::PrivateAddress));
         // The neighbours of both, which are ordinary public addresses and must
-        // stay fetchable — a guard that is too wide is a feature that does not
+        // stay fetchable, a guard that is too wide is a feature that does not
         // work, and nobody reports it as a security bug.
         assert!(vet("http://100.63.255.255/").is_ok());
         assert!(vet("http://100.128.0.1/").is_ok());

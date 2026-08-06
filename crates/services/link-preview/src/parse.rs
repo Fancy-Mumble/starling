@@ -4,7 +4,7 @@
 //!
 //! It reads `<meta>` and `<title>` and stops at `</head>`. A conforming parser
 //! would build a document we would then throw away, on input chosen by a
-//! stranger — every parser bug in it becomes reachable from a chat message.
+//! stranger, every parser bug in it becomes reachable from a chat message.
 //! The job is four strings out of the head of a document, and the smaller thing
 //! that does only that has less to get wrong.
 //!
@@ -32,7 +32,7 @@ pub struct Card {
     ///
     /// **Not** what goes on the wire. `Preview.image_key` names an object in
     /// the files service, and putting a remote URL there would send every
-    /// viewer to fetch it — which is precisely the network probe that having
+    /// viewer to fetch it, which is precisely the network probe that having
     /// the server fetch previews exists to prevent. Kept because the fetch that
     /// stores it needs somewhere to start.
     pub image: String,
@@ -103,7 +103,7 @@ fn tags<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
     let mut at = 0;
     // Every slice is a `get`. The input is a page a stranger chose, so a byte
     // index that lands inside a multi-byte character is a panic reachable from
-    // a chat message — and `at` walks the string, so it is exactly the index
+    // a chat message, and `at` walks the string, so it is exactly the index
     // most likely to land in the middle of one.
     while let Some(start) = lower.get(at..).and_then(|rest| rest.find(&opener)) {
         let start = at + start;

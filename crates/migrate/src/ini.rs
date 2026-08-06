@@ -202,7 +202,7 @@ impl Ini {
 }
 
 /// Keys murmur honours that have no deployment-config home yet, and the phase
-/// that will give them one. See `PORTING-PLAN.md` §4.
+/// that will give them one. See `docs/PORTING-PLAN.md` §4.
 const UNIMPLEMENTED: &[(&str, &str)] = &[
     ("database", "2"),
     ("certrequired", "2"),
@@ -220,7 +220,7 @@ const UNIMPLEMENTED: &[(&str, &str)] = &[
     ("textmessagelength", "2"),
     ("imagemessagelength", "2"),
     ("allowrecording", "2"),
-    ("ice", "6 (replaced by gRPC - see PORTING-PLAN.md §6)"),
+    ("ice", "6 (replaced by gRPC - see docs/PORTING-PLAN.md §6)"),
     ("webrtcsfuenabled", "6"),
     ("webrtcsfuport", "6"),
     ("webrtcsfupublicip", "6"),

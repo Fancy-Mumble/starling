@@ -14,11 +14,11 @@ only in `scaling.puml`, gateway mechanics only in `gateway-internals.puml`.
 
 Rendered PNGs are build output and are not committed, `*.png` here is ignored.
 
-**One exception: `shape.svg` is committed.** The root README embeds it, and
-GitHub renders no `.puml`, so a source-only rule there would mean no picture at
-all on the page most people read first. It is the only render in the tree, and
-it must be regenerated whenever `shape.puml` changes — see *The committed SVG*
-below. Nothing regenerates it for you.
+**One exception: `shape.svg` and `shape-dark.svg` are committed.** The root
+README embeds them, and GitHub renders no `.puml`, so a source-only rule there
+would mean no picture at all on the page most people read first. They are the
+only renders in the tree, and both must be regenerated whenever `shape.iuml`
+changes. See *The committed SVGs* below. Nothing regenerates them for you.
 
 Prose lives in `../ARCHITECTURE.md`, `../PROTOCOL-COMPATIBILITY.md` and
 `../CONFIGURATION.md`. Diagrams carry structure; rationale goes in the docs, so
@@ -78,16 +78,16 @@ EOF
 The second step is not optional and is why this is written down. PlantUML puts
 the background in a **CSS `style` attribute on the root `<svg>`** and emits no
 background element, so a viewer that drops that attribute gets the text on
-whatever is behind it — an unreadable diagram in one theme or the other. The
+whatever is behind it, an unreadable diagram in one theme or the other. The
 injected `<rect>` is a painted element and survives. The colour is read back out
 of the file rather than hard-coded, so the one snippet serves both variants.
 
 ### Why two wrappers and not one flag
 
-`shape.iuml` holds the body; `shape.puml` and `shape-dark.puml` are wrappers
-that differ only in the canvas and the colour of the text floating on it. Cards
-keep their light fills and dark text in both, so the variants are one picture on
-two pages rather than two pictures.
+`shape.iuml` holds the body and hard-codes no colour: every fill is a variable
+the wrapper supplies. The dark render is dark throughout, canvas, cards and all,
+with light text. Overriding only the canvas leaves white cards on a dark page,
+which is worse than shipping no dark render, and was the first attempt.
 
 The obvious alternatives were tried and all fail, because `!theme plain` and the
 explicit fills in the body are applied *after* them and win:

@@ -87,7 +87,7 @@ pub fn defaults(virtual_server: u32) -> Snapshot {
         cert_required: false,
         log_days: 31,
         // The leaky bucket that silently drops when it is wrong
-        // (`PORTING-PLAN.md` R5). These two numbers are murmur's.
+        // (`docs/PORTING-PLAN.md` R5). These two numbers are murmur's.
         message_limit: 1,
         message_burst: 5,
         plugin_message_limit: 4,

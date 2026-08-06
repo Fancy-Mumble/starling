@@ -12,7 +12,7 @@
 //! Not yet wired to a CLI: the entrypoint's argument parsing is a separate,
 //! not-yet-built piece (`crates/starling`), so nothing outside this crate
 //! calls [`Ini::migrate`] yet. This is a migration aid with an expiry date,
-//! not a permanent second config format (`PORTING-PLAN.md` §4).
+//! not a permanent second config format (`docs/PORTING-PLAN.md` §4).
 
 mod ini;
 

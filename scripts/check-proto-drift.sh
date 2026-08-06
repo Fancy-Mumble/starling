@@ -14,7 +14,7 @@
 #
 # The three trees each carry their own copy of Mumble.proto / MumbleUDP.proto.
 # Duplicating a *generated* artifact is cheap; duplicating the *contract* is what
-# must be prevented. See PORTING-PLAN.md §2.2.
+# must be prevented. See docs/PORTING-PLAN.md §2.2.
 #
 # The comparison is of **wire meaning**, not bytes: comments and whitespace
 # legitimately differ between the trees (they document each side's perspective),

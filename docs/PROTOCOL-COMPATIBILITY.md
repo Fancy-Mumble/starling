@@ -290,11 +290,11 @@ proto3:
 The rule at the top of this document is worth exactly what enforces it, and for
 a long time that was one script that believed the wrong thing:
 `check-proto-drift.sh` asserted Starling's proto matched `vendor/server`'s while
-calling the fork "upstream's source of truth". It is not — it is the fork. So
+calling the fork "upstream's source of truth". It is not, it is the fork. So
 the check verified Fancy-consistency and said nothing about Mumble
 compatibility, which is how §1's numbering drift survived.
 
-There are now three scripts asking five distinct questions — hygiene carries
+There are now three scripts asking five distinct questions, hygiene carries
 three of them, because they share nothing but the file they live in. All are
 offline, take seconds, and run in CI:
 
@@ -308,7 +308,7 @@ offline, take seconds, and run in CI:
 
 Two things to know about how they divide the work.
 
-**The drift check cannot see a rule all three trees break identically** — it
+**The drift check cannot see a rule all three trees break identically**, it
 compares them with each other, so unanimity reads as health. That blindness is
 by construction, not an oversight, and it is exactly the shape §1's drift had.
 Hygiene covers the rules that live outside any single tree's copy, and the
@@ -318,6 +318,6 @@ can answer.
 **None of them is evidence about the encoders.** They prove the schemas agree;
 D1 was two implementations that both compiled against agreeing schemas and put
 different bytes on the wire. That needs the golden frames in
-`scripts/canon-fixtures.json` — captured bytes, one side asserting it produces
+`scripts/canon-fixtures.json`, captured bytes, one side asserting it produces
 them and the other that it reads them back as the same meaning. See
 `PROTOCOL-MIGRATION.md` M6.

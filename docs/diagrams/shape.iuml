@@ -12,9 +12,10 @@
 ' `-darkmode`, `-S<param>` and the env lookup were all tried and all lose to the
 ' `!theme` and the explicit fills below, which is why the split exists.
 '
-' The cards keep their light fills and dark text in both renders. Only the
-' canvas and the text floating on it change, so the dark variant is the same
-' picture on a dark page rather than a differently-coloured picture.
+' Every colour is a variable set by the wrapper, so the dark render is dark
+' throughout: dark canvas, dark cards, light text. An earlier attempt changed
+' only the canvas and left the cards white, which on a dark page is a worse
+' result than no dark mode at all.
 
 skinparam componentStyle rectangle
 skinparam shadowing false
@@ -31,16 +32,16 @@ so the gateway is never in the media path and cannot be its bottleneck.
 Rationale: <b>ARCHITECTURE.md</b>.   Shard keys: <b>scaling.puml</b>.   Gateway parts: <b>gateway-internals.puml</b>.
 endheader
 
-actor "Mumble client\n«legacy or Fancy»" as client #E3F2FD
-actor "**operator**" as oper #F3E5F5
+actor "Mumble client\n«legacy or Fancy»" as client $c_client
+actor "**operator**" as oper $c_oper
 
-component "**gateway**\nTLS · framing · limits\n**single writer per client socket**" as gw #FFE9D6
+component "**gateway**\nTLS · framing · limits\n**single writer per client socket**" as gw $c_gw
 
-component "**21 services**, tiered\nessential · core · optional\n«gRPC, no client reaches them directly»" as svc #FAFAFA
+component "**21 services**, tiered\nessential · core · optional\n«gRPC, no client reaches them directly»" as svc $c_svc
 
-component "**voice**\nits own UDP socket" as voice #E8F5E9
-component "**files**\nsigned URL, out of band" as files #E8F5E9
-component "**operator-api**\nREST + OpenAPI\n**off by default**" as opapi #EDE7F6
+component "**voice**\nits own UDP socket" as voice $c_media
+component "**files**\nsigned URL, out of band" as files $c_media
+component "**operator-api**\nREST + OpenAPI\n**off by default**" as opapi $c_opapi
 
 client --> gw : **control** · Mumble over TCP+TLS
 gw --> svc : gRPC, routed by the\n**16-bit type in the frame header**

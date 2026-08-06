@@ -6,7 +6,7 @@ use crate::ids::ChannelId;
 /// Read/write access to the channel tree.
 ///
 /// Handlers take `&dyn ChannelStore`, so a SQL-backed implementation can go
-/// behind it without touching a handler (`DESIGN.md` §1).
+/// behind it without touching a handler (`docs/DESIGN.md` §1).
 ///
 /// # Contract
 ///

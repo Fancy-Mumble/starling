@@ -8,10 +8,8 @@ Fancy fork).
 Starlings fly in *murmurations*, which keeps the name in the Mumble/Murmur
 family, and describes the job.
 
-The bird is **Sterling** — one letter off the project, and by the usual
-etymology "little star", after the star struck on early Norman pennies. It is
-also what you call something dependable, which is the only promise a server
-mascot should make.
+The bird is Sterling. One letter off the project, and by the usual etymology
+"little star", after the star struck on early Norman pennies.
 
 **A gateway in front, independent gRPC services behind it, and media planes that
 bypass the gateway entirely.** Architecture:
@@ -24,8 +22,8 @@ bypass the gateway entirely.** Architecture:
 How far the port has got, measured against two different targets:
 [`docs/GAP-ANALYSIS.md`](docs/GAP-ANALYSIS.md) against upstream murmur, and
 [`docs/FANCY-PARITY.md`](docs/FANCY-PARITY.md) against the Fancy fork. A feature
-can be done by one measure and missing by the other, so neither number alone
-says whether a client will work.
+can be done by one measure and missing by the other, so neither file answers
+the question on its own.
 
 ## Quick start
 
@@ -46,7 +44,7 @@ certificate fingerprint, so keeping that directory keeps the server's identity
 stable across restarts.
 
 **Linux, macOS and Windows.** Services on one host reach each other over the
-platform's own local IPC — a Unix domain socket, or a named pipe on Windows —
+platform's own local IPC, a Unix domain socket or a named pipe on Windows,
 and the built-in defaults pick whichever this build can serve, so the quick
 start above needs no configuration file on any of the three. A hand-written
 `unix:` endpoint is a startup error on Windows rather than a substitution: the
@@ -57,8 +55,8 @@ two are different permission boundaries and only one exists per build.
 
 One image, one entrypoint, and `command` decides which service a container is.
 [`docker-compose.yml`](docker-compose.yml) is the deployment of
-`docs/ARCHITECTURE.md` — 22 containers by default, the 21 services plus the
-gateway — configured by [`deploy/starling.toml`](deploy/starling.toml):
+`docs/ARCHITECTURE.md`: 22 containers by default, the 21 services plus the
+gateway, configured by [`deploy/starling.toml`](deploy/starling.toml).
 
 ```sh
 docker compose up -d --wait --build                  # build, start in tier order, block
@@ -69,8 +67,7 @@ docker compose up -d --wait --build starling         # instead: one container, i
 Keep the `--build`. Compose builds only when the image is *missing*, so a stale
 `starling:local` is reused however far the source has moved. Every container
 runs the same binary picked by `command`, so that failure surfaces as a service
-exiting with `no service named "..."` — which says nothing about the image, and
-is the reason this warning is here.
+exiting with `no service named "..."`, which says nothing about the image.
 
 Then connect a Mumble client to `localhost:64738`. `--wait` returns once every
 container is healthy, and health here is a TCP connect: this build has no HTTP
@@ -122,8 +119,8 @@ when a service is added. A new service is a TOML block.
 | **core**      | voice, text, pchat, moderation                                                                                               | that feature is dead; the server runs |
 | **optional**  | screenshare, files, plugins, push, audit, onboarding, social, link-preview, context-actions, directory, health, operator-api | nobody notices                        |
 
-The gateway's own tier is `core`, which it would never consult: a tier says what
-the gateway does while a service is unhealthy.
+The gateway's own tier is `core`, which it never consults. A tier says what the
+gateway does while a service is unhealthy.
 
 ## Quality gates
 
@@ -145,9 +142,9 @@ python3 scripts/check-proto-hygiene.py # ...and none of them breaks its own rule
 python3 scripts/check-proto-compat.py  # ...and we still match real upstream Mumble
 ```
 
-Three checks because each is blind where the next one looks. The drift check
-compares our trees, so it catches one that fell behind but never a rule all of
-them break identically — both such rules did, see
+Each check is blind where the next one looks. The drift check compares our
+trees, so it catches one that fell behind but never a rule all of
+them break identically. Both such rules did, see
 [`docs/PROTOCOL-MIGRATION.md`](docs/PROTOCOL-MIGRATION.md) M6. Hygiene covers
 those. Neither compares against Mumble itself, so neither can see a break with a
 released client; compat reads `mumble-voip/mumble` from the `upstream` remote in

@@ -3,7 +3,7 @@
 //! The end-to-end crypto lives in the client
 //! (`vendor/client/crates/mumble-protocol/src/persistent/`), so this service
 //! never sees plaintext. What it owns is storage, fan-out, offline queues,
-//! key-holder bookkeeping and rate limiting (`PORTING-PLAN.md`, persistent
+//! key-holder bookkeeping and rate limiting (`docs/PORTING-PLAN.md`, persistent
 //! chat).
 //!
 //! The key is `channel_id ‖ uuidv7`, so the table is physically ordered

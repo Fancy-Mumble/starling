@@ -142,7 +142,7 @@ mod tests {
         assert!(session.inbound.is_none());
         assert!(session.outbound.is_empty());
         // `inbound_mid` became `inbound_mids` when the SFU learned to carry
-        // more than one track, and this assertion was never updated — the
+        // more than one track, and this assertion was never updated, the
         // fork's crate has not compiled its own tests since.
         assert!(session.inbound_mids.is_empty());
         assert!(!session.needs_initial_keyframe);

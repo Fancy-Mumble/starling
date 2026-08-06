@@ -2,7 +2,7 @@
 //!
 //! **Additive only** is a rollback rule, not a style: a service that drops a
 //! column cannot be rolled back to the binary that reads it, and rollback is
-//! the only thing that makes replacing a live server safe (`PORTING-PLAN.md`
+//! the only thing that makes replacing a live server safe (`docs/PORTING-PLAN.md`
 //! §3).
 //!
 //! Recording by *name* rather than by number means two services can grow their

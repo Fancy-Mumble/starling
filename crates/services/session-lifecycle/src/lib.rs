@@ -12,7 +12,7 @@
 //!
 //! The handshake order is murmur's, transcribed with line references in
 //! [`handshake`]. Getting it wrong produces a client that connects in
-//! development and hangs in the wild (`PORTING-PLAN.md` R4).
+//! development and hangs in the wild (`docs/PORTING-PLAN.md` R4).
 
 pub mod ids;
 pub mod session;

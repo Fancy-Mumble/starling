@@ -13,7 +13,7 @@
 //!
 //! The ordering is not cosmetic. `Messages.cpp:843` is explicit that listeners
 //! must come *after* `ServerSync`, and a client that tolerates a different
-//! order in development can hang against it in the wild (`PORTING-PLAN.md` R4).
+//! order in development can hang against it in the wild (`docs/PORTING-PLAN.md` R4).
 //!
 //! Every call out of here goes to the service that owns the answer: userdata
 //! authenticates, voice mints the cipher, metadata supplies the tree,
@@ -1456,7 +1456,7 @@ fn reject(conn: u64, kind: tcp::reject::RejectType, reason: &str) -> ServerActio
 ///
 /// Opus only: every Mumble client since 1.2.4 speaks it, and the server never
 /// touches audio content, so there is nothing to gain by negotiating anything
-/// older (`PORTING-PLAN.md` §1.2).
+/// older (`docs/PORTING-PLAN.md` §1.2).
 fn codec_version() -> tcp::CodecVersion {
     tcp::CodecVersion {
         alpha: -2_147_483_637,

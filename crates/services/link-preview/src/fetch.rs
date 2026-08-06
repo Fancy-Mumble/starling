@@ -10,7 +10,7 @@
 //! So this resolves the host itself, drops every address that is inside the
 //! deployment, and then **connects to the address it checked** rather than to
 //! the name. Connecting by name again would re-resolve, and the second answer
-//! does not have to match the first — that is DNS rebinding, and it is the
+//! does not have to match the first, that is DNS rebinding, and it is the
 //! standard way past a checker that validates one lookup and connects with
 //! another.
 //!
@@ -138,8 +138,8 @@ pub struct Fetcher {
     /// Test-only: connect to loopback anyway.
     ///
     /// `cfg(test)`, so it is not a configuration knob and no operator can
-    /// switch the guard off by accident. The HTTP exchange itself — statuses,
-    /// redirects, the byte cap, the content-type refusal — is the part of this
+    /// switch the guard off by accident. The HTTP exchange itself (statuses,
+    /// redirects, the byte cap, the content-type refusal) is the part of this
     /// file that runs against a stranger's server, and it cannot be exercised
     /// at all without a server, and a test server is on loopback.
     #[cfg(test)]
@@ -161,7 +161,7 @@ impl Fetcher {
         // The provider is named rather than taken from the process default.
         // `ClientConfig::builder()` panics when no default is installed, and
         // whether one is depends on which *other* component happened to start
-        // first — a preview service that works or panics according to the
+        // first, a preview service that works or panics according to the
         // deployment's start-up order is not a service.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let tls = ClientConfig::builder_with_provider(provider)
@@ -372,7 +372,7 @@ impl Fetcher {
 
     /// The same, with the test-only escape hatch. There is no build in which
     /// both of these exist, so the release binary has no path to `resolve_any`
-    /// at all — not a flag that defaults to off, an absence.
+    /// at all, not a flag that defaults to off, an absence.
     #[cfg(test)]
     async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, FetchError> {
         if self.allow_private {
@@ -476,7 +476,7 @@ fn join(base: &str, location: &str) -> String {
     // is a URL we were sent and `location` is a header the far end wrote, so a
     // byte index that lands inside a multi-byte character is a panic reachable
     // from a redirect. The fallbacks are the whole string or "/", which produce
-    // a URL that fails `vet` on the next hop — a refused preview instead of a
+    // a URL that fails `vet` on the next hop, a refused preview instead of a
     // downed service.
     let scheme_end = base.find("://").map_or(0, |at| at + 3);
     let after_scheme = base.get(scheme_end..).unwrap_or_default();
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn what_the_client_is_told_does_not_map_the_network() {
         // A stranger must not be able to tell "this name does not exist" from
-        // "this name is a machine inside the deployment" — that is a port scan
+        // "this name is a machine inside the deployment", that is a port scan
         // with extra steps.
         assert_eq!(
             FetchError::ResolvesInside.reason(),
@@ -579,7 +579,7 @@ mod exchange {
     //! The HTTP exchange, against a server that answers on loopback.
     //!
     //! Everything here needs a *server*, and a test server is on loopback,
-    //! which the guard refuses — correctly. So these use the `cfg(test)`
+    //! which the guard refuses, correctly. So these use the `cfg(test)`
     //! fetcher that skips the address check, and nothing else about the
     //! pipeline is stubbed: real sockets, real HTTP/1.1, real redirects.
 

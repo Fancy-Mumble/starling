@@ -162,7 +162,7 @@ const TOTP_SECRET_BYTES: usize = 20;
 ///
 /// `rand::rng()` is seeded from the operating system and reseeded as it runs;
 /// what matters here is only that nothing else can reproduce it, because a
-/// predictable second factor is worse than none — the account is trusted more
+/// predictable second factor is worse than none, the account is trusted more
 /// for having one.
 #[must_use]
 pub fn new_totp_secret() -> Vec<u8> {
@@ -171,7 +171,7 @@ pub fn new_totp_secret() -> Vec<u8> {
     (0..TOTP_SECRET_BYTES).map(|_| rng.random()).collect()
 }
 
-/// RFC 4648 base32, unpadded — the form every authenticator app takes.
+/// RFC 4648 base32, unpadded, the form every authenticator app takes.
 ///
 /// Written out rather than pulled in as a dependency: it is fifteen lines, and
 /// the alternative is a supply-chain edge on the one path that hands out key

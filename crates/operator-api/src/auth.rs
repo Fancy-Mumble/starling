@@ -3,7 +3,7 @@
 //! A new mode is a new implementation of [`Authenticator`], never a new arm in
 //! a `match`, which is what lets an operator's existing identity provider
 //! become the admin plane's without touching this crate
-//! (`docs/ARCHITECTURE.md` §3, `DESIGN.md` §3).
+//! (`docs/ARCHITECTURE.md` §3, `docs/DESIGN.md` §3).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

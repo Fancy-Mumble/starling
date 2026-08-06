@@ -115,7 +115,7 @@ def main() -> int:
     # The repo root may be named, and has to be when this runs out of a `git
     # worktree`: the sibling trees are then nowhere near this file, so deriving
     # the root from its own location finds no `vendor/server`, and the check
-    # skips — which reads exactly like a check that passed.
+    # skips, which reads exactly like a check that passed.
     root = pathlib.Path(positional[0]).resolve() if positional else here.parent.parent
 
     fork = root / FORK
