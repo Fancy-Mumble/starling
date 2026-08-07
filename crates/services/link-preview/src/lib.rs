@@ -182,7 +182,9 @@ impl ClientService for LinkPreviewService {
         let mut actions = Actions::new();
         for url in &request.urls {
             match vet(url) {
-                Err(refusal) => actions.push(self.refuse(&inbound, &request.request_id, url, refusal)),
+                Err(refusal) => {
+                    actions.push(self.refuse(&inbound, &request.request_id, url, refusal));
+                }
                 Ok(()) => {
                     // The fetch happens off this handler and the answer arrives
                     // through the fanout. A preview is a request to a host
