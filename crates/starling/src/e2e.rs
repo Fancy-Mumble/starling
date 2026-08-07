@@ -2391,7 +2391,9 @@ const LIVE_TOKEN: &str = "e2e-live-channel-token";
     reason = "edition 2024 has no safe way to set an environment variable, and               token auth deliberately names a variable rather than holding a               secret, so a test of it has to set one"
 )]
 async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
-    use starling_runtime::config::{AuthMode, OperatorAuth, ServiceConfig, StaticToken, TokenAuth};
+    use starling_runtime::config::{
+        AuthMode, OperatorAudit, OperatorAuth, ServiceConfig, StaticToken, TokenAuth,
+    };
 
     // SAFETY: setting an environment variable is only unsound alongside a
     // concurrent read from another thread. These tests are serialised by
@@ -2435,6 +2437,15 @@ async fn deployment_with_operator_api(data_dir: &Path) -> (Deployment, u16) {
                 }],
             }),
             ..OperatorAuth::default()
+        });
+        // The deployment's own directory, never the `/var/log/starling` default:
+        // audit is fail-closed, so the very first operator action, of which
+        // opening this channel is one, is refused with a 503 when the record
+        // cannot be written, and a test must not depend on a writable system
+        // path. Same reasoning as the endpoint above.
+        service.audit = Some(OperatorAudit {
+            path: data_dir_for_endpoint.join("operator-audit.log"),
+            fail_closed: true,
         });
     })
     .await;
