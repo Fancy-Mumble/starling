@@ -218,5 +218,8 @@ jobs:
           tool: cargo-fuzz
 
       - name: Fuzz decode
-        run: cargo +nightly fuzz run decode -- -max_total_time=60
+        # Pin the gnu host target. cargo-fuzz otherwise selects
+        # x86_64-unknown-linux-musl here, whose static libc is incompatible
+        # with AddressSanitizer and whose std the runner does not have.
+        run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -max_total_time=60
         working-directory: crates/proto/classic
