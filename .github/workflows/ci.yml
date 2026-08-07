@@ -111,10 +111,16 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc -y
 
+      # fmt, Clippy and the doc checks are platform-portable, so they run once
+      # on Linux. Windows compiles the workspace far slower, and re-running them
+      # there nearly doubled its wall time for no added signal. Windows still
+      # builds and runs the tests below, the coverage that is actually OS-specific.
       - name: Formatting
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       - name: Clippy
+        if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
@@ -123,9 +129,11 @@ jobs:
       # `cargo test --all-targets` skips doctests; the lint config denies
       # broken intra-doc links, so run them too.
       - name: Doc tests
+        if: runner.os == 'Linux'
         run: cargo test --workspace --doc
 
       - name: Documentation builds without warnings
+        if: runner.os == 'Linux'
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
