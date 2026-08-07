@@ -60,6 +60,13 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// up, not the delivery of a frame, and the two have no reason to share a
 /// number.
 const LIVE_START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for a deployment's services to bind their endpoints.
+///
+/// Like [`LIVE_START_TIMEOUT`] and unlike [`FRAME_TIMEOUT`], this bounds cold
+/// startup rather than a frame. On a loaded Windows runner one service's named
+/// pipe can take well past the frame budget to appear, which surfaced as an
+/// intermittent "never bound" on whichever test lost the race.
+const SERVICE_BIND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upstream `UDPTunnel`: audio over the control connection.
 const UDP_TUNNEL: u16 = 1;
@@ -387,7 +394,7 @@ impl Deployment {
 /// A service reached over `http://` is left alone: it has no local artefact to
 /// watch, and the deadline below is what catches a genuine hang.
 async fn wait_until_serving(config: &Config, services: &[&str]) {
-    let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + SERVICE_BIND_TIMEOUT;
     for service in services {
         // Read off the configured string rather than through a parsed endpoint
         // type. All this needs is what the endpoint binds, and depending on the
