@@ -153,10 +153,11 @@ jobs:
   # unsafe inside dependencies (bytes, prost, hashbrown) along the paths our
   # tests actually exercise, which is where a UB regression would come from.
   #
-  # Socket and async-runtime tests cannot run under Miri (no real I/O, and
-  # tokio's scheduler uses unsupported syscalls), so those modules are skipped.
-  # Skips are module-anchored; inclusion filters match substrings and silently
-  # over-select.
+  # It runs over the two contract crates, whose lib tests are pure logic (frame
+  # and version encoding, the permission bitset, envelope type allocation) with
+  # no I/O. Socket and async-runtime tests cannot run under Miri (no real I/O,
+  # and tokio's scheduler uses unsupported syscalls), so the service crates,
+  # whose lib tests stand up the runtime, are left to the normal test job.
   # ----------------------------------------------------------------
   miri:
     name: Miri (UB check)
@@ -185,17 +186,10 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p starling-proto --lib
 
-      - name: Miri (starling-model, pure logic, no I/O)
+      - name: Miri (starling-proto-fancy, envelope, permission and page logic)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo +nightly miri test -p starling-model --lib
-
-      - name: Miri (starling-server, handlers only)
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
-        run: >
-          cargo +nightly miri test -p starling-server --lib --
-          --skip "listener::" --skip "core::"
+        run: cargo +nightly miri test -p starling-proto-fancy --lib
 
   # ----------------------------------------------------------------
   # Fuzz the frame decoder. It is the first thing an unauthenticated peer
@@ -225,4 +219,4 @@ jobs:
 
       - name: Fuzz decode
         run: cargo +nightly fuzz run decode -- -max_total_time=60
-        working-directory: crates/starling-proto
+        working-directory: crates/proto/classic
