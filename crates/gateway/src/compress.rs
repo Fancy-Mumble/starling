@@ -15,7 +15,7 @@
 //!
 //! # What it is not
 //!
-//! **Not a service.** [`COMPRESSED_BATCH`] is a property of the connection, not
+//! **Not a service.** [`COMPRESSED_BATCH`](starling_proto_fancy::types::COMPRESSED_BATCH) is a property of the connection, not
 //! a destination on it, what comes out of a batch is ordinary frames that
 //! route exactly as they did before. That is why it is numbered far from the
 //! service block rather than taking the next free slot there.

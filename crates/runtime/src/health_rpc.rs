@@ -1,6 +1,6 @@
 //! Every service's readiness, over gRPC, without the service writing any of it.
 //!
-//! [`Health`](crate::health::Health) has always existed per service, and until
+//! [`Health`] has always existed per service, and until
 //! this module the only way to read it was `/readyz` on the process holding it.
 //! That is enough for a Kubernetes probe and useless for anything else:
 //!
@@ -11,7 +11,7 @@
 //! * nothing could ask a service how it was without being that service.
 //!
 //! So the runtime adds this to every service's routes in
-//! [`serve`](crate::serve), the same way it adds config, discovery and metrics.
+//! [`serve`](crate::serve()), the same way it adds config, discovery and metrics.
 //! A service opts into nothing and cannot forget to implement it, which is the
 //! only way a health surface stays honest, the service most worth asking about
 //! is the one nobody remembered to instrument.
@@ -132,7 +132,7 @@ impl HealthRpc for HealthReporter {
 
 /// Add the health surface to a service's own routes.
 ///
-/// A free function so [`serve`](crate::serve) can apply it uniformly without
+/// A free function so [`serve`](crate::serve()) can apply it uniformly without
 /// every service's `routes()` remembering to.
 #[must_use]
 pub fn with_health(

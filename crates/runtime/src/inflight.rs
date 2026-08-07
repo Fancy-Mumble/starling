@@ -1,7 +1,7 @@
 //! How many requests a service is handling at once, measured for every service
 //! without any service measuring anything.
 //!
-//! [`Pressure`](crate::pressure::Pressure) can describe any bounded thing, but
+//! [`Pressure`] can describe any bounded thing, but
 //! a registry only holds what somebody remembered to put in it, and the
 //! service nobody instrumented is reliably the service that falls over. The
 //! gateway's control lane got a gauge because somebody had already been bitten

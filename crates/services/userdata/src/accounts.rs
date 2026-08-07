@@ -435,7 +435,7 @@ impl Accounts {
     ///
     /// The name, if it is empty or already registered. Uniqueness is checked
     /// here rather than left to the `ux_account_name` index: a violated index
-    /// fails inside [`Self::write`], which only logs, so the cache would keep
+    /// fails inside `Self::write`, which only logs, so the cache would keep
     /// the new name while the table kept the old one, and the two would disagree
     /// until the next restart.
     pub async fn rename(&self, scope: u32, id: u64, name: &str) -> Result<Account, String> {

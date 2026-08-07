@@ -4,7 +4,7 @@
 //! `PermissionQuery.permissions`, so the values are transcribed from
 //! `vendor/server/src/ACL.h:21` and must never be renumbered.
 //!
-//! The *policy* that evaluates it is [`crate::evaluate`]. It lives outside this
+//! The *policy* that evaluates it is [`crate::evaluate()`]. It lives outside this
 //! module because evaluation needs the ancestor chain, the ACL entries and the
 //! group memberships, and a trait taking only ids would have to fetch them,
 //! which is how murmur's `ACLCache` ends up threaded through everything.

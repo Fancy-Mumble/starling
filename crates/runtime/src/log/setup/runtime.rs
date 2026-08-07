@@ -79,7 +79,7 @@ impl LogRuntime {
     /// Start from an operator's `[logging]` section.
     ///
     /// [`Self::start`] takes a resolved [`LogSpec`]; this takes the unresolved
-    /// [`LogConfig`] and carries its fallback warnings, a misspelled level, an
+    /// [`crate::log::LogConfig`] and carries its fallback warnings, a misspelled level, an
     /// unknown category, into the log itself. Resolving in the composition root
     /// instead would mean every entry point remembering to report them, and the
     /// one that forgot would log at the wrong level in silence.

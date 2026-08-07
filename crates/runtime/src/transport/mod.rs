@@ -25,7 +25,7 @@
 //! all: they take a `dyn Transport` and call it.
 //!
 //! Adding a transport is therefore a new module plus one line in
-//! [`TRANSPORTS`], and no edit to anything that serves or dials.
+//! `TRANSPORTS`, and no edit to anything that serves or dials.
 
 mod http;
 mod in_process;

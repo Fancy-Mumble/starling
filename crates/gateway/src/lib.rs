@@ -18,7 +18,7 @@
 //! | | |
 //! |---|---|
 //! | [`listener`] | accept, TLS, mint a connection id |
-//! | [`connection`] | one TLS stream, control framing, two queues with two policies |
+//! | `connection` | one TLS stream, control framing, two queues with two policies |
 //! | [`router`] | the `u16` → service table, read from TOML |
 //! | [`limiter`] | a bucket per route, never one shared, never a silent drop |
 //! | [`resume`] | a sequence number per session and a bounded replay ring |

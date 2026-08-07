@@ -15,7 +15,7 @@
 //!
 //! Here each backend is one type implementing [`SqlDialect`], and [`Dialect`]
 //! carries it. Adding one is a new file, a new variant, and one arm in
-//! [`Dialect::behaviour`]: nothing that already works is touched.
+//! `Dialect::behaviour`: nothing that already works is touched.
 //!
 //! # The differences, in one table
 //!

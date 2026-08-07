@@ -6,7 +6,7 @@
 //! at connect time, which is the same shape murmur has.
 //!
 //! What `Any` unifies is the *protocol*. It does not unify the SQL; that is
-//! [`crate::dialect`]'s job, and the reason a pool alone is not enough.
+//! [`crate::storage::dialect`]'s job, and the reason a pool alone is not enough.
 //!
 //! # Two things a pool gets wrong unless told
 //!
@@ -16,7 +16,7 @@
 //! enforcement is one, so running the pragma once after connecting arms it on
 //! exactly one pooled connection and leaves the rest ignoring every
 //! `ON DELETE CASCADE` in the schema. Whether a delete cascaded would then depend
-//! on which connection the pool happened to hand out. [`after_connect`] runs it
+//! on which connection the pool happened to hand out. `after_connect` runs it
 //! on every one.
 //!
 //! **`:memory:` is private to a connection.** Two connections to `sqlite::memory:`
@@ -66,7 +66,7 @@ impl Backend {
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the scheme is unsupported or the database
-    /// cannot be reached within [`CONNECT_TIMEOUT`].
+    /// cannot be reached within `CONNECT_TIMEOUT`.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         // `Any` resolves a scheme to a driver through a registry that starts
         // empty. Without this every connection fails with "no driver found",

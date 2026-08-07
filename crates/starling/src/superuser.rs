@@ -14,7 +14,7 @@
 //! straight to userdata's own database rather than asking a service, because in
 //! both situations the point is not needing the rest of the server to be running.
 //!
-//! It reads userdata's storage through the same [`ServiceContext::storage`] the
+//! It reads userdata's storage through the same [`starling_runtime::ServiceContext::storage`] the
 //! service uses, so the file it writes is by construction the file the service
 //! reads. Deriving the path a second way here is how a tool ends up quietly
 //! editing a database nobody loads.

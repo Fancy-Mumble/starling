@@ -70,7 +70,7 @@ impl Target {
 ///
 /// The wire field is `target` inbound and `context` outbound, and they are not
 /// the same numbers (`MumbleUDP.proto`). Ordered by directness, which is what
-/// makes [`Audience::add`] able to fold two ways of being reached with `min`.
+/// makes `Audience::add` able to fold two ways of being reached with `min`.
 pub mod context {
     /// Someone in the speaker's own channel.
     pub const NORMAL: u8 = 0;

@@ -177,7 +177,7 @@ fn admit(
     Ok(identity.subject)
 }
 
-/// [`admit`], for a handler that cannot answer with this module's JSON body.
+/// `admit`, for a handler that cannot answer with this module's JSON body.
 ///
 /// The WebSocket upgrade returns a `Response` and not a `Json<ApiError>`,
 /// and authorisation still has to happen before the upgrade, a socket that
@@ -186,7 +186,7 @@ fn admit(
 ///
 /// # Errors
 ///
-/// The same statuses [`admit`] produces, with the reason as plain text.
+/// The same statuses `admit` produces, with the reason as plain text.
 pub fn admit_live(
     api: &OperatorApi,
     headers: &HeaderMap,

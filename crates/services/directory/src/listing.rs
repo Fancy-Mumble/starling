@@ -49,7 +49,7 @@ impl Listing {
     ///
     /// Hand-rolled rather than pulled from an XML crate: this is nine text
     /// elements with no attributes, no namespaces and no nesting, and the whole
-    /// of the correctness lives in [`escape`].
+    /// of the correctness lives in `escape`.
     #[must_use]
     pub fn to_xml(&self) -> String {
         let mut xml = String::from("<server>");

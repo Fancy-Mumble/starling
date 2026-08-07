@@ -202,7 +202,7 @@ impl ClientHandle {
     ///
     /// # Errors
     ///
-    /// [`QueueError::ControlOverflow`] when the control queue is full, which
+    /// `QueueError::ControlOverflow` when the control queue is full, which
     /// the caller turns into a disconnect. Audio never returns an error: it
     /// drops the oldest frame and counts it.
     pub fn send(&self, lane: Lane, frame: Outbound) -> Result<(), QueueError> {

@@ -895,7 +895,7 @@ impl Handshake {
     /// the client may need its own session id before it can process listeners
     /// (`Messages.cpp:843`), and `ServerSync` is the message that carries it.
     /// Called from [`Self::authenticate`] for that reason, not from
-    /// [`Self::welcome`]: everything `welcome` builds precedes the sync.
+    /// `Self::welcome`: everything `welcome` builds precedes the sync.
     pub async fn restore_and_announce(
         &self,
         connections: &Connections,

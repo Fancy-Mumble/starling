@@ -49,7 +49,7 @@ impl Ini {
     ///
     /// # Errors
     ///
-    /// [`MigrateError::Io`] if `path` cannot be read.
+    /// `MigrateError::Io` if `path` cannot be read.
     pub fn read(path: &Path) -> Result<Self, MigrateError> {
         let contents = std::fs::read_to_string(path).map_err(|source| MigrateError::Io {
             path: path.to_path_buf(),
@@ -168,7 +168,7 @@ impl Ini {
     /// Only the deployment-layer subset survives the translation: the listen
     /// address and the virtual server's id, name and port. Everything else the
     /// `.ini` configures is operational (`docs/ARCHITECTURE.md` §4) and is
-    /// reported by [`Self::warn_about_unimplemented`] instead, since it has no
+    /// reported by `Self::warn_about_unimplemented` instead, since it has no
     /// field to land in yet.
     #[must_use]
     pub fn to_config(&self) -> Config {
@@ -194,7 +194,7 @@ impl Ini {
     ///
     /// # Errors
     ///
-    /// [`MigrateError::Render`] if the migrated config could not be
+    /// `MigrateError::Render` if the migrated config could not be
     /// serialised, not expected in practice, see that variant's docs.
     pub fn migrate(&self) -> Result<String, MigrateError> {
         Ok(toml::to_string_pretty(&self.to_config())?)
