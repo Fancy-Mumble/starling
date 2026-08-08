@@ -43,7 +43,8 @@ only thing that changes.
    git push origin v0.3.0
    ```
 
-   The `docker` workflow builds and publishes `:0.3.0`, `:0.3` and `:latest`.
+   The `docker` workflow builds and publishes `:0.3.0`, `:0.3` and `:latest`,
+   and cuts a matching GitHub release (auto-generated notes) for the tag.
 
 ## Running a published image
 
