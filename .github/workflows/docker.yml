@@ -43,9 +43,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The workspace version plus the short commit: a main build's immutable,
+      # human-legible pin, e.g. 0.2.0-e649422, and valid semver (a pre-release of
+      # 0.2.0). Bump the workspace version right after a release so these read as
+      # the next version's pre-releases rather than the shipped one's.
+      - name: Compute dev version tag
+        id: dev
+        run: |
+          v=$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)
+          echo "tag=${v}-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       # A tag push gets :X.Y.Z, :X.Y and (as the newest) :latest; a main push
-      # gets :edge and :sha-<short>. `latest=auto` withholds :latest from branch
-      # builds, and the sha tag is gated to branches so a release stays clean.
+      # gets :edge and :<version>-<short>. `latest=auto` withholds :latest from
+      # branch builds, and the version pin is branch-only so a release keeps the
+      # clean semver tags alone.
       - name: Tags and labels
         id: meta
         uses: docker/metadata-action@v5
@@ -55,7 +66,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=edge,branch=main
-            type=sha,prefix=sha-,enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=${{ steps.dev.outputs.tag }},enable=${{ github.ref_type == 'branch' }}
           flavor: |
             latest=auto
 

@@ -26,10 +26,11 @@ only thing that changes.
 | Trigger | Tags |
 |---|---|
 | `git tag vX.Y.Z` | `X.Y.Z`, `X.Y`, `latest` |
-| push to `main` | `edge`, `sha-<short>` |
+| push to `main` | `edge`, `<version>-<short>` (e.g. `0.2.0-e649422`) |
 
 `latest` always points at the newest release; `edge` at the tip of `main`; a
-`sha-<short>` tag is the immutable pin for a specific commit.
+`<version>-<short>` tag (e.g. `0.2.0-e649422`, a semver pre-release of `0.2.0`)
+is the immutable pin for a specific commit.
 
 ## Cutting a release
 
@@ -61,5 +62,5 @@ STARLING_IMAGE=ghcr.io/fancy-mumble/starling:0.2.0 \
   docker compose up -d --wait starling
 ```
 
-Use `:latest` for the newest release, `:edge` to track `main`, or a `:sha-<short>`
-for an exact commit.
+Use `:latest` for the newest release, `:edge` to track `main`, or a
+`:<version>-<short>` (e.g. `:0.2.0-e649422`) for an exact commit.
