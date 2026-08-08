@@ -25,6 +25,14 @@ pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
         ..tcp::ChannelState::default()
     };
     set_legacy_temporary(&mut state, channel.flags & FLAG_TEMPORARY != 0);
+    // The one Fancy field written here rather than left to the envelope, because
+    // it is the only signal the client has that a channel is encrypted at all:
+    // it reads `ChannelState.pchat_protocol` (upstream field 1000) directly and
+    // derives the persistence mode from it. Announced only when set, so a stock
+    // client sees exactly what it did before.
+    if channel.pchat_protocol != 0 {
+        state.pchat_protocol = Some(channel.pchat_protocol as i32);
+    }
     state
 }
 
@@ -150,6 +158,15 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
             channel.flags & !FLAG_HIDDEN
         };
         fields.push("flags".to_owned());
+    }
+    // Read for the third time for the reason `hidden` and expiry were: the
+    // field was on the wire and nothing took it off, so a client asking for an
+    // encrypted channel got an ordinary one. It never reached the tree, so the
+    // announcement carried no protocol, the client never entered E2E mode, and
+    // the whole persistent-chat feature was unreachable through the UI.
+    if let Some(protocol) = state.pchat_protocol {
+        channel.pchat_protocol = protocol.max(0) as u32;
+        fields.push("pchat_protocol".to_owned());
     }
     ChannelEdit {
         channel,

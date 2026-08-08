@@ -419,6 +419,7 @@ impl Trees {
                     "parent" => channel.parent = values.parent,
                     "expiry_mode" => channel.expiry_mode = values.expiry_mode,
                     "expiry_duration_s" => channel.expiry_duration_s = values.expiry_duration_s,
+                    "pchat_protocol" => channel.pchat_protocol = values.pchat_protocol,
                     other => tracing::warn!(field = other, "ignoring an unknown channel field"),
                 }
             }

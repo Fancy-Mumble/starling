@@ -51,6 +51,14 @@ message Channel {
   uint32 expiry_mode = 10;
   uint32 expiry_duration_s = 11;
   uint64 created_at_ms = 12;
+  // Which persistent-chat protocol the channel runs, as upstream's
+  // ChannelState.pchat_protocol (field 1000) numbers them. 0 is "none".
+  //
+  // The client decides whether a channel is end-to-end encrypted from this and
+  // nothing else: it renders the persistence banner, unlocks the Signal bridge
+  // and routes the message through pchat. Dropped here, every encrypted-channel
+  // feature is unreachable no matter what the rest of the stack supports.
+  uint32 pchat_protocol = 13;
 }
 
 message Membership {
