@@ -782,16 +782,14 @@ impl Handshake {
         visible
             .into_iter()
             .map(|channel| {
-                let state = tcp::ChannelState {
-                    channel_id: Some(channel.id),
-                    parent: channel.parent,
-                    name: Some(channel.name),
-                    description: Some(channel.description),
-                    position: Some(channel.position),
-                    max_users: Some(channel.max_users),
-                    links: channel.links,
-                    ..tcp::ChannelState::default()
-                };
+                // metadata's serializer, not a second copy of it. This built its
+                // own ChannelState until it drifted: metadata learned to publish
+                // `pchat_protocol` and the handshake did not, so a channel was
+                // encrypted for whoever watched it being created and an ordinary
+                // room to everyone who connected afterwards - including the same
+                // user after a reconnect. `temporary` was already missing here
+                // for the same reason.
+                let state = starling_metadata::serialize::channel_state(&channel);
                 to_conn(inbound.conn, 7, state.encode_to_vec())
             })
             .collect()
