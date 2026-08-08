@@ -53,6 +53,11 @@ members = [
 ]
 
 [workspace.package]
+# The release version. The `starling` binary and the internal libraries
+# (runtime, crypto, gate, sfu, migrate, operator-api) inherit it, and a git tag
+# `vX.Y.Z` cut from it is what publishes a container image. The services, the
+# gateway and the proto crates instead carry their own `version` and bump
+# independently, so a change confined to one service need not move everything.
 version = "0.2.0"
 edition = "2024"
 # Matches rust-toolchain.toml. Kept in step with it deliberately: this is the

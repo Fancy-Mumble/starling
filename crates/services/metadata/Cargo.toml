@@ -1,7 +1,7 @@
 [package]
 name = "starling-metadata"
 description = "the channel tree and who is in it, one actor per virtual server"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
