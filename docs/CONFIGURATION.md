@@ -37,11 +37,11 @@ default_deadline = "5s"              # per gRPC call unless a route overrides it
 [gateway.tls]
 cert = "/etc/starling/tls/cert.pem"
 key  = "/etc/starling/tls/key.pem"
-# Omit both and a self-signed pair is generated on first boot, as murmur does.
+# Omit both and a self-signed pair is generated on first boot.
 
 [gateway.limits]
-# Per route, never one shared bucket. murmur's single 1 msg/s bucket silently
-# ate SDP offers; a throttled message here is reported, never dropped in silence.
+# Per route, never one shared bucket; a throttled message here is reported,
+# never dropped in silence.
 control   = { rate = "1/s",  burst = 5  }   # matches murmur for legacy clients
 signalling = { rate = "10/s", burst = 20 }  # WebRTC bursts on share start
 plugin    = { rate = "4/s",  burst = 15 }   # murmur's own plugin bucket
@@ -139,11 +139,8 @@ default exists so a first boot starts, not so a deployment ships on it.
 
 **One UDP port serves every endpoint, not every service.** A WebTransport
 session is addressed by `:path`, so more endpoints here cost no more ports. Two
-*independent* services are a different question: give each its own UDP port and
-point clients at it with `Alt-Svc: h3=":8443"` from your existing HTTPS
-endpoint, or put a QUIC-aware L4 proxy in front and steer on SNI. Note that
-QUIC connection migration means SNI steering also needs connection-ID-aware
-routing, or a client changing network drops its session.
+*independent* services each need their own UDP port, fronted by a QUIC-aware
+proxy or advertised with `Alt-Svc`.
 
 ### Audit is fail-closed
 
@@ -159,9 +156,9 @@ service the operator may not be running.
 
 ## A service
 
-Every service block takes the same keys. `types` is the outer message type from
-`PROTOCOL-COMPATIBILITY.md` §3, one number per service, because the service's own
-message types live in its nested envelope and the gateway never looks inside.
+Every service block takes the same keys. `types` is the outer message type, one
+set per service; a service's own message types live in its nested envelope, which
+the gateway never looks inside.
 
 ```toml
 [services.text]
