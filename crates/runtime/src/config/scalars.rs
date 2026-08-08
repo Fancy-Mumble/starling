@@ -1,9 +1,7 @@
 //! The three scalar shapes the configuration uses: durations, sizes and rates.
 //!
-//! They are written the way an operator writes them (`"15m"`, `"512MiB"`,
-//! `"10/s"`) and parsed into typed values, because a config that accepts
-//! `"15"` and silently means seconds is a config that eventually means
-//! minutes to somebody.
+//! Written the way an operator writes them (`"15m"`, `"512MiB"`, `"10/s"`) and
+//! parsed into typed values; a bare `"15"` is refused rather than guessed at.
 
 use std::fmt;
 use std::str::FromStr;

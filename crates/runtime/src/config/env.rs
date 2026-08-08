@@ -1,19 +1,13 @@
 //! Environment overrides, so a Kubernetes `ConfigMap` works without templating
 //! and `docker compose` works without a mount.
 //!
-//! The rule is one line: `[services.text] endpoint` becomes
-//! `STARLING_SERVICES_TEXT_ENDPOINT`: uppercase, dots and dashes to
+//! One rule: `[services.text] endpoint` becomes
+//! `STARLING_SERVICES_TEXT_ENDPOINT` -- uppercase, dots and dashes to
 //! underscores, `STARLING_` prefix.
 //!
-//! # Why the walk goes outwards from the config rather than inwards from the
-//! variable
-//!
-//! `STARLING_SERVICES_LINK_PREVIEW_ENDPOINT` cannot be split back into
-//! `services.link-preview.endpoint` by looking at underscores: `link_preview`
-//! and `link.preview` produce the same variable. So the config tree is walked,
-//! each leaf's variable name is *computed*, and the environment is consulted for
-//! that exact name. Ambiguity disappears because the tree says which shape is
-//! real.
+//! The mapping runs config-to-variable, not the reverse: `link_preview` and
+//! `link.preview` would yield the same variable, so the tree is walked and each
+//! leaf's name computed, which a reverse split could not disambiguate.
 
 use crate::config::{Config, ConfigError};
 
@@ -32,8 +26,8 @@ pub fn env_key(path: &[&str]) -> String {
 ///
 /// # Errors
 ///
-/// [`ConfigError::Environment`] when a value does not fit the key it overrides
-/// a port that is not a number is a startup failure, not a default.
+/// [`ConfigError::Environment`] when a value does not fit its key; a
+/// non-numeric port is a startup failure, not a silent default.
 pub fn apply_environment(
     config: &mut Config,
     vars: &[(String, String)],

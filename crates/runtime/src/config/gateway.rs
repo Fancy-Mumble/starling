@@ -15,9 +15,8 @@ pub struct GatewayConfig {
     /// The control plane. TLS terminates here.
     pub listen_tcp: String,
 
-    /// Per client. Full means **disconnect that client**: dropping a control
-    /// message desyncs it permanently and silently, and queueing without a
-    /// bound is a memory `DoS` (`docs/ARCHITECTURE.md` §5).
+    /// Per client; full means **disconnect that client**. Dropping a control
+    /// message desyncs it silently, and unbounded queueing is a memory `DoS`.
     pub control_queue: usize,
 
     /// Per client, for tunnelled audio. Full means drop the oldest and count
@@ -138,9 +137,8 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
 
 /// One named bucket.
 ///
-/// `PartialEq` so a live change can be compared with what is already applied:
-/// the gateway re-reads the operator's `messagelimit` on the frame path, and
-/// re-tuning a bucket that has not changed would be work done per frame.
+/// `PartialEq` so a live `messagelimit` change can be compared with what is
+/// applied, and an unchanged bucket skipped rather than re-tuned per frame.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitConfig {
@@ -152,9 +150,9 @@ pub struct LimitConfig {
 
 /// Certificate and key.
 ///
-/// Omit both and a self-signed pair is generated on first boot, as murmur does:
-/// Mumble clients identify a server by certificate fingerprint, so the pair
-/// must then be stable across restarts.
+/// Omit both and a self-signed pair is generated on first boot. Mumble clients
+/// identify a server by certificate fingerprint, so the pair must then be
+/// stable across restarts.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsConfig {

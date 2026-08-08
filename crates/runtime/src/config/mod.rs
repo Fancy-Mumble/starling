@@ -1,13 +1,10 @@
 //! Deployment configuration: read once at startup and injected at construction.
 //!
-//! There are two configuration layers and only one of them is this file.
-//! Anything that needs a restart anyway lives here, endpoints, ports, TLS
-//! paths, storage URLs, tiers and routes, so there is no late-subscriber
-//! problem and no service to be down. Anything an operator expects to change
-//! live belongs to the `server-config` service (`docs/CONFIGURATION.md`).
+//! The restart-anyway layer -- endpoints, ports, TLS paths, storage URLs, tiers
+//! and routes. Anything an operator expects to change live belongs to the
+//! `server-config` service instead.
 //!
-//! Unknown keys are **rejected**, so a typo fails loudly instead of silently
-//! leaving a limit at its default.
+//! Unknown keys are **rejected**, so a typo fails loudly.
 
 mod env;
 mod gateway;
@@ -42,10 +39,9 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// The operator event log: who connected, what was refused.
     ///
-    /// Separate from [`telemetry`](Self::telemetry) because the two answer to
-    /// different people. `RUST_LOG` is a developer's dial and may be turned
-    /// down to nothing; this is the record an operator is entitled to keep, and
-    /// it has its own level, categories and destinations.
+    /// Separate from [`telemetry`](Self::telemetry): `RUST_LOG` is a developer's
+    /// dial, while this is the record an operator keeps, with its own level,
+    /// categories and destinations.
     pub logging: LogConfig,
     /// Every service, by name.
     pub services: BTreeMap<String, ServiceConfig>,
@@ -59,9 +55,8 @@ pub struct Config {
 pub struct RuntimeConfig {
     /// Every service in one process, over in-memory transports.
     ///
-    /// Same binary, same config file, and `endpoint` values are ignored. It is
-    /// the mode for a single VPS, and it exercises the same boundaries, which
-    /// is why it is not a second code path.
+    /// Same binary and config file, with `endpoint` values ignored; the
+    /// single-VPS mode.
     pub all_in_one: bool,
     /// Where generated certificates and default databases live.
     pub data_dir: PathBuf,
@@ -185,11 +180,10 @@ impl Config {
 
     /// The built-in defaults, with every service on a local endpoint.
     ///
-    /// This is what a first boot with no file gets, and what `--all-in-one`
-    /// starts from. Which local mechanism that is belongs to
-    /// [`crate::transport::local_endpoint`]: a Unix socket, or a named pipe on
-    /// Windows, so that a first boot works on the platform it happens on
-    /// without an operator having to allocate a port per service.
+    /// What a first boot with no file gets, and what `--all-in-one` starts from.
+    /// The local mechanism -- Unix socket, or named pipe on Windows -- is
+    /// [`crate::transport::local_endpoint`], so a first boot needs no per-service
+    /// port allocation.
     #[must_use]
     pub fn with_defaults(run_dir: &Path) -> Self {
         let mut config = Self {
@@ -282,7 +276,7 @@ impl Config {
     }
 }
 
-/// The tier each service ships with, from `docs/ARCHITECTURE.md` §4.
+/// The tier each service ships with.
 fn default_tier(kind: ServiceKind) -> Tier {
     match kind {
         ServiceKind::SessionLifecycle
@@ -299,8 +293,7 @@ fn default_tier(kind: ServiceKind) -> Tier {
 
 /// The upstream types a service answers for, plus its own envelope.
 ///
-/// Upstream numbers are flat and frozen, so they are listed here once and never
-/// again: `docs/diagrams/services.puml` is the same table in picture form.
+/// Upstream numbers are flat and frozen, so they are listed here once.
 fn default_types(kind: ServiceKind) -> Vec<u16> {
     let upstream: &[u16] = match kind {
         // UserState (9) and UserStats (22) are connection state, and both were

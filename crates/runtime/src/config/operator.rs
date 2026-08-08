@@ -1,13 +1,11 @@
-//! Authentication for the admin plane, which is a Strategy chosen in the TOML.
+//! Authentication for the admin plane, chosen in the TOML.
 //!
 //! The operator surface can create users, rewrite ACLs, ban and read the
-//! database, the highest-privilege plane in the system. So authentication is
-//! **whatever the operator already runs** rather than something we invent, and
-//! a new mode is a new implementation rather than a new arm in a `match`
-//! (`docs/ARCHITECTURE.md` §3).
+//! database -- the highest-privilege plane in the system -- so authentication is
+//! **whatever the operator already runs** rather than something we invent.
 //!
-//! Against Ice, which this replaces: `icesecret` is one static string that *is*
-//! the identity, has no scope, and rotates by editing a file and restarting.
+//! Unlike Ice, which this replaces: its `icesecret` is one static string that is
+//! the identity, unscoped, rotated only by editing a file and restarting.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

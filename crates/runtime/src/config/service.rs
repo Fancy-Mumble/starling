@@ -1,10 +1,7 @@
 //! One service's deployment configuration.
 //!
-//! Every service block takes the same keys, and `types` is the outer message
-//! type from `docs/PROTOCOL-COMPATIBILITY.md` §3, one number per service,
-//! because the service's own message types live in its nested envelope and the
-//! gateway never looks inside. Adding a service is three lines of TOML and no
-//! gateway release.
+//! Every service block takes the same keys. `types` is the outer message type,
+//! one set per service; a service's own types live in its nested envelope.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,14 +18,20 @@ use crate::tier::Tier;
 pub struct ServiceConfig {
     /// A service the operator has chosen not to run.
     ///
-    /// The gateway treats an absent service exactly as it treats an unhealthy
-    /// one, by tier, so switching this off is a supported deployment, not a
-    /// broken one.
+    /// The gateway treats it by tier, exactly as it treats an unhealthy one, so
+    /// switching it off is a supported deployment, not a broken one.
     pub enabled: bool,
 
     /// `http://host:port` or `unix:/run/starling/name.sock`.
     ///
-    /// Ignored in all-in-one mode, where calls never leave the process.
+    /// Where other services **dial** this one and, unless [`Self::bind`] says
+    /// otherwise, the address it **serves** on -- one string for both directions.
+    ///
+    /// Not ignored under `--all-in-one`: a service binds this string in every
+    /// mode, so the shipped local endpoints mean all-in-one serves over real
+    /// sockets. Use `inproc:name` for calls that never leave the process; a
+    /// co-located pair short-circuits to in-process once the callee registers,
+    /// even over a configured socket.
     pub endpoint: Option<String>,
 
     /// What the gateway does while this service is down.
@@ -39,11 +42,21 @@ pub struct ServiceConfig {
 
     /// Which rate-limit bucket inbound frames for this service are charged to.
     ///
-    /// Absent means the default control bucket, which is murmur's 1/s. Screen
-    /// sharing must not be on that one, see `ratelimit`.
+    /// Absent means the default control bucket (1/s); screen sharing must not be
+    /// on that one.
     pub limits: Option<String>,
 
-    /// The address this service's own gRPC server binds.
+    /// The address this service's own gRPC server binds, when it differs from
+    /// the one others dial it at.
+    ///
+    /// Absent (the normal case) means [`Self::endpoint`]: one address per
+    /// service. Set it when the dialled name is not bindable -- on Kubernetes
+    /// `endpoint` names a Service whose virtual `ClusterIP` belongs to no
+    /// interface, so a pod cannot bind it; `bind = "http://0.0.0.0:50051"`
+    /// separates the two without moving the name others dial.
+    ///
+    /// Both parse the same way, so a `unix:` endpoint with an `http://` bind is
+    /// two visible boundaries, never a silent transport change.
     pub bind: Option<String>,
 
     /// Voice's own UDP socket. Audio skips the gateway entirely.
@@ -124,8 +137,8 @@ impl ServiceConfig {
 pub struct StorageConfig {
     /// `sqlite://...`, `postgres://...` or `mysql://...`.
     pub url: String,
-    /// Pool size. In-memory SQLite is capped to one automatically, because five
-    /// connections to `:memory:` are five different databases.
+    /// Pool size. In-memory SQLite is capped to one automatically (five
+    /// connections to `:memory:` are five different databases).
     pub max_connections: u32,
 }
 
@@ -142,7 +155,7 @@ impl Default for StorageConfig {
 ///
 /// `operator-api` writes this itself rather than calling the audit service:
 /// audit is optional, and the highest-privilege plane must not depend on a
-/// service the operator may not be running.
+/// service that may not be running.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OperatorAudit {
@@ -163,16 +176,11 @@ impl Default for OperatorAudit {
 
 /// The live channel's WebTransport half.
 ///
-/// Off unless configured, and for a reason beyond caution: WebTransport is
-/// HTTP/3 over QUIC, and a reverse proxy generally cannot forward it. A
-/// deployment behind one reaches the same channel over the WebSocket at
-/// `/v1/events` and never binds this port at all.
+/// Off unless configured: WebTransport is HTTP/3 over QUIC, which a reverse
+/// proxy generally cannot forward. Behind one, reach the same channel over the
+/// WebSocket at `/v1/events` and never bind this port.
 ///
-/// `listen` is UDP, and it is a *different* socket from the API's TCP `listen`.
-/// One port per service rather than one shared: a WebTransport session is
-/// addressed by path, so several endpoints share this listener, but two
-/// independent services cannot share a UDP port without a QUIC-aware proxy
-/// steering on SNI.
+/// `listen` is UDP, a different socket from the API's TCP `listen`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WebTransport {
@@ -182,10 +190,9 @@ pub struct WebTransport {
     pub listen: String,
     /// The certificate chain, PEM.
     ///
-    /// Required in practice even when a proxy terminates TLS for every other
-    /// surface: this listener is the one the proxy is not terminating. A
-    /// self-signed pair is generated here on first boot if absent, which a
-    /// browser will refuse, so a real certificate is the deployed answer.
+    /// Needed even when a proxy terminates TLS elsewhere -- this is the listener
+    /// it does not terminate. Absent, a self-signed pair is generated on first
+    /// boot, which a browser refuses, so deploy a real one.
     pub cert: Option<PathBuf>,
     /// The private key, PEM.
     pub key: Option<PathBuf>,
