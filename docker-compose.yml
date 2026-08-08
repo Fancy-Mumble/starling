@@ -1,7 +1,6 @@
-# Starling, as docs/diagrams/deployment.puml describes it for compose: the
-# Kubernetes picture with the load balancers replaced by published ports, and
-# voice reachable at the same host:port the gateway is, because a legacy
-# Mumble client sends UDP to the port it made TCP to and cannot be redirected.
+# Starling for docker compose: the Kubernetes shape with load balancers replaced
+# by published ports, and voice reachable at the same host:port as the gateway
+# (a legacy Mumble client sends UDP to the port it made TCP to).
 #
 # One image, twenty containers, one TOML, nineteen services and the gateway.
 # The entrypoint takes a service name, so every container below differs only in
@@ -17,12 +16,9 @@
 # `--build` (tags and the release flow are in docs/RELEASING.md):
 #   STARLING_IMAGE=ghcr.io/fancy-mumble/starling:latest docker compose up -d --wait
 #
-# `--build` is not decoration. Compose builds only when the image is *missing*,
-# so once `starling:local` exists it is reused whatever the source says, and
-# because every container here runs the same binary chosen by `command`, a stale
-# image fails in a way that reads like a bug in the code: a service added since
-# the build exits with `no service named "..."`, since the binary inside has no
-# arm for it. Rebuild whenever `crates/` has moved.
+# `--build` matters: compose builds only when the image is missing, so a stale
+# `starling:local` is reused and a service added since the last build exits with
+# `no service named "..."`. Rebuild whenever `crates/` has moved.
 #
 # Connect a Mumble client to localhost:64738. On first boot the gateway
 # generates a self-signed certificate into the `starling-data` volume, so the
@@ -33,40 +29,29 @@
 #   docker compose --profile admin up -d --wait   # ... plus operator-api
 #   docker compose up -d --wait starling          # instead: ONE container
 #
-# Note the difference. A profile is additive, it adds operator-api to the
-# stack, which is what the admin plane wants. All-in-one is a *replacement*,
-# and enabling its profile would start it alongside the twenty containers it
-# replaces, both claiming port 64738. Naming the service is what limits the set
-# to it; compose enables a named service's profile for you.
+# A profile is additive (admin adds operator-api). All-in-one is a *replacement*:
+# naming the `starling` service starts it alone and enables its profile, whereas
+# `--profile all-in-one` would start it alongside the twenty it replaces, both
+# claiming port 64738.
 #
-# `--wait` is what makes this controlled: it returns when every container is
-# healthy, or fails. Health here is a TCP connect, because this build has no
-# HTTP /healthz, readiness is an in-process gate the runtime consults, and
-# nothing serves it over the network yet. So a healthy container means "the
-# listener is up", not "its caches are warm".
+# `--wait` returns when every container is healthy. Health is a TCP connect (no
+# HTTP /healthz here), so healthy means "the listener is up", not "caches warm".
 
 # ---------------------------------------------------------------------------
 # What every service shares. Only `command` differs between most of them.
 # ---------------------------------------------------------------------------
-# A probe that stops probing once it has succeeded.
+# A probe that stops once it has succeeded.
 #
-# `/dev/tcp` is a bash builtin; dash does not have it and the image has no curl.
-# So the only probe available from outside is "open a TCP connection and drop
-# it", and against the gateway that is an *incomplete TLS handshake*, which it
-# records in the operator's security log, by design. Repeating it every two
-# seconds forever fills that log with a peer the operator cannot identify and
-# did not cause.
+# `/dev/tcp` is a bash builtin (dash lacks it, no curl in the image), so the only
+# external probe is a TCP connect. Against the gateway that is an incomplete TLS
+# handshake, which it logs as a security event -- so the first success latches to
+# a file and every later probe is a stat, rather than filling that log every two
+# seconds. The file is on a per-container tmpfs, recreated empty on every start,
+# so a restarted container genuinely re-probes.
 #
-# So the first success latches into a file and every later probe is a stat. The
-# file lives on a per-container tmpfs (below), which Docker recreates empty on
-# every container start (including a restart) so a container that comes back
-# genuinely re-probes rather than inheriting a stale "healthy".
-#
-# What this gives up: health stops tracking liveness after the first success. It
-# is worth it here because nothing consumes it after that. `depends_on:
-# service_healthy` and `up --wait` are both start-up gates, no orchestrator is
-# acting on the steady-state value, and a process that dies takes its container
-# with it, which `docker ps` shows either way.
+# Trade-off: health stops tracking liveness after the first success, which is
+# fine here -- `depends_on` and `up --wait` are start-up gates, and a dead
+# process takes its container with it.
 #
 # $$HOSTNAME, not 127.0.0.1: the runtime has one address per service rather than
 # a bind/advertise pair, so a service reached at `http://text:50051` *binds* that
@@ -85,15 +70,13 @@ x-grpc-healthcheck: &grpc-healthcheck
 
 x-starling: &starling
   image: ${STARLING_IMAGE:-starling:local}
-  # Every service names the same image, so this builds once and the other
-  # nineteen are cache hits against the result.
+  # Same image for every service: built once, cache hits after.
   build:
     context: .
     dockerfile: Dockerfile
   restart: unless-stopped
-  # SIGTERM raises the drain (crates/runtime/src/shutdown.rs) and the runtime
-  # then finishes what it is holding. Docker's default 10s would cut that
-  # short; 30s is what Kubernetes allows and what the drain was written for.
+  # SIGTERM drains the runtime; 30s to finish (Docker's default 10s cuts it
+  # short, 30s is what Kubernetes allows).
   stop_grace_period: 30s
   networks: [starling]
   volumes:
@@ -136,10 +119,9 @@ services:
     <<: *starling
     command: ["server-config", "--config", "/etc/starling/starling.toml"]
 
-  # The composed read model every service in the control, core and realtime
-  # groups reads through. It has no client-facing message type, so the gateway
-  # never attaches to it, but it calls permissions and userdata, which is the
-  # only reason this waits.
+  # The composed read model the other services read through. No client-facing
+  # type, so the gateway never attaches; it waits only because it calls
+  # permissions and userdata.
   session-view:
     <<: *starling
     command: ["session-view", "--config", "/etc/starling/starling.toml"]
@@ -147,10 +129,9 @@ services:
       permissions: {condition: service_healthy}
       userdata: {condition: service_healthy}
 
-  # Owns a connection's existence: version, authentication, CryptSetup, Ping,
-  # timeout, teardown. It waits on voice because voice mints the ciphers,
-  # key material never crosses a service boundary, so session-lifecycle asks
-  # voice for a ready-made CryptSetup payload to forward.
+  # Owns a connection's existence: version, auth, CryptSetup, Ping, timeout,
+  # teardown. Waits on voice because voice mints the ciphers (key material never
+  # crosses a service boundary), handing back a ready-made CryptSetup to forward.
   session-lifecycle:
     <<: *starling
     command: ["session-lifecycle", "--config", "/etc/starling/starling.toml"]
@@ -165,10 +146,9 @@ services:
   # core, down means that feature is dead and the server still runs.
   # -------------------------------------------------------------------------
 
-  # Binds its OWN UDP socket. Audio goes client -> voice with no gateway hop,
-  # so this container publishes UDP 64738 while the gateway publishes TCP
-  # 64738: to a client they are one host:port pair, which is the only thing a
-  # legacy client can cope with.
+  # Its own UDP socket: audio goes client -> voice with no gateway hop, so this
+  # publishes UDP 64738 where the gateway publishes TCP 64738 -- one host:port
+  # pair to a legacy client.
   voice:
     <<: *starling
     command: ["voice", "--config", "/etc/starling/starling.toml"]
@@ -188,9 +168,8 @@ services:
     command: ["moderation", "--config", "/etc/starling/starling.toml"]
 
   # -------------------------------------------------------------------------
-  # optional, down means nobody notices. Nothing waits on these, and the
-  # gateway does not either: it sheds their routes by tier while they are
-  # missing rather than refusing logins.
+  # optional: down means nobody notices. Nothing waits on these; the gateway
+  # sheds their routes by tier rather than refusing logins.
   # -------------------------------------------------------------------------
   screenshare:
     <<: *starling
@@ -205,10 +184,8 @@ services:
     ports:
       - "${STARLING_FILES_PORT:-8080}:8080/tcp"
     healthcheck:
-      # Both listeners: the gRPC surface and its own HTTP one. Checking only
-      # the first would call it ready with bulk transfer dead. The HTTP one is
-      # on loopback because `listen` is a real 0.0.0.0 bind, unlike the gRPC
-      # endpoint.
+      # Both listeners: the gRPC surface and its own HTTP one -- checking only
+      # the first would call it ready with bulk transfer dead.
       test:
         - "CMD"
         - "bash"
@@ -247,46 +224,33 @@ services:
     <<: *starling
     command: ["context-actions", "--config", "/etc/starling/starling.toml"]
 
-  # Announces this server to the public Mumble list, once an hour. Silent until
+  # Announces this server to the public Mumble list hourly. Silent until
   # registry_name / registry_password / registry_url are set in server-config,
-  # and it refuses to announce a password-protected server at all, which is
-  # murmur's rule and not ours.
-  #
-  # It reads the gateway's certificate from the shared volume, because the
-  # fingerprint it publishes has to be the one clients are actually shown.
+  # and it never announces a password-protected server. Reads the gateway's
+  # certificate from the shared volume so the fingerprint it publishes matches.
   directory:
     <<: *starling
     command: ["directory", "--config", "/etc/starling/starling.toml"]
     healthcheck:
-      # Nothing to probe, and that is deliberate: this service has no gRPC
-      # surface and no listener, because nothing dials it. A TCP healthcheck
-      # would fail forever and hold `up --wait` open; compose treats a container
-      # with no healthcheck as ready once it is running, which for a timer loop
-      # is exactly the truth available.
+      # Nothing to probe: no gRPC surface, no listener, nothing dials it. A TCP
+      # check would fail forever and hold `up --wait` open; no healthcheck means
+      # ready once running, which is the truth available for a timer loop.
       disable: true
 
-  # The other collector, and the opposite shape: this one *is* dialled. It asks
-  # every service how it is on a timer and holds the answer, so `operator-api`
-  # serves `/v1/health` from one snapshot instead of fanning out across twenty
-  # endpoints per page load.
-  #
-  # In the default set rather than `--profile admin`, even though `operator-api`
-  # is its only reader. The sweep is what makes silence into evidence, a
-  # service that stops answering reads UNREACHABLE, a state no service can
-  # report about itself, and a collector that starts with the dashboard would
-  # have no history of the outage the operator opened it to look at.
+  # Dialled, unlike directory: it polls every service on a timer and holds the
+  # answers, so `operator-api` serves `/v1/health` from one snapshot. In the
+  # default set (not `--profile admin`) so the sweep has history before the
+  # dashboard opens -- a service that stops answering reads UNREACHABLE, which
+  # none can report about itself.
   health:
     <<: *starling
     command: ["health", "--config", "/etc/starling/starling.toml"]
 
   # -------------------------------------------------------------------------
-  # The front door, started last.
-  #
-  # It attaches to every routed service and reconnects on its own, so waiting
-  # is not required for correctness; it is here so that `up --wait` returning
-  # means a client can actually log in, rather than meaning the port is open.
-  # It waits on essential and core only: waiting on optional would make a
-  # broken link-preview an outage, which is the opposite of what its tier says.
+  # The front door, started last. It reconnects to services on its own, so the
+  # depends_on below is only so `up --wait` returning means a client can log in,
+  # not just that the port is open. It waits on essential and core only --
+  # waiting on optional would make a broken link-preview an outage.
   # -------------------------------------------------------------------------
   gateway:
     <<: *starling
@@ -294,9 +258,8 @@ services:
     ports:
       - "${STARLING_PORT:-64738}:64738/tcp"
     healthcheck:
-      # The one probe that provoked this whole design: an unfinished TLS
-      # handshake, which the gateway is right to record. Latched, so it happens
-      # once per container start instead of every two seconds forever.
+      # An unfinished TLS handshake, which the gateway records; latched so it
+      # happens once per start, not every two seconds.
       test:
         - "CMD"
         - "bash"
@@ -321,11 +284,10 @@ services:
   # -------------------------------------------------------------------------
   # The admin plane, `--profile admin`.
   #
-  # The highest-privilege surface in the system, so: off unless asked for,
-  # published on loopback only, and refusing any request it cannot first
-  # record. It calls the authorities directly rather than through
-  # session-view, because an operator edits registered accounts and offline
-  # bans while session-view is a view of *connected* users.
+  # The highest-privilege surface: off unless asked for, loopback-only, and
+  # refusing any request it cannot first record. It calls the authorities
+  # directly, not through session-view, since an operator edits registered
+  # accounts and offline bans while session-view sees only connected users.
   #
   #   STARLING_ADMIN_TOKEN=$(openssl rand -hex 32) \
   #     docker compose --profile admin up -d --wait
@@ -341,13 +303,9 @@ services:
       # The TOML ships `enabled = false` so that nothing starts this surface by
       # accident; choosing the profile is the act that turns it on.
       STARLING_SERVICES_OPERATOR_API_ENABLED: "true"
-      # Empty rather than a default, and never a literal here. Compose
-      # interpolates this line whichever profile is selected, so `:?` would
-      # break plain `up` too, and it is not needed: an unset variable arrives
-      # empty, and an empty bearer token is refused as malformed before it is
-      # ever compared (crates/operator-api/src/auth.rs). Forgetting to set it
-      # therefore starts an admin plane nobody can authenticate to, which is
-      # the fail-closed direction.
+      # Empty rather than a default, never a literal. An unset variable arrives
+      # empty, and an empty bearer token is refused as malformed, so forgetting
+      # to set it starts an admin plane nobody can authenticate to -- fail-closed.
       STARLING_ADMIN_TOKEN: ${STARLING_ADMIN_TOKEN:-}
     ports:
       # 127.0.0.1 on purpose. This wants the opposite exposure to the gateway.
@@ -366,32 +324,58 @@ services:
       userdata: {condition: service_healthy}
       moderation: {condition: service_healthy}
       server-config: {condition: service_healthy}
-      # `/v1/health` is the one route that reads another service rather than an
-      # authority, and it is the route a dashboard opens on. Waiting on it here
-      # is what makes `--profile admin up --wait` mean the Health page works,
-      # rather than meaning :8081 accepts connections.
+      # `/v1/health` is the route a dashboard opens on; waiting on health here
+      # makes `--profile admin up --wait` mean the Health page works, not just
+      # that :8081 accepts connections.
       health: {condition: service_healthy}
 
   # -------------------------------------------------------------------------
-  # The single-box deployment.
-  #
-  # Every service in one process over in-memory transports: same binary, same
-  # TOML, gRPC replaced by in-process calls. `--all-in-one` overrides the
-  # file's `all_in_one = false` at the command line, so there is no second
-  # config to keep in step.
+  # The single-box deployment: every service in one process, gRPC replaced by
+  # in-process calls. `--all-in-one` overrides the file's `all_in_one = false`,
+  # so there is no second config.
   #
   #   docker compose up -d --wait starling
   #
-  # Name the service. It is behind a profile so that a bare `up` does not start
-  # it, but a profile only ever *adds*, `--profile all-in-one up` would bring
-  # up the twenty containers above as well, and the two sets would fight over
-  # port 64738 and the same volume. Naming it starts it and nothing else, and
-  # enables its profile on the way.
+  # Name the service, don't use `--profile all-in-one`: a profile only adds, so
+  # it would also start the twenty containers this replaces and fight over port
+  # 64738.
+  #
+  # The `inproc:` endpoint overrides below are required. A service binds its own
+  # `endpoint` in every mode, so left alone all twenty-one would try to bind
+  # `http://<name>:50051` -- names of the containers this replaces, which are not
+  # running -- and die. Overriding here, not in the TOML, keeps one routing table
+  # for both deployments.
   # -------------------------------------------------------------------------
   starling:
     <<: *starling
     profiles: ["all-in-one"]
     command: ["--all-in-one", "--config", "/etc/starling/starling.toml"]
+    environment:
+      RUST_LOG: ${STARLING_LOG:-info}
+      STARLING_SERVICES_SESSION_LIFECYCLE_ENDPOINT: inproc:session-lifecycle
+      STARLING_SERVICES_SESSION_VIEW_ENDPOINT: inproc:session-view
+      STARLING_SERVICES_PERMISSIONS_ENDPOINT: inproc:permissions
+      STARLING_SERVICES_METADATA_ENDPOINT: inproc:metadata
+      STARLING_SERVICES_USERDATA_ENDPOINT: inproc:userdata
+      STARLING_SERVICES_SERVER_CONFIG_ENDPOINT: inproc:server-config
+      STARLING_SERVICES_VOICE_ENDPOINT: inproc:voice
+      STARLING_SERVICES_TEXT_ENDPOINT: inproc:text
+      STARLING_SERVICES_PCHAT_ENDPOINT: inproc:pchat
+      STARLING_SERVICES_MODERATION_ENDPOINT: inproc:moderation
+      STARLING_SERVICES_SCREENSHARE_ENDPOINT: inproc:screenshare
+      STARLING_SERVICES_FILES_ENDPOINT: inproc:files
+      STARLING_SERVICES_PLUGINS_ENDPOINT: inproc:plugins
+      STARLING_SERVICES_PUSH_ENDPOINT: inproc:push
+      STARLING_SERVICES_AUDIT_ENDPOINT: inproc:audit
+      STARLING_SERVICES_ONBOARDING_ENDPOINT: inproc:onboarding
+      STARLING_SERVICES_SOCIAL_ENDPOINT: inproc:social
+      STARLING_SERVICES_LINK_PREVIEW_ENDPOINT: inproc:link-preview
+      STARLING_SERVICES_CONTEXT_ACTIONS_ENDPOINT: inproc:context-actions
+      STARLING_SERVICES_HEALTH_ENDPOINT: inproc:health
+      STARLING_SERVICES_GATEWAY_ENDPOINT: inproc:gateway
+      # Not started by this profile (the TOML ships it disabled), but named so
+      # that turning it on here does not reintroduce the failure above.
+      STARLING_SERVICES_OPERATOR_API_ENDPOINT: inproc:operator-api
     ports:
       - "${STARLING_PORT:-64738}:64738/tcp"
       - "${STARLING_PORT:-64738}:64738/udp"
