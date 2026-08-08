@@ -1,7 +1,6 @@
 [workspace]
-# v3 is the edition-2024 default for packages, but a virtual manifest has to
-# opt in by hand or it silently stays on v2. v3 is what makes `rust-version`
-# below bind: a dependency needing a newer compiler is not selected.
+# A virtual manifest defaults to resolver v2 unless it opts in; v3 makes the
+# `rust-version` pin below bind, so a crate needing a newer compiler is skipped.
 resolver = "3"
 members = [
     # Wire and security primitives, no I/O, no state.
@@ -54,15 +53,12 @@ members = [
 
 [workspace.package]
 # The release version. The `starling` binary and the internal libraries
-# (runtime, crypto, gate, sfu, migrate, operator-api) inherit it, and a git tag
-# `vX.Y.Z` cut from it is what publishes a container image. The services, the
-# gateway and the proto crates instead carry their own `version` and bump
-# independently, so a change confined to one service need not move everything.
+# (runtime, crypto, gate, sfu, migrate, operator-api) inherit it; the services,
+# the gateway and the proto crates carry their own.
 version = "0.2.0"
 edition = "2024"
-# Matches rust-toolchain.toml. Kept in step with it deliberately: this is the
-# version the resolver holds dependencies to, so letting it drift below the
-# pin would admit crates the pinned compiler cannot build.
+# Matches rust-toolchain.toml: the version the resolver holds dependencies to.
+# Drifting below the pin would admit crates the pinned compiler cannot build.
 rust-version = "1.95"
 license = "MIT"
 publish = false
@@ -123,14 +119,13 @@ tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
-# QUIC and HTTP/3, for the WebTransport half of the live channel.
-# quinn default features drag in rustls-platform-verifier and, through it, jni:
-# this dials nothing and verifies no peer, so a trust store is dead weight.
+# QUIC and HTTP/3, for the WebTransport half of the live channel. Default
+# features drag in rustls-platform-verifier (and jni); this verifies no peer, so
+# a trust store is dead weight.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"
-# The `datagram` feature is not optional for us: WebTransport requires the
-# client and server to agree on datagram support, and h3-quinn does not
-# implement the extension without it.
+# `datagram` is required: WebTransport needs datagram support, which h3-quinn
+# does not implement without it.
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 rcgen = "0.14.8"
@@ -153,8 +148,7 @@ uuid = { version = "1", features = ["v7"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-# Control-stream compression (PROTOCOL-REDESIGN.md §5, S3), declared here
-# before it had a user and now wired into the gateway.
+# Control-stream compression, wired into the gateway.
 zstd = "0.13"
 
 # -- crypto -----------------------------------------------------------------
@@ -177,8 +171,8 @@ bitflags = "2.13"
 async-trait = "0.1"
 
 # -- Workspace-wide lints ---------------------------------------------------
-# Mirrors the FancyMumble client and mumble-plugin-host workspaces so crates
-# compile cleanly with the same standards across all three trees.
+# The same lint set as the client and plugin-host workspaces, so all three hold
+# to one standard.
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "deny"

@@ -1,6 +1,5 @@
-# The build context is the whole workspace, and `target/` is the largest thing
-# in it by orders of magnitude. Sending it would also be pointless: the builder
-# stage compiles into its own cache mount.
+# The largest thing in the context, and pointless to send: the builder compiles
+# into its own cache mount.
 /target
 /deploy/target
 

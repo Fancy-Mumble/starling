@@ -1,12 +1,9 @@
 name: CI
 
-# Mirrors the gates the client (FancyMumbleNext) and plugin-host workspaces
-# enforce, so code holds to the same standard in all three trees:
+# The same gates as the client and plugin-host workspaces:
 #   fmt --check | clippy -D warnings | tests | cargo-deny | Miri
-#
-# Starling additionally gates the protobuf contract (check-proto-drift.sh) and
-# fuzzes the frame decoder, because unlike the client it decodes bytes from
-# unauthenticated peers.
+# Starling adds the protobuf contract and a fuzz of the frame decoder, since it
+# decodes bytes from unauthenticated peers.
 
 on:
   push:

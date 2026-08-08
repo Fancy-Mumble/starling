@@ -1,11 +1,8 @@
 # syntax=docker/dockerfile:1
 
-# One image, one entrypoint (docs/ARCHITECTURE.md §9).
-#
-# The entrypoint takes a service name, so compose runs `command: ["text"]` and
-# Kubernetes runs `args: ["text"]`. Twenty-one Dockerfiles would be twenty-one
-# things to keep in sync, and it would make `--all-in-one` a separate build
-# rather than a matter of arguments.
+# One image, one entrypoint. It takes a service name, so compose runs
+# `command: ["text"]` and Kubernetes runs `args: ["text"]`, and `--all-in-one`
+# is a matter of arguments rather than a separate build.
 
 # Must match rust-toolchain.toml. It is an ARG rather than a literal so the pin
 # is moved in one place when the toolchain moves.
@@ -13,8 +10,7 @@ ARG RUST_VERSION=1.95
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
-# prost-build 0.14 shells out to `protoc` rather than bundling one, the same
-# package .github/workflows/ci.yml installs for the Linux job.
+# prost-build shells out to `protoc` rather than bundling one.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
@@ -22,15 +18,11 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
-# `--locked`: the image is built from Cargo.lock, so an image rebuilt in six
-# months is the dependency tree this one was reviewed against rather than
-# whatever resolves that day.
-#
-# The release profile is lto = "thin" with codegen-units = 1, so the first
-# build is slow. Both cache mounts survive it; a rebuild after a source change
-# is minutes rather than the whole thing again. The binary is copied out of the
-# target cache inside the same layer, because a cache mount is not part of the
-# image.
+# `--locked` builds from Cargo.lock, so a rebuild months later is the same
+# dependency tree. The release profile is thin-LTO, so the first build is slow;
+# the cache mounts make a rebuild after a source change minutes instead. The
+# binary is copied out within the same layer, since a cache mount is not part of
+# the image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked --bin starling \
@@ -38,14 +30,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates: link-preview fetches URLs, and a container with no trust
-# store fails that in a way that looks like the remote host being down.
-#
-# bash is already present (Debian Essential) and is load-bearing for the
-# compose healthchecks: this build serves no HTTP /healthz to curl, health is
-# an in-process readiness gate, not an endpoint, so the only honest liveness
-# probe from outside is a TCP connect, which bash does with /dev/tcp and dash
-# cannot do at all.
+# ca-certificates: link-preview fetches URLs, and no trust store makes that look
+# like the remote host being down. bash (already present) is load-bearing for
+# the compose healthchecks: there is no HTTP /healthz, so the only probe is a TCP
+# connect via bash's /dev/tcp, which dash cannot do.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
@@ -53,10 +41,9 @@ RUN apt-get update \
 
 COPY --from=builder /usr/local/bin/starling /usr/local/bin/starling
 
-# Generated certificates and the per-service SQLite files live here, and this
-# is expected to be a volume. Mumble clients identify a server by certificate
-# fingerprint, so losing the pair on every restart is a security warning for
-# every client that has connected before.
+# Generated certificates and per-service SQLite files live here; expected to be a
+# volume. Mumble clients trust a server by certificate fingerprint, so losing the
+# pair on restart warns every client that connected before.
 USER starling
 WORKDIR /var/lib/starling
 
@@ -69,6 +56,5 @@ WORKDIR /var/lib/starling
 EXPOSE 64738/tcp 64738/udp 50051/tcp 8080/tcp 8081/tcp
 
 ENTRYPOINT ["starling"]
-# A container run with no arguments is the single-box deployment: every
-# service in one process, over in-memory transports.
+# No arguments = the single-box deployment: every service in one process.
 CMD ["--all-in-one"]

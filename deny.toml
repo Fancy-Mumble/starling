@@ -1,14 +1,11 @@
-# cargo-deny policy for the Starling workspace.
-#
-# Mirrors the client and plugin-host policies: RUSTSEC advisories, a licence
+# cargo-deny policy for the Starling workspace: RUSTSEC advisories, a licence
 # allow-list, banned/duplicate crates and registry sources. Run locally with:
 #
 #     cargo deny check advisories bans licenses sources
 #
-# Starling is a network server that terminates TLS for untrusted peers, so the
-# dependency graph is kept deliberately small and the ignore list deliberately
-# empty. Add an entry only with a justification, and only when there is
-# genuinely no upgrade path - never to silence a fixable vulnerability.
+# This is a network server terminating TLS for untrusted peers, so the ignore
+# list is kept empty. Add an entry only with a justification and no upgrade
+# path -- never to silence a fixable vulnerability.
 
 [graph]
 all-features = true
@@ -19,10 +16,8 @@ all-features = true
 [advisories]
 yanked = "deny"
 ignore = [
-    # rustls-pemfile is used only by the `starling` binary, to read a
-    # certificate and key from disk at startup - never on peer-controlled
-    # input. The client carries the same advisory for the same crate; both
-    # clear together by migrating to the rustls-pki-types PEM API.
+    # rustls-pemfile is used only at startup to read a cert/key from disk, never
+    # on peer input. Clears by migrating to the rustls-pki-types PEM API.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile (unmaintained): startup-only cert/key parsing, no peer input" },
 ]
 
@@ -48,9 +43,8 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# aws-lc-sys carries the historic OpenSSL licence alongside ISC/Apache-2.0.
-# It can enter the graph as rustls' default crypto provider; Starling selects
-# the `ring` provider explicitly, so this is a guard rather than a permission.
+# aws-lc-sys carries the historic OpenSSL licence. It can enter as rustls'
+# default provider; Starling selects `ring` explicitly, so this is a guard.
 exceptions = [
     { name = "aws-lc-sys", allow = ["OpenSSL"] },
 ]
@@ -73,6 +67,6 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# No git dependencies. Adding one to a server that terminates TLS for untrusted
-# peers needs a deliberate decision, so leave this empty and let cargo-deny fail.
+# No git dependencies: adding one needs a deliberate decision, so leave this
+# empty and let cargo-deny fail.
 allow-git = []
