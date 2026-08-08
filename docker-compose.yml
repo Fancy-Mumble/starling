@@ -12,6 +12,11 @@
 #   docker compose down                  # stop, keep the certificate + data
 #   docker compose down -v               # ... and throw the volume away
 #
+# The image defaults to a locally built `starling:local`, which is why `--build`
+# is here. To run a published build instead, set STARLING_IMAGE and drop
+# `--build` (tags and the release flow are in docs/RELEASING.md):
+#   STARLING_IMAGE=ghcr.io/fancy-mumble/starling:latest docker compose up -d --wait
+#
 # `--build` is not decoration. Compose builds only when the image is *missing*,
 # so once `starling:local` exists it is reused whatever the source says, and
 # because every container here runs the same binary chosen by `command`, a stale

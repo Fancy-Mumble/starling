@@ -1,0 +1,76 @@
+# Build and publish the container image to GHCR.
+#
+# One image (docs/ARCHITECTURE.md §9): the entrypoint takes the service name, so
+# every deployment — the all-in-one box or the twenty-container split in
+# docker-compose.yml — runs this same image with a different `command`.
+#
+# Versioning follows Fancy Mumble: a semver git tag `vX.Y.Z`, cut from the
+# workspace version, is a release and publishes `:X.Y.Z`, `:X.Y` and `:latest`.
+# Every push to main publishes a rolling `:edge` and a `:sha-<short>` to pin to.
+# See docs/RELEASING.md.
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+# One image build per ref; a newer push to the same branch/tag cancels the older.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/fancy-mumble/starling
+
+jobs:
+  image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to the org's GHCR, via GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A tag push gets :X.Y.Z, :X.Y and (as the newest) :latest; a main push
+      # gets :edge and :sha-<short>. `latest=auto` withholds :latest from branch
+      # builds, and the sha tag is gated to branches so a release stays clean.
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=edge,branch=main
+            type=sha,prefix=sha-,enable=${{ github.ref_type == 'branch' }}
+          flavor: |
+            latest=auto
+
+      # amd64 only: the release profile is thin-LTO with codegen-units=1, and
+      # cross-building arm64 under QEMU turns a slow build into a very slow one.
+      # Add `linux/arm64` here (and a native or well-cached builder) when it is
+      # actually needed.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
