@@ -3,22 +3,20 @@
 #   starling --all-in-one --config starling.toml
 #   starling text          --config starling.toml
 #
-# This file is the *deployment* layer: endpoints, ports, TLS paths, storage
-# URLs, tiers and routes. Everything an operator changes while the server runs,
-# bandwidth, message limits, the welcome text, belongs to the `server-config`
-# service instead, because the two have different lifetimes (docs/CONFIGURATION.md).
+# The deployment layer: endpoints, ports, TLS paths, storage URLs, tiers, routes.
+# Settings an operator changes while the server runs (bandwidth, message limits,
+# welcome text) live in the `server-config` service instead.
 #
-# Unknown keys are rejected at startup rather than ignored, so a typo fails
-# loudly instead of silently leaving a limit at its default. Every key is
+# Unknown keys are rejected at startup, so a typo fails loudly. Every key is
 # overridable by environment variable: [services.text] endpoint becomes
 # STARLING_SERVICES_TEXT_ENDPOINT.
 #
 # Migrating from murmur? `starling migrate-config mumble-server.ini` prints the
-# equivalent of an existing .ini on stdout.
+# equivalent config on stdout.
 
 [runtime]
-# Every service in one process, over in-memory transports. Same binary, same
-# file; `endpoint` values are ignored. This is the mode for a single VPS.
+# All services in one process over in-memory transports (`endpoint` values
+# ignored); the single-VPS mode. `--all-in-one` overrides this from the CLI.
 all_in_one = false
 # Generated certificates and default databases live here.
 data_dir = "starling-data"
@@ -32,24 +30,24 @@ port = 64738
 
 [gateway]
 listen_tcp = "0.0.0.0:64738"
-# Per client. Full means disconnect that client: dropping a control message
-# desyncs it permanently and silently, and unbounded queueing is a memory DoS.
+# Per client; full = disconnect it. Dropping a control message desyncs a client
+# silently, and unbounded queueing is a memory DoS.
 control_queue = 4096
-# Per client, for tunnelled audio. Full means drop the oldest and count it.
+# Per client, tunnelled audio; full = drop oldest and count it.
 audio_queue = 128
 default_deadline = "5s"
-# Deadlines alone fail slowly, so a service that keeps failing is shed at the
-# door instead of being waited on.
+# Shed a repeatedly-failing service at the door instead of waiting on it.
 breaker_failures = 5
 breaker_cooldown = "10s"
 
 [gateway.tls]
-# Omit both and a self-signed pair is generated on first boot, as murmur does.
+# Omit both: a self-signed pair is generated on first boot. Set both to use your
+# own certificate.
 # cert = "/etc/starling/tls/cert.pem"
 # key  = "/etc/starling/tls/key.pem"
 
-# Buckets are per route, never one shared. murmur's single 1 msg/s bucket
-# silently ate screen-share SDP offers; here a throttled message is reported.
+# Buckets are per route, never one shared, and a throttled message is reported
+# rather than silently dropped.
 [gateway.limits.control]
 rate = "1/s"
 burst = 5
@@ -59,26 +57,21 @@ burst = 20
 [gateway.limits.plugin]
 rate = "4/s"
 burst = 15
-# Tunnelled audio, for every client whose UDP is blocked. A client sending 10 ms
-# Opus frames emits a hundred a second, so the control bucket would cut it off
-# mid-sentence with silence as the only symptom. murmur does not limit this path
-# at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
 [gateway.limits.acl]
-# The ACL editor opens the channel tree with one query per channel, so an
-# administrator on a thirty-channel server emits thirty in a second or two.
+# The ACL editor opens one query per channel, so a large tree emits a burst.
 rate = "20/s"
 burst = 60
 [gateway.limits.chat]
-# A person typing. Losing a message somebody wrote is the worst failure here:
-# silent, unattributed, and the sender believes they were heard.
+# A person typing; losing a message they wrote is the worst failure here.
 rate = "5/s"
 burst = 20
 [gateway.limits.audio]
+# Speech is ~100 frames/s, so the control bucket would cut it off mid-sentence.
 rate = "200/s"
 burst = 400
 
-# A Fancy client that reconnects replays only the gap rather than pulling a
-# full flood of every ChannelState and UserState. Legacy clients cannot resume.
+# A reconnecting Fancy client replays only the gap, not a full re-flood; legacy
+# clients cannot resume.
 [gateway.resume]
 enabled = true
 ring = 256
@@ -91,14 +84,9 @@ log_format = "text"          # json | text
 # metrics = "0.0.0.0:9090"
 # otlp_endpoint = "http://otel-collector:4317"
 
-# The operator event log: who connected, what was refused, what an
-# administrator changed. Distinct from [telemetry] above, which carries
-# developer diagnostics and is driven by RUST_LOG, this one is the record you
-# are entitled to keep, and it has its own level and destinations.
-#
-# Developer diagnostics are the other dial: RUST_LOG=debug shows per-connection
-# detail, RUST_LOG=trace adds every frame and every reply, and
-# RUST_LOG=starling_voice=trace narrows that to one service.
+# The operator event log: who connected, what was refused, what an admin
+# changed. Distinct from [telemetry] (developer diagnostics, driven by RUST_LOG);
+# this is the record you keep, with its own level and destinations.
 [logging]
 level = "info"               # debug | info | notice | warning | error
 # Empty means every category. Named, it records only these:
@@ -120,16 +108,12 @@ records = 1000
 
 # -- Services ---------------------------------------------------------------
 #
-# Every block takes the same keys. `types` is the outer message type from
-# docs/PROTOCOL-COMPATIBILITY.md §3, one number per service, because a
-# service's own message types live in its nested envelope and the gateway never
-# looks inside. Adding a service is three lines and no gateway release.
+# Every block takes the same keys. `types` is the outer message type, one set
+# per service; a service's own types live in its nested envelope.
 #
-# The `unix:` endpoints below are the co-located deployment on a Unix host. On
-# Windows the equivalent is `pipe:`, a named pipe, whose ACL is the boundary
-# file permissions are here, and a `unix:` endpoint is refused at startup
-# rather than quietly served over something else. Running with no --config at
-# all picks the right one for the platform; see docs/CONFIGURATION.md.
+# The `unix:` endpoints are the co-located deployment on a Unix host; on Windows
+# use `pipe:` (a named pipe, whose ACL is the boundary that file permissions are
+# here). Running with no --config picks the right one for the platform.
 
 [services.session-lifecycle]
 endpoint = "unix:/run/starling/session-lifecycle.sock"
@@ -139,10 +123,10 @@ types = [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
 [services.session-view]
 endpoint = "unix:/run/starling/session-view.sock"
 tier = "essential"
-types = []                   # no client-facing type: internal by construction
+types = []                   # internal: no client-facing type
 
 [services.permissions]
-limits = "acl"                # not the 1/s control bucket: an editor opens N at once
+limits = "acl"                # editor bursts; not the 1/s control bucket
 endpoint = "unix:/run/starling/permissions.sock"
 tier = "essential"
 types = [12, 13, 20, 1001]
@@ -166,11 +150,11 @@ types = [24, 25, 1013]
 endpoint = "unix:/run/starling/voice.sock"
 tier = "core"
 types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
-udp_listen = "0.0.0.0:64738" # voice's OWN socket, audio skips the gateway
-limits = "audio"             # never the 1/s control bucket: this is speech
+udp_listen = "0.0.0.0:64738" # voice's own socket, audio skips the gateway
+limits = "audio"             # speech, not the 1/s control bucket
 
 [services.text]
-limits = "chat"               # not the 1/s control bucket: a person typing
+limits = "chat"               # a person typing; not the 1/s control bucket
 endpoint = "unix:/run/starling/text.sock"
 tier = "core"
 types = [11, 1005]
@@ -238,52 +222,41 @@ types = [16, 17, 1017]
 
 # -- Storage, per service ---------------------------------------------------
 #
-# Each service owns its own schema; no service reads another's tables. With no
-# block, a SQLite file under `data_dir` named after the service is used.
+# Each service owns its schema; none reads another's. With no block, a SQLite
+# file named after the service is used under `data_dir`.
 #
 # [services.pchat.storage]
 # url = "postgres://starling:@db/starling_pchat"
 # max_connections = 16
 
-# The gateway's own block.
-#
-# It owns no wire types (it is the process that *routes* them) and nothing
-# dials it to do work. It needs an endpoint anyway, because the `health`
-# collector dials every service to ask how it is, and without one the gateway
-# is the single component missing from the health dashboard: the process every
-# client connects to, holding every control queue in the server.
+# The gateway's own block. It owns no wire types (it routes them) and nothing
+# dials it for work, but it needs an endpoint so the `health` collector can
+# reach it -- otherwise the process every client connects to is the one
+# component missing from the health dashboard.
 [services.gateway]
 enabled = true
 endpoint = "unix:/run/starling/gateway.sock"
-# `core`, the default. The tier says what the *gateway* does while a service is
-# unhealthy, so the gateway's own tier is a value it would only ever consult
-# about itself; there is no answer for it to act on.
+# `core` (the default). A tier says what the gateway does while a service is
+# unhealthy, so the gateway's own tier is one it would only consult about itself.
 tier = "core"
 types = []
 
 # -- The collectors ---------------------------------------------------------
 #
-# Neither owns a wire type, because no client addresses them: they are things
-# the server does rather than things a client asks for. `Config::with_defaults`
-# has always created both, so a server started with no `--config` runs them,
-# but `--config` **replaces** the defaults outright, so a file that omits them
-# is a file that turns them off. That is why they are written out here.
+# Neither owns a wire type; no client addresses them. A server with no --config
+# runs both by default, but --config replaces the defaults, so omitting them
+# here turns them off -- which is why they are written out.
 
-# Announces this server to the public list. Calls out, is never called, and so
-# needs no endpoint at all.
+# Announces this server to the public list. Calls out, is never called, so needs
+# no endpoint.
 [services.directory]
 enabled = false
 tier = "optional"
 types = []
 
-# Asks every other service how it is, once every few seconds, and holds the
-# answers so `operator-api` can serve `/v1/health` from one place instead of
-# fanning out across twenty endpoints per page load.
-#
-# Unlike the announcer this one *is* dialled, so it needs a real endpoint.
-# Without it the service fails at startup with "has no endpoint in the
-# configuration" and `/v1/health` answers 502, up, reachable, and with nothing
-# behind it.
+# Asks every service how it is every few seconds and holds the answers, so
+# `operator-api` serves `/v1/health` from one place. It IS dialled, so it needs
+# an endpoint; without it startup fails and `/v1/health` answers 502.
 [services.health]
 enabled = true
 endpoint = "unix:/run/starling/health.sock"
@@ -292,10 +265,9 @@ types = []
 
 # -- The admin plane --------------------------------------------------------
 #
-# The replacement for Ice: REST + OpenAPI, authentication is whatever you
-# already run, and every action is recorded before it happens. Off by default
-# and localhost-bound when on, because it wants the opposite exposure to the
-# gateway's.
+# The Ice replacement: REST + OpenAPI, your own authentication, every action
+# recorded before it happens. Off by default and localhost-bound when on (the
+# opposite exposure to the gateway).
 
 [services.operator-api]
 enabled = false

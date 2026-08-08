@@ -1,31 +1,19 @@
-# Starling deployment configuration for docker compose.
+# Starling deployment config for docker compose: a gateway in front, each
+# service in its own container behind it. Endpoints are `http://<name>:50051`
+# rather than the Unix sockets of starling.example.toml, since the services are
+# not co-located.
 #
-# The multi-process shape of docs/ARCHITECTURE.md: a gateway in front,
-# independent gRPC services behind it, and the media planes bypassing the
-# gateway entirely. This differs from starling.example.toml in exactly one
-# respect, endpoints are `http://<name>:50051` rather than Unix sockets,
-# because "co-located, and file permissions are the auth" stops being true the
-# moment each service is its own container.
-#
-# Every container mounts this same file and is told which service to be:
-#
-#   starling text --config /etc/starling/starling.toml
-#
-# so the routing table one service sees is the routing table all of them see.
-# A per-container file would let two of them disagree about where a third is.
-#
-# Unknown keys are rejected at startup rather than ignored, so a typo fails
-# loudly instead of silently leaving a limit at its default.
+# Every container mounts this same file and is told which service to be
+# (`starling text --config /etc/starling/starling.toml`), so all share one
+# routing table. Unknown keys are rejected at startup, so a typo fails loudly.
 
 [runtime]
-# False on purpose: this file is the twenty-one-container deployment. The
-# `all-in-one` compose profile passes `--all-in-one`, which overrides this at
-# the command line rather than needing a second file.
+# The 21-container deployment; the `all-in-one` compose profile passes
+# `--all-in-one` to override this.
 all_in_one = false
-# A named volume, because the gateway generates its certificate here on first
-# boot and Mumble clients identify a server by certificate fingerprint, a
-# fresh pair on every restart is a security warning for every connected client.
-# The per-service SQLite files live here too, one per service.
+# Named volume: the gateway's first-boot certificate lives here (clients trust a
+# server by fingerprint, so it must survive restarts), as do the per-service
+# SQLite files.
 data_dir = "/var/lib/starling"
 
 [[virtual_servers]]
@@ -36,28 +24,26 @@ port = 64738
 # -- The gateway ------------------------------------------------------------
 
 [gateway]
-# 0.0.0.0 rather than the container's own name: this is the one listener
-# reached from outside the compose network, through a published port.
+# 0.0.0.0: the one listener reached from outside the compose network.
 listen_tcp = "0.0.0.0:64738"
-# Per client. Full means disconnect that client: dropping a control message
-# desyncs it permanently and silently, and unbounded queueing is a memory DoS.
+# Per client; full = disconnect it. Dropping a control message desyncs a client
+# silently, and unbounded queueing is a memory DoS.
 control_queue = 4096
-# Per client, for tunnelled audio. Full means drop the oldest and count it.
+# Per client, tunnelled audio; full = drop oldest and count it.
 audio_queue = 128
 default_deadline = "5s"
-# Deadlines alone fail slowly, so a service that keeps failing is shed at the
-# door instead of being waited on.
+# Shed a repeatedly-failing service at the door instead of waiting on it.
 breaker_failures = 5
 breaker_cooldown = "10s"
 
 [gateway.tls]
-# Omit both and a self-signed pair is generated in `data_dir` on first boot, as
-# murmur does. Mount your own and set these two to use a real certificate.
+# Omit both: a self-signed pair is generated in `data_dir` on first boot. Set
+# both to use your own certificate.
 # cert = "/etc/starling/tls/cert.pem"
 # key  = "/etc/starling/tls/key.pem"
 
-# Buckets are per route, never one shared. murmur's single 1 msg/s bucket
-# silently ate screen-share SDP offers; here a throttled message is reported.
+# Buckets are per route, never one shared, and a throttled message is reported
+# rather than silently dropped.
 [gateway.limits.control]
 rate = "1/s"
 burst = 5
@@ -67,26 +53,21 @@ burst = 20
 [gateway.limits.plugin]
 rate = "4/s"
 burst = 15
-# Tunnelled audio, for every client whose UDP is blocked. A client sending 10 ms
-# Opus frames emits a hundred a second, so the control bucket would cut it off
-# mid-sentence with silence as the only symptom. murmur does not limit this path
-# at all (`Server.cpp:1905`), so a bucket is already stricter than upstream.
 [gateway.limits.acl]
-# The ACL editor opens the channel tree with one query per channel, so an
-# administrator on a thirty-channel server emits thirty in a second or two.
+# The ACL editor opens one query per channel, so a large tree emits a burst.
 rate = "20/s"
 burst = 60
 [gateway.limits.chat]
-# A person typing. Losing a message somebody wrote is the worst failure here:
-# silent, unattributed, and the sender believes they were heard.
+# A person typing; losing a message they wrote is the worst failure here.
 rate = "5/s"
 burst = 20
 [gateway.limits.audio]
+# Speech is ~100 frames/s, so the control bucket would cut it off mid-sentence.
 rate = "200/s"
 burst = 400
 
-# A Fancy client that reconnects replays only the gap rather than pulling a
-# full flood of every ChannelState and UserState. Legacy clients cannot resume.
+# A reconnecting Fancy client replays only the gap, not a full re-flood; legacy
+# clients cannot resume.
 [gateway.resume]
 enabled = true
 ring = 256
@@ -95,33 +76,25 @@ ttl = "120s"
 # -- Observability ----------------------------------------------------------
 
 [telemetry]
-# `docker compose logs` is a terminal, not a log collector. Switch to "json"
-# when something downstream is parsing it.
+# `docker compose logs` is a terminal; switch to "json" for a log collector.
 log_format = "text"
-# Neither key below binds a listener in this build, the runtime records that
-# OTLP is configured and keeps spans local, and nothing serves the metrics
-# registry over HTTP yet. Left commented so enabling them is a deliberate act
-# rather than a setting that appears to work.
+# Neither binds a listener in this build (OTLP is recorded but spans stay local;
+# nothing serves the metrics registry yet). Commented so enabling is deliberate.
 # metrics = "0.0.0.0:9090"
 # otlp_endpoint = "http://otel-collector:4317"
 
 # -- Services ---------------------------------------------------------------
 #
-# One block per container. `endpoint` is both where the service binds and where
-# every other service dials it, the runtime has one address per service, not a
-# bind/advertise pair, so the host part must be the compose service name.
-# Docker's embedded resolver answers a container's own network alias, so
-# binding `text:50051` inside the `text` container binds that container's own
-# address, and one line stays the single source of truth for both directions.
+# One block per container. `endpoint` is where the service both binds and is
+# dialled (one address per service, no bind/advertise split), so the host must
+# be the compose service name; Docker's resolver makes a container's own alias
+# bind its own address.
 #
-# If a deployment ever puts a container on several networks, that bind picks
-# one of them. The escape hatch is per-container and needs no change here:
-# give that one container STARLING_SERVICES_TEXT_ENDPOINT=http://0.0.0.0:50051,
-# which overrides only its own entry, only where it binds.
+# On a multi-network container that bind picks one network; override just that
+# one with STARLING_SERVICES_TEXT_ENDPOINT=http://0.0.0.0:50051.
 #
-# `types` is the outer message type from docs/PROTOCOL-COMPATIBILITY.md §3,
-# one number per service, because a service's own message types live in its
-# nested envelope and the gateway never looks inside.
+# `types` is the outer message type, one set per service; a service's own types
+# live in its nested envelope.
 
 [services.session-lifecycle]
 endpoint = "http://session-lifecycle:50051"
@@ -131,10 +104,10 @@ types = [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
 [services.session-view]
 endpoint = "http://session-view:50051"
 tier = "essential"
-types = []                   # no client-facing type: internal by construction
+types = []                   # internal: no client-facing type
 
 [services.permissions]
-limits = "acl"                # not the 1/s control bucket: an editor opens N at once
+limits = "acl"                # editor bursts; not the 1/s control bucket
 endpoint = "http://permissions:50051"
 tier = "essential"
 types = [12, 13, 20, 1001]
@@ -158,17 +131,17 @@ types = [24, 25, 1013]
 endpoint = "http://voice:50051"
 tier = "core"
 types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
-# Voice's OWN socket, audio skips the gateway. A legacy client sends UDP to
-# the host:port it made TCP to, which is why compose publishes this container's
-# UDP 64738 on the same host port the gateway publishes TCP 64738 on.
+# Voice's own socket, bypassing the gateway. A legacy client sends UDP to the
+# host:port it made TCP to, so compose maps this UDP 64738 to the host port the
+# gateway's TCP 64738 is on.
 udp_listen = "0.0.0.0:64738"
-limits = "audio" # never the 1/s control bucket: this is speech
-# Deliberately no `public_url`: setting it advertises an explicit voice
-# endpoint to Fancy clients, which only makes sense once voice is reachable
-# somewhere other than the gateway's address.
+limits = "audio"             # speech, not the 1/s control bucket
+# No `public_url`: setting it advertises an explicit voice endpoint to Fancy
+# clients, which only helps once voice is reachable somewhere other than the
+# gateway's address.
 
 [services.text]
-limits = "chat"               # not the 1/s control bucket: a person typing
+limits = "chat"               # a person typing; not the 1/s control bucket
 endpoint = "http://text:50051"
 tier = "core"
 types = [11, 1005]
@@ -194,9 +167,8 @@ endpoint = "http://files:50051"
 tier = "optional"
 types = [1009]
 listen = "0.0.0.0:8080"      # its own HTTP listener, published by compose
-# What the signed URLs handed out over the control channel point at, which is
-# what a *client* must be able to reach, not what the container binds. Change
-# this to your public name the moment the stack is not on localhost.
+# What the signed URLs point at, i.e. what a client must reach, not what the
+# container binds. Set to your public name once the stack leaves localhost.
 public_url = "http://localhost:8080"
 url_ttl = "15m"
 max_upload = "512MiB"
@@ -237,46 +209,35 @@ endpoint = "http://context-actions:50051"
 tier = "optional"
 types = [16, 17, 1017]
 
-# The gateway's own block.
-#
-# It owns no wire types (it is the process that *routes* them) and nothing
-# dials it to do work. It needs an endpoint anyway, because the `health`
-# collector below dials every service to ask how it is, and without one the
-# gateway is the single component missing from the health dashboard: the
-# process every client connects to, holding every control queue in the server.
+# The gateway's own block. It owns no wire types (it routes them) and nothing
+# dials it for work, but it needs an endpoint so the `health` collector can
+# reach it -- otherwise the process every client connects to is the one
+# component missing from the health dashboard.
 [services.gateway]
 enabled = true
 endpoint = "http://gateway:50051"
-# `core`, the default. The tier says what the *gateway* does while a service is
-# unhealthy, so the gateway's own tier is a value it would only ever consult
-# about itself; there is no answer for it to act on.
+# `core` (the default). A tier says what the gateway does while a service is
+# unhealthy, so the gateway's own tier is one it would only consult about itself.
 tier = "core"
 types = []
 
-# The one service with no `endpoint`, because nothing dials it, it dials the
-# public Mumble server list, hourly, and has no gRPC surface to reach. It does
-# nothing at all until `registry_name`, `registry_password` and `registry_url`
-# are set in `server-config`, which is where murmur keeps them too.
+# No `endpoint`: nothing dials it. It dials the public Mumble server list hourly
+# and has no gRPC surface. Silent until `registry_name`, `registry_password` and
+# `registry_url` are set in `server-config`.
 [services.directory]
 tier = "optional"
 types = []
 
 [services.directory.options]
-# Where the public list's own certificate is verified. Debian's path, which is
-# what this image is; change it for an image that keeps its trust store
-# elsewhere. A missing bundle is a startup error for the announcement rather
-# than a silent unverified POST, the document carries a shared secret.
+# Where the public list's certificate is verified; Debian's path, as this image
+# is. A missing bundle is a startup error rather than a silent unverified POST
+# of a shared secret.
 trust_store = "/etc/ssl/certs/ca-certificates.crt"
 
-# Asks every other service how it is, once every few seconds, and holds the
-# answers so `operator-api` can serve `/v1/health` from one place instead of
-# fanning out across twenty endpoints per page load.
-#
-# Unlike the announcer above this one *is* dialled, so it needs a real
-# endpoint. Without this block the collector is simply absent, `--config`
-# replaces `Config::with_defaults` rather than merging with it, and
-# `/v1/health` answers 502 "health is unreachable": the admin plane up,
-# reachable, and with nothing behind the one route a dashboard opens on.
+# Asks every service how it is every few seconds and holds the answers, so
+# `operator-api` serves `/v1/health` from one place. It IS dialled, so it needs
+# an endpoint; omit this block and the collector never starts, so `/v1/health`
+# answers 502.
 [services.health]
 enabled = true
 endpoint = "http://health:50051"
@@ -285,11 +246,9 @@ types = []
 
 # -- Storage, per service ---------------------------------------------------
 #
-# Each service owns its own schema; no service reads another's tables. With no
-# block, a SQLite file under `data_dir` named after the service is used, which
-# is what every service above does, so twenty separate files in one volume.
-#
-# Point a service at a real database when it outgrows that:
+# Each service owns its schema; none reads another's. With no block, a SQLite
+# file named after the service is used under `data_dir` (what every service
+# above does). Point one at a real database when it outgrows that:
 #
 # [services.pchat.storage]
 # url = "postgres://starling:@db/starling_pchat"
@@ -297,14 +256,12 @@ types = []
 
 # -- The admin plane --------------------------------------------------------
 #
-# The replacement for Ice: REST + OpenAPI, authentication is whatever you
-# already run, and every action is recorded before it happens. Off by default
-# and published only on loopback when on, because it wants the opposite
-# exposure to the gateway's. The `admin` compose profile starts it.
+# The Ice replacement: REST + OpenAPI, your own authentication, every action
+# recorded before it happens. Off by default and loopback-only when on (the
+# opposite exposure to the gateway). The `admin` compose profile starts it.
 #
-# Unlike every other block, this one needs BOTH `endpoint` and `listen`: the
-# runtime serves a (empty) gRPC surface at `endpoint` for every service that
-# does not opt out, and the REST API is a second listener on top.
+# It needs BOTH `endpoint` and `listen`: an (empty) gRPC surface at `endpoint`
+# like every service, and the REST API as a second listener.
 
 [services.operator-api]
 enabled = false
@@ -317,9 +274,8 @@ types = []
 mode = "token"               # oidc | jwt | mtls | token
 
 [services.operator-api.auth.token]
-# The variable's name, never the secret itself. Compose passes it through from
-# the host environment; there is no default, so an unset variable is an
-# unusable token rather than a known one.
+# The variable's name, never the secret. Compose passes it from the host; no
+# default, so an unset variable is an unusable token, not a known one.
 tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
 
 [services.operator-api.audit]
