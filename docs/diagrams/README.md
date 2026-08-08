@@ -64,6 +64,8 @@ Regenerate **both** whenever `shape.iuml` changes:
 java -jar plantuml.jar -Playout=smetana -tsvg shape.puml shape-dark.puml
 python - <<'EOF'
 import re
+FONT = ("Inter, system-ui, -apple-system, 'Segoe UI', "
+        "Roboto, Helvetica, Arial, sans-serif")
 for f in ('shape.svg', 'shape-dark.svg'):
     s = open(f, encoding='utf-8').read()
     m = re.search(r'style="[^"]*background:(#[0-9A-Fa-f]{6})', s)
@@ -71,16 +73,27 @@ for f in ('shape.svg', 'shape-dark.svg'):
     s, n = re.subn(r'(<defs/><g>)',
                    rf'\1<rect width="100%" height="100%" fill="{m.group(1)}"/>', s, count=1)
     assert n == 1, f'anchor not found in {f}'
+    s, n = re.subn(r'font-family="Inter"', f'font-family="{FONT}"', s)
+    assert n, f'no Inter font-family in {f}'
     open(f, 'w', encoding='utf-8').write(s)
 EOF
 ```
 
-The second step is not optional and is why this is written down. PlantUML puts
-the background in a **CSS `style` attribute on the root `<svg>`** and emits no
-background element, so a viewer that drops that attribute gets the text on
-whatever is behind it, an unreadable diagram in one theme or the other. The
-injected `<rect>` is a painted element and survives. The colour is read back out
-of the file rather than hard-coded, so the one snippet serves both variants.
+Neither pass is optional, and that is why this is written down.
+
+The **background** one: PlantUML puts the canvas colour in a CSS `style`
+attribute on the root `<svg>` and emits no background element, so a viewer that
+drops that attribute gets the text on whatever is behind it, an unreadable
+diagram in one theme or the other. The injected `<rect>` is a painted element
+and survives. The colour is read back out of the file rather than hard-coded, so
+the one snippet serves both variants.
+
+The **font** one: `skinparam defaultFontName Inter` emits a bare
+`font-family="Inter"`, and almost no viewer, GitHub's included, has Inter. Left
+alone it falls back to the browser default, which on a machine missing the named
+font can be a monospace, which is what this replaces. Widening it to a stack ends
+the fallback at `sans-serif`, so Inter if present and a proportional sans either
+way.
 
 ### Why two wrappers and not one flag
 

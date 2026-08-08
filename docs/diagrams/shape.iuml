@@ -17,6 +17,10 @@
 ' only the canvas and left the cards white, which on a dark page is a worse
 ' result than no dark mode at all.
 
+' The README embeds the SVG renders. A post-render step widens this single font
+' name into a fallback stack (see README.md), so a viewer without Inter still
+' gets a sans-serif rather than the monospace a missing font can fall back to.
+skinparam defaultFontName Inter
 skinparam componentStyle rectangle
 skinparam shadowing false
 skinparam nodesep 14
