@@ -1,0 +1,48 @@
+{{- if and .Values.files.ingress.enabled .Values.services.files.enabled }}
+{{- $full := include "starling.fullname" . }}
+{{/*
+The bulk plane, and the only part of Starling an Ingress fits: it is plain
+HTTP. The control plane cannot use one and never will - `Ingress` is HTTP-only
+and Mumble is raw TCP+TLS - which is also why the front component is called the
+gateway rather than the ingress.
+
+What clients are handed is `services.files.publicUrl`, not this host, so the
+two have to name the same address. validate.yaml refuses the install if
+publicUrl is unset, because the failure otherwise is a signed URL that resolves
+nowhere and an upload that times out.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $full }}-files
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: files
+  {{- with .Values.files.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.files.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.files.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.files.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ $full }}-files
+                port:
+                  number: 8080
+          {{- end }}
+    {{- end }}
+{{- end }}

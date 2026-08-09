@@ -44,7 +44,7 @@ use crate::evaluate::Acls;
 pub struct Context<'a> {
     /// Every channel's ACL set, for the named-group walk.
     pub acls: &'a Acls,
-    /// The virtual server.
+    /// The server instance.
     pub scope: u32,
     /// The channel being evaluated for, murmur's `currentChannel`.
     pub target: u32,

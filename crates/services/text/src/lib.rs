@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use starling_proto_fancy::common::{Ack, Scope};
-use starling_proto_fancy::fancy::feature::{TextEnvelope, text_envelope};
+use starling_proto_fancy::fancy::feature::{
+    ScheduleAck, ScheduleCancel, ScheduleList, ScheduleQuery, ScheduleStatus, Scheduled,
+    TextEnvelope, text_envelope,
+};
 use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
@@ -44,9 +47,24 @@ use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 pub mod filter;
+pub mod scheduled;
 
 /// Upstream `TextMessage`.
 const TEXT_MESSAGE: u16 = 11;
+
+/// The longest the delivery timer sleeps before it looks again.
+///
+/// A day, as murmur's does (`Server.cpp:2443`): a delivery a month out should
+/// cost a handful of wakeups, and a timer that is never re-armed is one that
+/// cannot notice a clock jump or a row another pod wrote.
+const MAX_DELIVERY_SLEEP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The shortest it sleeps, so a row it cannot claim cannot spin it.
+const MIN_DELIVERY_SLEEP_MS: u64 = 250;
+
+/// How long the timer waits before looking again when the roster is cold and
+/// something is already due.
+const COLD_ROSTER_RETRY_MS: u64 = 1_000;
 
 /// The readiness gate that stays closed until the roster has a snapshot.
 ///
@@ -111,6 +129,12 @@ pub struct TextService {
     /// without limit and never the delivery of the message itself. A chat
     /// observer falling behind is not a reason to stop serving chat.
     events: broadcast::Sender<MessageEvent>,
+    /// Wakes the delivery timer when what is due next has changed.
+    ///
+    /// Without it a message scheduled for two minutes from now would wait
+    /// behind whatever the timer was already sleeping on, which is up to a
+    /// day.
+    schedules: tokio::sync::Notify,
 }
 
 impl TextService {
@@ -196,9 +220,7 @@ impl TextService {
         };
         let Ok(reply) = MetadataClient::new(channel)
             .get_tree(TreeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
             })
             .await
         else {
@@ -247,9 +269,7 @@ impl TextService {
         };
         let Ok(reply) = SessionViewClient::new(channel)
             .list(SubscribeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 subscriber: "text".to_owned(),
             })
             .await
@@ -278,7 +298,7 @@ impl Text for TextRpc {
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryPage>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         Ok(Response::new(
             self.0
                 .history(scope, req.channel, req.limit, &req.before)
@@ -288,7 +308,7 @@ impl Text for TextRpc {
 
     async fn purge(&self, request: Request<PurgeRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         let _ = sqlx::query(
             "DELETE FROM text_message WHERE server_id = ? AND channel_id = ? AND sent_at_ms < ?",
         )
@@ -355,7 +375,7 @@ impl Text for TextRpc {
         request: Request<AnnounceRequest>,
     ) -> Result<Response<AnnounceResult>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
 
         if req.body.is_empty() {
             return Err(Status::invalid_argument("an announcement needs a body"));
@@ -669,9 +689,36 @@ impl TextService {
         let Ok(envelope) = TextEnvelope::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
-        let Some(text_envelope::Body::History(request)) = envelope.body else {
-            return Actions::new();
-        };
+        match envelope.body {
+            Some(text_envelope::Body::History(request)) => self.on_history(inbound, request).await,
+            Some(text_envelope::Body::Schedule(request)) => {
+                self.on_schedule(inbound, request).await
+            }
+            Some(text_envelope::Body::Query(query)) => {
+                self.on_schedule_query(inbound, &query).await
+            }
+            Some(text_envelope::Body::Cancel(cancel)) => {
+                self.on_schedule_cancel(inbound, &cancel).await
+            }
+            // Server-to-client bodies and an empty envelope. Answering a
+            // client's own copy of a page or an ack would be echoing its claim
+            // about state only the server holds.
+            Some(
+                text_envelope::Body::Page(_)
+                | text_envelope::Body::Edit(_)
+                | text_envelope::Body::Delete(_)
+                | text_envelope::Body::List(_)
+                | text_envelope::Body::Ack(_),
+            )
+            | None => Actions::new(),
+        }
+    }
+
+    async fn on_history(
+        &self,
+        inbound: &Inbound,
+        request: starling_proto_fancy::fancy::feature::HistoryRequest,
+    ) -> Actions {
         let cursor = request.page.unwrap_or_default();
         let before = Uuid7::parse(&cursor.before_id)
             .map(Uuid7::to_vec)
@@ -726,17 +773,380 @@ impl TextService {
     }
 }
 
+/// Scheduled messages: the client half.
+///
+/// The store, the schema and the reasoning about what is kept are in
+/// [`scheduled`]; this is the part that answers a client.
+impl TextService {
+    /// One `ScheduleAck`, addressed at the connection that asked.
+    fn ack(inbound: &Inbound, id: &str, status: ScheduleStatus, reason: &str) -> Actions {
+        let envelope = TextEnvelope {
+            body: Some(text_envelope::Body::Ack(ScheduleAck {
+                schedule_id: id.to_owned(),
+                status: status as i32,
+                reason: reason.to_owned(),
+            })),
+        };
+        vec![to_conn(
+            inbound.conn,
+            ServiceKind::Text.outer_type(),
+            envelope.encode_to_vec(),
+        )]
+    }
+
+    /// A refusal, which is an ack with a reason a client can show.
+    ///
+    /// murmur answers most of these with `PermissionDenied` and the rest by
+    /// dropping the frame. Neither reaches a compose panel, and a scheduling
+    /// dialog that silently does nothing is the worst of the three.
+    fn refuse(inbound: &Inbound, reason: &str) -> Actions {
+        tracing::debug!(session = inbound.session, reason, "schedule refused");
+        Self::ack(inbound, "", ScheduleStatus::ScheduleRefused, reason)
+    }
+
+    /// Accept a message for later delivery, or say why not.
+    async fn on_schedule(&self, inbound: &Inbound, request: Scheduled) -> Actions {
+        // The owner has to outlive the connection, so a peer with no
+        // certificate has nothing this can be keyed on. murmur refuses for the
+        // same reason (`Messages.cpp:5330`).
+        let Some(cert) = self.roster.cert_of(inbound.session) else {
+            return Self::refuse(inbound, "scheduling a message needs a client certificate");
+        };
+
+        let mut channels = request.channels.clone();
+        let mut trees = request.trees.clone();
+        channels.sort_unstable();
+        channels.dedup();
+        trees.sort_unstable();
+        trees.dedup();
+        if channels.is_empty() && trees.is_empty() {
+            return Self::refuse(inbound, "a scheduled message needs a target channel");
+        }
+        if channels.len() + trees.len() > scheduled::MAX_TARGETS {
+            return Self::refuse(inbound, "too many target channels");
+        }
+
+        // The same body rules a message sent now would meet, applied now
+        // rather than at the due time: a refusal is only useful while somebody
+        // is still looking at the compose box.
+        let config = self.settings.get(inbound.scope);
+        let body = match filter::check(
+            &request.body,
+            config.allow_html,
+            config.text_message_length,
+            config.image_message_length,
+        ) {
+            filter::Verdict::Deliver => request.body.clone(),
+            filter::Verdict::Rewritten(text) => text,
+            filter::Verdict::TooLong => {
+                return Self::refuse(inbound, "that message is too long");
+            }
+        };
+        if body.is_empty() {
+            return Self::refuse(inbound, "a scheduled message needs a body");
+        }
+
+        let now = now_ms();
+        if request.deliver_at_ms <= now {
+            return Self::refuse(inbound, "the delivery time must be in the future");
+        }
+        if request.deliver_at_ms - now > scheduled::MAX_LEAD_MS {
+            return Self::refuse(inbound, "the delivery time is too far away");
+        }
+
+        if scheduled::pending_count(&self.store, inbound.scope, &cert).await
+            >= scheduled::MAX_PENDING_PER_CREATOR
+        {
+            return Self::refuse(inbound, "you already have too many scheduled messages");
+        }
+
+        // Checked here and not again at the due time, which is a deliberate
+        // difference from a message sent now. The permission plane answers
+        // about a *session*, and the creator of a message due tomorrow may
+        // well not have one then; asking on behalf of a session that no longer
+        // exists can only be denied, which would make every overnight schedule
+        // fail. Rights lost between the two are therefore not caught, and a
+        // channel that has to be certain gates entry rather than posting.
+        for channel in channels.iter().chain(trees.iter()).copied() {
+            if !self
+                .permit
+                .allows(inbound, channel, Perm::TEXT_MESSAGE.bits())
+                .await
+            {
+                return Self::refuse(inbound, "you may not post in that channel");
+            }
+        }
+
+        let row = scheduled::Row {
+            // The server's, never the peer's: an id a client picks is an id it
+            // can collide with somebody else's row.
+            id: Uuid7::now(),
+            channels,
+            trees,
+            body,
+            deliver_at_ms: request.deliver_at_ms,
+            creator_cert: cert,
+            creator_name: self.roster.name_of(inbound.session).unwrap_or_default(),
+            created_at_ms: now,
+            status: ScheduleStatus::SchedulePending as i32,
+        };
+        if let Err(error) = scheduled::store(&self.store, inbound.scope, &row).await {
+            tracing::error!(%error, "could not store a scheduled message");
+            return Self::refuse(inbound, "the server could not store that message");
+        }
+
+        self.logger.log(
+            LogEvent::info(Category::Message, "message scheduled")
+                .with("session", inbound.session)
+                .with("schedule", row.id.to_string())
+                .with("deliver_at_ms", row.deliver_at_ms)
+                .with("length", row.body.len()),
+        );
+        // The timer is asleep until whatever was next; this one may be sooner.
+        self.schedules.notify_one();
+
+        Self::ack(
+            inbound,
+            &row.id.to_string(),
+            ScheduleStatus::SchedulePending,
+            "",
+        )
+    }
+
+    /// The caller's own scheduled messages.
+    ///
+    /// Only ever the caller's: a list keyed on anything but the asking
+    /// certificate would hand one user everybody else's drafts.
+    async fn on_schedule_query(&self, inbound: &Inbound, query: &ScheduleQuery) -> Actions {
+        let rows = match self.roster.cert_of(inbound.session) {
+            Some(cert) => {
+                scheduled::list(&self.store, inbound.scope, &cert, query.include_finished).await
+            }
+            // Not a refusal: a peer with no certificate cannot have scheduled
+            // anything, so the honest answer is an empty list.
+            None => Vec::new(),
+        };
+        let envelope = TextEnvelope {
+            body: Some(text_envelope::Body::List(ScheduleList {
+                messages: rows.iter().map(scheduled::Row::to_canon).collect(),
+            })),
+        };
+        vec![to_conn(
+            inbound.conn,
+            ServiceKind::Text.outer_type(),
+            envelope.encode_to_vec(),
+        )]
+    }
+
+    /// Cancel a pending message, if the caller is the one who scheduled it.
+    async fn on_schedule_cancel(&self, inbound: &Inbound, cancel: &ScheduleCancel) -> Actions {
+        let Some(id) = Uuid7::parse(&cancel.schedule_id) else {
+            return Self::refuse(inbound, "no such scheduled message");
+        };
+        let cert = self.roster.cert_of(inbound.session).unwrap_or_default();
+        let owned = scheduled::get(&self.store, inbound.scope, id)
+            .await
+            .is_some_and(|row| !cert.is_empty() && row.creator_cert == cert);
+        // One answer for "not yours" and "not there": telling them apart would
+        // let anyone probe for other people's schedule ids.
+        if !owned {
+            return Self::refuse(inbound, "no such scheduled message");
+        }
+        if !scheduled::finish(
+            &self.store,
+            inbound.scope,
+            id,
+            ScheduleStatus::ScheduleCancelled,
+        )
+        .await
+        {
+            return Self::refuse(inbound, "that message is no longer pending");
+        }
+
+        self.logger.log(
+            LogEvent::info(Category::Message, "scheduled message cancelled")
+                .with("session", inbound.session)
+                .with("schedule", id.to_string()),
+        );
+        // What was next may have just gone away.
+        self.schedules.notify_one();
+        Self::ack(
+            inbound,
+            &cancel.schedule_id,
+            ScheduleStatus::ScheduleCancelled,
+            "",
+        )
+    }
+
+    /// Deliver everything due in `scope`, and answer when the next one is.
+    ///
+    /// Returns `None` when nothing is pending, which is the timer's cue to
+    /// sleep until something wakes it.
+    async fn deliver_due(&self, scope: u32) -> Option<u64> {
+        // A cold roster addresses nobody, and a message delivered to nobody is
+        // marked delivered and gone, so a due message waits for membership.
+        //
+        // It asks for a wake-up shortly rather than reporting the real due
+        // time, which is in the past and would spin, or nothing, which would
+        // sleep for a day over a message that is due now. Nothing is said
+        // unless something is actually waiting: a cold roster with an empty
+        // table is a service that has just started.
+        if !self.roster.is_warm() {
+            let next = scheduled::next_due(&self.store, scope).await?;
+            if next > now_ms() {
+                return Some(next);
+            }
+            tracing::warn!("the session-view roster is cold; a due message is waiting on it");
+            return Some(now_ms() + COLD_ROSTER_RETRY_MS);
+        }
+        for row in scheduled::due(&self.store, scope, now_ms()).await {
+            // Claimed before it is sent, not after. The claim is the same
+            // conditional update a cancel uses, so exactly one of the two can
+            // win and a message can never be posted to a channel twice. The
+            // cost is the other direction: a crash between the claim and the
+            // send loses that message rather than repeating it, which is the
+            // side to fail on for something that is already public.
+            if !scheduled::finish(
+                &self.store,
+                scope,
+                row.id,
+                ScheduleStatus::ScheduleDelivered,
+            )
+            .await
+            {
+                continue;
+            }
+            self.deliver(scope, &row).await;
+        }
+        scheduled::next_due(&self.store, scope).await
+    }
+
+    /// Post one stored message to the channels it named.
+    async fn deliver(&self, scope: u32, row: &scheduled::Row) {
+        let mut wanted = row.channels.clone();
+        if !row.trees.is_empty() {
+            for channel in self.expand_channels(scope, &row.trees, true).await {
+                if !wanted.contains(&channel) {
+                    wanted.push(channel);
+                }
+            }
+        }
+
+        let mut recipients: Vec<u32> = Vec::new();
+        for channel in &wanted {
+            for session in self.roster.in_channel(*channel, 0) {
+                if !recipients.contains(&session) {
+                    recipients.push(session);
+                }
+            }
+        }
+
+        // Attributed to the creator only while the same certificate is still
+        // connected. Otherwise it goes out with no actor, which every client
+        // renders as a message from the server, exactly as murmur does
+        // (`Server.cpp:2477`).
+        let actor = self.roster.session_with_cert(&row.creator_cert);
+        let sent_at = now_ms();
+        let message = starling_proto::proto::tcp::TextMessage {
+            actor,
+            session: Vec::new(),
+            channel_id: row.channels.clone(),
+            tree_id: row.trees.clone(),
+            message: row.body.clone(),
+            message_id: Some(Uuid7::now().to_string()),
+            timestamp: Some(sent_at),
+            ..starling_proto::proto::tcp::TextMessage::default()
+        };
+
+        self.logger.log(
+            LogEvent::info(Category::Message, "scheduled message delivered")
+                .with("schedule", row.id.to_string())
+                .with("recipients", recipients.len())
+                .with("length", row.body.len()),
+        );
+
+        // Stored whether or not anybody was there to read it: history is what
+        // makes a message delivered into an empty channel worth scheduling.
+        for channel in &row.channels {
+            let stored = StoredMessage {
+                id: Vec::new(),
+                channel: *channel,
+                sender_account: 0,
+                sender_name: row.creator_name.clone(),
+                body: row.body.clone(),
+                sent_at_ms: sent_at,
+            };
+            let _ = self.record(scope, &stored).await;
+        }
+
+        let _ = self.events.send(MessageEvent {
+            sender_session: actor.unwrap_or_default(),
+            sender_account: 0,
+            sender_name: row.creator_name.clone(),
+            sender_registered: false,
+            channels: row.channels.clone(),
+            sessions: recipients.clone(),
+            tree: row.trees.clone(),
+            body: row.body.clone(),
+            sent_at_ms: sent_at,
+            // The server sent it. A watcher that could not tell this from a
+            // message typed just now would attribute it to a session that may
+            // be doing something else entirely.
+            from_client: false,
+        });
+
+        if recipients.is_empty() {
+            return;
+        }
+        self.fanout.push(to_sessions(
+            recipients,
+            TEXT_MESSAGE,
+            message.encode_to_vec(),
+        ));
+    }
+
+    /// Deliver due messages until shutdown, sleeping until the next one.
+    ///
+    /// Woken early by [`Self::schedules`] when a schedule or a cancel changes
+    /// what "next" means; otherwise it sleeps, capped at a day so a delivery a
+    /// month out costs a handful of wakeups rather than one long timer nothing
+    /// can adjust. murmur's reaper does the same (`Server.cpp:2443`).
+    async fn deliver_loop(self: Arc<Self>, scopes: Vec<u32>) {
+        loop {
+            let mut next: Option<u64> = None;
+            for scope in &scopes {
+                if let Some(due) = self.deliver_due(*scope).await {
+                    next = Some(next.map_or(due, |held: u64| held.min(due)));
+                }
+            }
+            let wait = next
+                .map_or(MAX_DELIVERY_SLEEP_MS, |due| {
+                    due.saturating_sub(now_ms()).min(MAX_DELIVERY_SLEEP_MS)
+                })
+                // A floor, so a row that is due but could not be claimed (a
+                // cancel won the race) cannot spin this loop.
+                .max(MIN_DELIVERY_SLEEP_MS);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
+                () = self.schedules.notified() => {}
+            }
+        }
+    }
+}
+
 impl Serve for TextService {
     const NAME: &'static str = "text";
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        store.migrate(scheduled::SCHEMA).await?;
         let settings = Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
         // Dropped on purpose: these live as long as the process, and a service
         // whose settings stopped updating would be enforcing yesterday's limit
         // with nothing to say so.
-        drop(settings.watch(&ctx.virtual_servers()));
+        drop(settings.watch(&ctx.instances()));
         ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
             store,
@@ -747,13 +1157,18 @@ impl Serve for TextService {
             resolver: ctx.resolver,
             roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
+            schedules: tokio::sync::Notify::new(),
         }))
     }
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        // Started here rather than in `build`, so a service that is only
+        // constructed (a test, a config check) never posts anything.
+        let deliveries = tokio::spawn(Arc::clone(&self).deliver_loop(ctx.instances()));
         ctx.shutdown.wait().await;
         follower.abort();
+        deliveries.abort();
         Ok(())
     }
 
@@ -793,6 +1208,10 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        store
+            .migrate(scheduled::SCHEMA)
+            .await
+            .expect("the scheduled-message schema");
         // Points at a `permissions` nothing is serving, so every check denies.
         // These tests exercise storage and history, not delivery; a test that
         // wanted delivery would have to stand one up, which is the right amount
@@ -812,6 +1231,7 @@ mod tests {
             resolver,
             roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
+            schedules: tokio::sync::Notify::new(),
         })
     }
 
@@ -1038,5 +1458,288 @@ mod tests {
             deny_type(&service.on_text_message(&frame("far too long")).await),
             Some(DenyType::TextTooLong as i32)
         );
+    }
+
+    // -- Scheduled messages -------------------------------------------------
+
+    /// The certificate session 7 presented in [`warm_with_certs`].
+    const ALICE: &[u8] = b"alice-cert";
+    /// Session 8's.
+    const BOB: &[u8] = b"bob-cert";
+
+    /// As [`warm`], but with certificates and names, which scheduling needs.
+    fn warm_with_certs(service: &TextService) {
+        use starling_proto_fancy::sessionview::{Session, Sessions, ViewEvent, view_event};
+        let member = |session, channel, cert: &[u8], name: &str| Session {
+            session,
+            channel,
+            cert_hash: cert.to_vec(),
+            name: name.to_owned(),
+            ..Session::default()
+        };
+        let _ = service.roster.apply(ViewEvent {
+            event: Some(view_event::Event::Snapshot(Sessions {
+                sessions: vec![
+                    member(7, 4, ALICE, "alice"),
+                    member(8, 4, BOB, "bob"),
+                    member(9, 9, b"carol-cert", "carol"),
+                ],
+                ..Sessions::default()
+            })),
+        });
+    }
+
+    /// One `TextEnvelope` frame carrying `body`, from session 7.
+    fn envelope(body: text_envelope::Body) -> Inbound {
+        Inbound {
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: ServiceKind::Text.outer_type(),
+            gateway: String::new(),
+            payload: TextEnvelope { body: Some(body) }.encode_to_vec(),
+        }
+    }
+
+    /// The `ScheduleAck` in `actions`.
+    fn ack_of(actions: &Actions) -> ScheduleAck {
+        use starling_proto_fancy::control::server_action;
+        let Some(server_action::Action::Send(send)) =
+            actions.first().and_then(|a| a.action.as_ref())
+        else {
+            panic!("expected a Send");
+        };
+        let Some(text_envelope::Body::Ack(ack)) = TextEnvelope::decode(send.payload.as_slice())
+            .expect("a text envelope")
+            .body
+        else {
+            panic!("expected an ack");
+        };
+        ack
+    }
+
+    /// A pending row due at `deliver_at_ms`, owned by `cert`.
+    fn pending(cert: &[u8], deliver_at_ms: u64) -> scheduled::Row {
+        scheduled::Row {
+            id: Uuid7::now(),
+            channels: vec![4],
+            trees: Vec::new(),
+            body: "later".to_owned(),
+            deliver_at_ms,
+            creator_cert: cert.to_vec(),
+            creator_name: "alice".to_owned(),
+            created_at_ms: now_ms(),
+            status: ScheduleStatus::SchedulePending as i32,
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduling_without_a_certificate_is_refused_rather_than_stored() {
+        // The owner has to outlive the connection, and a session id does not.
+        // murmur refuses for the same reason (`Messages.cpp:5330`).
+        let service = service().await;
+        warm(&service); // no certificates in this roster
+        let actions = service
+            .frame(envelope(text_envelope::Body::Schedule(Scheduled {
+                channels: vec![4],
+                body: "later".to_owned(),
+                deliver_at_ms: now_ms() + 60_000,
+                ..Scheduled::default()
+            })))
+            .await;
+        assert_eq!(
+            ack_of(&actions).status,
+            ScheduleStatus::ScheduleRefused as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_time_in_the_past_is_refused_with_a_reason() {
+        // The client validates this too, and a server that trusted it would be
+        // trusting a clock it does not own.
+        let service = service().await;
+        warm_with_certs(&service);
+        let actions = service
+            .frame(envelope(text_envelope::Body::Schedule(Scheduled {
+                channels: vec![4],
+                body: "later".to_owned(),
+                deliver_at_ms: now_ms() - 1,
+                ..Scheduled::default()
+            })))
+            .await;
+        let ack = ack_of(&actions);
+        assert_eq!(ack.status, ScheduleStatus::ScheduleRefused as i32);
+        assert!(
+            ack.reason.contains("future"),
+            "a refusal a panel can show, not an empty ack: {}",
+            ack.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_shows_the_asking_certificate_its_own_messages_and_no_others() {
+        // Anything else hands one user everybody else's drafts.
+        let service = service().await;
+        warm_with_certs(&service);
+        for cert in [ALICE, BOB] {
+            scheduled::store(&service.store, 1, &pending(cert, now_ms() + 60_000))
+                .await
+                .expect("stored");
+        }
+
+        let actions = service
+            .frame(envelope(text_envelope::Body::Query(ScheduleQuery {
+                include_finished: false,
+            })))
+            .await;
+        use starling_proto_fancy::control::server_action;
+        let Some(server_action::Action::Send(send)) =
+            actions.first().and_then(|a| a.action.as_ref())
+        else {
+            panic!("expected a Send");
+        };
+        let Some(text_envelope::Body::List(list)) = TextEnvelope::decode(send.payload.as_slice())
+            .expect("a text envelope")
+            .body
+        else {
+            panic!("expected a list");
+        };
+        assert_eq!(list.messages.len(), 1);
+        assert_eq!(list.messages[0].creator_cert, ALICE);
+    }
+
+    #[tokio::test]
+    async fn only_the_certificate_that_scheduled_a_message_may_cancel_it() {
+        // And "not yours" answers the same as "not there", so the id space
+        // cannot be probed.
+        let service = service().await;
+        warm_with_certs(&service);
+        let row = pending(BOB, now_ms() + 60_000);
+        scheduled::store(&service.store, 1, &row)
+            .await
+            .expect("stored");
+
+        let actions = service
+            .frame(envelope(text_envelope::Body::Cancel(ScheduleCancel {
+                schedule_id: row.id.to_string(),
+            })))
+            .await;
+        assert_eq!(
+            ack_of(&actions).status,
+            ScheduleStatus::ScheduleRefused as i32
+        );
+        assert_eq!(
+            scheduled::get(&service.store, 1, row.id)
+                .await
+                .map(|held| held.status),
+            Some(ScheduleStatus::SchedulePending as i32),
+            "somebody else's message stays pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_due_message_is_delivered_once_and_only_once() {
+        // The claim is a conditional update, so a second pass over the same
+        // row finds nothing to claim. Without it, two timer ticks (or two
+        // pods) would each post the same message to the channel.
+        let service = service().await;
+        warm_with_certs(&service);
+        let row = pending(ALICE, now_ms() - 1);
+        scheduled::store(&service.store, 1, &row)
+            .await
+            .expect("stored");
+
+        let mut delivered = service.fanout.subscribe();
+        let _ = service.deliver_due(1).await;
+        let _ = service.deliver_due(1).await;
+
+        assert!(delivered.try_recv().is_ok(), "the first pass posts it");
+        assert!(
+            delivered.try_recv().is_err(),
+            "the second pass must find nothing to claim"
+        );
+        assert_eq!(
+            scheduled::get(&service.store, 1, row.id)
+                .await
+                .map(|held| held.status),
+            Some(ScheduleStatus::ScheduleDelivered as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_message_is_never_delivered() {
+        let service = service().await;
+        warm_with_certs(&service);
+        let row = pending(ALICE, now_ms() - 1);
+        scheduled::store(&service.store, 1, &row)
+            .await
+            .expect("stored");
+        assert!(
+            scheduled::finish(&service.store, 1, row.id, ScheduleStatus::ScheduleCancelled).await
+        );
+
+        let mut delivered = service.fanout.subscribe();
+        let _ = service.deliver_due(1).await;
+        assert!(delivered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cold_roster_holds_a_due_message_rather_than_delivering_it_to_nobody() {
+        // Delivering into an unknown roster would mark it delivered and lose
+        // it, which is the one outcome a scheduled message cannot survive.
+        let service = service().await;
+        let row = pending(ALICE, now_ms() - 1);
+        scheduled::store(&service.store, 1, &row)
+            .await
+            .expect("stored");
+
+        // It asks to be woken again rather than sleeping over it, and the row
+        // is still pending.
+        let next = service.deliver_due(1).await.expect("a retry, not a day");
+        assert!(next <= now_ms() + COLD_ROSTER_RETRY_MS);
+        assert_eq!(
+            scheduled::get(&service.store, 1, row.id)
+                .await
+                .map(|held| held.status),
+            Some(ScheduleStatus::SchedulePending as i32),
+            "still pending, to be delivered once membership is known"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_is_attributed_to_its_creator_only_while_they_are_connected() {
+        // murmur sends it with no actor otherwise, which every client renders
+        // as a message from the server (`Server.cpp:2477`).
+        let service = service().await;
+        warm_with_certs(&service);
+        let mut delivered = service.fanout.subscribe();
+
+        scheduled::store(&service.store, 1, &pending(ALICE, now_ms() - 1))
+            .await
+            .expect("stored");
+        let _ = service.deliver_due(1).await;
+        assert_eq!(
+            actor_of(&delivered.try_recv().expect("a delivery")),
+            Some(7)
+        );
+
+        // The same message from somebody who has since disconnected.
+        service.roster.remove(7);
+        scheduled::store(&service.store, 1, &pending(ALICE, now_ms() - 1))
+            .await
+            .expect("stored");
+        let _ = service.deliver_due(1).await;
+        assert_eq!(actor_of(&delivered.try_recv().expect("a delivery")), None);
+    }
+
+    /// The actor on the `TextMessage` a delivery pushed.
+    fn actor_of(action: &starling_proto_fancy::control::ServerAction) -> Option<u32> {
+        use starling_proto_fancy::control::server_action;
+        let Some(server_action::Action::Send(send)) = action.action.as_ref() else {
+            panic!("expected a Send");
+        };
+        starling_proto::proto::tcp::TextMessage::decode(send.payload.as_slice())
+            .expect("a text message")
+            .actor
     }
 }

@@ -28,6 +28,7 @@ use starling_crypto::ocb2::{Block, Ocb2};
 use starling_proto::codec;
 use starling_proto::proto::tcp;
 use starling_proto::proto::udp;
+use starling_proto_fancy::fancy;
 use starling_runtime::config::Config;
 use starling_runtime::inproc::Broker;
 use starling_runtime::log::{Category, FieldValue, LogRuntime, LogSpec};
@@ -257,6 +258,10 @@ impl Deployment {
                             ..Channel::default()
                         }),
                         temporary: false,
+                        invitee_user_ids: Vec::new(),
+                        // Deployment set-up runs once; a name that is already
+                        // there is a bug worth seeing, not one to absorb.
+                        reuse_existing: false,
                     })
                     .await
                     .ok()?;
@@ -610,6 +615,14 @@ struct Client {
     /// middle of the handshake flood, and it is the only thing that makes a
     /// datagram from this client decryptable by the server.
     crypt_setup: Option<tcp::CryptSetup>,
+    /// The `fancy_version` the server volunteered, if it did.
+    ///
+    /// Kept the same way and for the same reason as `crypt_setup`: it arrives
+    /// unprompted in the middle of the handshake flood, in a *second* `Version`
+    /// the server sends only once it knows the peer's epoch. A real client gates
+    /// features on it, so a test that wants to know whether a feature could work
+    /// at all is asking about this field.
+    announced_fancy_version: Option<u64>,
 }
 
 impl Client {
@@ -631,6 +644,43 @@ impl Client {
             stream,
             buffer: BytesMut::with_capacity(8 * 1024),
             crypt_setup: None,
+            announced_fancy_version: None,
+        }
+    }
+
+    /// The same client, presenting a certificate of its own.
+    ///
+    /// Mumble's durable identity: the server asks for one
+    /// (`crates/crypto/src/peer_cert.rs`) and never requires it, so most tests
+    /// here connect without. Anything that has to outlive the connection needs
+    /// it, which for now means scheduling a message for later.
+    async fn connect_with_certificate(port: u16, dir: &Path) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Self-signed and generated here, exactly as a real client's is: the
+        // server pins the hash of whatever it is shown and asks no CA.
+        let identity = starling_crypto::identity::load_or_generate(
+            &dir.join("client-cert.pem"),
+            &dir.join("client-key.pem"),
+        )
+        .expect("a client certificate");
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TrustAnyCertificate))
+            .with_client_auth_cert(identity.certs, identity.key)
+            .expect("the generated certificate is usable");
+        let connector = TlsConnector::from(Arc::new(config));
+
+        let tcp = connect_with_retry(port).await;
+        let name = ServerName::try_from("localhost").expect("a valid server name");
+        let stream = connector
+            .connect(name, tcp)
+            .await
+            .expect("the gateway completes a TLS handshake");
+        Self {
+            stream,
+            buffer: BytesMut::with_capacity(8 * 1024),
+            crypt_setup: None,
+            announced_fancy_version: None,
         }
     }
 
@@ -678,6 +728,15 @@ impl Client {
                     && let Ok(setup) = tcp::CryptSetup::decode(payload.as_slice())
                 {
                     self.crypt_setup = Some(setup);
+                }
+                // Only when it carries one: the opening `Version` does not, and
+                // letting that overwrite the second would record the absence
+                // rather than the announcement.
+                if frame.type_id == 0
+                    && let Ok(version) = tcp::Version::decode(payload.as_slice())
+                    && let Some(fancy) = version.fancy_version
+                {
+                    self.announced_fancy_version = Some(fancy);
                 }
                 return Some((frame.type_id, payload));
             }
@@ -927,6 +986,29 @@ async fn handshake(client: &mut Client, username: &str) -> u32 {
 /// ones it has stored for this server at login, which is how a channel
 /// password the user saved once opens the channel on every later connection.
 async fn handshake_with_tokens(client: &mut Client, username: &str, tokens: Vec<String>) -> u32 {
+    handshake_as(
+        client,
+        tcp::Authenticate {
+            username: Some(username.to_owned()),
+            tokens,
+            ..tcp::Authenticate::default()
+        },
+        None,
+    )
+    .await
+}
+
+/// The same handshake, with the credentials and client build spelled out.
+///
+/// `fancy` is the version a Fancy client advertises, and `None` is a stock
+/// Mumble client. The two are not interchangeable to the server: a stock client
+/// is never sent an out-of-tree channel, because it would render one under the
+/// root.
+async fn handshake_as(
+    client: &mut Client,
+    authenticate: tcp::Authenticate,
+    fancy: Option<u64>,
+) -> u32 {
     let (greeting_type, greeting_payload) = client.recv().await;
     assert_eq!(
         greeting_type, 0,
@@ -941,20 +1023,12 @@ async fn handshake_with_tokens(client: &mut Client, username: &str, tokens: Vec<
             0,
             &tcp::Version {
                 version_v2: Some(MUMBLE_VERSION_V2),
+                fancy_version: fancy,
                 ..tcp::Version::default()
             },
         )
         .await;
-    client
-        .send(
-            2,
-            &tcp::Authenticate {
-                username: Some(username.to_owned()),
-                tokens,
-                ..tcp::Authenticate::default()
-            },
-        )
-        .await;
+    client.send(2, &authenticate).await;
 
     let (before_sync, sync_payload) = client.recv_until(5).await;
     assert!(
@@ -985,6 +1059,316 @@ async fn handshake_with_tokens(client: &mut Client, username: &str, tokens: Vec<
     assert_eq!(next_type, 25, "SuggestConfig must follow ServerConfig");
 
     session
+}
+
+/// The wire epoch this server speaks, as a client announces it.
+///
+/// `handshake_as` above deliberately does not send this: its clients are the
+/// epoch-0 shape, which is what most of these tests are about. A client that
+/// does send it is told which Fancy features exist, and that is a different
+/// handshake with one more frame in it.
+const CLIENT_FANCY_PROTOCOL: u32 = 1;
+
+/// Where persistent chat lives on the wire, from the one table that owns it.
+const PCHAT_OUTER_TYPE: u16 = starling_proto_fancy::types::ServiceKind::Pchat.outer_type();
+
+/// Handshake as a client that speaks epoch 1, returning `(session, announced)`.
+///
+/// `announced` is the `fancy_version` the server volunteered in its **second**
+/// `Version`. A client gates real features on that number, so "did it arrive"
+/// is the whole question this helper exists to answer.
+async fn handshake_epoch1(client: &mut Client, username: &str) -> (u32, Option<u64>) {
+    let (greeting_type, greeting_payload) = client.recv().await;
+    assert_eq!(greeting_type, 0, "the server speaks Version first");
+    let greeting =
+        tcp::Version::decode(greeting_payload.as_slice()).expect("a well-formed Version");
+    assert_eq!(
+        greeting.fancy_version, None,
+        "the opening Version cannot know the peer's epoch yet, so it must not claim features"
+    );
+
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                fancy_protocol: Some(CLIENT_FANCY_PROTOCOL),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    client
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some(username.to_owned()),
+                opus: Some(true),
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+
+    let (before_sync, sync_payload) = client.recv_until(5).await;
+    // The ordering that matters for this frame specifically: a client reads its
+    // voice cipher off the announced version, so a version arriving after the
+    // keys would leave the two ends on different ciphers.
+    let version_at = before_sync
+        .iter()
+        .position(|&kind| kind == 0)
+        .expect("the second Version arrives before ServerSync");
+    let crypt_at = before_sync
+        .iter()
+        .position(|&kind| kind == 15)
+        .expect("CryptSetup precedes ServerSync");
+    assert!(
+        version_at < crypt_at,
+        "the feature version must precede CryptSetup, saw {before_sync:?}"
+    );
+
+    let sync = tcp::ServerSync::decode(sync_payload.as_slice()).expect("a well-formed ServerSync");
+    let session = sync.session.expect("ServerSync carries the session id");
+    (session, client.announced_fancy_version)
+}
+
+#[tokio::test]
+async fn a_client_on_our_epoch_is_told_which_fancy_features_exist() {
+    // The gap that made every encrypted channel carry nothing. Starling
+    // announced the wire epoch and withheld the product version, so the client
+    // knew *how* to speak but not *what exists* -- and it gates on the latter.
+    // With it absent `mumble-tauri` leaves `message_id` unset, its
+    // encrypted-message path is keyed on that id, and it therefore builds no
+    // ciphertext at all. The channel is correctly signal_v1 at both ends and no
+    // message ever crosses it.
+    let data_dir = TempDir::new("epoch1-version");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let (_, announced) = handshake_epoch1(&mut alice, "alice").await;
+
+    let announced = announced.expect("an epoch-1 peer must be told the feature version");
+    assert!(
+        announced >= starling_gate::FancyVersion::new(0, 2, 12).to_wire(),
+        "below 0.2.12 a client tunnels everything instead of speaking natively"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_stock_client_is_never_told_a_feature_version() {
+    // The other half, and the reason the announcement is conditional rather
+    // than unconditional: to a peer that never named an epoch, a product
+    // version reads as licence to send the 100-999 layout, which this server
+    // routes nowhere. Silence keeps it on `PluginDataTransmission`, which is
+    // relayed correctly. `handshake` sends no `fancy_protocol`, so this is the
+    // stock shape.
+    let data_dir = TempDir::new("stock-version");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+    assert_eq!(
+        alice.announced_fancy_version, None,
+        "a stock client must not be given a product version"
+    );
+
+    deployment.stop();
+}
+
+/// Drive the handshake to `ServerConfig` and return it decoded.
+///
+/// Not `handshake`: that helper asserts order and throws the frame away, and
+/// these tests are about what the frame says.
+async fn server_config_of(client: &mut Client, username: &str) -> tcp::ServerConfig {
+    let (greeting_type, _) = client.recv().await;
+    assert_eq!(greeting_type, 0, "the server speaks Version first");
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    client
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some(username.to_owned()),
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+    let (_, payload) = client.recv_until(24).await;
+    tcp::ServerConfig::decode(payload.as_slice()).expect("a well-formed ServerConfig")
+}
+
+#[tokio::test]
+async fn a_configured_media_plane_is_advertised_in_the_handshake() {
+    // The client warns on every share that the server has no relay unless
+    // `ServerConfig` says otherwise, so an SFU that starts but is never
+    // advertised looks exactly like no SFU at all.
+    let data_dir = TempDir::new("sfu-advertised");
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        if let Some(service) = config.services.get_mut("screenshare") {
+            // A literal IP, the media-plane precondition; port 0 keeps the
+            // SFU's real UDP socket ephemeral under parallel tests.
+            service.public_url = Some("127.0.0.1:0".to_owned());
+        }
+    })
+    .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let config = server_config_of(&mut alice, "alice").await;
+    assert_eq!(
+        config.webrtc_sfu_available,
+        Some(true),
+        "a deployment with a media plane must say so in the handshake"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_server_without_a_media_plane_does_not_claim_one() {
+    // Absent, not `Some(false)`, matching murmur: the client defaults the
+    // field and a claimed relay that does not exist would have every share
+    // negotiate against nothing instead of warning up front.
+    let data_dir = TempDir::new("sfu-absent");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let config = server_config_of(&mut alice, "alice").await;
+    assert_eq!(config.webrtc_sfu_available, None);
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn an_encrypted_message_reaches_the_other_member_of_its_channel() {
+    // Persistent chat, end to end over the real wire: the server stores an
+    // opaque ciphertext and relays it to the rest of the channel. Asserted on
+    // the bytes, because the one transformation this service must never make is
+    // to the payload -- a re-encoded ciphertext is a message the recipient
+    // cannot decrypt, and it would fail identically to not arriving at all.
+    let data_dir = TempDir::new("pchat-relay");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let (alice_session, _) = handshake_epoch1(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let (_, _) = handshake_epoch1(&mut bob, "bob").await;
+
+    const CIPHERTEXT: &[u8] = b"\x00\xffnot plaintext\x00";
+    let envelope = fancy::pchat::PchatEnvelope {
+        body: Some(fancy::pchat::pchat_envelope::Body::Message(
+            fancy::pchat::Message {
+                message_id: "01234567-89ab-7def-8123-456789abcdef".to_owned(),
+                channel: 0,
+                ciphertext: CIPHERTEXT.to_vec(),
+                epoch: 1,
+                protocol: fancy::pchat::Protocol::SignalV1 as i32,
+                ..fancy::pchat::Message::default()
+            },
+        )),
+    };
+    alice
+        .send_raw(PCHAT_OUTER_TYPE, &envelope.encode_to_vec())
+        .await;
+
+    let (_, delivered) = bob.recv_until(PCHAT_OUTER_TYPE).await;
+    let Some(fancy::pchat::pchat_envelope::Body::Message(message)) =
+        fancy::pchat::PchatEnvelope::decode(delivered.as_slice())
+            .expect("a well-formed PchatEnvelope")
+            .body
+    else {
+        panic!("expected a pchat message");
+    };
+
+    assert_eq!(
+        message.ciphertext, CIPHERTEXT,
+        "the ciphertext must cross byte for byte"
+    );
+    assert_eq!(
+        message.sender, alice_session,
+        "the server stamps the live sender rather than trusting the wire"
+    );
+    assert_eq!(
+        message.protocol,
+        fancy::pchat::Protocol::SignalV1 as i32,
+        "the recipient has to know which scheme sealed it"
+    );
+    assert_eq!(
+        message.message_id, "01234567-89ab-7def-8123-456789abcdef",
+        "the sender's id must cross untouched: an archive message is sealed \
+         against it (AAD = channel ‖ message_id ‖ sent_at_ms), so a server that \
+         re-mints it delivers a ciphertext nobody can open"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_sender_key_distribution_reaches_the_member_it_names() {
+    // How Signal sender keys actually travel. The client has no canon form for
+    // `PchatSenderKeyDistribution`, so it relays it the epoch-independent way:
+    // wrapped in `PluginDataTransmission` (upstream type 26) with a
+    // `fancy-native:121` id, addressed at the channel's current members. Nothing
+    // decrypts cross-client until this leg works, and it fails invisibly --
+    // messages arrive and simply cannot be read.
+    //
+    // Asserted from outside because the two halves are owned by different
+    // processes: the client fills the receiver list, the server stamps the
+    // sender and strips the list.
+    #[allow(deprecated, reason = "the legacy bridge shipped clients still use")]
+    {
+        let data_dir = TempDir::new("skdm-relay");
+        let deployment = Deployment::start(data_dir.path()).await;
+
+        let mut alice = Client::connect(deployment.port).await;
+        let alice_session = handshake(&mut alice, "alice").await;
+        let mut bob = Client::connect(deployment.port).await;
+        let bob_session = handshake(&mut bob, "bob").await;
+
+        const SKDM: &[u8] = b"\x33opaque sender key distribution";
+        alice
+            .send(
+                26,
+                &tcp::PluginDataTransmission {
+                    // Deliberately wrong, and the point: murmur overwrites this
+                    // rather than trusting it, or a peer could distribute a key
+                    // in somebody else's name.
+                    sender_session: Some(99999),
+                    receiver_sessions: vec![bob_session],
+                    data: Some(SKDM.to_vec()),
+                    data_id: Some("fancy-native:121".to_owned()),
+                },
+            )
+            .await;
+
+        let (_, delivered) = bob.recv_until(26).await;
+        let relayed = tcp::PluginDataTransmission::decode(delivered.as_slice())
+            .expect("a well-formed PluginDataTransmission");
+
+        assert_eq!(
+            relayed.data.as_deref(),
+            Some(SKDM),
+            "the key material must cross untouched"
+        );
+        assert_eq!(
+            relayed.data_id.as_deref(),
+            Some("fancy-native:121"),
+            "the id is how the receiving client knows which message this wraps"
+        );
+        assert_eq!(
+            relayed.sender_session,
+            Some(alice_session),
+            "the server stamps the real sender; the receiver keys the sender key on it"
+        );
+
+        deployment.stop();
+    }
 }
 
 #[tokio::test]
@@ -2361,6 +2745,47 @@ mod example_config {
             "the file is the multi-container deployment; --all-in-one is a flag, not a second file"
         );
     }
+
+    #[test]
+    fn the_all_in_one_profile_overrides_every_endpoint_it_would_otherwise_bind() {
+        // `--all-in-one` is a flag rather than a second file, and that is only
+        // half of what the single-box deployment needs. `endpoint` is what a
+        // service *binds*, in every mode - a service resolves its own address
+        // before it has registered with the broker, so the in-process
+        // short-circuit cannot apply to its own listener - and the file above
+        // points every service at a container name. Run one process with it and
+        // all twenty-one die on "failed to lookup address information", the
+        // gateway included, because those containers are exactly what this
+        // profile replaces.
+        //
+        // So the profile overrides each endpoint to `inproc:`. This test exists
+        // because that block is a list nobody would think to extend: adding a
+        // service to the routing table would leave the single-box deployment
+        // broken in a way only a full `up --wait` shows.
+        let compose = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("docker-compose.yml"),
+        )
+        .expect("docker-compose.yml must be readable");
+
+        let config = shipped("deploy/starling.toml");
+        for (name, service) in &config.services {
+            if service.endpoint.is_none() {
+                continue;
+            }
+            let expected = format!(
+                "STARLING_SERVICES_{}_ENDPOINT: inproc:{name}",
+                name.replace('-', "_").to_uppercase()
+            );
+            assert!(
+                compose.contains(&expected),
+                "the all-in-one profile never overrides {name}, so it would try to bind \
+                 {:?} - a container that profile does not start. Add:\n      {expected}",
+                service.endpoint.as_deref().unwrap_or_default()
+            );
+        }
+    }
 }
 
 // ── The live channel ────────────────────────────────────────────────────────
@@ -2582,7 +3007,7 @@ async fn a_channel_change_reaches_a_live_subscriber_as_the_right_kind_of_event()
         .expect("metadata is reachable");
     let created = MetadataClient::new(grpc)
         .create(CreateRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             actor: None,
             channel: Some(Channel {
                 parent: Some(0),
@@ -2590,6 +3015,8 @@ async fn a_channel_change_reaches_a_live_subscriber_as_the_right_kind_of_event()
                 ..Channel::default()
             }),
             temporary: false,
+            invitee_user_ids: Vec::new(),
+            reuse_existing: false,
         })
         .await
         .expect("the channel is created")
@@ -2614,7 +3041,7 @@ async fn a_channel_change_reaches_a_live_subscriber_as_the_right_kind_of_event()
         .expect("metadata is reachable");
     let renamed = MetadataClient::new(grpc)
         .update(UpdateRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             actor: None,
             channel: id,
             fields: vec!["name".to_owned()],
@@ -2712,6 +3139,380 @@ async fn the_live_channel_refuses_a_subscriber_without_a_credential() {
         tokio_tungstenite::connect_async(request).await.is_err(),
         "the live channel accepted a subscriber with no credential"
     );
+
+    deployment.stop();
+}
+
+// -- Meeting rooms: out-of-tree channels, the invitee flow, and deleting one
+
+/// The `Channel.flags` bits `metadata` packs, for building a room to provision.
+const FLAG_HIDDEN: u32 = 1;
+const FLAG_DETACHED: u32 = 4;
+/// `signal_v1`, the Signal sender-key group protocol a meeting room runs.
+const PCHAT_SIGNAL_V1: u32 = 4;
+/// A Fancy client build, i.e. one that understands an out-of-tree channel.
+const FANCY_CLIENT: u64 = 1;
+/// How long to wait before concluding a frame is *not* coming.
+///
+/// Short, and it has to be: this is asserting an absence, so every millisecond
+/// of it is spent on every run. Everything that would produce the frame is
+/// in-process and has already happened by the time it is called - the grant it
+/// follows was acknowledged over gRPC - so a frame still in flight after this
+/// is not a slow one, it is one the server decided not to send.
+const NOT_COMING: Duration = Duration::from_millis(750);
+
+/// Register an account that logs in with a password rather than a certificate.
+///
+/// The harness dials `with_no_client_auth`, so an account bound to a
+/// certificate can never be *logged into* here: `authenticate` finds the record
+/// by name, sees a certificate hash it cannot match, and refuses with
+/// `NameTaken`. A password is the proof a test client can actually present, and
+/// the invitee flow needs a live session that carries a real account.
+async fn register_with_password(deployment: &Deployment, name: &str, password: &str) -> u64 {
+    use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+    use starling_proto_fancy::userdata::{Account, RegisterRequest};
+
+    let transport = deployment
+        .resolver
+        .channel("userdata")
+        .expect("userdata is reachable");
+    UserDataClient::new(transport)
+        .register(RegisterRequest {
+            scope: None,
+            actor: None,
+            account: Some(Account {
+                name: name.to_owned(),
+                ..Account::default()
+            }),
+            password: password.to_owned(),
+        })
+        .await
+        .expect("the account is registered")
+        .into_inner()
+        .id
+}
+
+/// Log in as a registered account from a Fancy or a stock client.
+async fn login(client: &mut Client, name: &str, password: &str, fancy: Option<u64>) -> u32 {
+    handshake_as(
+        client,
+        tcp::Authenticate {
+            username: Some(name.to_owned()),
+            password: Some(password.to_owned()),
+            ..tcp::Authenticate::default()
+        },
+        fancy,
+    )
+    .await
+}
+
+/// Provision a meeting room the way the calendar does.
+///
+/// One call: out of the tree, hidden, end-to-end encrypted, on an absolute
+/// deadline, and private to `invitees`. `reuse_existing` is what makes it safe
+/// to run twice, which the real caller does - a room is provisioned by
+/// whichever of the meeting starting and somebody asking to join happens first.
+async fn provision_room(
+    deployment: &Deployment,
+    name: &str,
+    invitees: &[u64],
+) -> starling_proto_fancy::metadata::ChannelResult {
+    use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+    use starling_proto_fancy::metadata::{Channel, CreateRequest};
+
+    let transport = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    MetadataClient::new(transport)
+        .create(CreateRequest {
+            scope: None,
+            actor: None,
+            channel: Some(Channel {
+                name: name.to_owned(),
+                // Named and ignored, as murmur's own host callback passes the
+                // root here: a detached channel is parentless whatever is sent.
+                parent: Some(0),
+                flags: FLAG_DETACHED | FLAG_HIDDEN,
+                pchat_protocol: PCHAT_SIGNAL_V1,
+                expiry_mode: 1,
+                expiry_duration_s: 7 * 24 * 60 * 60,
+                ..Channel::default()
+            }),
+            temporary: false,
+            invitee_user_ids: invitees.iter().map(|id| *id as u32).collect(),
+            reuse_existing: true,
+        })
+        .await
+        .expect("the room is provisioned")
+        .into_inner()
+}
+
+/// Admit or drop one account, over the surface a plugin would call.
+async fn set_access(deployment: &Deployment, channel: u32, account: u64, admit: bool) {
+    use starling_proto_fancy::metadata::AccessRequest;
+    use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+
+    let transport = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    let mut client = MetadataClient::new(transport);
+    let request = AccessRequest {
+        scope: None,
+        actor: None,
+        channel,
+        account,
+    };
+    let result = if admit {
+        client.grant_access(request).await
+    } else {
+        client.revoke_access(request).await
+    };
+    let result = result.expect("the access change is answered").into_inner();
+    assert!(result.applied, "refused: {}", result.refused);
+}
+
+impl Client {
+    /// The next `ChannelState` describing `channel`, or `None` within `within`.
+    ///
+    /// Skips everything else, for the reason [`Self::next_move_of`] does, and
+    /// returns an `Option` because both answers are assertions here: a private
+    /// room the invitee is told about, and the same room the uninvited are not.
+    async fn next_channel_state(
+        &mut self,
+        channel: u32,
+        within: Duration,
+    ) -> Option<tcp::ChannelState> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (type_id, payload) = self.next_frame(remaining).await?;
+            if type_id != 7 {
+                continue;
+            }
+            let state =
+                tcp::ChannelState::decode(payload.as_slice()).expect("a well-formed ChannelState");
+            if state.channel_id == Some(channel) {
+                return Some(state);
+            }
+        }
+    }
+
+    /// Whether the server tells this client `channel` is gone, within `within`.
+    async fn told_channel_gone(&mut self, channel: u32, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some((type_id, payload)) = self.next_frame(remaining).await else {
+                return false;
+            };
+            if type_id != 6 {
+                continue;
+            }
+            let gone = tcp::ChannelRemove::decode(payload.as_slice())
+                .expect("a well-formed ChannelRemove");
+            if gone.channel_id == channel {
+                return true;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_meeting_room_is_provisioned_out_of_tree_and_told_only_to_its_invitees() {
+    // The server half of a scheduled meeting: the calendar asks for a room and
+    // gets a parentless, hidden, end-to-end-encrypted channel that exists only
+    // for the people invited to it.
+    //
+    // Three clients, because the room has to be withheld for two *different*
+    // reasons and a test that checked one would pass while the other leaked:
+    //
+    //   * dave holds no invitation - the ACL keeps it from him;
+    //   * carol holds one but runs a stock client - it is kept from her anyway,
+    //     because a client that does not understand a parentless channel hangs
+    //     it under the root, and then every meeting on the server is in her
+    //     channel list (`vendor/server/src/murmur/ServerUser.h`).
+    let data_dir = TempDir::new("meeting-room");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let bob = register_with_password(&deployment, "bob", "hunter2").await;
+    let carol = register_with_password(&deployment, "carol", "hunter3").await;
+
+    let mut bob_client = Client::connect(deployment.port).await;
+    let _ = login(&mut bob_client, "bob", "hunter2", Some(FANCY_CLIENT)).await;
+    let mut carol_client = Client::connect(deployment.port).await;
+    let _ = login(&mut carol_client, "carol", "hunter3", None).await;
+    let mut dave = Client::connect(deployment.port).await;
+    let _ = handshake_as(
+        &mut dave,
+        tcp::Authenticate {
+            username: Some("dave".to_owned()),
+            ..tcp::Authenticate::default()
+        },
+        Some(FANCY_CLIENT),
+    )
+    .await;
+
+    let provisioned = provision_room(&deployment, "Standup [ab12cd34]", &[bob]).await;
+    assert!(provisioned.applied, "refused: {}", provisioned.refused);
+    assert!(provisioned.created, "the first call makes the room");
+    let room = provisioned.channel.expect("a provisioned room");
+    assert_eq!(room.parent, None, "a meeting room is out of the tree");
+
+    let state = timeout(
+        FRAME_TIMEOUT,
+        bob_client.next_channel_state(room.id, FRAME_TIMEOUT),
+    )
+    .await
+    .expect("bob was never told about the room he was invited to")
+    .expect("bob was never told about the room he was invited to");
+    assert_eq!(state.parent, None, "the room has no place in bob's tree");
+    assert!(
+        state
+            .attributes
+            .contains(&(tcp::ChannelAttribute::Detached as i32)),
+        "without the attribute bob's client hangs it under the root"
+    );
+    assert_eq!(state.hidden, Some(true));
+    assert_eq!(
+        state.pchat_protocol,
+        Some(tcp::PchatProtocol::SignalV1 as i32),
+        "the only thing that puts the client into end-to-end mode"
+    );
+    assert!(
+        state.expires_at.is_some(),
+        "a room that self-destructs has to say when"
+    );
+
+    assert!(
+        dave.next_channel_state(room.id, NOT_COMING).await.is_none(),
+        "an uninvited client must not be told a private room exists"
+    );
+
+    // Carol is invited *now*, and still hears nothing: her client could not
+    // render the room.
+    set_access(&deployment, room.id, carol, true).await;
+    assert!(
+        carol_client
+            .next_channel_state(room.id, NOT_COMING)
+            .await
+            .is_none(),
+        "a stock client must never be sent an out-of-tree channel"
+    );
+
+    // Provisioning again finds the same room rather than minting a second one,
+    // which is what lets the two triggers for a meeting both fire.
+    let again = provision_room(&deployment, "Standup [ab12cd34]", &[bob]).await;
+    assert!(again.applied && !again.created, "the second call reuses it");
+    assert_eq!(again.channel.map(|c| c.id), Some(room.id));
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn leaving_a_meeting_room_takes_it_off_the_leavers_client_and_deleting_it_leaves_the_server_up()
+ {
+    // The rest of a room's life. Two things, in one deployment because the
+    // second depends on the first having put somebody inside a parentless
+    // channel:
+    //
+    //   * revoking access moves the leaver out and tells *them* the room is
+    //     gone, without touching anybody else's copy of it
+    //     (`Server::revokeChannelAccess`, `Server.cpp:3713`);
+    //   * deleting the room afterwards does not take the server down. That is
+    //     the C++ crash this guards: `removeChannel` took the parent as the
+    //     destination for displaced users and dereferenced it, so deleting a
+    //     meeting room or a friend DM killed the process
+    //     (`Server.cpp:2161`).
+    use starling_proto_fancy::metadata::RemoveRequest;
+    use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+
+    let data_dir = TempDir::new("meeting-leave");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let bob = register_with_password(&deployment, "bob", "hunter2").await;
+    let alice = register_with_password(&deployment, "alice", "hunter4").await;
+
+    let mut bob_client = Client::connect(deployment.port).await;
+    let bob_session = login(&mut bob_client, "bob", "hunter2", Some(FANCY_CLIENT)).await;
+    let mut alice_client = Client::connect(deployment.port).await;
+    let alice_session = login(&mut alice_client, "alice", "hunter4", Some(FANCY_CLIENT)).await;
+
+    let room = provision_room(&deployment, "Standup [ab12cd34]", &[bob, alice])
+        .await
+        .channel
+        .expect("a provisioned room")
+        .id;
+    for client in [&mut bob_client, &mut alice_client] {
+        assert!(
+            client
+                .next_channel_state(room, FRAME_TIMEOUT)
+                .await
+                .is_some(),
+            "both invitees are told about the room"
+        );
+    }
+
+    assert_eq!(
+        bob_client
+            .enter(bob_session, room, "bob joins the meeting")
+            .await,
+        Ok(room),
+        "an invitee may enter the room they were admitted to"
+    );
+
+    set_access(&deployment, room, bob, false).await;
+    assert_eq!(
+        timeout(FRAME_TIMEOUT, bob_client.next_channel_of(bob_session))
+            .await
+            .expect("bob was left sitting in a channel he may no longer see"),
+        0,
+        "the move comes first: a client cannot leave a channel it has been \
+         told does not exist"
+    );
+    assert!(
+        bob_client.told_channel_gone(room, FRAME_TIMEOUT).await,
+        "a room somebody may no longer see must leave their channel list"
+    );
+    assert!(
+        !alice_client.told_channel_gone(room, NOT_COMING).await,
+        "one invitee leaving must not take the room off everybody else's client"
+    );
+
+    // Alice is still in the room when it is deleted, which is the case that
+    // crashed: her destination is the parent a detached channel does not have.
+    assert_eq!(
+        alice_client
+            .enter(alice_session, room, "alice joins the meeting")
+            .await,
+        Ok(room)
+    );
+    let transport = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    let removed = MetadataClient::new(transport)
+        .remove(RemoveRequest {
+            scope: None,
+            actor: None,
+            channel: room,
+        })
+        .await
+        .expect("the room is removed")
+        .into_inner();
+    assert!(removed.applied, "refused: {}", removed.refused);
+
+    assert_eq!(
+        timeout(FRAME_TIMEOUT, alice_client.next_channel_of(alice_session))
+            .await
+            .expect("alice was never relocated out of the deleted room"),
+        0,
+        "an occupant of a parentless channel goes to the root, not nowhere"
+    );
+    assert!(alice_client.told_channel_gone(room, FRAME_TIMEOUT).await);
+
+    // The definitive no-crash check: the server is still answering.
+    let mut late = Client::connect(deployment.port).await;
+    let _ = handshake(&mut late, "late").await;
 
     deployment.stop();
 }
@@ -3433,4 +4234,356 @@ fn listener_context(payload: &[u8]) -> u32 {
         // the same oneof, and the two are not interchangeable.
         other => panic!("the server sent a frame with no context: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Social and scheduled messages
+//
+// Both were features that answered on the wire and did nothing on screen, so
+// the assertions here are deliberately about *who* a frame names and *who* it
+// reaches, not merely that one arrived.
+// ---------------------------------------------------------------------------
+
+/// The social service's outer type.
+const SOCIAL: u16 = 1015;
+/// The text service's outer type.
+const TEXT: u16 = 1005;
+
+/// One `SocialEnvelope`, ready to send.
+fn social(body: fancy::social::social_envelope::Body) -> fancy::social::SocialEnvelope {
+    fancy::social::SocialEnvelope { body: Some(body) }
+}
+
+/// The next social body a client is given.
+async fn next_social(client: &mut Client) -> fancy::social::social_envelope::Body {
+    let (_, payload) = client.recv_until(SOCIAL).await;
+    fancy::social::SocialEnvelope::decode(payload.as_slice())
+        .expect("a well-formed SocialEnvelope")
+        .body
+        .expect("an envelope with a body in it")
+}
+
+#[tokio::test]
+async fn a_reaction_reaches_the_channel_including_the_person_who_sent_it() {
+    // Two failures at once, and each made the feature do nothing rather than
+    // do it wrongly. The relay excluded the sender, and the client has no
+    // optimistic update, so a reactor never saw their own pill. And the actor
+    // was whatever the peer wrote, which is nothing.
+    let data_dir = TempDir::new("reaction");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SOCIAL,
+            &social(fancy::social::social_envelope::Body::Reaction(
+                fancy::social::Reaction {
+                    channel: 0,
+                    message_id: "m-1".to_owned(),
+                    emoji: Some(fancy::wire::Emoji {
+                        kind: Some(fancy::wire::emoji::Kind::Unicode("\u{1f44d}".to_owned())),
+                    }),
+                    ..fancy::social::Reaction::default()
+                },
+            )),
+        )
+        .await;
+
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let fancy::social::social_envelope::Body::Reaction(reaction) = next_social(client).await
+        else {
+            panic!("{who} was sent something other than the reaction");
+        };
+        assert_eq!(reaction.message_id, "m-1", "{who}");
+        assert_eq!(
+            reaction.actor, alice_session,
+            "{who} must be told who reacted; the peer never says"
+        );
+    }
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_typing_indicator_names_the_typist_and_is_not_echoed_to_them() {
+    let data_dir = TempDir::new("typing");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SOCIAL,
+            &social(fancy::social::social_envelope::Body::Typing(
+                fancy::social::Typing {
+                    channel: 0,
+                    actor: 0,
+                    typing: true,
+                },
+            )),
+        )
+        .await;
+
+    let fancy::social::social_envelope::Body::Typing(typing) = next_social(&mut bob).await else {
+        panic!("bob was sent something other than the typing indicator");
+    };
+    assert_eq!(
+        typing.actor, alice_session,
+        "a client drops an indicator whose actor is 0, which is what it sends"
+    );
+
+    // And alice is not told about her own keystrokes. Scanning for a *social*
+    // frame rather than any frame: a `UserState` from bob's join is unrelated
+    // traffic that would otherwise read as an echo.
+    let echo = timeout(Duration::from_millis(750), async {
+        loop {
+            let (type_id, _) = alice.recv().await;
+            if type_id == SOCIAL {
+                return ();
+            }
+        }
+    })
+    .await;
+    assert!(echo.is_err(), "alice was told that she is typing");
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_poll_and_its_vote_carry_the_identity_and_the_channel_the_server_resolved() {
+    // The vote is the half that was invisible: the canon vote carries no
+    // channel, and a client drops a vote it cannot route to a poll card, so
+    // the tally never moved however correctly the server counted.
+    let data_dir = TempDir::new("poll");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SOCIAL,
+            &social(fancy::social::social_envelope::Body::Poll(
+                fancy::social::Poll {
+                    poll_id: "p-1".to_owned(),
+                    channel: 0,
+                    question: "lunch?".to_owned(),
+                    options: vec!["yes".to_owned(), "no".to_owned()],
+                    ..fancy::social::Poll::default()
+                },
+            )),
+        )
+        .await;
+
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let fancy::social::social_envelope::Body::Poll(poll) = next_social(client).await else {
+            panic!("{who} was sent something other than the poll itself");
+        };
+        assert_eq!(poll.question, "lunch?", "{who}");
+        assert_eq!(poll.creator, alice_session, "{who} must be told whose poll");
+    }
+
+    bob.send(
+        SOCIAL,
+        &social(fancy::social::social_envelope::Body::Vote(
+            fancy::social::PollVote {
+                poll_id: "p-1".to_owned(),
+                options: vec![1],
+                ..fancy::social::PollVote::default()
+            },
+        )),
+    )
+    .await;
+
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let fancy::social::social_envelope::Body::Vote(vote) = next_social(client).await else {
+            panic!("{who} was sent something other than the vote");
+        };
+        assert_eq!(vote.voter, bob_session, "{who} must be told who voted");
+        assert_eq!(vote.options, vec![1], "{who}");
+        assert_eq!(
+            vote.channel, 0,
+            "{who} needs the poll's channel to find the card the vote belongs to"
+        );
+    }
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_scheduled_message_is_stored_timed_and_delivered_to_the_channel() {
+    // The whole path the `scheduled-messages` suite drives, minus the panel:
+    // an ack that says it was accepted, the timer, and the message arriving as
+    // ordinary channel text for everybody who is there when it is due.
+    let data_dir = TempDir::new("scheduled");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // With a client certificate: the owner of a message due later has to
+    // outlive the connection that scheduled it, and only a certificate does.
+    let mut alice = Client::connect_with_certificate(deployment.port, data_dir.path()).await;
+    let _ = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    let due_at = starling_runtime::ids::now_ms() + 2_000;
+    alice
+        .send(
+            TEXT,
+            &fancy::feature::TextEnvelope {
+                body: Some(fancy::feature::text_envelope::Body::Schedule(
+                    fancy::feature::Scheduled {
+                        channels: vec![0],
+                        body: "from the past".to_owned(),
+                        deliver_at_ms: due_at,
+                        ..fancy::feature::Scheduled::default()
+                    },
+                )),
+            },
+        )
+        .await;
+
+    let (_, payload) = alice.recv_until(TEXT).await;
+    let Some(fancy::feature::text_envelope::Body::Ack(ack)) =
+        fancy::feature::TextEnvelope::decode(payload.as_slice())
+            .expect("a well-formed TextEnvelope")
+            .body
+    else {
+        panic!("scheduling was not acknowledged");
+    };
+    assert_eq!(
+        ack.status,
+        fancy::feature::ScheduleStatus::SchedulePending as i32,
+        "refused: {}",
+        ack.reason
+    );
+    assert!(!ack.schedule_id.is_empty(), "an ack names the message");
+
+    // Both clients get it as ordinary channel text when it comes due, which is
+    // the point: a scheduled message is a message, not a notification.
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let (_, payload) = client.recv_until(11).await;
+        let message = tcp::TextMessage::decode(payload.as_slice()).expect("a TextMessage");
+        assert_eq!(message.message, "from the past", "{who}");
+    }
+
+    // And it has left the pending list, so a panel re-fetching after delivery
+    // shows nothing.
+    alice
+        .send(
+            TEXT,
+            &fancy::feature::TextEnvelope {
+                body: Some(fancy::feature::text_envelope::Body::Query(
+                    fancy::feature::ScheduleQuery {
+                        include_finished: false,
+                    },
+                )),
+            },
+        )
+        .await;
+    let (_, payload) = alice.recv_until(TEXT).await;
+    let Some(fancy::feature::text_envelope::Body::List(list)) =
+        fancy::feature::TextEnvelope::decode(payload.as_slice())
+            .expect("a well-formed TextEnvelope")
+            .body
+    else {
+        panic!("the query was not answered with a list");
+    };
+    assert!(
+        list.messages.is_empty(),
+        "a delivered message is not still pending"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_scheduled_message_can_be_cancelled_and_then_never_arrives() {
+    let data_dir = TempDir::new("scheduled-cancel");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect_with_certificate(deployment.port, data_dir.path()).await;
+    let _ = handshake(&mut alice, "alice").await;
+
+    alice
+        .send(
+            TEXT,
+            &fancy::feature::TextEnvelope {
+                body: Some(fancy::feature::text_envelope::Body::Schedule(
+                    fancy::feature::Scheduled {
+                        channels: vec![0],
+                        body: "never mind".to_owned(),
+                        deliver_at_ms: starling_runtime::ids::now_ms() + 1_500,
+                        ..fancy::feature::Scheduled::default()
+                    },
+                )),
+            },
+        )
+        .await;
+    let (_, payload) = alice.recv_until(TEXT).await;
+    let Some(fancy::feature::text_envelope::Body::Ack(ack)) =
+        fancy::feature::TextEnvelope::decode(payload.as_slice())
+            .expect("a well-formed TextEnvelope")
+            .body
+    else {
+        panic!("scheduling was not acknowledged");
+    };
+    assert_eq!(
+        ack.status,
+        fancy::feature::ScheduleStatus::SchedulePending as i32,
+        "refused: {}",
+        ack.reason
+    );
+
+    alice
+        .send(
+            TEXT,
+            &fancy::feature::TextEnvelope {
+                body: Some(fancy::feature::text_envelope::Body::Cancel(
+                    fancy::feature::ScheduleCancel {
+                        schedule_id: ack.schedule_id.clone(),
+                    },
+                )),
+            },
+        )
+        .await;
+    let (_, payload) = alice.recv_until(TEXT).await;
+    let Some(fancy::feature::text_envelope::Body::Ack(cancelled)) =
+        fancy::feature::TextEnvelope::decode(payload.as_slice())
+            .expect("a well-formed TextEnvelope")
+            .body
+    else {
+        panic!("the cancel was not acknowledged");
+    };
+    assert_eq!(
+        cancelled.status,
+        fancy::feature::ScheduleStatus::ScheduleCancelled as i32,
+        "refused: {}",
+        cancelled.reason
+    );
+
+    // Past the due time, with room for the timer's own granularity.
+    let arrived = timeout(Duration::from_millis(3_000), async {
+        loop {
+            let (type_id, payload) = alice.recv().await;
+            if type_id == 11
+                && tcp::TextMessage::decode(payload.as_slice())
+                    .is_ok_and(|message| message.message == "never mind")
+            {
+                return ();
+            }
+        }
+    })
+    .await;
+    assert!(arrived.is_err(), "a cancelled message was delivered anyway");
+
+    deployment.stop();
 }

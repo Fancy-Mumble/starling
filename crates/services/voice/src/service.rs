@@ -259,7 +259,7 @@ impl VoiceService {
     /// way back to agreement.
     fn follow_view(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            let scope = ctx.instances().first().copied().unwrap_or(1);
             loop {
                 self.read_view(&ctx, scope).await;
                 tokio::time::sleep(VIEW_RETRY).await;
@@ -278,9 +278,7 @@ impl VoiceService {
         };
         let Ok(stream) = SessionViewClient::new(channel)
             .subscribe(SubscribeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 subscriber: Self::NAME.to_owned(),
             })
             .await
@@ -375,7 +373,7 @@ impl VoiceService {
     /// first.
     fn follow_tree(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            let scope = ctx.instances().first().copied().unwrap_or(1);
             loop {
                 self.read_tree(&ctx, scope).await;
                 tokio::time::sleep(VIEW_RETRY).await;
@@ -393,9 +391,7 @@ impl VoiceService {
         };
         let Ok(stream) = MetadataClient::new(channel)
             .watch(TreeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
             })
             .await
         else {
@@ -416,7 +412,7 @@ impl VoiceService {
     /// audio for every peer while the server browser's numbers are refreshed.
     fn refresh_details(self: Arc<Self>, ctx: ServiceContext) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            let scope = ctx.instances().first().copied().unwrap_or(1);
             let mut ticker = tokio::time::interval(DETAILS_REFRESH);
             loop {
                 // The first tick is immediate, so a restarted service reports
@@ -454,9 +450,7 @@ impl VoiceService {
         if let Ok(channel) = ctx.resolver.channel("server-config")
             && let Ok(snapshot) = ServerConfigClient::new(channel)
                 .get(ConfigRequest {
-                    scope: Some(Scope {
-                        virtual_server: scope,
-                    }),
+                    scope: Some(Scope { instance: scope }),
                 })
                 .await
         {
@@ -472,9 +466,7 @@ impl VoiceService {
         if let Ok(channel) = ctx.resolver.channel("session-view")
             && let Ok(sessions) = SessionViewClient::new(channel)
                 .list(SubscribeRequest {
-                    scope: Some(Scope {
-                        virtual_server: scope,
-                    }),
+                    scope: Some(Scope { instance: scope }),
                     subscriber: Self::NAME.to_owned(),
                 })
                 .await

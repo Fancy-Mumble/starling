@@ -1,0 +1,85 @@
+{{- $full := include "starling.fullname" . -}}
+Starling {{ .Chart.AppVersion }} installed as {{ .Release.Name }}, in {{ .Values.mode }} mode.
+
+Connect a Mumble client to:
+
+{{- if eq .Values.gateway.service.type "LoadBalancer" }}
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $full }} -w
+
+  Use the EXTERNAL-IP on port {{ .Values.gateway.service.port }}. It is
+  <pending> until the cluster's load balancer answers.
+{{- else if eq .Values.gateway.service.type "NodePort" }}
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $full }} -o jsonpath='{.spec.ports[0].nodePort}'
+
+  ... on any node's address.
+{{- else }}
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }} {{ .Values.gateway.service.port }}:{{ .Values.gateway.service.port }}
+
+  The Service is {{ .Values.gateway.service.type }}, so it has no address of
+  its own outside the cluster. Note that port-forward is TCP only: voice will
+  not work through it, and the client falls back to tunnelling audio over the
+  control connection.
+{{- end }}
+
+{{- if not .Values.gateway.tls.existingSecret }}
+
+The gateway generates a self-signed certificate into its volume on first boot,
+as murmur does, so the client asks you to trust it once. Keep that volume:
+Mumble identifies a server by certificate fingerprint, and a regenerated pair
+looks to every client exactly like a man-in-the-middle.
+
+Give it a real certificate with gateway.tls.existingSecret (a Secret holding
+tls.crt and tls.key - what cert-manager and `kubectl create secret tls` both
+produce). More than one gateway replica requires this.
+{{- end }}
+
+Set the SuperUser password before anyone can administer the server:
+
+  kubectl -n {{ .Release.Namespace }} exec -it {{ if eq .Values.mode "all-in-one" }}{{ $full }}-0{{ else }}{{ $full }}-userdata-0{{ end }} -- \
+    starling set-superuser-password <password> --config /etc/starling/starling.toml
+
+{{- if eq .Values.mode "services" }}
+
+Watch it come up:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+Nothing here waits on anything else. A service that is not up yet is a startup
+ordering fact the runtime dials through lazily, so the pods settle in whatever
+order the scheduler gives them and the gateway attaches as they arrive.
+
+{{- if .Values.voice.colocateWithGateway }}
+
+Voice runs as a second container in the gateway pod, so TCP and UDP {{ .Values.gateway.service.port }} answer at
+one address - which is the only arrangement a legacy Mumble client can use.
+Your cluster's load balancer must accept both protocols on one Service
+(Kubernetes 1.24+, GA in 1.26). If it refuses, check:
+
+  kubectl -n {{ .Release.Namespace }} describe svc {{ $full }}
+{{- else }}
+
+Voice has its own Service ({{ $full }}-voice-udp) and is NOT at the gateway's
+address. Legacy clients send UDP to the host:port they made TCP to and have no
+field to learn another, so they will tunnel audio over TCP instead. Only Fancy
+clients follow services.voice.publicUrl.
+{{- end }}
+{{- end }}
+
+{{- if .Values.operatorApi.enabled }}
+
+The admin plane is on, as a {{ .Values.operatorApi.service.type }} Service. It is deliberately not
+published - it wants the opposite exposure to the gateway's:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-operator-api {{ .Values.operatorApi.port }}:{{ .Values.operatorApi.port }}
+  curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:{{ .Values.operatorApi.port }}/v1/health
+{{- end }}
+
+{{- if not .Values.services.directory.enabled }}
+
+This server is not announced to the public Mumble list. Enable it with
+services.directory.enabled, which also needs gateway.tls.existingSecret and the
+registry_* settings in the server-config service.
+{{- end }}

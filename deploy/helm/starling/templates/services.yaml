@@ -1,0 +1,84 @@
+{{- if eq .Values.mode "services" }}
+{{- $full := include "starling.fullname" . }}
+{{/*
+The ClusterIP every other service dials, one per workload. This name is what
+the config file's `endpoint` carries, so the Service and the routing table
+cannot drift: both are rendered from the same entry.
+
+`directory` gets none - nothing dials it.
+*/}}
+{{- range $name := (keys .Values.services | sortAlpha) }}
+{{- $svc := index $.Values.services $name }}
+{{- if and $svc.enabled (not $svc.noEndpoint) }}
+{{- if and (eq $name "voice") $.Values.voice.colocateWithGateway }}
+{{/* colocated voice is served by the gateway pod; its Service is in gateway.yaml */}}
+{{- else }}
+{{- $port := include "starling.grpcPort" (dict "name" $name "root" $) }}
+{{- if ne $name "gateway" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-{{ $name }}
+  labels:
+    {{- include "starling.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "starling.selectorLabels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+  ports:
+    - name: grpc
+      port: {{ $port }}
+      targetPort: grpc
+      protocol: TCP
+    {{- if eq $name "files" }}
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+voice standing on its own: its UDP socket needs an address clients can reach,
+and it is not the gateway's. Legacy clients cannot be told about it - they send
+UDP to the host:port they made TCP to - so this is only useful together with
+services.voice.publicUrl, which Fancy clients read and others ignore.
+*/}}
+{{- $voice := .Values.services.voice }}
+{{- if and $voice.enabled (not .Values.voice.colocateWithGateway) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-voice-udp
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: voice
+  {{- with .Values.voice.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.voice.service.type }}
+  {{- with .Values.voice.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- if eq .Values.voice.service.type "LoadBalancer" }}
+  externalTrafficPolicy: {{ .Values.voice.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: voice
+  ports:
+    - name: voice-udp
+      port: {{ .Values.gateway.service.port }}
+      targetPort: voice-udp
+      protocol: UDP
+{{- end }}
+{{- end }}

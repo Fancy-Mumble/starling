@@ -1,0 +1,215 @@
+{{- if eq .Values.mode "all-in-one" }}
+{{- $full := include "starling.fullname" . }}
+{{- $d := .Values.defaults }}
+{{/*
+Every service in one process over in-memory transports: same image, same
+routing table, gRPC replaced by in-process calls. `--all-in-one` overrides the
+config file's `all_in_one = false` at the command line, so there is no second
+config to keep in step, and `endpoint` is ignored because calls never leave the
+process.
+
+One pod, one volume, and both protocols on one address without a sidecar,
+because there is only one container to put them in.
+*/}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: all-in-one
+spec:
+  # One. Every service is in this process, including the ones that own a
+  # database file, so a second replica is a second server sharing a name.
+  replicas: 1
+  serviceName: {{ $full }}
+  selector:
+    matchLabels:
+      {{- include "starling.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: all-in-one
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with $d.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "starling.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: all-in-one
+    spec:
+      serviceAccountName: {{ include "starling.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $d.terminationGracePeriodSeconds }}
+      {{- with $d.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $d.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $d.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: starling
+          image: {{ include "starling.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - "--all-in-one"
+            - "--config"
+            - "/etc/starling/starling.toml"
+          env:
+            {{- include "starling.commonEnv" . | nindent 12 }}
+          ports:
+            - name: mumble-tcp
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: TCP
+            - name: mumble-udp
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: UDP
+            {{- if .Values.services.files.enabled }}
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.operatorApi.enabled }}
+            - name: rest
+              containerPort: {{ .Values.operatorApi.port }}
+              protocol: TCP
+            {{- end }}
+          # There is no gRPC port to probe here - every call is in-process - so
+          # the client port is the only listener to ask about. That makes this
+          # the one probe that is an unfinished TLS handshake, which the
+          # gateway records as a security event, so it runs rarely rather than
+          # every few seconds.
+          readinessProbe:
+            tcpSocket:
+              port: mumble-tcp
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 4
+          livenessProbe:
+            tcpSocket:
+              port: mumble-tcp
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml $d.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "starling.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "starling.volumes" . | nindent 8 }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            # Every service's database is on this one volume in this mode, so
+            # it holds what twenty separate claims would in the other.
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: all-in-one
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  {{- with .Values.gateway.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.gateway.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.gateway.service.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if eq .Values.gateway.service.type "LoadBalancer" }}
+  externalTrafficPolicy: {{ .Values.gateway.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: all-in-one
+  ports:
+    - name: mumble-tcp
+      port: {{ .Values.gateway.service.port }}
+      targetPort: mumble-tcp
+      protocol: TCP
+    - name: mumble-udp
+      port: {{ .Values.gateway.service.port }}
+      targetPort: mumble-udp
+      protocol: UDP
+{{- if .Values.services.files.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-files
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: files
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: all-in-one
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- if .Values.operatorApi.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-operator-api
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator-api
+spec:
+  type: {{ .Values.operatorApi.service.type }}
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: all-in-one
+  ports:
+    - name: rest
+      port: {{ .Values.operatorApi.port }}
+      targetPort: rest
+      protocol: TCP
+{{- end }}
+{{- end }}

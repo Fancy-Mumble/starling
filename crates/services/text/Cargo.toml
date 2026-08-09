@@ -14,7 +14,7 @@ starling-runtime.workspace = true
 sqlx.workspace = true
 
 prost.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tonic.workspace = true
 tracing.workspace = true

@@ -1,0 +1,84 @@
+# Starling as a system service, for the .deb and the .rpm.
+#
+# Not enabled by installing the package. A voice server that starts listening
+# on 64738 because somebody ran `apt install` is a surprise, so this waits to
+# be asked:
+#
+#   sudo systemctl enable --now starling
+#   journalctl -u starling -n 40      # the first start prints the SuperUser password
+#
+# Deliberately no --config. That is what makes this the same first start a
+# person gets from the terminal: with nowhere configured yet, Starling writes a
+# starter configuration, creates the administrator and prints both, and the
+# journal is where an operator who installed a package is already looking.
+#
+#   configuration   /var/lib/starling/config/starling/starling.toml
+#   data            /var/lib/starling/data/starling
+#
+# Edit the first, back up the second. Neither is touched again after the first
+# start.
+
+[Unit]
+Description=Starling, a Mumble server
+Documentation=https://github.com/Fancy-Mumble/starling
+After=network-online.target
+Wants=network-online.target
+
+# Not into a crash loop: a server that cannot bind its port will not be able to
+# five seconds later either, and a burst limit turns that from a busy journal
+# into one failed unit somebody can see. Here rather than in [Service], which is
+# where systemd used to take them and now silently ignores them.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/starling --all-in-one
+
+# No user to create and none left behind: systemd allocates one for the
+# lifetime of the service and gives it /var/lib/starling to keep, which
+# persists across restarts even though the uid does not.
+DynamicUser=yes
+StateDirectory=starling
+WorkingDirectory=/var/lib/starling
+
+# Where the first start puts what it writes. Named explicitly rather than left
+# to $HOME, because a system service has no home directory worth the name and
+# the alternative is a server whose databases land wherever systemd decided
+# HOME was. Both are under StateDirectory, so both are covered by the same
+# backup and the same `systemctl clean`.
+Environment=XDG_CONFIG_HOME=/var/lib/starling/config
+Environment=XDG_DATA_HOME=/var/lib/starling/data
+
+Restart=on-failure
+RestartSec=5s
+
+# This process terminates TLS for unauthenticated peers on a public port, so it
+# gets no more of the system than it needs. Every one of these was checked
+# against a running all-in-one rather than copied from a template.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Unix sockets between the in-process services, TCP for the control plane, UDP
+# for voice. Nothing else: no netlink, no packet sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

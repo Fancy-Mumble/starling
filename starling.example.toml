@@ -1,296 +1,144 @@
-# Starling deployment configuration.
+# Starling.
 #
 #   starling --all-in-one --config starling.toml
-#   starling text          --config starling.toml
 #
-# The deployment layer: endpoints, ports, TLS paths, storage URLs, tiers, routes.
-# Settings an operator changes while the server runs (bandwidth, message limits,
-# welcome text) live in the `server-config` service instead.
+# Copy this file, change what you care about, delete the rest. Anything you do
+# not mention keeps its built-in value, so a three-line file is a working
+# server. Unknown keys are refused at startup, so a typo fails loudly.
 #
-# Unknown keys are rejected at startup, so a typo fails loudly. Every key is
-# overridable by environment variable: [services.text] endpoint becomes
-# STARLING_SERVICES_TEXT_ENDPOINT.
+# Everything under [instances.settings] can also be changed later from the
+# admin UI, and a setting you change there stops following this file -- your
+# choice wins, and the rest of the file goes on working.
+#
+# The advanced knobs are not here. Rate limits, service endpoints, the admin API
+# and log routing live in `examples/advanced/`, one file each; pull one in with
+#
+#   include = ["examples/advanced/logging.toml"]
+#
+# `examples/reference.toml` lists every key that exists, with its default and a
+# sentence on what it does.
 #
 # Migrating from murmur? `starling migrate-config mumble-server.ini` prints the
-# equivalent config on stdout.
+# equivalent of an existing .ini on stdout.
 
-[runtime]
-# All services in one process over in-memory transports (`endpoint` values
-# ignored); the single-VPS mode. `--all-in-one` overrides this from the CLI.
-all_in_one = false
-# Generated certificates and default databases live here.
-data_dir = "starling-data"
 
-[[virtual_servers]]
-id = 1
+# -- Your server ------------------------------------------------------------
+
+[[instances]]
+# Shown in the server browser, and the name of the root channel.
 name = "Starling"
+# The port clients connect to, TCP and UDP. Mumble's default is 64738.
 port = 64738
 
-# -- The gateway ------------------------------------------------------------
 
-[gateway]
-listen_tcp = "0.0.0.0:64738"
-# Per client; full = disconnect it. Dropping a control message desyncs a client
-# silently, and unbounded queueing is a memory DoS.
-control_queue = 4096
-# Per client, tunnelled audio; full = drop oldest and count it.
-audio_queue = 128
-default_deadline = "5s"
-# Shed a repeatedly-failing service at the door instead of waiting on it.
-breaker_failures = 5
-breaker_cooldown = "10s"
+[instances.settings]
 
-[gateway.tls]
-# Omit both: a self-signed pair is generated on first boot. Set both to use your
-# own certificate.
+# How many people may be connected at once.
+max_users = 100
+# Required to connect. Empty means anyone with the address can join.
+# A server with a password set is never listed publicly.
+password = ""
+# Shown once, on connect. Supports the basic HTML a Mumble client renders.
+welcome_text = ""
+# Refuse anyone whose client has no certificate. Certificates are how Mumble
+# recognises a returning user, so this is stricter than it sounds: it keeps out
+# people who never made one, not people you have not met.
+cert_required = false
+
+# Audio ---------------------------------------------------------------------
+
+# Bits per second per speaking user. 72000 is Mumble's default and sounds good;
+# lower it if your uplink is the bottleneck.
+max_bandwidth = 72000
+# Whether clients may record, and announce that they are recording.
+allow_recording = true
+
+# Chat ----------------------------------------------------------------------
+
+# Longest message, in characters. 0 removes the limit.
+text_message_length = 5000
+# Longest image, in bytes. Images are sent inline in messages.
+image_message_length = 131072
+# Whether messages may carry markup. Off means plain text everywhere.
+allow_html = true
+# Days of chat history kept before it is deleted.
+log_days = 31
+
+# Channels ------------------------------------------------------------------
+
+# How deep the channel tree may go, and how many channels may exist at all.
+channel_nesting_limit = 10
+channel_count_limit = 1000
+
+# Being listed publicly -----------------------------------------------------
+#
+# Off until these are filled in. Announcing a server to the public list is a
+# decision you cannot take back, so silence is the default. Note that a server
+# with a password is never listed, and neither is one that does not answer
+# server-browser pings (`allow_ping`, on by default).
+
+# registry_name     = "Frog Pond"
+# registry_url      = "https://frogpond.example"   # required; the listing links here
+# registry_password = "a secret you choose"        # proves a later update is still you
+# registry_hostname = "frogpond.example"           # how the list should reach you
+# registry_location = "DE"                         # ISO country code
+
+
+# -- Files ------------------------------------------------------------------
+#
+# Uploads and avatars. Delete this block for the defaults, or say
+# `enabled = false` to switch file sharing off entirely.
+
+[services.files]
+# Largest upload accepted.
+max_upload = "512MiB"
+# How long a download link stays valid.
+url_ttl = "15m"
+# What download links point at. Set this once the server is reachable under a
+# name other than the one you are testing from.
+# public_url = "https://files.example.org"
+
+
+# -- Screen share -----------------------------------------------------------
+#
+# Signalling always works. Media relay (the WebRTC SFU) starts only when
+# `public_url` names the literal IP clients can reach this host at - an IP,
+# not a hostname, because it goes into SDP answers verbatim. Without it,
+# clients are told the server has no relay.
+
+# [services.screenshare]
+# public_url = "203.0.113.9:64740"
+# UDP port for media. 0 or absent = OS-assigned.
+# options = { media_port = "64740" }
+
+
+# -- TLS --------------------------------------------------------------------
+#
+# With neither key set, a self-signed certificate is generated on first boot and
+# kept in `data_dir`. That is fine, and not a compromise: Mumble clients
+# identify a server by certificate fingerprint rather than by a public
+# authority. Set both to present your own instead.
+
+# [gateway.tls]
 # cert = "/etc/starling/tls/cert.pem"
 # key  = "/etc/starling/tls/key.pem"
 
-# Buckets are per route, never one shared, and a throttled message is reported
-# rather than silently dropped.
-[gateway.limits.control]
-rate = "1/s"
-burst = 5
-[gateway.limits.signalling]
-rate = "10/s"
-burst = 20
-[gateway.limits.plugin]
-rate = "4/s"
-burst = 15
-[gateway.limits.acl]
-# The ACL editor opens one query per channel, so a large tree emits a burst.
-rate = "20/s"
-burst = 60
-[gateway.limits.chat]
-# A person typing; losing a message they wrote is the worst failure here.
-rate = "5/s"
-burst = 20
-[gateway.limits.audio]
-# Speech is ~100 frames/s, so the control bucket would cut it off mid-sentence.
-rate = "200/s"
-burst = 400
 
-# A reconnecting Fancy client replays only the gap, not a full re-flood; legacy
-# clients cannot resume.
-[gateway.resume]
-enabled = true
-ring = 256
-ttl = "120s"
+# -- Where things are kept --------------------------------------------------
 
-# -- Observability ----------------------------------------------------------
+[runtime]
+# Databases, the generated certificate, and the sockets services talk over.
+# Back this directory up and you have backed up the server.
+data_dir = "starling-data"
 
-[telemetry]
-log_format = "text"          # json | text
-# metrics = "0.0.0.0:9090"
-# otlp_endpoint = "http://otel-collector:4317"
 
-# The operator event log: who connected, what was refused, what an admin
-# changed. Distinct from [telemetry] (developer diagnostics, driven by RUST_LOG);
-# this is the record you keep, with its own level and destinations.
+# -- Logs -------------------------------------------------------------------
+#
+# Who connected, what was refused, what an admin changed. This is the record you
+# keep; developer diagnostics are a separate dial (`RUST_LOG`).
+
 [logging]
 level = "info"               # debug | info | notice | warning | error
-# Empty means every category. Named, it records only these:
-#   server | session | channel | message | permission | security | plugin | admin
-categories = []
-queue = 4096                 # records buffered before the writer drops and counts
-
-[logging.console]
-enabled = true               # to stderr
 
 # [logging.file]
 # path = "/var/log/starling/server.log"
-# max_bytes = 33554432       # rotate past this; 0 disables rotation
-# keep = 5                   # rotated generations to retain
-
-[logging.memory]
-enabled = true               # the ring the admin API reads
-records = 1000
-
-# -- Services ---------------------------------------------------------------
-#
-# Every block takes the same keys. `types` is the outer message type, one set
-# per service; a service's own types live in its nested envelope.
-#
-# The `unix:` endpoints are the co-located deployment on a Unix host; on Windows
-# use `pipe:` (a named pipe, whose ACL is the boundary that file permissions are
-# here). Running with no --config picks the right one for the platform.
-
-[services.session-lifecycle]
-endpoint = "unix:/run/starling/session-lifecycle.sock"
-tier = "essential"
-types = [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
-
-[services.session-view]
-endpoint = "unix:/run/starling/session-view.sock"
-tier = "essential"
-types = []                   # internal: no client-facing type
-
-[services.permissions]
-limits = "acl"                # editor bursts; not the 1/s control bucket
-endpoint = "unix:/run/starling/permissions.sock"
-tier = "essential"
-types = [12, 13, 20, 1001]
-
-[services.metadata]
-endpoint = "unix:/run/starling/metadata.sock"
-tier = "essential"
-types = [6, 7, 1002]
-
-[services.userdata]
-endpoint = "unix:/run/starling/userdata.sock"
-tier = "essential"
-types = [14, 18, 23, 1003]
-
-[services.server-config]
-endpoint = "unix:/run/starling/server-config.sock"
-tier = "essential"
-types = [24, 25, 1013]
-
-[services.voice]
-endpoint = "unix:/run/starling/voice.sock"
-tier = "core"
-types = [1, 19, 1004]        # UDPTunnel, VoiceTarget, Fancy envelope
-udp_listen = "0.0.0.0:64738" # voice's own socket, audio skips the gateway
-limits = "audio"             # speech, not the 1/s control bucket
-
-[services.text]
-limits = "chat"               # a person typing; not the 1/s control bucket
-endpoint = "unix:/run/starling/text.sock"
-tier = "core"
-types = [11, 1005]
-
-[services.pchat]
-endpoint = "unix:/run/starling/pchat.sock"
-tier = "core"
-types = [1006]
-
-[services.moderation]
-endpoint = "unix:/run/starling/moderation.sock"
-tier = "core"
-types = [8, 10, 1007]
-
-[services.screenshare]
-endpoint = "unix:/run/starling/screenshare.sock"
-tier = "optional"
-types = [1008]
-limits = "signalling"        # not the 1/s control bucket
-
-[services.files]
-endpoint = "unix:/run/starling/files.sock"
-tier = "optional"
-types = [1009]
-listen = "0.0.0.0:8080"
-public_url = "https://files.example.org"
-url_ttl = "15m"
-max_upload = "512MiB"
-
-[services.plugins]
-endpoint = "unix:/run/starling/plugins.sock"
-tier = "optional"
-types = [26, 1010]
-limits = "plugin"
-
-[services.push]
-endpoint = "unix:/run/starling/push.sock"
-tier = "optional"
-types = [1011]
-
-[services.audit]
-endpoint = "unix:/run/starling/audit.sock"
-tier = "optional"
-types = [1012]
-
-[services.onboarding]
-endpoint = "unix:/run/starling/onboarding.sock"
-tier = "optional"
-types = [1014]
-
-[services.social]
-endpoint = "unix:/run/starling/social.sock"
-tier = "optional"
-types = [1015]
-
-[services.link-preview]
-endpoint = "unix:/run/starling/link-preview.sock"
-tier = "optional"
-types = [1016]
-
-[services.context-actions]
-endpoint = "unix:/run/starling/context-actions.sock"
-tier = "optional"
-types = [16, 17, 1017]
-
-# -- Storage, per service ---------------------------------------------------
-#
-# Each service owns its schema; none reads another's. With no block, a SQLite
-# file named after the service is used under `data_dir`.
-#
-# [services.pchat.storage]
-# url = "postgres://starling:@db/starling_pchat"
-# max_connections = 16
-
-# The gateway's own block. It owns no wire types (it routes them) and nothing
-# dials it for work, but it needs an endpoint so the `health` collector can
-# reach it -- otherwise the process every client connects to is the one
-# component missing from the health dashboard.
-[services.gateway]
-enabled = true
-endpoint = "unix:/run/starling/gateway.sock"
-# `core` (the default). A tier says what the gateway does while a service is
-# unhealthy, so the gateway's own tier is one it would only consult about itself.
-tier = "core"
-types = []
-
-# -- The collectors ---------------------------------------------------------
-#
-# Neither owns a wire type; no client addresses them. A server with no --config
-# runs both by default, but --config replaces the defaults, so omitting them
-# here turns them off -- which is why they are written out.
-
-# Announces this server to the public list. Calls out, is never called, so needs
-# no endpoint.
-[services.directory]
-enabled = false
-tier = "optional"
-types = []
-
-# Asks every service how it is every few seconds and holds the answers, so
-# `operator-api` serves `/v1/health` from one place. It IS dialled, so it needs
-# an endpoint; without it startup fails and `/v1/health` answers 502.
-[services.health]
-enabled = true
-endpoint = "unix:/run/starling/health.sock"
-tier = "optional"
-types = []
-
-# -- The admin plane --------------------------------------------------------
-#
-# The Ice replacement: REST + OpenAPI, your own authentication, every action
-# recorded before it happens. Off by default and localhost-bound when on (the
-# opposite exposure to the gateway).
-
-[services.operator-api]
-enabled = false
-listen = "127.0.0.1:8081"
-tier = "optional"
-types = []
-
-[services.operator-api.auth]
-mode = "token"               # oidc | jwt | mtls | token
-
-[services.operator-api.auth.token]
-# The variable's name, never the secret itself.
-tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
-
-# [services.operator-api.auth.oidc]
-# issuer      = "https://keycloak.example.org/realms/starling"
-# audience    = "starling-admin"
-# scope_claim = "roles"
-# [services.operator-api.auth.oidc.map]
-# "starling-admin"   = ["*"]
-# "starling-auditor" = ["userdata:read", "audit:read"]
-
-[services.operator-api.audit]
-path = "/var/log/starling/operator-audit.log"
-# Cannot be recorded -> it does not happen.
-fail_closed = true

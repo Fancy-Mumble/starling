@@ -186,7 +186,7 @@ async fn apply(
             let channel = api.resolver().channel("context-actions").ok()?;
             let result = ContextActionsClient::new(channel)
                 .add(AddRequest {
-                    scope: Some(Scope { virtual_server: 1 }),
+                    scope: Some(Scope { instance: 1 }),
                     actor: None,
                     entry: Some(Entry {
                         action: action.clone(),
@@ -214,7 +214,7 @@ async fn apply(
             let channel = api.resolver().channel("context-actions").ok()?;
             let result = ContextActionsClient::new(channel)
                 .remove(RemoveRequest {
-                    scope: Some(Scope { virtual_server: 1 }),
+                    scope: Some(Scope { instance: 1 }),
                     actor: None,
                     owner: OWNER.to_owned(),
                     action: action.clone(),
@@ -259,7 +259,7 @@ pub(crate) async fn withdraw_entries(api: &OperatorApi, registered: &[String]) {
     for action in registered {
         let _ = client
             .remove(RemoveRequest {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 actor: None,
                 owner: OWNER.to_owned(),
                 action: action.clone(),

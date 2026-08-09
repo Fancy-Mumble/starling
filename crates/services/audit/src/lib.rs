@@ -18,14 +18,19 @@ use starling_proto_fancy::audit::audit_server::{Audit, AuditServer};
 use starling_proto_fancy::audit::{
     Entry, EntryPage, QueryRequest, RecordResult, VerifyRequest, VerifyResult,
 };
-use starling_proto_fancy::fancy::feature::{AuditEnvelope, AuditRecord, Page, audit_envelope};
+use starling_proto_fancy::fancy::feature::{
+    AuditEnvelope, AuditRecord, Config, Page, VerifyResult as VerifyResultMsg, audit_envelope,
+};
 use starling_proto_fancy::fancy::wire::PageInfo;
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::permit::Permit;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
+use starling_runtime::trail;
 use tonic::{Request, Response, Status};
 
 /// The schema, with the indexes the three query shapes actually use.
@@ -52,6 +57,8 @@ pub struct AuditService {
     store: Store,
     fanout: Fanout,
     logger: Logger,
+    /// Gates every client-facing read of the record.
+    permit: Permit,
     /// `log_days`, the retention an operator sets.
     ///
     /// It existed in `server-config` and was read by nothing, so the operator
@@ -70,6 +77,18 @@ const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600
 
 /// Milliseconds in a day.
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// The channel `ViewAudit` is held on.
+///
+/// The fork gates the audit surface on Write in the root channel
+/// (`AuditLogBridge::pushConfig`), which is its "is this an administrator"
+/// test. Reading the operator record is not a per-channel power: an entry names
+/// channels the reader may not be in, so a check against any other channel
+/// would be one an admin of one room could pass.
+const ROOT_CHANNEL: u32 = 0;
+
+/// What `ViewAudit` is, until it is a permission of its own.
+const WRITE: u32 = Perm::WRITE.bits();
 
 /// The hash of one entry, given the hash before it.
 ///
@@ -105,7 +124,25 @@ impl AuditService {
         .unwrap_or_default()
     }
 
-    /// Delete entries older than `log_days`, for one virtual server.
+    /// How many entries the chain holds.
+    ///
+    /// Counted rather than walked: the status card wants a number beside the
+    /// verify button, and reading every row to produce one would make opening
+    /// the config half as expensive as the verify it sits next to.
+    async fn height(&self, scope: u32) -> u64 {
+        use sqlx::Row as _;
+        sqlx::query("SELECT count(*) AS n FROM server_audit WHERE server_id = ?")
+            .bind(i64::from(scope))
+            .fetch_optional(self.store.pool())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.try_get::<i64, _>("n").ok())
+            .unwrap_or_default()
+            .unsigned_abs()
+    }
+
+    /// Delete entries older than `log_days`, for one server instance.
     ///
     /// Returns how many went, so the operator log can say so, a retention
     /// sweep that silently removes a month of records is exactly the kind of
@@ -164,7 +201,7 @@ impl AuditService {
         }
     }
 
-    /// One sweep per interval, across every virtual server, until aborted.
+    /// One sweep per interval, across every server instance, until aborted.
     async fn sweep_forever(self: Arc<Self>, scopes: Vec<u32>) {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
@@ -378,13 +415,13 @@ pub struct AuditRpc(Arc<AuditService>);
 impl Audit for AuditRpc {
     async fn record(&self, request: Request<Entry>) -> Result<Response<RecordResult>, Status> {
         let entry = request.into_inner();
-        let scope = entry.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = entry.scope.as_ref().map_or(1, |s| s.instance);
         Ok(Response::new(self.0.record(scope, entry).await))
     }
 
     async fn query(&self, request: Request<QueryRequest>) -> Result<Response<EntryPage>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         Ok(Response::new(self.0.query(scope, &req).await))
     }
 
@@ -393,7 +430,7 @@ impl Audit for AuditRpc {
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResult>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         Ok(Response::new(self.0.verify(scope).await))
     }
 }
@@ -405,19 +442,70 @@ impl ClientService for AuditService {
             return Actions::new();
         }
         let Ok(envelope) = AuditEnvelope::decode(inbound.payload.as_slice()) else {
+            tracing::debug!(
+                conn = inbound.conn,
+                session = inbound.session,
+                len = inbound.payload.len(),
+                "undecodable AuditEnvelope"
+            );
             return Actions::new();
         };
-        let Some(audit_envelope::Body::Query(query)) = envelope.body else {
+        let Some(body) = envelope.body else {
             return Actions::new();
         };
-        let cursor = query.page.unwrap_or_default();
+
+        // Every body below reads the operator record, so the gate is taken once
+        // here rather than per arm: an arm added later inherits the check
+        // instead of having to remember it.
+        //
+        // **This was missing entirely, and the log was world-readable.** Any
+        // connected client could send this envelope and page the whole record
+        // of who banned whom, who was registered under which name and every
+        // channel an operator touched. `ViewAudit` is Write on the root channel
+        // (`vendor/server/src/murmur/AuditLogBridge.cpp:218`), which is the
+        // fork's admin gate and the one the client's tab already assumes.
+        if !self.permit.allows(&inbound, ROOT_CHANNEL, WRITE).await {
+            tracing::info!(
+                session = inbound.session,
+                scope = inbound.scope,
+                "audit access refused: no Write on the root channel"
+            );
+            // Silence rather than a refusal message: an unauthorized query
+            // "receives an empty response, never a partial leak"
+            // (`Mumble.proto`, FancyAuditQuery), and answering "you may not"
+            // tells an unprivileged client the log exists and is non-empty.
+            return Actions::new();
+        }
+
+        match body {
+            audit_envelope::Body::Query(query) => self.serve_query(&inbound, &query, outer).await,
+            audit_envelope::Body::ConfigQuery(_) => self.serve_config(&inbound, outer).await,
+            audit_envelope::Body::Verify(verify) => {
+                self.serve_verify(&inbound, &verify, outer).await
+            }
+            // The rest are server->client bodies; a client sending one is
+            // either confused or probing, and neither deserves an answer.
+            _ => Actions::new(),
+        }
+    }
+}
+
+impl AuditService {
+    /// A page of the record, newest first.
+    async fn serve_query(
+        &self,
+        inbound: &Inbound,
+        query: &starling_proto_fancy::fancy::feature::Query,
+        outer: u16,
+    ) -> Actions {
+        let cursor = query.page.clone().unwrap_or_default();
         let page = self
             .query(
                 inbound.scope,
                 &QueryRequest {
                     since_ms: query.since_ms,
                     until_ms: query.until_ms,
-                    category: query.category,
+                    category: query.category.clone(),
                     target_account: query.target_account,
                     limit: cursor.page_size(50, 200),
                     // Keyset pagination, so a client pages by handing back the
@@ -432,6 +520,7 @@ impl ClientService for AuditService {
 
         let reply = AuditEnvelope {
             body: Some(audit_envelope::Body::Page(Page {
+                query_id: query.query_id.clone(),
                 page: Some(if page.more {
                     PageInfo::more_before(
                         page.entries
@@ -463,6 +552,55 @@ impl ClientService for AuditService {
                     .collect(),
             })),
         };
+
+        // The config rides along with the first page rather than waiting to be
+        // asked for. The tab runs a query as it opens and reads the config half
+        // afterwards, so sending both here means the chain-status card has a
+        // height by the time anybody can look at it, and a client that never
+        // opens the config half has paid one `count(*)` for it.
+        let mut actions = vec![to_conn(inbound.conn, outer, reply.encode_to_vec())];
+        actions.extend(self.serve_config(inbound, outer).await);
+        actions
+    }
+
+    /// The config snapshot, and the chain height the status card renders.
+    async fn serve_config(&self, inbound: &Inbound, outer: u16) -> Actions {
+        let settings = self.settings.get(inbound.scope);
+        let reply = AuditEnvelope {
+            body: Some(audit_envelope::Body::Config(Config {
+                // Reaching this point means the service is running and the
+                // caller may read it; there is no separate off switch to
+                // report, and claiming one would be a toggle that does nothing.
+                enabled: true,
+                categories: trail::category::ALL
+                    .iter()
+                    .map(|category| (*category).to_owned())
+                    .collect(),
+                retention_days: settings.log_days,
+                chain_height: self.height(inbound.scope).await,
+            })),
+        };
+        vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+    }
+
+    /// Walk the chain for the operator who asked.
+    async fn serve_verify(
+        &self,
+        inbound: &Inbound,
+        verify: &starling_proto_fancy::fancy::feature::Verify,
+        outer: u16,
+    ) -> Actions {
+        let result = self.verify(inbound.scope).await;
+        let reply = AuditEnvelope {
+            body: Some(audit_envelope::Body::VerifyResult(VerifyResultMsg {
+                intact: result.intact,
+                checked: result.checked,
+                broken_at: Uuid7::from_slice(&result.broken_at)
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                query_id: verify.query_id.clone(),
+            })),
+        };
         vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
     }
 }
@@ -479,11 +617,12 @@ impl Serve for AuditService {
         store.migrate(SCHEMA).await?;
         let settings =
             starling_runtime::Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
-        drop(settings.watch(&ctx.virtual_servers()));
+        drop(settings.watch(&ctx.instances()));
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
+            permit: Permit::new(ctx.resolver.clone()),
             settings,
         }))
     }
@@ -494,7 +633,7 @@ impl Serve for AuditService {
     /// and doing it on the write path would make every audited action wait for
     /// a `DELETE` that concerns none of it.
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
-        let scopes = ctx.virtual_servers();
+        let scopes = ctx.instances();
         let sweeper = tokio::spawn(Arc::clone(&self).sweep_forever(scopes));
         ctx.shutdown.wait().await;
         sweeper.abort();
@@ -542,6 +681,10 @@ mod tests {
             store,
             fanout: Fanout::default(),
             logger: Logger::null(),
+            // Points at a socket nothing is serving, so every check denies.
+            // That is the useful default for a test: the gate's failure
+            // direction is the property worth pinning.
+            permit: Permit::new(resolver.clone()),
             settings: starling_runtime::Settings::fixed(
                 resolver,
                 starling_proto_fancy::serverconfig::Snapshot {
@@ -629,6 +772,68 @@ mod tests {
             )
             .await;
         assert!(ancient.entries.is_empty(), "until_ms was ignored");
+    }
+
+    /// One client frame carrying `body`.
+    fn frame_of(body: audit_envelope::Body) -> Inbound {
+        Inbound {
+            conn: 1,
+            session: 42,
+            type_id: ServiceKind::Audit.outer_type(),
+            payload: AuditEnvelope { body: Some(body) }.encode_to_vec(),
+            gateway: "test".to_owned(),
+            scope: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_without_write_on_root_is_told_nothing() {
+        // The hole this gate closes: `frame` ran the query for anybody who
+        // sent the envelope, so any connected client could page the whole
+        // record of who banned whom and who was registered under which name.
+        //
+        // `permissions` is unreachable here, which is itself a denial: a stale
+        // deny is safe, a stale grant is a security bug.
+        let service = service().await;
+        let _ = service.record(1, entry("ban")).await;
+
+        for body in [
+            audit_envelope::Body::Query(starling_proto_fancy::fancy::feature::Query::default()),
+            audit_envelope::Body::ConfigQuery(starling_proto_fancy::fancy::feature::ConfigQuery {}),
+            audit_envelope::Body::Verify(starling_proto_fancy::fancy::feature::Verify::default()),
+        ] {
+            let actions = service.frame(frame_of(body)).await;
+            assert!(
+                actions.is_empty(),
+                "an ungated client was answered; the log is world-readable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_to_client_body_is_never_acted_on() {
+        // A client that sends back a Page or a Config is either confused or
+        // probing. Answering either would let it drive the reply path.
+        let service = service().await;
+        let actions = service
+            .frame(frame_of(audit_envelope::Body::Page(Page::default())))
+            .await;
+        assert!(actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_chain_height_is_what_the_status_card_reports() {
+        // The card renders a height beside the verify button, so the number
+        // has to be the row count rather than the page size a query happens
+        // to return.
+        let service = service().await;
+        assert_eq!(service.height(1).await, 0);
+        for action in ["ban", "kick", "unban"] {
+            let _ = service.record(1, entry(action)).await;
+        }
+        assert_eq!(service.height(1).await, 3);
+        // Another server instance's entries are not this one's height.
+        assert_eq!(service.height(2).await, 0);
     }
 
     #[tokio::test]

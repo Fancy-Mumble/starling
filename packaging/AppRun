@@ -1,0 +1,23 @@
+#!/bin/sh
+# The AppImage's entrypoint.
+#
+# One deviation from running the binary directly, and it is the reason this file
+# exists: an AppImage is a thing people double-click, and a double-click passes
+# no arguments. `starling` with no arguments prints its usage, which is right for
+# a binary on a PATH and useless in a window that closes a moment later. So an
+# AppImage started with nothing to do starts the server.
+#
+# Anything else is passed straight through, so the file is still a normal CLI:
+#
+#   ./Starling-x86_64.AppImage --version
+#   ./Starling-x86_64.AppImage set-superuser-password hunter2
+#   ./Starling-x86_64.AppImage --all-in-one --config ./my.toml
+set -eu
+
+HERE="$(dirname "$(readlink -f "$0")")"
+BIN="${HERE}/usr/bin/starling"
+
+if [ "$#" -eq 0 ]; then
+    exec "${BIN}" --all-in-one
+fi
+exec "${BIN}" "$@"

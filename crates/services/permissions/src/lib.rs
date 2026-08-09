@@ -221,9 +221,7 @@ impl PermissionsService {
                 Ok(transport) => {
                     MetadataClient::new(transport)
                         .watch(TreeRequest {
-                            scope: Some(Scope {
-                                virtual_server: scope,
-                            }),
+                            scope: Some(Scope { instance: scope }),
                         })
                         .await
                 }
@@ -436,9 +434,7 @@ impl PermissionsService {
                 Ok(transport) => {
                     SessionViewClient::new(transport)
                         .subscribe(SubscribeRequest {
-                            scope: Some(Scope {
-                                virtual_server: scope,
-                            }),
+                            scope: Some(Scope { instance: scope }),
                             subscriber: Self::NAME.to_owned(),
                         })
                         .await
@@ -710,9 +706,7 @@ impl PermissionsService {
         let transport = resolver.channel("session-view").ok()?;
         let resolved = SessionViewClient::new(transport)
             .get(SessionGetRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 session,
             })
             .await
@@ -932,13 +926,13 @@ impl Serve for PermissionsService {
         Ok(Arc::new(service))
     }
 
-    /// Follow the channel tree for every virtual server, until shutdown.
+    /// Follow the channel tree for every server instance, until shutdown.
     ///
-    /// One subscription per virtual server: `metadata` shards by it, and a tree
+    /// One subscription per server instance: `metadata` shards by it, and a tree
     /// is only meaningful within one.
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let mut followers = Vec::new();
-        for scope in ctx.virtual_servers() {
+        for scope in ctx.instances() {
             let service = Arc::clone(&self);
             followers.push(tokio::spawn(
                 async move { service.follow_tree(scope).await },
@@ -965,10 +959,10 @@ impl Serve for PermissionsService {
     }
 }
 
-/// The scope a request names, defaulting to the first virtual server.
+/// The scope a request names, defaulting to the first server instance.
 #[must_use]
 pub fn scope_of(scope: Option<Scope>) -> u32 {
-    scope.map_or(1, |scope| scope.virtual_server)
+    scope.map_or(1, |scope| scope.instance)
 }
 
 /// The outer type this service owns.

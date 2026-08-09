@@ -47,6 +47,16 @@ COPY --from=builder /usr/local/bin/starling /usr/local/bin/starling
 USER starling
 WORKDIR /var/lib/starling
 
+# `USER` does not set this, and the default is a directory `starling` cannot
+# write. It matters because `--all-in-one` with no `--config` now writes a
+# starter configuration where the platform keeps them, which under an unwritable
+# HOME is a container that fails to start instead of one that just works.
+#
+# A container that already has a `starling-data/` here keeps it: an existing data
+# directory beats this, so upgrading a deployment that ran with no `--config`
+# changes nothing about where its databases and certificate live.
+ENV HOME=/var/lib/starling
+
 # Documentation, not publication, compose decides what is actually reachable.
 #   64738/tcp  gateway, control plane, TLS terminates there
 #   64738/udp  voice, its own socket; audio never touches the gateway

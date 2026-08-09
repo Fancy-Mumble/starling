@@ -98,6 +98,12 @@ pub struct ChannelJson {
     pub hidden: bool,
     /// Vanishes when the last member leaves.
     pub temporary: bool,
+    /// Out of the tree: parentless, and not the root.
+    ///
+    /// `parent` above is 0 for it, because a channel viewer's tree has to put
+    /// it somewhere, so this is the only thing distinguishing a meeting room or
+    /// a friend DM from a channel that really does sit at the root.
+    pub detached: bool,
 }
 
 /// A text message, as an event reports it.
@@ -173,11 +179,11 @@ pub enum Event {
 
     /// The server's state became readable, and this channel is live.
     ///
-    /// Virtual servers are configuration here; there is nothing to boot at
+    /// Server instances are configuration here; there is nothing to boot at
     /// runtime. So this fires when the bridge attaches, which is what a
     /// consumer wants it for either way: the moment it is worth asking.
     Started {
-        /// Which virtual server.
+        /// Which server instance.
         server_id: u32,
     },
     /// The server's state stopped being readable.
@@ -186,7 +192,7 @@ pub enum Event {
     /// consumer's side they are indistinguishable, and both mean the same
     /// thing, what you are holding is now stale.
     Stopped {
-        /// Which virtual server.
+        /// Which server instance.
         server_id: u32,
     },
 
@@ -275,7 +281,7 @@ impl EventHub {
         if self.attached.fetch_add(1, Ordering::Relaxed) + 1 == BRIDGES {
             self.live.store(true, Ordering::Relaxed);
             self.publish(Event::Started {
-                server_id: scope.virtual_server,
+                server_id: scope.instance,
             });
         }
     }
@@ -289,7 +295,7 @@ impl EventHub {
         if self.attached.fetch_sub(1, Ordering::Relaxed) == BRIDGES {
             self.live.store(false, Ordering::Relaxed);
             self.publish(Event::Stopped {
-                server_id: scope.virtual_server,
+                server_id: scope.instance,
             });
         }
     }
@@ -312,7 +318,7 @@ impl EventHub {
     /// Start every bridge task. Returns immediately; the tasks run until
     /// shutdown and reconnect on their own.
     pub fn spawn_bridges(&self, resolver: starling_runtime::channel::Resolver) {
-        let scope = Scope { virtual_server: 1 };
+        let scope = Scope { instance: 1 };
         drop(tokio::spawn(bridge_sessions(
             self.clone(),
             resolver.clone(),
@@ -687,6 +693,7 @@ fn user_json(s: &starling_proto_fancy::sessionview::Session) -> UserJson {
 /// `Channel.flags` bits, from `metadata`'s `tree_actor.rs`.
 const CHANNEL_HIDDEN: u32 = 1;
 const CHANNEL_TEMPORARY: u32 = 2;
+const CHANNEL_DETACHED: u32 = 4;
 
 fn channel_json(c: &starling_proto_fancy::metadata::Channel) -> ChannelJson {
     ChannelJson {
@@ -699,6 +706,7 @@ fn channel_json(c: &starling_proto_fancy::metadata::Channel) -> ChannelJson {
         links: c.links.clone(),
         hidden: c.flags & CHANNEL_HIDDEN != 0,
         temporary: c.flags & CHANNEL_TEMPORARY != 0,
+        detached: c.flags & CHANNEL_DETACHED != 0,
     }
 }
 
@@ -755,6 +763,7 @@ mod tests {
                 links: Vec::new(),
                 hidden: false,
                 temporary: false,
+                detached: false,
             },
         });
         assert!(json.contains(r#""event":"channelStateChanged""#), "{json}");

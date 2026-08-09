@@ -198,7 +198,7 @@ impl Plugins for PluginsRpc {
 
     async fn kv_get(&self, request: Request<KvGetRequest>) -> Result<Response<KvValue>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let value = self
             .0
             .kv
@@ -213,7 +213,7 @@ impl Plugins for PluginsRpc {
 
     async fn kv_scan(&self, request: Request<KvScanRequest>) -> Result<Response<KvPage>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let pairs = self
             .0
             .kv
@@ -237,7 +237,7 @@ impl Plugins for PluginsRpc {
 
     async fn kv_write(&self, request: Request<KvWriteRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         // The batch is applied atomically, which is what lets a plugin keep its
         // own secondary indexes consistent with its records.
         let ops: Vec<KvOp> = req

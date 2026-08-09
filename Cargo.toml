@@ -98,8 +98,8 @@ starling-migrate = { path = "crates/migrate" }
 
 # -- wire -------------------------------------------------------------------
 bytes = "1"
-prost = "0.14.3"
-prost-build = "0.14.3"
+prost = "0.14.4"
+prost-build = "0.14.4"
 tonic = { version = "0.14", features = ["router", "transport"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
@@ -148,6 +148,8 @@ uuid = { version = "1", features = ["v7"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
+# The operator's channel-name and user-name patterns (`runtime::names`).
+regex = "1"
 # Control-stream compression, wired into the gateway.
 zstd = "0.13"
 

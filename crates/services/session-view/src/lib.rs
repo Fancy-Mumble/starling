@@ -76,7 +76,7 @@ impl SessionViewService {
     /// has never seen. A caller that gets `None` evaluates as an anonymous guest,
     /// which is the safe direction.
     fn asker(&self, query: &ColdQuery) -> Option<Subject> {
-        let scope = query.scope.map_or(1, |scope| scope.virtual_server);
+        let scope = query.scope.map_or(1, |scope| scope.instance);
         let Some(cold_query::Query::Acl(acl)) = &query.query else {
             return None;
         };
@@ -127,7 +127,7 @@ impl SessionView for ViewRpc {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let scope = request.into_inner().scope.map_or(1, |s| s.virtual_server);
+        let scope = request.into_inner().scope.map_or(1, |s| s.instance);
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BUFFER);
 
         // Snapshot first, then deltas. A subscriber must never have to ask for
@@ -168,7 +168,7 @@ impl SessionView for ViewRpc {
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<Session>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         self.0
             .sessions
             .get(scope, req.session)
@@ -180,7 +180,7 @@ impl SessionView for ViewRpc {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<SessionList>, Status> {
-        let scope = request.into_inner().scope.map_or(1, |s| s.virtual_server);
+        let scope = request.into_inner().scope.map_or(1, |s| s.instance);
         Ok(Response::new(self.0.sessions.snapshot(scope)))
     }
 
@@ -189,7 +189,7 @@ impl SessionView for ViewRpc {
         request: Request<Announcement>,
     ) -> Result<Response<starling_proto_fancy::common::Ack>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         match req.what {
             Some(announcement::What::Up(session)) => {
                 self.0.sessions.upsert(scope, session.clone());
@@ -275,7 +275,7 @@ mod tests {
         let rpc = ViewRpc(service());
         let _ = rpc
             .announce(Request::new(Announcement {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 what: Some(announcement::What::Up(session(7))),
             }))
             .await
@@ -283,7 +283,7 @@ mod tests {
 
         let got = rpc
             .get(Request::new(GetRequest {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 session: 7,
             }))
             .await
@@ -297,7 +297,7 @@ mod tests {
         // A stale grant is a security bug; a session that has left must not
         // still be answerable.
         let rpc = ViewRpc(service());
-        let scope = Some(Scope { virtual_server: 1 });
+        let scope = Some(Scope { instance: 1 });
         let _ = rpc
             .announce(Request::new(Announcement {
                 scope,
@@ -318,7 +318,7 @@ mod tests {
 
         assert!(
             rpc.get(Request::new(GetRequest {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 session: 7,
             }))
             .await
@@ -327,11 +327,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn virtual_servers_do_not_see_each_other_s_sessions() {
+    async fn server_instances_do_not_see_each_other_s_sessions() {
         let rpc = ViewRpc(service());
         let _ = rpc
             .announce(Request::new(Announcement {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 what: Some(announcement::What::Up(session(7))),
             }))
             .await
@@ -339,7 +339,7 @@ mod tests {
 
         let other = rpc
             .list(Request::new(SubscribeRequest {
-                scope: Some(Scope { virtual_server: 2 }),
+                scope: Some(Scope { instance: 2 }),
                 subscriber: "test".to_owned(),
             }))
             .await
@@ -373,7 +373,7 @@ mod tests {
 
         let subject = service
             .asker(&ColdQuery {
-                scope: Some(Scope { virtual_server: 1 }),
+                scope: Some(Scope { instance: 1 }),
                 query: Some(cold_query::Query::Acl(
                     starling_proto_fancy::sessionview::AclQuery {
                         session: 7,

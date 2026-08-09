@@ -133,7 +133,7 @@ pub struct PushRpc(Arc<PushService>);
 impl Push for PushRpc {
     async fn register(&self, request: Request<Registration>) -> Result<Response<Ack>, Status> {
         let registration = request.into_inner();
-        let scope = registration.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = registration.scope.as_ref().map_or(1, |s| s.instance);
         self.0.register(scope, &registration).await;
         Ok(Response::new(Ack {}))
     }
@@ -143,7 +143,7 @@ impl Push for PushRpc {
         request: Request<UnregisterRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let _ = sqlx::query("DELETE FROM push_registration WHERE server_id = ? AND token = ?")
             .bind(i64::from(scope))
             .bind(&req.token)
@@ -157,7 +157,7 @@ impl Push for PushRpc {
         request: Request<Notification>,
     ) -> Result<Response<NotifyResult>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let mut delivered = 0;
         let mut skipped = 0;
         for account in &req.accounts {
@@ -192,7 +192,7 @@ impl Push for PushRpc {
         request: Request<SubscriptionRequest>,
     ) -> Result<Response<SubscriptionList>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         Ok(Response::new(SubscriptionList {
             registrations: self.0.subscriptions(scope, req.account).await,
         }))

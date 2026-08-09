@@ -28,7 +28,7 @@ jobs:
     name: Build and push image
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub release on a tag
+      contents: read # check out the tree; the release itself is release.yml's
       packages: write # push to the org's GHCR, via GITHUB_TOKEN
     steps:
       - uses: actions/checkout@v6
@@ -86,20 +86,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # A tagged build is a release: publish a GitHub release for the same tag
-      # once the image is pushed, so the package and the release stay in step.
-      # Branch (edge) builds skip this.
-      - name: Create GitHub release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          body: |
-            Container image, built and pushed to GHCR by this release:
-
-            ```
-            docker pull ghcr.io/fancy-mumble/starling:${{ steps.meta.outputs.version }}
-            ```
-
-            Also tagged `:latest`. Running it — the all-in-one box or the
-            twenty-container split — is documented in docs/RELEASING.md.
+      # The GitHub release for a tag is cut by `release.yml`, which is also
+      # what attaches the .deb, .rpm, .AppImage, .dmg and .exe to it. This
+      # workflow used to cut one too; both wrote the same release, so whichever
+      # finished last replaced the other's notes with its own.

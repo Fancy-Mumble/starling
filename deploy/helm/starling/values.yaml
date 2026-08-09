@@ -1,0 +1,491 @@
+# Starling on Kubernetes.
+#
+# The deployment layer only (docs/CONFIGURATION.md "Two layers"). Everything an
+# operator changes at runtime - bandwidth, welcome text, message limits, the
+# public-list credentials - belongs to the `server-config` service and is not
+# here; putting it here would make a restart the way to change it.
+
+# ---------------------------------------------------------------------------
+# Which shape to deploy
+# ---------------------------------------------------------------------------
+# "services"   the multi-process shape: one workload per service, the picture
+#              docs/ARCHITECTURE.md §9 draws for Kubernetes.
+# "all-in-one" every service in one process over in-memory transports. Same
+#              image, same config; `--all-in-one` overrides `runtime.all_in_one`
+#              at the command line. One pod, one volume, no gRPC hop.
+#
+# Start here if you are trying the chart out. The routing table below is read
+# in both modes, so moving between them is this one value.
+mode: services
+
+image:
+  repository: ghcr.io/fancy-mumble/starling
+  # Empty means Chart.appVersion. Pin to `sha-<short>` for an immutable
+  # deployment; docs/RELEASING.md lists what each tag means.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# runtime
+# ---------------------------------------------------------------------------
+runtime:
+  # The gateway's generated certificate and every service's SQLite file live
+  # here. Both matter across a restart, so this is a volume in every mode.
+  dataDir: /var/lib/starling
+
+# The server instances this deployment carries. One is the normal case.
+instances:
+  - id: 1
+    name: Starling
+    port: 64738
+
+telemetry:
+  # "text" or "json". Anything scraping these logs wants json.
+  logFormat: json
+  # Neither binds a listener in this build. Left empty rather than defaulted so
+  # that setting one is a deliberate act rather than a value that looks live.
+  metrics: ""
+  otlpEndpoint: ""
+
+# RUST_LOG for every container.
+logLevel: info
+
+# ---------------------------------------------------------------------------
+# The gateway: the only component clients connect to
+# ---------------------------------------------------------------------------
+gateway:
+  replicas: 1
+
+  # Per client. Full means disconnect that client: dropping a control message
+  # desyncs it permanently and silently, and unbounded queueing is a memory DoS.
+  controlQueue: 4096
+  # Per client, for tunnelled audio. Full means drop the oldest and count it.
+  audioQueue: 128
+  defaultDeadline: 5s
+  # Deadlines alone fail slowly, so a service that keeps failing is shed at the
+  # door instead of being waited on.
+  breakerFailures: 5
+  breakerCooldown: 10s
+
+  tls:
+    # A Secret holding `tls.crt` and `tls.key` - the shape cert-manager and
+    # `kubectl create secret tls` both produce.
+    #
+    # Leave empty and the gateway generates a self-signed pair into its own
+    # volume on first boot, as murmur does. That is fine for one replica and
+    # wrong for more than one: Mumble clients identify a server by certificate
+    # fingerprint, and two gateway pods that each generated their own would
+    # present a different identity per connection. The chart refuses that
+    # combination rather than letting it be discovered by a client warning.
+    existingSecret: ""
+    mountPath: /etc/starling/tls
+
+  # Per route, never one shared bucket. murmur's single 1 msg/s bucket silently
+  # ate screen-share SDP offers; a throttled message here is reported.
+  limits:
+    control:
+      rate: 1/s
+      burst: 5
+    signalling:
+      rate: 10/s
+      burst: 20
+    plugin:
+      rate: 4/s
+      burst: 15
+    acl:
+      # The ACL editor opens the channel tree with one query per channel, so an
+      # administrator on a thirty-channel server emits thirty in a second or two.
+      rate: 20/s
+      burst: 60
+    chat:
+      # A person typing. Losing a message somebody wrote is the worst failure
+      # here: silent, unattributed, and the sender believes they were heard.
+      rate: 5/s
+      burst: 20
+    audio:
+      rate: 200/s
+      burst: 400
+
+  # A Fancy client that reconnects replays only the gap rather than pulling a
+  # full flood of every ChannelState and UserState. Legacy clients cannot resume.
+  resume:
+    enabled: true
+    ring: 256
+    ttl: 120s
+
+  # How clients reach the server. Ingress is not an option and never will be:
+  # `Ingress` is HTTP-only, Mumble is raw TCP+TLS, and voice is UDP.
+  service:
+    type: LoadBalancer
+    port: 64738
+    annotations: {}
+    loadBalancerIP: ""
+    loadBalancerClass: ""
+    # "Local" preserves the client source address, which is what the
+    # source-IP affinity below is keyed on, and what the server logs and bans
+    # by. "Cluster" hands every connection the node's address instead.
+    externalTrafficPolicy: Local
+    # Pins a client's UDP to the pod its TCP went to. Only meaningful with more
+    # than one gateway replica; harmless with one.
+    sessionAffinity: ClientIP
+    externalIPs: []
+
+# ---------------------------------------------------------------------------
+# voice: the UDP plane, and the one genuinely awkward thing about this on K8s
+# ---------------------------------------------------------------------------
+# A legacy Mumble client sends UDP to the same host:port it made TCP to and
+# cannot be redirected, so voice has to answer at the gateway's address.
+#
+# colocateWithGateway runs voice as a second container in the gateway pod, so
+# one Service address carries TCP 64738 to the gateway and UDP 64738 to voice.
+# That is the "sidecar in the same pod" option docs/ARCHITECTURE.md §9 names,
+# and it is the only one that needs nothing from the cluster but a Service.
+#
+# Set it false to give voice its own workload and its own UDP Service. Legacy
+# clients then cannot find it, so this only makes sense together with
+# `services.voice.publicUrl`, which hands Fancy clients an explicit voice
+# endpoint. Fancy clients will follow it; every other client will not.
+voice:
+  colocateWithGateway: true
+  # The gRPC port voice serves on when colocated. Not 50051: two containers in
+  # one pod share a network namespace, so voice and the gateway cannot both
+  # bind it.
+  colocatedGrpcPort: 50052
+  # Only read when colocateWithGateway is false.
+  service:
+    type: LoadBalancer
+    annotations: {}
+    loadBalancerIP: ""
+    externalTrafficPolicy: Local
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+# Every service writes a SQLite file named after itself under `runtime.dataDir`
+# and reads no other service's tables, so each workload gets its own volume
+# rather than sharing one. Point an individual service at a real database with
+# `services.<name>.storage.url` when it outgrows that.
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  # The image runs as a non-root user, so the volume has to be group-writable
+  # by the pod. Kubernetes chgrps the volume to this gid and adds it to every
+  # container's supplementary groups, so the value itself does not matter as
+  # long as one is set.
+  fsGroup: 1000
+
+# ---------------------------------------------------------------------------
+# Defaults every workload inherits, overridable per service below
+# ---------------------------------------------------------------------------
+defaults:
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # SIGTERM raises the drain and the runtime finishes what it is holding.
+  # Kubernetes sends SIGKILL this many seconds later whatever the process
+  # thinks about it, which is the number the drain was written against.
+  terminationGracePeriodSeconds: 30
+  # Readiness here means "the gRPC listener is up", not "the caches are warm".
+  # The runtime's real readiness is an in-process gate served over
+  # `starling.health.v1.Health`, which is not the `grpc.health.v1.Health` that
+  # a native Kubernetes `grpc:` probe speaks - so a TCP connect is the honest
+  # probe available from outside. See the chart README.
+  probes:
+    enabled: true
+    readiness:
+      initialDelaySeconds: 2
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 6
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# A PodDisruptionBudget for the tiers whose absence rejects logins.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # Which tiers get one. `essential` is the set that stops logins when down.
+  tiers:
+    - essential
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+# ---------------------------------------------------------------------------
+# The routing table
+# ---------------------------------------------------------------------------
+# One entry per service. `types` is the outer message type from
+# docs/PROTOCOL-COMPATIBILITY.md §3, one number per service, because a
+# service's own message types live in its nested envelope and the gateway never
+# looks inside. `tier` says what the gateway does while this service is down.
+#
+# Adding a service is an entry here and nothing else: the gateway routes on the
+# outer type and forwards the payload verbatim, so it needs no stubs and no
+# release.
+#
+# Per-entry keys beyond the routing ones, all optional:
+#   replicas, resources, nodeSelector, tolerations, affinity, podAnnotations
+#   storage.url          point this one service at a real database
+#   persistence.enabled  false for a service with nothing to keep
+#   extraToml            raw TOML appended to this service's block
+services:
+
+  # -- essential: down means reject logins ---------------------------------
+  session-lifecycle:
+    enabled: true
+    tier: essential
+    types: [0, 2, 3, 4, 5, 9, 15, 21, 22, 1000]
+
+  session-view:
+    enabled: true
+    tier: essential
+    types: []                  # no client-facing type: internal by construction
+
+  permissions:
+    enabled: true
+    tier: essential
+    types: [12, 13, 20, 1001]
+    limits: acl                # not the 1/s control bucket: an editor opens N at once
+
+  metadata:
+    enabled: true
+    tier: essential
+    types: [6, 7, 1002]
+
+  userdata:
+    enabled: true
+    tier: essential
+    types: [14, 18, 23, 1003]
+
+  server-config:
+    enabled: true
+    tier: essential
+    types: [24, 25, 1013]
+
+  # -- core: down means that feature is dead and the server still runs -----
+  voice:
+    enabled: true
+    tier: core
+    types: [1, 19, 1004]       # UDPTunnel, VoiceTarget, Fancy envelope
+    limits: audio              # never the 1/s control bucket: this is speech
+    # Empty follows gateway.service.port, which is the only correct value: a
+    # legacy client sends UDP to the host:port it made TCP to. Set it only to
+    # bind a different interface, and keep the port the same.
+    udpListen: ""
+    # Advertises an explicit voice endpoint to Fancy clients. Leave empty while
+    # voice answers at the gateway's address, which is the colocated default;
+    # set it only when voice is reachable somewhere else, and know that legacy
+    # clients ignore it.
+    publicUrl: ""
+
+  text:
+    enabled: true
+    tier: core
+    types: [11, 1005]
+    limits: chat               # not the 1/s control bucket: a person typing
+
+  pchat:
+    enabled: true
+    tier: core
+    types: [1006]
+
+  moderation:
+    enabled: true
+    tier: core
+    types: [8, 10, 1007]
+
+  # -- optional: down means nobody notices ---------------------------------
+  screenshare:
+    enabled: true
+    tier: optional
+    types: [1008]
+    limits: signalling         # not the 1/s control bucket
+
+  files:
+    enabled: true
+    tier: optional
+    types: [1009]
+    listen: 0.0.0.0:8080
+    # What the signed URLs handed out over the control channel point at, which
+    # is what a *client* must reach - not what the container binds. The
+    # in-cluster default below is wrong for every client outside the cluster;
+    # set this to the Ingress host under `files.ingress` and it is right again.
+    publicUrl: ""
+    urlTtl: 15m
+    maxUpload: 512MiB
+
+  plugins:
+    enabled: true
+    tier: optional
+    types: [26, 1010]
+    limits: plugin
+
+  push:
+    enabled: true
+    tier: optional
+    types: [1011]
+
+  audit:
+    enabled: true
+    tier: optional
+    types: [1012]
+
+  onboarding:
+    enabled: true
+    tier: optional
+    types: [1014]
+
+  social:
+    enabled: true
+    tier: optional
+    types: [1015]
+
+  link-preview:
+    enabled: true
+    tier: optional
+    types: [1016]
+
+  context-actions:
+    enabled: true
+    tier: optional
+    types: [16, 17, 1017]
+
+  # Announces this server to the public Mumble list, once an hour. Silent until
+  # registry_name / registry_password / registry_url are set in `server-config`.
+  #
+  # It publishes the fingerprint of the gateway's certificate, which it reads
+  # from disk - so it needs the same certificate the gateway presents. In this
+  # shape the gateway and directory are different pods, so that means
+  # `gateway.tls.existingSecret`. The chart refuses to render this enabled
+  # without one rather than deploying an announcer that finds no certificate
+  # and says so once an hour into a log nobody reads.
+  directory:
+    enabled: false
+    tier: optional
+    types: []
+    # Nothing dials it: no gRPC surface, no endpoint, and so no probe either.
+    noEndpoint: true
+    persistence:
+      enabled: false
+    extraToml: |
+      [services.directory.options]
+      # Where the public list's own certificate is verified. Debian's path,
+      # which is what this image is. A missing bundle fails the announcement
+      # rather than posting unverified: the payload carries a shared secret.
+      trust_store = "/etc/ssl/certs/ca-certificates.crt"
+
+  # The other collector, and the opposite shape: this one is dialled. It asks
+  # every service how it is on a timer and holds the answer, so `operator-api`
+  # serves /v1/health from one snapshot instead of fanning out across twenty
+  # endpoints per page load.
+  #
+  # On by default even though operator-api is its only reader: a service that
+  # stops answering reads UNREACHABLE, a state no service can report about
+  # itself, and a collector that started with the dashboard would have no
+  # history of the outage the operator opened it to look at.
+  health:
+    enabled: true
+    tier: optional
+    types: []
+    persistence:
+      enabled: false
+
+  # The gateway's own block. It owns no wire types - it is the process that
+  # routes them - and nothing dials it to do work. It needs an endpoint anyway,
+  # because the `health` collector dials every service, and without one the
+  # gateway is the single component missing from the health dashboard: the
+  # process every client connects to, holding every control queue in the server.
+  gateway:
+    enabled: true
+    # The tier says what the *gateway* does while a service is unhealthy, so
+    # the gateway's own tier is a value it would only ever consult about
+    # itself. `core` is the default and there is no answer for it to act on.
+    tier: core
+    types: []
+
+# ---------------------------------------------------------------------------
+# The admin plane
+# ---------------------------------------------------------------------------
+# The highest-privilege surface in the system: off unless asked for, never
+# given a LoadBalancer by this chart, and refusing any request it cannot first
+# record. Reach it with `kubectl port-forward`, or put your own authenticating
+# proxy in front.
+operatorApi:
+  enabled: false
+  tier: optional
+  listen: 0.0.0.0:8081
+  port: 8081
+
+  auth:
+    # oidc | jwt | mtls | token
+    mode: token
+    token:
+      # The chart creates a Secret from this value. Prefer existingSecret and
+      # keep the token out of your values file and out of `helm get values`.
+      value: ""
+      existingSecret: ""
+      existingSecretKey: token
+      scopes: ["*"]
+
+  audit:
+    path: /var/lib/starling/operator-audit.log
+    # Cannot be recorded -> it does not happen.
+    failClosed: true
+
+  service:
+    type: ClusterIP
+    annotations: {}
+
+  persistence:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# The one component that can use an Ingress
+# ---------------------------------------------------------------------------
+# The bulk plane is plain HTTP, so unlike the gateway it fits an Ingress. Turn
+# this on and set `services.files.publicUrl` to the same host, or the signed
+# URLs handed to clients will point somewhere they cannot reach.
+files:
+  ingress:
+    enabled: false
+    className: ""
+    annotations:
+      # 512MiB is `services.files.maxUpload`; an ingress with a smaller body
+      # limit rejects the upload the server was willing to take.
+      nginx.ingress.kubernetes.io/proxy-body-size: 512m
+    hosts:
+      - host: files.starling.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+# Extra TOML appended to the generated config, for keys this chart does not
+# model. `--config` replaces the defaults rather than merging with them, so the
+# generated file is complete on its own and this is additive to it.
+extraToml: ""

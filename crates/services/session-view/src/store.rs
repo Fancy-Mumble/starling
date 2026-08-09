@@ -1,4 +1,4 @@
-//! The composed view itself: sessions by virtual server.
+//! The composed view itself: sessions by server instance.
 //!
 //! Sharded by session id in the deployment model (`docs/diagrams/scaling.puml`)
 //! unsharded, one actor performs every domain read, which is Discord's
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use starling_proto_fancy::sessionview::{Session, Sessions as SessionList};
 
-/// Every connected session, by virtual server.
+/// Every connected session, by server instance.
 #[derive(Debug, Clone, Default)]
 pub struct Sessions {
     inner: Arc<Mutex<HashMap<u32, Shard>>>,

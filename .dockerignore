@@ -15,10 +15,15 @@
 .gitignore
 
 # Not inputs to `cargo build`.
+#
+# `starling.example.toml` is missing from this list on purpose: it stopped being
+# documentation when `crates/starling/src/firstrun.rs` started `include_str!`ing
+# it as the configuration a first start writes. Excluding it breaks the build.
 /docs/
 /.github/
 /scripts/
 /deploy/
+/packaging/
 Dockerfile
 .dockerignore
 docker-compose.yml

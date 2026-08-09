@@ -46,13 +46,12 @@ pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
         .map(|value| {
             value
                 .parse::<u32>()
-                .map_err(|_| format!("--server needs a virtual server id, not {value:?}"))
+                .map_err(|_| format!("--server needs a server instance id, not {value:?}"))
         })
         .transpose()?;
 
     let config = crate::compose::load(arguments).map_err(|error| error.to_string())?;
-    let scope =
-        scope.unwrap_or_else(|| config.virtual_servers.first().map_or(1, |server| server.id));
+    let scope = scope.unwrap_or_else(|| config.instances.first().map_or(1, |server| server.id));
 
     // The configured logger, not `Logger::null()`. This command resets the
     // administrator credential while deliberately bypassing the operator API,
@@ -81,7 +80,7 @@ pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
             // credential changed, never what it changed to.
             logger.log(
                 LogEvent::notice(Category::Admin, "superuser password set")
-                    .with("virtual_server", scope)
+                    .with("instance", scope)
                     .with("source", "command line"),
             );
             Ok::<_, ServiceError>(())
@@ -96,7 +95,7 @@ pub(crate) fn set_password(arguments: &[String]) -> Result<(), String> {
     // answered, and the answer is what the caller is waiting for. The password
     // itself is deliberately not echoed, whoever ran this typed it.
     crate::out(&format!(
-        "superuser password set on virtual server {scope}\n"
+        "superuser password set on server instance {scope}\n"
     ))
 }
 
@@ -182,7 +181,7 @@ mod tests {
 
     #[test]
     fn a_non_numeric_server_id_is_reported_rather_than_defaulted() {
-        // Defaulting would set the password on virtual server 1 while the
+        // Defaulting would set the password on server instance 1 while the
         // operator believes they set it on another.
         let error = set_password(&args(&["set-superuser-password", "pw", "--server", "main"]))
             .expect_err("a non-numeric id must be refused");

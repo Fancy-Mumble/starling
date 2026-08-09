@@ -1,0 +1,26 @@
+apiVersion: v2
+name: starling
+description: |
+  Starling, in the shape docs/ARCHITECTURE.md §9 describes: one image whose
+  entrypoint takes a service name, a gateway in front, and the media planes
+  bypassing it entirely.
+type: application
+
+# The chart's own version, bumped when the templates change.
+version: 0.1.0
+
+# The image tag this chart is written against: [workspace.package].version in
+# the root Cargo.toml, which docs/RELEASING.md ties the image tag to.
+appVersion: "0.2.0"
+
+keywords:
+  - mumble
+  - voice
+  - starling
+home: https://github.com/Fancy-Mumble/starling
+sources:
+  - https://github.com/Fancy-Mumble/starling
+annotations:
+  # The gateway is raw TCP+TLS and voice is UDP, so neither can sit behind an
+  # Ingress. Both need a Service the cluster can actually give an address to.
+  artifacthub.io/containsSecurityUpdates: "false"

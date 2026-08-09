@@ -1,0 +1,241 @@
+{{- if eq .Values.mode "services" }}
+{{- $full := include "starling.fullname" . }}
+{{- $d := .Values.defaults }}
+{{- $gw := .Values.services.gateway }}
+{{- $voice := .Values.services.voice }}
+{{- $colocate := and $voice.enabled .Values.voice.colocateWithGateway }}
+{{- $voicePort := .Values.voice.colocatedGrpcPort }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}-gateway
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+    starling.fancy-mumble.org/tier: {{ $gw.tier }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  serviceName: {{ $full }}-gateway
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "starling.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with $.Values.defaults.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "starling.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+        starling.fancy-mumble.org/tier: {{ $gw.tier }}
+        {{- if $colocate }}
+        # The voice container lives here too, so the voice ClusterIP selects
+        # this pod. Two component labels cannot be carried at once, which is
+        # why the voice Service selects on the gateway's.
+        starling.fancy-mumble.org/carries-voice: "true"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "starling.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $d.terminationGracePeriodSeconds }}
+      {{- include "starling.podSpecExtras" (dict "svc" $gw "root" .) | nindent 6 }}
+      containers:
+        - name: gateway
+          image: {{ include "starling.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - "gateway"
+            - "--config"
+            - "/etc/starling/starling.toml"
+          env:
+            {{- include "starling.commonEnv" . | nindent 12 }}
+            {{- include "starling.bindEnv" (dict "name" "gateway" "root" .) | nindent 12 }}
+          ports:
+            - name: mumble-tcp
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: TCP
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          # Probed on the gRPC port rather than on 64738. A bare TCP connect to
+          # the client port is an unfinished TLS handshake, which the gateway
+          # is right to record in the operator's security log - and a probe
+          # every few seconds forever would fill that log with a peer the
+          # operator cannot identify and did not cause.
+          {{- include "starling.tcpProbes" (dict "probes" (default $d.probes $gw.probes) "port" "grpc") | nindent 10 }}
+          resources:
+            {{- toYaml (default $d.resources $gw.resources) | nindent 12 }}
+          volumeMounts:
+            {{- include "starling.volumeMounts" . | nindent 12 }}
+        {{- if $colocate }}
+        # Voice, in the gateway's pod so that one address answers both
+        # protocols. A legacy Mumble client sends UDP to the host:port it made
+        # TCP to and cannot be redirected, so this is what makes the client
+        # port a single host:port pair rather than two addresses it has no
+        # field to learn the second of.
+        #
+        # It binds a different gRPC port from the gateway: containers in one
+        # pod share a network namespace, so both on 50051 would be a collision
+        # at startup.
+        - name: voice
+          image: {{ include "starling.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - "voice"
+            - "--config"
+            - "/etc/starling/starling.toml"
+          env:
+            {{- include "starling.commonEnv" . | nindent 12 }}
+            {{- include "starling.bindEnv" (dict "name" "voice" "root" .) | nindent 12 }}
+          ports:
+            - name: voice-grpc
+              containerPort: {{ $voicePort }}
+              protocol: TCP
+            - name: voice-udp
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: UDP
+          {{- include "starling.tcpProbes" (dict "probes" (default $d.probes $voice.probes) "port" "voice-grpc") | nindent 10 }}
+          resources:
+            {{- toYaml (default $d.resources $voice.resources) | nindent 12 }}
+          volumeMounts:
+            {{- include "starling.volumeMounts" . | nindent 12 }}
+        {{- end }}
+      volumes:
+        {{- include "starling.volumes" . | nindent 8 }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+---
+{{/*
+The gateway's gRPC ClusterIP. The `health` collector dials it here, which is
+the only reason the gateway has an endpoint at all: without one it would be the
+single component missing from the health dashboard.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-gateway
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP
+{{- if $colocate }}
+---
+{{/*
+Colocated voice, dialled by every other service at the name the routing table
+carries. It selects the gateway pod, because that is where the container is.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-voice
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: voice
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: grpc
+      port: {{ $voicePort }}
+      targetPort: voice-grpc
+      protocol: TCP
+{{- end }}
+---
+{{/*
+The client-facing address, and the one object in this chart that cannot be an
+Ingress: `Ingress` is HTTP-only, and this is raw TCP+TLS with a UDP plane
+beside it on the same port number.
+
+Both protocols on one Service so that a client reaches TCP and UDP 64738 at one
+address. Kubernetes has allowed mixed protocols on a LoadBalancer since 1.24
+(GA in 1.26); on anything older, or on a cloud load balancer that refuses the
+combination, set voice.colocateWithGateway=false and give voice its own
+Service - and accept that legacy clients will not follow it.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  {{- with .Values.gateway.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.gateway.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.gateway.service.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if eq .Values.gateway.service.type "LoadBalancer" }}
+  # Preserves the client source address, which is what the server logs, bans
+  # and - with sessionAffinity below - pins a UDP flow by.
+  externalTrafficPolicy: {{ .Values.gateway.service.externalTrafficPolicy }}
+  {{- with .Values.gateway.service.sessionAffinity }}
+  sessionAffinity: {{ . }}
+  {{- end }}
+  {{- end }}
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: mumble-tcp
+      port: {{ .Values.gateway.service.port }}
+      targetPort: mumble-tcp
+      protocol: TCP
+    {{- if $colocate }}
+    - name: mumble-udp
+      port: {{ .Values.gateway.service.port }}
+      targetPort: voice-udp
+      protocol: UDP
+    {{- end }}
+{{- end }}

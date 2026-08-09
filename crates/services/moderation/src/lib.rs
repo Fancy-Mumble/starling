@@ -214,7 +214,7 @@ pub struct ModerationRpc(Arc<ModerationService>);
 impl Moderation for ModerationRpc {
     async fn check_ban(&self, request: Request<BanCheck>) -> Result<Response<BanVerdict>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         let now = now_ms();
         for ban in self.0.bans(scope).await {
             let by_address = covers(&ban, &req.address);
@@ -237,7 +237,7 @@ impl Moderation for ModerationRpc {
 
     async fn ban(&self, request: Request<BanRequest>) -> Result<Response<BanResult>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         let Some(mut ban) = req.ban else {
             return Ok(Response::new(BanResult {
                 applied: false,
@@ -315,7 +315,7 @@ impl Moderation for ModerationRpc {
 
     async fn unban(&self, request: Request<UnbanRequest>) -> Result<Response<BanResult>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |s| s.virtual_server);
+        let scope = req.scope.map_or(1, |s| s.instance);
         let _ = sqlx::query("DELETE FROM ban WHERE server_id = ? AND id = ?")
             .bind(i64::from(scope))
             .bind(req.id as i64)
@@ -341,7 +341,7 @@ impl Moderation for ModerationRpc {
         &self,
         request: Request<starling_proto_fancy::common::Scope>,
     ) -> Result<Response<BanList>, Status> {
-        let scope = request.into_inner().virtual_server;
+        let scope = request.into_inner().instance;
         Ok(Response::new(BanList {
             bans: self.0.bans(scope).await,
         }))
@@ -511,9 +511,7 @@ impl ModerationService {
         let transport = self.resolver.channel("session-view").ok()?;
         let found = SessionViewClient::new(transport)
             .get(GetRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 session,
             })
             .await

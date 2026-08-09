@@ -76,6 +76,7 @@
     "PollState.closed": 3,
     "PollState.poll": 1,
     "PollState.tallies": 2,
+    "PollVote.channel": 4,
     "PollVote.options": 2,
     "PollVote.poll_id": 1,
     "PollVote.voter": 3,

@@ -70,7 +70,7 @@ pub struct DirectoryService {
     trust_store: PathBuf,
     /// The control port clients are told to connect to.
     port: u16,
-    /// Which virtual server this announces.
+    /// Which server instance this announces.
     scope: u32,
 }
 
@@ -233,10 +233,10 @@ impl DirectoryService {
         }
     }
 
-    /// This service's virtual server, as a request scope.
+    /// This service's server instance, as a request scope.
     const fn scope(&self) -> Scope {
         Scope {
-            virtual_server: self.scope,
+            instance: self.scope,
         }
     }
 }
@@ -285,10 +285,10 @@ impl Serve for DirectoryService {
                 .map_or_else(|| PathBuf::from(DEFAULT_TRUST_STORE), PathBuf::from),
             port: ctx
                 .config
-                .virtual_servers
+                .instances
                 .first()
                 .map_or(64738, |server| server.port),
-            scope: ctx.virtual_servers().first().copied().unwrap_or(1),
+            scope: ctx.instances().first().copied().unwrap_or(1),
         }))
     }
 

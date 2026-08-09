@@ -1,0 +1,252 @@
+# Build the downloadable Starling, for people who are not deploying a container.
+#
+# `docker.yml` covers the deployment that already has an orchestrator. This
+# covers the other one: somebody who wants a Mumble server, on a machine, now.
+# Every file it produces is the all-in-one binary in a wrapper that platform
+# understands, and `--all-in-one` with no configuration writes one, creates the
+# administrator and prints the password (crates/starling/src/firstrun.rs), so
+# there is nothing between downloading a file and being on a server.
+#
+#   Linux     .tar.gz  .deb  .rpm  .AppImage      x86_64 and aarch64
+#   Windows   .zip (with the bare .exe alongside) x86_64
+#   macOS     .tar.gz  .dmg                       Intel and Apple silicon
+#
+# Native runners throughout, no cross-compilation: the release profile is
+# thin-LTO with codegen-units=1, and cross-linking that under QEMU turns a slow
+# build into one that outlasts the job timeout.
+#
+# See docs/RELEASING.md.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # A dry run. Builds and packages everything and publishes nothing, which is
+  # the only way to exercise any of this before a tag: none of it runs on a
+  # pull request, so the first time a broken package table is noticed would
+  # otherwise be the release it broke.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every target that can be built should be, even when one cannot: a
+      # macOS toolchain failure must not cost the Linux packages their release.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest, deliberately. The glibc a binary is built
+          # against is the oldest it will run on, and building on 24.04 would
+          # produce a `.deb` that refuses to install on Debian 12.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, kind: linux, arch: x86_64 }
+          # Needs the free arm64 runners, which are public-repository only.
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, kind: linux, arch: aarch64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows, arch: x86_64 }
+          - { os: macos-13, target: x86_64-apple-darwin, kind: macos, arch: x86_64 }
+          - { os: macos-14, target: aarch64-apple-darwin, kind: macos, arch: arm64 }
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # starling-proto's build.rs shells out to protoc rather than bundling one.
+      - name: Install protoc
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux)   sudo apt-get update && sudo apt-get install -y protobuf-compiler ;;
+            Windows) choco install protoc -y ;;
+            macOS)   brew install protobuf ;;
+          esac
+
+      # The version comes from the tag when there is one, and from the workspace
+      # otherwise. They have to agree: cargo-deb and cargo-generate-rpm take the
+      # version from Cargo.toml no matter what the tag says, so a tag ahead of
+      # the workspace would publish `v0.3.0` containing `starling_0.2.0`, and
+      # `starling --version` would disagree with the file it came out of.
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          workspace=$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$workspace" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match [workspace.package].version ${workspace}; bump one or the other" >&2
+              exit 1
+            fi
+          fi
+          echo "version=${workspace}" >> "$GITHUB_OUTPUT"
+
+      # No --target: the runner is native, and `target/release/` is where both
+      # packaging tools look for the binary without being told.
+      - name: Build
+        run: cargo build --release --locked --bin starling
+
+      # What every archive carries besides the binary. The example is the file
+      # a first start writes a copy of, so the one on disk and the one being
+      # read about are the same file.
+      - name: Stage
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          name="starling-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp starling.example.toml packaging/README-archive.txt "dist/${name}/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp target/release/starling.exe packaging/start-starling.cmd "dist/${name}/"
+          else
+            cp target/release/starling "dist/${name}/"
+          fi
+          if [ "${{ matrix.kind }}" = linux ]; then
+            cp packaging/starling.service "dist/${name}/"
+          fi
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      # -- Linux ------------------------------------------------------------
+      - name: Archive (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -C dist -czf "dist/${{ steps.stage.outputs.name }}.tar.gz" "${{ steps.stage.outputs.name }}"
+
+      - name: Debian and RPM packages
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -eu
+          cargo install cargo-deb cargo-generate-rpm --locked
+          # --no-build, so both package the binary the step above produced
+          # rather than each spending twenty minutes building their own.
+          cargo deb -p starling --no-build
+          cargo generate-rpm -p crates/starling
+          mv target/debian/*.deb target/generate-rpm/*.rpm dist/
+
+      # AppImage: an AppDir, then the tool that turns one into a single file.
+      # `--appimage-extract-and-run` because the runners have no FUSE, and
+      # without it the tool tries to mount itself and hangs.
+      - name: AppImage
+        if: matrix.kind == 'linux'
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -eu
+          mkdir -p AppDir/usr/bin
+          cp target/release/starling AppDir/usr/bin/
+          install -m 755 packaging/AppRun AppDir/AppRun
+          cp packaging/starling.desktop AppDir/
+          cp .github/images/starling2.png AppDir/starling.png
+          cp starling.example.toml packaging/README-archive.txt AppDir/
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir \
+            "dist/Starling-${{ steps.version.outputs.version }}-${ARCH}.AppImage"
+
+      # -- Windows ----------------------------------------------------------
+      # The bare .exe as well as the zip. Somebody who already knows what they
+      # are doing should not have to unpack an archive to get one file.
+      - name: Zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/${{ steps.stage.outputs.name }}" -DestinationPath "dist/${{ steps.stage.outputs.name }}.zip"
+          Copy-Item target/release/starling.exe "dist/starling-${{ steps.version.outputs.version }}-x86_64-windows.exe"
+
+      # -- macOS ------------------------------------------------------------
+      # Unsigned and unnotarised, so Gatekeeper refuses it until the quarantine
+      # attribute is cleared. README-archive.txt inside says how. Signing needs
+      # a paid Apple developer identity, which this project does not have.
+      - name: Disk image
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          hdiutil create -volname "Starling ${{ steps.version.outputs.version }}" \
+            -srcfolder "dist/${{ steps.stage.outputs.name }}" -ov -format UDZO \
+            "dist/starling-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+
+      - name: Prune the staging directory
+        shell: bash
+        run: rm -rf "dist/${{ steps.stage.outputs.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    # A dry run stops here: everything above it ran, and nothing was published.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The tag without its `v`, which is what the file names carry.
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # One file, so a download can be checked without hunting for its digest.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS.txt
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the file for your machine, run it, and it will write its
+            own configuration, create the SuperUser account and print the
+            password. Then point a Mumble client at `localhost:64738`.
+
+            | | |
+            |---|---|
+            | Windows | `starling-${{ steps.version.outputs.version }}-x86_64-windows.exe`, or the `.zip` for the example configuration and a double-clickable launcher |
+            | macOS | the `.dmg` — `arm64` for Apple silicon, `x86_64` for Intel |
+            | Debian, Ubuntu | `.deb` — `sudo apt install ./starling_*.deb`, then `sudo systemctl enable --now starling` |
+            | Fedora, RHEL, openSUSE | `.rpm` |
+            | Any Linux | the `.AppImage` — one file, `chmod +x` and run |
+
+            The macOS builds are not signed by Apple; the README inside says
+            what to do about Gatekeeper. `SHA256SUMS.txt` covers every file.
+
+            ## Container image
+
+            ```
+            docker pull ghcr.io/fancy-mumble/starling:${{ github.ref_name }}
+            ```
+
+            Also tagged `:latest`. Running it — the all-in-one box or the
+            twenty-container split — is in `docs/RELEASING.md`.

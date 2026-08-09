@@ -1,0 +1,147 @@
+{{- if eq .Values.mode "services" }}
+{{- $full := include "starling.fullname" . }}
+{{- $d := .Values.defaults }}
+{{/*
+One StatefulSet per service, and the only difference between most of them is
+the argument after the binary name. That is the whole point of one image whose
+entrypoint takes a service name.
+
+StatefulSet rather than Deployment because every service writes a SQLite file
+named after itself under data_dir, so each replica needs its own volume, and
+because a Deployment rolling onto a ReadWriteOnce claim starts the new pod
+before releasing the old one's volume and wedges.
+*/}}
+{{- range $name := (keys .Values.services | sortAlpha) }}
+{{- $svc := index $.Values.services $name }}
+{{- if $svc.enabled }}
+{{- if and (ne $name "gateway") (not (and (eq $name "voice") $.Values.voice.colocateWithGateway)) }}
+{{- $port := include "starling.grpcPort" (dict "name" $name "root" $) }}
+{{- $wantsVolume := eq (include "starling.wantsVolume" (dict "svc" $svc "root" $)) "true" }}
+{{- $probes := default $d.probes $svc.probes }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}-{{ $name }}
+  labels:
+    {{- include "starling.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+    starling.fancy-mumble.org/tier: {{ $svc.tier }}
+spec:
+  replicas: {{ default $d.replicas $svc.replicas }}
+  # Not a headless service, so pods get no individual DNS names. Nothing here
+  # addresses a pod directly: services find each other through the ClusterIP
+  # below, which is what the config file's `endpoint` names.
+  serviceName: {{ $full }}-{{ $name }}
+  # Nothing in this deployment depends on start order - a service that is not
+  # up yet is a startup ordering fact the runtime dials through lazily, not an
+  # error - so there is no reason to bring replicas up one at a time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "starling.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      annotations:
+        # Roll every workload when the routing table changes. A service holding
+        # the previous table would disagree with the gateway about where a
+        # third one is.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        {{- with (default $d.podAnnotations $svc.podAnnotations) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "starling.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $name }}
+        starling.fancy-mumble.org/tier: {{ $svc.tier }}
+    spec:
+      serviceAccountName: {{ include "starling.serviceAccountName" $ }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      # SIGTERM raises the drain and the runtime finishes what it is holding.
+      terminationGracePeriodSeconds: {{ default $d.terminationGracePeriodSeconds $svc.terminationGracePeriodSeconds }}
+      {{- include "starling.podSpecExtras" (dict "svc" $svc "root" $) | nindent 6 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "starling.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $.Values.securityContext | nindent 12 }}
+          args:
+            - {{ $name | quote }}
+            - "--config"
+            - "/etc/starling/starling.toml"
+          env:
+            {{- include "starling.commonEnv" $ | nindent 12 }}
+            {{- if not $svc.noEndpoint }}
+            {{- include "starling.bindEnv" (dict "name" $name "root" $) | nindent 12 }}
+            {{- end }}
+          ports:
+            {{- if not $svc.noEndpoint }}
+            - name: grpc
+              containerPort: {{ $port }}
+              protocol: TCP
+            {{- end }}
+            {{- if eq $name "files" }}
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- end }}
+            {{- if and (eq $name "voice") $svc.udpListen }}
+            - name: voice-udp
+              containerPort: {{ $.Values.gateway.service.port }}
+              protocol: UDP
+            {{- end }}
+          {{- if $svc.noEndpoint }}
+          # No probes on purpose: this service has no listener at all. Nothing
+          # dials it - it dials out, hourly - so there is nothing to connect to
+          # and a TCP probe would fail forever. A container with no readiness
+          # probe is ready once it is running, which for a timer loop is
+          # exactly the truth available.
+          {{- else }}
+          {{- include "starling.tcpProbes" (dict "probes" $probes "port" "grpc") | nindent 10 }}
+          {{- if eq $name "files" }}
+          # Both listeners have to be up, and a probe can only name one port.
+          # The gRPC surface gates traffic from other services; this one gates
+          # the container being called started at all, so bulk transfer being
+          # dead cannot read as ready.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml (default $d.resources $svc.resources) | nindent 12 }}
+          volumeMounts:
+            {{- include "starling.volumeMounts" $ | nindent 12 }}
+      volumes:
+        {{- include "starling.volumes" $ | nindent 8 }}
+        {{- if not $wantsVolume }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if $wantsVolume }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml $.Values.persistence.accessModes | nindent 10 }}
+        {{- if $.Values.persistence.storageClass }}
+        storageClassName: {{ $.Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ default $.Values.persistence.size (and $svc.persistence $svc.persistence.size) }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -120,6 +120,10 @@ async fn openapi() -> impl IntoResponse {
 /// detail. The proto documents the layout at `Channel.flags`.
 const CHANNEL_HIDDEN: u32 = 1;
 const CHANNEL_TEMPORARY: u32 = 2;
+/// Out of the tree: parentless, and not the root. Surfaced because `parent` is
+/// null for both, so a caller building a tree from this JSON has no other way
+/// to tell a meeting room from the server's own root channel.
+const CHANNEL_DETACHED: u32 = 4;
 
 /// What a refusal looks like on the wire.
 #[derive(Debug, Serialize)]
@@ -224,13 +228,13 @@ fn operator_actor(subject: String, scope: &str) -> Option<Actor> {
     })
 }
 
-/// The virtual server every route addresses.
+/// The server instance every route addresses.
 ///
 /// One constant, not a parameter on each handler: multi-tenancy is a
 /// deployment shape Starling supports but this API has never exposed, and a
 /// half-threaded `scope` would read as though it did.
 fn scope() -> Option<Scope> {
-    Some(Scope { virtual_server: 1 })
+    Some(Scope { instance: 1 })
 }
 
 /// One account, as JSON.
@@ -311,9 +315,9 @@ struct AccountUpdate {
     /// import rather than having to first connect with one; empty clears it.
     #[serde(default)]
     cert_hash: Option<String>,
-    /// Which virtual server the account belongs to. Defaults to the first.
+    /// Which server instance the account belongs to. Defaults to the first.
     #[serde(default)]
-    virtual_server: Option<u32>,
+    instance: Option<u32>,
 }
 
 impl AccountUpdate {
@@ -409,7 +413,7 @@ async fn create_account(
 
     let account = UserDataClient::new(channel)
         .register(RegisterRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             actor: None,
             account: Some(Account {
                 name: new.name,
@@ -500,7 +504,7 @@ async fn update_account(
     };
 
     let scope = Some(Scope {
-        virtual_server: change.virtual_server.unwrap_or(1),
+        instance: change.instance.unwrap_or(1),
     });
     let channel = api
         .resolver()
@@ -566,7 +570,7 @@ async fn delete_account(
 
     let _ = UserDataClient::new(channel)
         .delete(starling_proto_fancy::userdata::DeleteRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             actor: None,
             id,
         })
@@ -1066,7 +1070,7 @@ async fn live_session(
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
     let sessions = SessionViewClient::new(channel)
         .list(SubscribeRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             subscriber: "operator-api".to_owned(),
         })
         .await
@@ -1211,7 +1215,7 @@ async fn list_bans(
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let bans = ModerationClient::new(channel)
-        .list_bans(Scope { virtual_server: 1 })
+        .list_bans(Scope { instance: 1 })
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?;
 
@@ -1258,7 +1262,7 @@ async fn get_health(
 
     let overview = HealthOverviewClient::new(channel)
         .get(OverviewRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
         })
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
@@ -1288,7 +1292,7 @@ async fn get_health(
             .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?,
     )
     .history(OverviewRequest {
-        scope: Some(Scope { virtual_server: 1 }),
+        scope: Some(Scope { instance: 1 }),
     })
     .await
     .map(tonic::Response::into_inner)
@@ -1367,7 +1371,7 @@ async fn get_config(
 
     let snapshot = ServerConfigClient::new(channel)
         .get(starling_proto_fancy::serverconfig::GetRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
         })
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
@@ -1403,7 +1407,7 @@ async fn list_channels(
 
     let tree = MetadataClient::new(channel)
         .get_tree(TreeRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
         })
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
@@ -1425,6 +1429,7 @@ async fn list_channels(
                 "links": c.links,
                 "hidden": c.flags & CHANNEL_HIDDEN != 0,
                 "temporary": c.flags & CHANNEL_TEMPORARY != 0,
+                "detached": c.flags & CHANNEL_DETACHED != 0,
                 "created_at_ms": c.created_at_ms,
             })
         })
@@ -1455,7 +1460,7 @@ async fn list_sessions(
 
     let sessions = SessionViewClient::new(channel)
         .list(SubscribeRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             subscriber: "operator-api".to_owned(),
         })
         .await
@@ -1507,6 +1512,12 @@ struct NewChannel {
     max_users: u32,
     #[serde(default)]
     temporary: bool,
+    /// Registered accounts to admit, which makes it a private room: `@all` is
+    /// denied see|enter|traverse and each of these is granted them. Empty
+    /// leaves the channel public, which is what an operator asking for nothing
+    /// in particular means.
+    #[serde(default)]
+    invitee_user_ids: Vec<u32>,
 }
 
 /// A change to one channel. Absent fields are left alone, as for an account.
@@ -1536,6 +1547,7 @@ fn channel_json(c: &starling_proto_fancy::metadata::Channel) -> serde_json::Valu
         "links": c.links,
         "hidden": c.flags & CHANNEL_HIDDEN != 0,
         "temporary": c.flags & CHANNEL_TEMPORARY != 0,
+        "detached": c.flags & CHANNEL_DETACHED != 0,
         "created_at_ms": c.created_at_ms,
     })
 }
@@ -1586,6 +1598,12 @@ async fn create_channel(
                 ..Channel::default()
             }),
             temporary: new.temporary,
+            invitee_user_ids: new.invitee_user_ids,
+            // An operator naming a channel that exists is told so. Reuse
+            // exists for a caller provisioning a room it expects to find
+            // again; here it would turn "create" into "create or hand me
+            // somebody else's room", which is not what the verb says.
+            reuse_existing: false,
         })
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
@@ -2059,7 +2077,7 @@ async fn set_config(
     // the field-wise merge, so a setting added there is settable here without a
     // second edit and the two cannot disagree about a name.
     let (mut snapshot, fields) = starling_runtime::settings::from_json(&values);
-    snapshot.virtual_server = 1;
+    snapshot.instance = 1;
     if fields.is_empty() {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
@@ -2069,7 +2087,7 @@ async fn set_config(
 
     let _ = ServerConfigClient::new(channel)
         .set(starling_proto_fancy::serverconfig::SetRequest {
-            scope: Some(Scope { virtual_server: 1 }),
+            scope: Some(Scope { instance: 1 }),
             actor: None,
             fields,
             values: Some(snapshot),

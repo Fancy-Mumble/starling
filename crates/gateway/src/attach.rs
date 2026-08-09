@@ -144,8 +144,8 @@ pub struct AttachContext {
     /// This gateway's identity, so a service can address the pod holding a
     /// session.
     pub gateway_id: String,
-    /// Which virtual server this gateway fronts.
-    pub virtual_server: u32,
+    /// Which server instance this gateway fronts.
+    pub instance: u32,
     /// How to reach services.
     pub resolver: Resolver,
     /// Who is connected.
@@ -181,7 +181,7 @@ async fn run_attachment(
         let hello = ClientEvent {
             event: Some(client_event::Event::Hello(GatewayHello {
                 gateway_id: ctx.gateway_id.clone(),
-                virtual_server: ctx.virtual_server,
+                instance: ctx.instance,
             })),
         };
         if relay.send(hello).await.is_err() {

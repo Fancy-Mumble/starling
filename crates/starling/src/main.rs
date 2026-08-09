@@ -12,8 +12,17 @@
 //! starling --all-in-one            every service, in-process transports
 //! starling migrate-config s.ini    print the equivalent TOML
 //! ```
+//!
+//! **And one download.** `--all-in-one` with no `--config` on a machine that has
+//! never run Starling writes a configuration where this platform keeps them,
+//! creates the administrator, and prints both; see [`firstrun`]. That is what
+//! makes the `.deb`, the `.AppImage`, the `.dmg` and the `.exe` in `docs/
+//! RELEASING.md` something a person can double-click.
 
+mod check;
 mod compose;
+mod firstrun;
+mod paths;
 mod superuser;
 mod units;
 
@@ -76,6 +85,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             out(&toml)
         }
+        Some("check-config") => check::check_config(arguments),
         Some("set-superuser-password") => superuser::set_password(arguments),
         Some("--all-in-one") => compose::all_in_one(arguments).map_err(|error| error.to_string()),
         Some(name) if !name.starts_with('-') => {
@@ -90,8 +100,14 @@ fn usage() -> String {
     let mut lines = String::from(
         "usage: starling <component> [--config <file>]\n\
          \x20      starling --all-in-one [--config <file>]\n\
+         \x20      starling check-config [--config <file>] [--strict]\n\
          \x20      starling migrate-config <mumble-server.ini>\n\
          \x20      starling set-superuser-password <password> [--server <id>] [--config <file>]\n\n\
+         With no --config, `--all-in-one` uses this platform's own configuration\n\
+         directory, and writes a starter file there the first time it is run.\n\n\
+         `check-config` loads exactly what a start would, environment included,\n\
+         and reports what would fail without binding anything. `--strict` makes\n\
+         warnings non-zero too, for CI.\n\n\
          components:\n\x20 gateway\n",
     );
     for name in units::names() {

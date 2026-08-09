@@ -1,0 +1,133 @@
+{{- if and (eq .Values.mode "services") .Values.operatorApi.enabled }}
+{{- $full := include "starling.fullname" . }}
+{{- $d := .Values.defaults }}
+{{/*
+The admin plane. The highest-privilege surface in the system, so it is off
+unless asked for, and this chart will not give it a LoadBalancer: reach it with
+`kubectl port-forward`, or put an authenticating proxy of your own in front.
+
+It calls the authorities directly rather than through session-view, because an
+operator edits registered accounts and offline bans while session-view is a
+view of connected users.
+*/}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}-operator-api
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator-api
+    starling.fancy-mumble.org/tier: {{ .Values.operatorApi.tier }}
+spec:
+  # One. The audit record is a file on this pod's volume, and a second replica
+  # would write a second, unrelated one.
+  replicas: 1
+  serviceName: {{ $full }}-operator-api
+  selector:
+    matchLabels:
+      {{- include "starling.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: operator-api
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "starling.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: operator-api
+        starling.fancy-mumble.org/tier: {{ .Values.operatorApi.tier }}
+    spec:
+      serviceAccountName: {{ include "starling.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $d.terminationGracePeriodSeconds }}
+      containers:
+        - name: operator-api
+          image: {{ include "starling.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - "operator-api"
+            - "--config"
+            - "/etc/starling/starling.toml"
+          env:
+            {{- include "starling.commonEnv" . | nindent 12 }}
+            {{- include "starling.bindEnv" (dict "name" "operator-api" "root" .) | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: rest
+              containerPort: {{ .Values.operatorApi.port }}
+              protocol: TCP
+          # The one service in this chart with a real HTTP health endpoint.
+          # It is a bare liveness answer, not the readiness aggregate: that is
+          # /v1/health, which reads the `health` collector and is authenticated.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            initialDelaySeconds: {{ $d.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ $d.probes.readiness.periodSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            initialDelaySeconds: {{ $d.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ $d.probes.liveness.periodSeconds }}
+          resources:
+            {{- toYaml $d.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "starling.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "starling.volumes" . | nindent 8 }}
+        {{- if not (and .Values.persistence.enabled .Values.operatorApi.persistence.enabled) }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if and .Values.persistence.enabled .Values.operatorApi.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-operator-api
+  labels:
+    {{- include "starling.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator-api
+  {{- with .Values.operatorApi.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.operatorApi.service.type }}
+  selector:
+    {{- include "starling.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: operator-api
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP
+    - name: rest
+      port: {{ .Values.operatorApi.port }}
+      targetPort: rest
+      protocol: TCP
+{{- end }}

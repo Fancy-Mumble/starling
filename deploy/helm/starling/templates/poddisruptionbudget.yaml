@@ -1,0 +1,33 @@
+{{- if and .Values.podDisruptionBudget.enabled (eq .Values.mode "services") }}
+{{- $full := include "starling.fullname" . }}
+{{/*
+Only for the tiers whose absence is an outage. An `optional` service being
+drained is the case its tier exists to describe: the gateway sheds its routes
+and keeps serving, so holding up a node drain for it would be wrong.
+
+A budget on a single-replica workload blocks voluntary eviction entirely, which
+is why this is off by default: it is only useful once the tier it names is
+actually running more than one.
+*/}}
+{{- range $name := (keys .Values.services | sortAlpha) }}
+{{- $svc := index $.Values.services $name }}
+{{- if and $svc.enabled (has $svc.tier $.Values.podDisruptionBudget.tiers) }}
+{{- if gt (int (default $.Values.defaults.replicas $svc.replicas)) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $full }}-{{ $name }}
+  labels:
+    {{- include "starling.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  minAvailable: {{ $.Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "starling.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

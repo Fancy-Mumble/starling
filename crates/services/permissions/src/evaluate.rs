@@ -46,7 +46,7 @@ pub enum Member {
 /// map from channel to a map of names would be two lookups to answer it.
 type Temporary = HashMap<(u32, u32, String), HashSet<Member>>;
 
-/// Every channel's ACL set, by virtual server.
+/// Every channel's ACL set, by server instance.
 #[derive(Debug, Clone, Default)]
 pub struct Acls {
     inner: Arc<Mutex<HashMap<(u32, u32), AclSet>>>,

@@ -1,4 +1,4 @@
-<img src=".github/images/starling.png" alt="Sterling, the Starling mascot" width="200" align="right">
+<img src=".github/images/starling2.png" alt="Sterling, the Starling mascot" width="200" align="right">
 
 # Starling
 
@@ -25,6 +25,32 @@ How far the port has got, measured against two different targets:
 can be done by one measure and missing by the other, so neither file answers
 the question on its own.
 
+## Install
+
+The [latest release](https://github.com/Fancy-Mumble/starling/releases/latest)
+has a build for each platform — `.deb`, `.rpm` and `.AppImage` for Linux, a
+`.dmg` for macOS, an `.exe` for Windows, and a `.tar.gz`/`.zip` for anything
+else. Run it, and it writes its own configuration, creates the SuperUser account
+and prints the password:
+
+```text
+==============================================================================
+  STARLING 0.2.0   |   FIRST START
+==============================================================================
+
+  Administrator
+    user            SuperUser
+    password        vSqAZ3aaSyHMHGNu9DK4
+  ...
+```
+
+Then point a Mumble client at `localhost:64738`. Where the configuration and the
+databases land, and what the packages install, is in
+[`docs/RELEASING.md`](docs/RELEASING.md#downloadable-builds).
+
+For a container, `ghcr.io/fancy-mumble/starling`; for a cluster,
+[`deploy/helm/starling`](deploy/helm/starling/README.md).
+
 ## Quick start
 
 ```sh
@@ -38,10 +64,30 @@ cargo run --bin starling -- text --config starling.toml
 cargo run --bin starling -- migrate-config /path/to/mumble-server.ini > starling.toml
 ```
 
-With no `--config`, built-in defaults apply and a self-signed certificate is
-generated in `starling-data/` on first boot. Mumble clients identify a server by
-certificate fingerprint, so keeping that directory keeps the server's identity
-stable across restarts.
+With no `--config`, Starling uses this platform's own configuration directory
+and writes a starter file there the first time it runs — except in a directory
+that already holds a `starling-data/`, which keeps the built-in defaults it has
+always had, so an existing deployment is left exactly where it is. Either way a
+self-signed certificate is generated on first boot and kept in the data
+directory. Mumble clients identify a server by certificate fingerprint, so
+keeping that directory keeps the server's identity stable across restarts.
+
+A configuration file overlays those defaults rather than replacing them, so it
+carries only what you are changing:
+
+```toml
+[[instances]]
+name = "Frog Pond"
+port = 64738
+
+[instances.settings]
+max_users = 20
+password  = "hunter2"
+```
+
+[`starling.example.toml`](starling.example.toml) is the file to copy;
+[`examples/advanced/`](examples/README.md) has the knobs you should not need,
+one file each, pulled in with `include`.
 
 **Linux, macOS and Windows.** Services on one host reach each other over the
 platform's own local IPC, a Unix domain socket or a named pipe on Windows,
@@ -87,11 +133,11 @@ Mumble-over-TCP and is brokered; realtime, bulk and admin traffic reach their
 service directly, so the gateway is never in the media path and cannot be its
 bottleneck.
 
-Two facts carry the rest of the gateway's design. It is the **single writer to
-each client socket**, so per-client ordering holds by construction. And the wire
-type is in the **framing, not the protobuf**, so routing is two bytes and a
-lookup: it parses no payload, links no service's stubs, and never recompiles
-when a service is added. A new service is a TOML block.
+The gateway is the **single writer to each client socket**, so per-client
+ordering holds by construction. And the wire type is in the **framing, not the
+protobuf**, so routing is two bytes and a lookup: it parses no payload, links no
+service's stubs, and never recompiles when a service is added. A new service is
+a TOML block.
 
 ## Crates
 

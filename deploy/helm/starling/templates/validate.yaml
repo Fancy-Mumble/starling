@@ -1,0 +1,32 @@
+{{/*
+Combinations that deploy cleanly and then fail somewhere a log line is the only
+symptom. Caught here instead, where the message can say what to do.
+
+This template renders nothing.
+*/}}
+
+{{- if not (has .Values.mode (list "services" "all-in-one")) }}
+{{- fail (printf "mode must be \"services\" or \"all-in-one\", got %q" .Values.mode) }}
+{{- end }}
+
+{{- if and (gt (int .Values.gateway.replicas) 1) (not .Values.gateway.tls.existingSecret) }}
+{{- fail "gateway.replicas > 1 needs gateway.tls.existingSecret.\n\nWithout a certificate to share, each gateway pod generates its own on first boot, so a client gets a different fingerprint per connection - which is what a man-in-the-middle also looks like. Create a TLS secret (cert-manager, or `kubectl create secret tls`) and name it in gateway.tls.existingSecret." }}
+{{- end }}
+
+{{- if and (eq .Values.mode "services") .Values.services.directory.enabled (not .Values.gateway.tls.existingSecret) }}
+{{- fail "services.directory.enabled needs gateway.tls.existingSecret in \"services\" mode.\n\ndirectory announces the fingerprint of the certificate clients are shown, and it reads that certificate from disk. Here it is a different pod from the gateway, so a self-signed pair generated into the gateway's own volume is not visible to it: the announcement would be skipped once an hour with a log line as the only sign." }}
+{{- end }}
+
+{{- if and .Values.operatorApi.enabled (eq .Values.operatorApi.auth.mode "token") }}
+{{- if and (not .Values.operatorApi.auth.token.value) (not .Values.operatorApi.auth.token.existingSecret) }}
+{{- fail "operatorApi.enabled with auth.mode=token needs a token.\n\nSet operatorApi.auth.token.existingSecret (preferred - it keeps the secret out of your values and out of `helm get values`), or operatorApi.auth.token.value. An empty token is refused as malformed, so the admin plane would start with nobody able to authenticate to it." }}
+{{- end }}
+{{- end }}
+
+{{- if and .Values.files.ingress.enabled (not .Values.services.files.publicUrl) }}
+{{- fail "files.ingress.enabled needs services.files.publicUrl.\n\nThe signed URLs the server hands clients over the control channel are built from public_url, not from the Ingress. Left unset it defaults to the in-cluster Service name, which no client outside the cluster can resolve - so uploads would be offered a URL they cannot reach. Set it to the same host as files.ingress.hosts[0]." }}
+{{- end }}
+
+{{- if and (eq .Values.mode "services") (not .Values.services.gateway.enabled) }}
+{{- fail "services.gateway.enabled is false, so nothing would hold a client socket. The gateway is the only component clients connect to." }}
+{{- end }}

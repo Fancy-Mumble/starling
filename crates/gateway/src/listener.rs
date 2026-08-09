@@ -142,7 +142,7 @@ impl Gateway {
 
         let ctx = AttachContext {
             gateway_id: self.gateway_id.clone(),
-            virtual_server: self.virtual_server(),
+            instance: self.instance(),
             resolver,
             registry: self.registry.clone(),
             resume: self.resume.clone(),
@@ -235,7 +235,7 @@ impl Gateway {
     ) -> tokio::task::JoinHandle<()> {
         let settings =
             starling_runtime::Settings::new(resolver.clone()).logging_to(self.logger.clone());
-        let scope = self.virtual_server();
+        let scope = self.instance();
         let live = Arc::clone(&self.message_limit);
         let logger = self.logger.clone();
         drop(settings.watch(&[scope]));
@@ -283,11 +283,8 @@ impl Gateway {
         })
     }
 
-    fn virtual_server(&self) -> u32 {
-        self.config
-            .virtual_servers
-            .first()
-            .map_or(1, |server| server.id)
+    fn instance(&self) -> u32 {
+        self.config.instances.first().map_or(1, |server| server.id)
     }
 
     fn acceptor(&self) -> Result<TlsAcceptor, GatewayError> {
@@ -425,7 +422,7 @@ impl Gateway {
                 .as_ref()
                 .map(|certificate| certificate.chain.clone())
                 .unwrap_or_default(),
-            virtual_server: self.virtual_server(),
+            instance: self.instance(),
         });
 
         let (mut reader, writer) = tokio::io::split(tls);

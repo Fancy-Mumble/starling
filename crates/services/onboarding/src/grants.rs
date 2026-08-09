@@ -211,7 +211,7 @@ impl Grants {
 /// A struct because the alternative is eight positional arguments, and among
 /// them are two `u32`s and a `bool`, `edit(scope, channel, ...)` transposed
 /// would compile, run, and write the grant to the wrong channel of the wrong
-/// virtual server. Named fields make that transposition impossible to write.
+/// server instance. Named fields make that transposition impossible to write.
 #[derive(Debug)]
 struct Edit<'a> {
     scope: u32,
@@ -245,9 +245,7 @@ async fn edit(
     } = *grant;
     let current = client
         .get_acl(AclRequest {
-            scope: Some(Scope {
-                virtual_server: scope,
-            }),
+            scope: Some(Scope { instance: scope }),
             channel,
         })
         .await;
@@ -277,9 +275,7 @@ async fn edit(
 
     let result = client
         .set_acl(SetAclRequest {
-            scope: Some(Scope {
-                virtual_server: scope,
-            }),
+            scope: Some(Scope { instance: scope }),
             // The service acting on its own behalf. Not the submitting
             // session: the account asked a question, the *server* decided
             // what that was worth, and an audit line naming the user would

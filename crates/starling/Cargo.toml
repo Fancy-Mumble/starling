@@ -11,6 +11,56 @@ publish.workspace = true
 name = "starling"
 path = "src/main.rs"
 
+# ---------------------------------------------------------------------------
+# The downloadable packages, built by .github/workflows/release.yml.
+#
+# Both tools read this file and both take their payload from an already-built
+# `target/release/starling`, so the release workflow builds once and packages
+# twice. Neither is ever run by CI on a pull request; a broken table here shows
+# up when a tag is cut, which is why docs/RELEASING.md says to try one locally:
+#
+#   cargo build --release --bin starling
+#   cargo deb -p starling --no-build
+#   cargo generate-rpm -p crates/starling
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+# No mailbox: this project's address is its issue tracker. The field is
+# mandatory, and inventing a domain would be worse than pointing at GitHub.
+maintainer = "Fancy Mumble <noreply@github.com>"
+copyright = "Fancy Mumble, MIT"
+extended-description = """\
+A pure-Rust Mumble server. A gateway in front, independent services behind it, \
+and media planes that bypass the gateway entirely -- all in one process when \
+run with --all-in-one, which is what this package is for.
+
+The first start writes a configuration, creates the SuperUser account and \
+prints its password. A systemd unit is installed but not enabled; \
+`systemctl enable --now starling` starts it, and the first start's output is \
+in `journalctl -u starling`."""
+section = "net"
+priority = "optional"
+# Asset paths are relative to this manifest, except `target/release/`, which
+# cargo-deb resolves against the real target directory.
+assets = [
+    ["target/release/starling", "usr/bin/", "755"],
+    ["../../packaging/starling.service", "usr/lib/systemd/system/", "644"],
+    ["../../starling.example.toml", "usr/share/doc/starling/", "644"],
+    ["../../examples/reference.toml", "usr/share/doc/starling/examples/", "644"],
+    ["../../packaging/README-archive.txt", "usr/share/doc/starling/README.txt", "644"],
+]
+
+[package.metadata.generate-rpm]
+# Paths here are relative to the working directory, and the workflow runs
+# `cargo generate-rpm -p crates/starling` from the workspace root.
+assets = [
+    { source = "target/release/starling", dest = "/usr/bin/starling", mode = "755" },
+    { source = "packaging/starling.service", dest = "/usr/lib/systemd/system/starling.service", mode = "644" },
+    { source = "starling.example.toml", dest = "/usr/share/doc/starling/starling.example.toml", mode = "644", doc = true },
+    { source = "examples/reference.toml", dest = "/usr/share/doc/starling/examples/reference.toml", mode = "644", doc = true },
+    { source = "packaging/README-archive.txt", dest = "/usr/share/doc/starling/README.txt", mode = "644", doc = true },
+]
+
 [dependencies]
 starling-runtime.workspace = true
 starling-proto-fancy.workspace = true
@@ -41,6 +91,13 @@ starling-context-actions.workspace = true
 starling-directory.workspace = true
 
 tokio.workspace = true
+# To quote the data directory into the configuration a first start writes. On
+# Windows that path is full of backslashes, and every one of them is an escape
+# in a TOML string; hand-quoting it produces a file Starling itself rejects.
+# In tests it also walks the serialised defaults, so the reference
+# configuration cannot fall behind the structs without a test saying which key
+# it lost.
+toml.workspace = true
 tracing.workspace = true
 # Not just for tests: `migrate-config` reports the keys it could not place
 # through `tracing`, and without a subscriber installed that report is
@@ -49,6 +106,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 starling-proto.workspace = true
+# The version encoding, so the handshake test names a feature gate by its parts
+# rather than re-deriving the shifts the wire actually carries.
+starling-gate.workspace = true
 # The client half of the voice cipher, so the audio test puts a genuinely
 # sealed datagram on the wire rather than one the server would never accept.
 starling-crypto.workspace = true
@@ -59,7 +119,7 @@ tokio-rustls.workspace = true
 # A real WebSocket client for the live-channel test: the point of an e2e test
 # is that nothing in the path is the code under test, and a hand-rolled
 # handshake here would be exactly that.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 futures-util.workspace = true
 serde_json.workspace = true
 

@@ -239,9 +239,39 @@ mod tests {
     #[test]
     fn entities_are_decoded_and_whitespace_collapsed() {
         let card = card(
-            "<head><title>Fish &amp; Chips\n   &#8212; a review &#x2014; part&nbsp;2</title></head>",
+            "<head><title>Fish &amp; Chips\n   &#128512; a review &#x1F600; part&nbsp;2</title></head>",
         );
-        assert_eq!(card.title, "Fish & Chips — a review — part 2");
+        // U+1F600, decimal and hex, because an emoji is the widest a single
+        // `char` gets: four UTF-8 bytes, and above the BMP, so it is also a
+        // surrogate pair anywhere the text passes through UTF-16. A decoder
+        // holding a codepoint in a `u16`, or truncating to one byte, passes on
+        // a Latin-1 entity and fails here.
+        //
+        // Written as `\u{...}` rather than as the character, so the assertion is
+        // byte-for-byte what the entity decodes to while the file stays ASCII.
+        assert_eq!(
+            card.title,
+            "Fish & Chips \u{1F600} a review \u{1F600} part 2"
+        );
+    }
+
+    #[test]
+    fn the_widest_codepoint_and_the_longest_entity_that_can_name_it_both_survive() {
+        // Two limits that meet. `char::from_u32` accepts up to U+10FFFF, and
+        // `decode` only treats `&...;` as an entity when the `;` is within ten
+        // bytes of the `&` - which the *longest* way to write that codepoint,
+        // seven decimal digits, just fits with one byte to spare. Tightening
+        // that window would silently stop decoding the top of the range,
+        // leaving the entity rendered as its own source text.
+        let widest = card("<head><title>&#1114111; and &#x10FFFF;</title></head>");
+        assert_eq!(widest.title, "\u{10FFFF} and \u{10FFFF}");
+
+        // A grapheme built from two codepoints, eight bytes in all: each entity
+        // decodes on its own and they are concatenated untouched, so the pair
+        // is still one cluster to anything that renders it. The whitespace
+        // collapse runs over the decoded string, and must not find a seam here.
+        let flag = card("<head><title>a &#x1F1E9;&#x1F1EA; b</title></head>");
+        assert_eq!(flag.title, "a \u{1F1E9}\u{1F1EA} b");
     }
 
     #[test]

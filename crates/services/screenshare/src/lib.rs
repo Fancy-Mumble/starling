@@ -539,8 +539,12 @@ impl Serve for ScreenshareService {
         // can reach it. An SFU that put its own private address in every SDP
         // answer would hand every viewer a candidate that cannot be dialled,
         // and the symptom is a share that connects and never shows a frame.
-        let sfu = match endpoint.0.parse() {
-            Ok(public_ip) => {
+        //
+        // `media_ip`, not a parse of our own: session-lifecycle advertises
+        // `webrtc_sfu_available` from the same call, and a second parser here
+        // is how the advertisement and the media plane drift apart.
+        let sfu = match service.media_ip() {
+            Some(public_ip) => {
                 let config = SfuConfig {
                     udp_port: service.option::<u16>("media_port").unwrap_or(0),
                     public_ip,
@@ -556,7 +560,7 @@ impl Serve for ScreenshareService {
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 tracing::info!(
                     "no public address for media; screen share signals but does not forward"
                 );

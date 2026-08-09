@@ -112,7 +112,7 @@ impl Files for FilesRpc {
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<ObjectInfo>, Status> {
         use sqlx::Row as _;
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let row = sqlx::query(
             "SELECT size, content_type, created_at_ms, sha256 FROM object \
              WHERE server_id = ? AND k = ?",
@@ -137,7 +137,7 @@ impl Files for FilesRpc {
 
     async fn delete(&self, request: Request<StatRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let scope = req.scope.as_ref().map_or(1, |s| s.virtual_server);
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
         let result = sqlx::query("DELETE FROM object WHERE server_id = ? AND k = ?")
             .bind(i64::from(scope))
             .bind(&req.key)

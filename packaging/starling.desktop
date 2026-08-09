@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Starling
+GenericName=Mumble Server
+Comment=Run a Mumble voice server on this machine
+# Terminal=true, because everything this reports -- the SuperUser password on
+# the first start most of all -- it reports by printing it.
+Exec=starling --all-in-one
+Terminal=true
+Icon=starling
+Categories=Network;Chat;AudioVideo;
+Keywords=mumble;voice;voip;server;
