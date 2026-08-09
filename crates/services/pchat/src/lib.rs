@@ -227,7 +227,9 @@ impl PchatService {
         use sqlx::Row as _;
         let page = request.page.clone().unwrap_or_default();
         let limit = page.page_size(50, 200);
-        let before = self.cursor_of(scope, request.channel, &page.before_id).await;
+        let before = self
+            .cursor_of(scope, request.channel, &page.before_id)
+            .await;
         // The protocol predicate is here as well as in `on_message` on purpose:
         // refusing to write only protects a database that has always run this
         // build, and a deployment that upgraded into it still has yesterday's
@@ -259,7 +261,9 @@ impl PchatService {
         // the next cursor, so it has to be the same identity the messages
         // themselves carry.
         let page_info = PageInfo::after(rows.len(), limit, || {
-            rows.get(limit as usize - 1).map(wire_id).unwrap_or_default()
+            rows.get(limit as usize - 1)
+                .map(wire_id)
+                .unwrap_or_default()
         });
         let messages = rows
             .into_iter()

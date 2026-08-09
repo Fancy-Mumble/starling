@@ -1034,7 +1034,13 @@ impl SessionLifecycleService {
         // not something a moderator can lend to somebody else.
         let bypass_full = self
             .permit
-            .allows_session_with_tokens(inbound.scope, moved, target, Perm::WRITE.bits(), Vec::new())
+            .allows_session_with_tokens(
+                inbound.scope,
+                moved,
+                target,
+                Perm::WRITE.bits(),
+                Vec::new(),
+            )
             .await;
 
         let Some(result) = self

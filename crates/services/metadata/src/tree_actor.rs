@@ -14,25 +14,9 @@ use starling_runtime::storage::Store;
 
 use crate::channel::is_full_for;
 
-/// Flags packed into `Channel::flags`, in the order `docs/STORAGE.md` lists.
-pub const FLAG_HIDDEN: u32 = 1;
-/// The channel disappears when its last member leaves.
-pub const FLAG_TEMPORARY: u32 = 2;
-/// The channel is **out of the tree**: parentless like the root, in nobody's
-/// channel list, and sent only to clients that understand a parentless channel.
-///
-/// What meeting rooms and friend DMs are made of (`vendor/server/src/Channel.h`,
-/// `ChannelAttribute::Detached`). It is not "ACL inheritance off", which is what
-/// this said while nothing set it: dropping its parents' ACL entries is a
-/// consequence of having no parents, and a channel that merely stopped
-/// inheriting would still be somewhere in the tree.
-///
-/// Fixed at creation. A channel that gained the flag later would keep a parent
-/// while claiming to have none; one that lost it would surface in every
-/// client's tree under the root.
-pub const FLAG_DETACHED: u32 = 4;
-/// A grouping node nobody can enter.
-pub const FLAG_STRUCTURAL: u32 = 8;
+pub use starling_proto_fancy::channel::{
+    FLAG_DETACHED, FLAG_HIDDEN, FLAG_STRUCTURAL, FLAG_TEMPORARY, is_detached,
+};
 
 /// `flags` with detachment forced to what the channel already was.
 ///
@@ -47,16 +31,6 @@ pub const fn with_detachment(flags: u32, detached: bool) -> u32 {
     } else {
         flags & !FLAG_DETACHED
     }
-}
-
-/// Whether `channel` is out of the tree.
-///
-/// A free function on the record rather than a method, because `parent: None`
-/// is true of the root as well and every caller that walks by parent id has to
-/// tell the two apart. Named so that the test reads as the question.
-#[must_use]
-pub const fn is_detached(channel: &Channel) -> bool {
-    channel.flags & FLAG_DETACHED != 0
 }
 
 /// The operator's ceilings on the tree.
@@ -1852,7 +1826,10 @@ mod tests {
             .unwrap_or_default();
         let _ = trees.link(1, lobby, &[scratch], &[]);
         let _ = trees.enter(1, 7, scratch, TreeLimits::UNLIMITED, false);
-        assert_eq!(trees.enter(1, 7, 0, TreeLimits::UNLIMITED, false).collected, Some(scratch));
+        assert_eq!(
+            trees.enter(1, 7, 0, TreeLimits::UNLIMITED, false).collected,
+            Some(scratch)
+        );
         assert!(links_of(&trees, lobby).is_empty());
     }
 
@@ -1978,7 +1955,11 @@ mod tests {
             TreeLimits::UNLIMITED,
         );
 
-        assert!(trees.enter(1, 5, annex, TreeLimits::UNLIMITED, false).applied);
+        assert!(
+            trees
+                .enter(1, 5, annex, TreeLimits::UNLIMITED, false)
+                .applied
+        );
         assert_eq!(listening(&trees, 5), vec![annex]);
         assert_eq!(gain(&trees, 5, annex), Some(0.4));
     }

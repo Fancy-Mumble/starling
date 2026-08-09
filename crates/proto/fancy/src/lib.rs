@@ -15,6 +15,7 @@
 //! makes "never break a native Mumble client" structural rather than a rule
 //! someone has to remember.
 
+pub mod channel;
 pub mod identity;
 pub mod page;
 pub mod perm;

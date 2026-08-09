@@ -358,10 +358,7 @@ impl Handshake {
         // with a `default_channel` would quietly seat everybody in the root.
         self.announce_up(connections, inbound.conn).await;
 
-        let Some(channel) = self
-            .landing(inbound.scope, session, account, &config)
-            .await
-        else {
+        let Some(channel) = self.landing(inbound.scope, session, account, &config).await else {
             // The root refused them, which it does only when it is full: there
             // is nowhere left to put this user, and admitting them to nowhere
             // would put a session in the tree that is in no channel. murmur
@@ -906,7 +903,7 @@ impl Handshake {
                 // room to everyone who connected afterwards - including the same
                 // user after a reconnect. `temporary` was already missing here
                 // for the same reason.
-                let state = starling_metadata::serialize::channel_state(&channel);
+                let state = starling_proto_fancy::channel::channel_state(&channel);
                 to_conn(inbound.conn, 7, state.encode_to_vec())
             })
             .collect()

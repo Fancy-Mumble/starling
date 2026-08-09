@@ -1282,9 +1282,7 @@ impl MetadataService {
     /// way for it to leave a channel that no longer exists. Telling it where it
     /// now is first leaves no such window.
     fn sweep(&self, scope: u32) {
-        let reaped = self
-            .trees
-            .reap_expired(scope, now_ms());
+        let reaped = self.trees.reap_expired(scope, now_ms());
         if reaped.channels.is_empty() {
             return;
         }

@@ -2754,6 +2754,7 @@ version = "0.2.0"
 dependencies = [
  "bitflags",
  "prost",
+ "starling-proto",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2832,7 +2833,6 @@ dependencies = [
  "prost",
  "serde",
  "starling-gate",
- "starling-metadata",
  "starling-proto",
  "starling-proto-fancy",
  "starling-runtime",
