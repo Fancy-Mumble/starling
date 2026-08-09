@@ -26,13 +26,13 @@ package "**scales out, bounded by the key**" as BOUND #FFF9C4 {
   component "**gateway**\nshard: **connection**\n--\nAny pod takes any connection. A client's\nTCP socket pins it for that connection's\nlifetime; **RESUME** lets it land elsewhere\nafter a restart." as gw #FFFFFF
   component "**session-lifecycle**\nshard: **connection**\n--\nOne state machine per connection,\nindependent of every other." as slife #FFFFFF
   component "**session-view**\nshard: **session id, from day one**\n--\nHolds a composed view per connected\nsession and updates all of them on every\nchange. Unsharded, that is one actor doing\nevery domain read,\n**Discord's guild-process bottleneck, relocated.**" as sview #FFE082
-  component "**metadata** · **server-config**\nshard: **virtual server**\n--\nOne actor per virtual server, the Discord\nguild-process pattern. Within one virtual\nserver it scales **vertically only**, which\nis also the answer to multiple virtual\nservers in one deployment." as meta #FFFFFF
+  component "**metadata** · **server-config**\nshard: **server instance**\n--\nOne actor per server instance, the Discord\nguild-process pattern. Within one server\ninstance it scales **vertically only**, which\nis also the answer to multiple server\ninstances in one deployment." as meta #FFFFFF
   component "**screenshare**\nshard: **SFU session**\n--\nEach broadcast is independent, and Fancy\nclients learn their SFU endpoint from the\nanswer, so placement is free." as share #FFFFFF
 }
 
 ' ═══════════════════════════════════════════════════════════════════════════
 package "**must not scale out at all**" as SINGLE #EDE7F6 {
-  component "**directory**\nshard: **none, one per virtual server**" as dir #FFFFFF
+  component "**directory**\nshard: **none, one per server instance**" as dir #FFFFFF
 }
 
 note bottom of SINGLE #EDE7F6
@@ -59,7 +59,7 @@ note bottom of PINNED #FFCDD2
   **a legacy client sends UDP to the port it made TCP to.**
   It cannot be redirected.
   Three ways out, and only the last scales:
-  · **one voice pod per virtual server**, vertical only, simplest, honest
+  · **one voice pod per server instance**, vertical only, simplest, honest
   · **a forwarding mesh between voice pods**, scales, costs a hop inside a 10 ms budget
   · **shard by channel and hand Fancy clients an explicit endpoint** in ServerSync,
     real scaling for Fancy, legacy pinned to the advertised pod
@@ -79,7 +79,7 @@ note bottom of BOUND #FFFFFF
   An unbounded inbox converts one slow consumer into an OOM, the
   specific failure Discord hit with Erlang process mailboxes under
   fanout. Applies to session-view per session and metadata per
-  virtual server alike.
+  server instance alike.
 end note
 
 note bottom of FREE #FFFFFF

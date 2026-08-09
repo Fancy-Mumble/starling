@@ -98,7 +98,7 @@ A route would not be enough; there is nothing behind it.
 | `verifyPassword`, `getCertificateList`, `updateCertificate` | no equivalent |
 | `sendWelcomeMessage`, `redirectWhisperGroup` | no equivalent |
 | `getChannelsForSession`, `getTreeForSession` | no per-session visibility view |
-| `getAllServers`, `start`, `stop`, `newServer`, `getUptime`, `getVersion` | virtual servers are configuration here; there is no runtime lifecycle to drive |
+| `getAllServers`, `start`, `stop`, `newServer`, `getUptime`, `getVersion` | server instances are configuration here; there is no runtime lifecycle to drive |
 
 ### 2.3 Deliberately not coming back
 
@@ -119,16 +119,33 @@ They are not all *finished*, and the e2e sweep says which:
 
 | Gap | Evidence |
 |---|---|
-| **Audit ingest fan-out is not wired.** Records are produced and never land | `audit-log` 1/9, whose own failure text is `server_audit has no rows - ingest fan-out not wired` |
+| ~~**Audit ingest fan-out is not wired.**~~ Fixed: `session-lifecycle` now records moves and speak-state changes, which were the two moderator powers no service audited; the client-facing query is gated on Write-on-root (it was ungated, so the record was world-readable) and serves the config and chain verify the admin tab needs | was `audit-log` 1/9 |
 | **pchat messages are not delivered.** The control plane answers; the message never arrives | `pchat` 0/1, `pchat-control-plane` 0/2, `signal-pchat` 3/4 |
-| **Reactions never appear** on a message | `reactions` 0/1 |
+| ~~**Reactions never appear** on a message~~ Fixed with typing and polls: `social` relayed to the whole server with the actor left as the peer wrote it (0), which every shipped client drops, and answered a poll with a tally message nothing decodes. It now addresses the channel through a roster, writes every actor, and relays the poll and the vote themselves | was `reactions` 0/1, `fancy-control-plane` 0/2 |
 | **Link previews are never produced** | `link-preview` 0/1 |
 | **A channel cannot be deleted from the admin surface** | `admin-channel-delete` 0/1 |
 | **Role creation half-works** | `admin-create-role` 2/4 |
 | Screen-share **SFU**, signalling only, no `str0m` | `GAP-ANALYSIS.md` S2, fork's `WebRtcSfuManager.cpp` |
 
-Six concrete defects. That is a list somebody can finish, which is why it is
-worth separating from §1.
+Six concrete defects, two of them now struck through. That is a list somebody
+can finish, which is why it is worth separating from §1.
+
+The audit fix needed a change on **both** ends, which is worth recording because
+the same shape will recur for every remaining native subsystem. Starling served
+the record and the client had the whole admin tab, and no byte passed between
+them: audit had no entry in the client's `canon.rs`, so `NativeCodec` fell
+through to the `PluginData` relay, which refuses a `ServerOnly` message — the
+tab sent nothing at all, silently. Every feature in this table should be checked
+for a canon translation before its service is debugged.
+
+The social fix is the same shape a second time, and it says the check has to go
+one level deeper than "is there a translation". There was one, and it was
+lossy: a vote translated into a canon `PollVote` that carries no channel, and
+the client drops a vote it cannot route to a poll card, so the tally never
+moved however correctly the server counted. A reaction lost its reactor the
+same way. Both fields are now on the wire and written by the server, which is
+the only party that cannot get them wrong. **A translation that compiles is not
+a translation that carries what the receiver reads.**
 
 ---
 
@@ -154,9 +171,6 @@ ends. A plugin host does not by itself make those tests pass.
 ---
 
 ## 5. What is built
-
-Stated because a list of holes is not a description of a system, and because
-this file is otherwise all holes.
 
 Everything in `GAP-ANALYSIS.md` §8, plus: the Fancy wire epoch and its
 negotiation (`PROTOCOL-COMPATIBILITY.md`), pchat's control plane and its

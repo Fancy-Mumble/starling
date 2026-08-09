@@ -251,7 +251,7 @@ Opus and incompressible.
 **S4, shard keys are part of the contract.** `voice` by channel (a channel's
 members must share a pod; Fancy clients are handed the endpoint via
 `VoiceEndpoint`, legacy scales vertically), `session-view` by session,
-`metadata` and `server-config` by virtual server. These are decided now
+`metadata` and `server-config` by server instance. These are decided now
 because a shard key cannot be retrofitted.
 
 **S5, loss is bounded and honest.** Control overflow to a client:
@@ -308,8 +308,8 @@ session-view, it has no client-facing type: internal by construction.
 
 Two files, because the planes have different compilers and different secrets:
 
-**`common.proto` (`starling.common.v1`), the mesh's.** `Scope` (virtual
-server), `Actor` (session | operator | internal), `Ack`, `Decision`. Imported
+**`common.proto` (`starling.common.v1`), the mesh's.** `Scope` (server
+instance), `Actor` (session | operator | internal), `Ack`, `Decision`. Imported
 by every L3 contract; never compiled into a client.
 
 **`fancy/wire.proto` (`starling.fancy.wire.v1`), the wire's.** `Cursor` and

@@ -287,7 +287,7 @@ Requirements, in priority order:
    passes and a failure does not mean starting over.
 4. **Loud about what it could not map.** Every dropped or approximated value is
    reported, never silently discarded, the same rule the `.ini` reader follows.
-5. **Per-tenant.** `--server-id` migrates one virtual server; omitted, it
+5. **Per-tenant.** `--server-id` migrates one server instance; omitted, it
    migrates all of them.
 
 The interesting cases are EAV → typed columns (L1), where a malformed `TEXT`

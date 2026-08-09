@@ -379,7 +379,10 @@ arranged*.
 - [x] Persistent chat: relay and store, UUIDv7-keyed, retention swept
 - [~] The remaining Fancy surface: push, audit, onboarding, social, link-preview
       and context-actions each have their service and envelope; several answer a
-      subset of their envelope's messages
+      subset of their envelope's messages. `social` now answers all of its
+      (reactions, typing, receipts, polls, watch, drawing), addressed at a
+      channel rather than at the server; scheduled messages are stored,
+      timed and delivered by `text`, and wait on a client that speaks them
 - [~] SFU and RPC: `operator-api` ships (REST + OpenAPI, pluggable auth,
       fail-closed audit); the SFU is signalling-only and the channelviewer Ice
       shim is not written
@@ -411,6 +414,12 @@ The in-process microkernel is gone: no bus, no lanes, no envelopes, no
 * **Audio routing is not wired to the socket.** The routing core, the ciphers,
   the packet codecs and the peer table are all present and tested; the UDP loop
   logs datagrams rather than routing them.
+
+* **Scheduled messages have no client.** The server half is complete, ported
+  from the fork's `wip/forums-scheduled-e2e-fixes` branch (wire ids 161-165,
+  `Messages.cpp:5322`) onto the canon's `TextEnvelope`. The client's own half
+  lives on an unmerged branch that still speaks epoch 0, so nothing exercises
+  it yet: the `scheduled-messages` suite is waiting on the client, not on this.
 
 ## 10. Lint suppressions
 

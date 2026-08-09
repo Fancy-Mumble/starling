@@ -34,7 +34,7 @@ package "**control plane**, gRPC only; no client reaches these directly" as CTRL
     component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms #FFFFFF
     component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta #FFFFFF
     component "**userdata**\nprofiles · accounts · blobs\n**SuperUser is account 0**, so a\nguest is `None`, never `0`\n**no password ⇒ not claimable**\n**by name alone**\n14,18,23 + **1003**" as users #FFFFFF
-    component "**server-config**\nruntime-mutable,\nper virtual server\n24,25 + **1013**" as scfg #FFFFFF
+    component "**server-config**\nruntime-mutable,\nper server instance\n24,25 + **1013**" as scfg #FFFFFF
   }
 
   package "core: a feature dies" as CORE #FFF8E1 {

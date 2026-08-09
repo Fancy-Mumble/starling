@@ -137,10 +137,31 @@ Three rules make it work:
   any Mumble server, so typing, watch-sync, WebRTC signalling and pchat key
   distribution survive a mismatch. Everything `ServerOnly` does not.
 
-**Starling therefore announces `fancy_protocol = 1` and no `fancy_version` at
-all.** Announcing a product version would be actively worse than silence: a
-client would take it as licence to send epoch-0 natives. With it absent, clients
-fall back to `PluginDataTransmission`, which Starling relays correctly.
+**Starling therefore announces `fancy_protocol = 1` first, and `fancy_version`
+only to a peer that has answered with epoch 1.** The two questions are answered
+at different times because whether the second one is *safe* to answer depends on
+something only the peer's own `Version` says.
+
+To an epoch-0 client a product version is licence to send epoch-0 natives, which
+this server routes nowhere; silence keeps that client on
+`PluginDataTransmission`, which Starling relays correctly. A peer that announced
+epoch 1 has already committed to this numbering and picks its framing from the
+epoch alone (`fancy_codec.rs`, `select_codec`, which does not consult
+`fancy_version`), so for that peer the hazard does not exist.
+
+Withholding it from *everyone* was the safe half of the decision, and the other
+half had a price that took a while to see, because it does not look like a
+protocol fault. A client reads `fancy_version` as "these features exist here"
+and gates on it. Absent, `mumble-tauri`'s `send_message` leaves `message_id`
+unset; the encrypted-channel path is keyed on that id, so it builds no
+ciphertext and sends no `PchatMessage` at all. The channel is correctly
+`signal_v1` at both ends, the banner renders, and nothing ever crosses it — the
+server's log shows only the plaintext half of the client's dual-path pair,
+carrying its `[Encrypted message]` placeholder. Every admin surface gated on the
+same number (the audit tab, at 0.4.2) is dark for the same reason.
+
+`fancy_announcement` in `session-lifecycle/src/handshake.rs` is the whole rule,
+and `FANCY_VERSION` there records which level Starling claims and why.
 
 The client keeps the mirror of this in `mumble-protocol/src/fancy_codec.rs`
 (`FANCY_PROTOCOL_EPOCH`, `speaks_epoch`), and announces its own epoch in the

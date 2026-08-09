@@ -1,28 +1,142 @@
 # Configuration
 
-## Two layers, and this file is only one of them
+Start from [`starling.example.toml`](../starling.example.toml). It is the file
+somebody running a server for their friends actually edits: the name, the port,
+how many people may join, the password, the chat and audio limits. Everything
+below it is a knob you should not need, and lives in
+[`examples/advanced/`](../examples/README.md).
+[`examples/reference.toml`](../examples/reference.toml) lists every key that
+exists, with its default and a sentence on what it does.
+
+Configuration comes from three places, each overlaying the one before:
+
+| | Where it lives | |
+|---|---|---|
+| Defaults | compiled into the binary | which is why `starling --all-in-one` with no file is a working server |
+| A file | wherever `--config` points | may `include` others |
+| Environment | `STARLING_*` | applied last, so it wins |
+
+### The file `--all-in-one` finds on its own
+
+Without `--config`, `--all-in-one` reads this platform's own configuration
+directory, and writes a starter file there the first time it runs — along with
+creating the SuperUser and printing its password, which is what makes a
+downloaded `.deb` or `.exe` a server without a manual first.
+
+| | |
+|---|---|
+| Linux, BSD | `$XDG_CONFIG_HOME/starling/starling.toml`, else `~/.config/starling/starling.toml` |
+| macOS | `~/Library/Application Support/Starling/starling.toml` |
+| Windows | `%APPDATA%\Starling\starling.toml` |
+
+Three things that file is not. It is not written when `--config` was passed —
+a path that names nothing is a typo, and reported as one. It is not written in a
+directory that already holds a `starling-data/`, which keeps the built-in
+defaults it has always had, so an existing deployment is never moved. And it is
+never rewritten: from the moment it exists it is yours, and a later start reads
+it and leaves it alone.
+
+Only `--all-in-one` does this. A single service (`starling text`) is the
+Kubernetes shape, which is always given a `--config`, and bringing a
+configuration into existence as a side effect of starting one pod of twenty-one
+would be a surprise in the worst possible place.
+
+[`deploy/starling.toml`](../deploy/starling.toml) is not part of that chain for
+anyone but `docker-compose.yml`, which mounts it into each container. It is not
+shipped inside the executable, and it names endpoints because its services are
+in separate containers where the built-in Unix sockets cannot be reached.
+
+## A file names what it changes
+
+A configuration file is an **overlay on the built-in defaults**, not a
+replacement for them. What it does not mention keeps its built-in value, so this
+is a complete, working server:
+
+```toml
+[[instances]]
+name = "Frog Pond"
+port = 64738
+
+[instances.settings]
+max_users = 20
+password  = "hunter2"
+```
+
+The whole service map -- endpoints, tiers, routes, rate-limit buckets -- comes
+from the defaults, which is where the routing table lives. It used to live in
+code *and* in every shipped file, and the copies drifted: `UserState` moved to
+`session-lifecycle` in code, the files went on naming `userdata`, and self-mute
+worked under `--all-in-one` and did nothing in the container deployment.
+
+Two consequences worth knowing:
+
+* **A value replaces, it does not merge, arrays included.** A `types` list is
+  the whole list; `[[instances]]` means *these* instances.
+* **Omitting a service no longer switches it off.** Say `enabled = false`.
+  (`operator-api` is the exception, and deliberately so: it has no built-in
+  entry at all, so a file that never mentions the admin plane does not run it.)
+
+Unknown keys are refused at startup, so a typo fails loudly instead of quietly
+leaving a limit at its default.
+
+## Splitting it across files
+
+```toml
+include = ["conf.d", "examples/advanced/logging.toml"]
+```
+
+A path is resolved against the directory of the file naming it; a directory
+means every `*.toml` directly inside it, in name order. Includes are merged in
+the order listed and **the including file is applied last**, so the file you are
+editing wins over what it pulls in. Includes may nest; a file reached twice is
+refused rather than merged twice, because the second visit is either a cycle or
+an ambiguity about which copy wins.
+
+## Two layers, and one file that writes to both
 
 murmur keeps deployment and operational settings together in one `Config` table.
 Starling splits them, because they have different lifetimes:
 
-| | **Deployment (this file** | **Operational) the `server-config` service** |
+| | **Deployment** | **Operational (the `server-config` service)** |
 |---|---|---|
-| Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `bandwidth`, `messagelimit`, `users`, `welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`, `certrequired`, `allow_ping`, `registry_*` |
-| Changed by | editing this file | an operator, at runtime, like murmur |
+| Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `max_users`, `welcome_text`, `password`, `max_bandwidth`, `message_limit`, `allow_html`, `cert_required`, `allow_ping`, `registry_*` |
+| Written in | the file, at any level | `[instances.settings]`, or the admin UI |
+| Changed by | editing the file | an operator, at runtime, like murmur |
 | Takes effect | on restart | immediately, republished to subscribers |
-| Scope | the process | per virtual server |
+| Scope | the process | per server instance |
 
-Anything that needs a restart anyway belongs here, so it is read once at startup
-and injected at construction, no late-subscriber problem and no service to be
-down. Anything an operator expects to change live belongs to `server-config`,
-which is an **essential** service for exactly that reason: the gateway cannot
-rate-limit without `messagelimit`, so a cold start without it rejects logins
-rather than quietly serving on defaults nobody chose.
+Anything that needs a restart anyway is read once at startup and injected at
+construction: no late-subscriber problem and no service to be down. Anything an
+operator expects to change live belongs to `server-config`, which is an
+**essential** service for exactly that reason: the gateway cannot rate-limit
+without `message_limit`, so a cold start without it rejects logins rather than
+quietly serving on defaults nobody chose.
 
-Every key below is overridable by environment variable, so a Kubernetes ConfigMap
-works without templating and `docker compose` works without a mount. The rule:
-`[services.text] endpoint` becomes `STARLING_SERVICES_TEXT_ENDPOINT`, uppercase,
-dots and dashes to underscores, `STARLING_` prefix.
+The file can still state what those settings *start* as, under
+`[instances.settings]`, because the first question anybody setting up a
+server asks is how to let twenty friends in and put a password on it, and that
+had no answer that looked like configuration.
+
+### Which wins
+
+Three layers, in order of how deliberate the statement is:
+
+1. murmur's defaults, for a server nobody has configured;
+2. `[instances.settings]`, the operator's starting values;
+3. whatever an operator has since changed at run time, which wins.
+
+The third layer is stored **with the list of fields it covers**, not as a whole
+snapshot, so a setting nobody has touched keeps following the file. Change
+`welcome_text` in the admin UI, and editing `max_users` in the file still works.
+A row written before this was recorded keeps all of its settings, so an upgrade
+changes nothing.
+
+## Environment variables
+
+Every key has one, so a Kubernetes `ConfigMap` needs no templating and
+`docker compose` needs no mount: `[services.text] endpoint` becomes
+`STARLING_SERVICES_TEXT_ENDPOINT`, uppercase, dots and dashes to underscores,
+`STARLING_` prefix. They are applied after the files, so they win.
 
 ---
 
@@ -156,9 +270,10 @@ service the operator may not be running.
 
 ## A service
 
-Every service block takes the same keys. `types` is the outer message type, one
-set per service; a service's own message types live in its nested envelope, which
-the gateway never looks inside.
+You write a block only for a service you are changing; every service already has
+one. They all take the same keys. `types` is the outer message type, one set per
+service; a service's own message types live in its nested envelope, which the
+gateway never looks inside.
 
 ```toml
 [services.text]
@@ -244,14 +359,10 @@ needs no generated stubs for the new service and no knowledge of its schema.
 ### The one service with no endpoint
 
 `directory` announces this server to the public Mumble list. Nothing dials it, so
-it has no `endpoint` and no gRPC surface, the only two lines it needs here are
-its tier and where to find a trust store:
+it has no `endpoint` and no gRPC surface, and the only line it needs here is
+where to find a trust store:
 
 ```toml
-[services.directory]
-tier = "optional"
-types = []
-
 [services.directory.options]
 # The public list's certificate is verified against this bundle. A missing one
 # fails the announcement rather than posting unverified, the payload carries a
@@ -259,9 +370,9 @@ types = []
 trust_store = "/etc/ssl/certs/ca-certificates.crt"
 ```
 
-**Everything that decides *whether* it announces is operational, not here**,
-because murmur lets an operator change it while the server runs. In
-`server-config`:
+**Everything that decides *whether* it announces is operational**, because
+murmur lets an operator change it while the server runs. Set it in the admin UI,
+or state the starting value in `[instances.settings]`:
 
 | Setting | murmur | Meaning |
 |---|---|---|
@@ -314,20 +425,41 @@ Every service runs in one process with in-process calls instead of gRPC. Same
 binary, same config file, `endpoint` values are ignored. This is the mode for a
 single VPS; the multi-process mode is for isolation or per-service scaling.
 
-## Virtual servers
+## Server instances
 
 ```toml
-[[virtual_servers]]
+[[instances]]
 id   = 1
 name = "Main"
 port = 64738
 
-[[virtual_servers]]
+[instances.settings]
+max_users = 20
+password  = "hunter2"
+
+[[instances]]
 id   = 2
 name = "Staging"
 port = 64739
 ```
 
-Metadata runs one actor per virtual server, sharded by id, the Discord
+Metadata runs one actor per server instance, sharded by id, the Discord
 guild-process pattern. Port numbers follow murmur's convention of
 `base_port + server_id`.
+
+`settings` is the operational half, per server; see
+[Two layers](#two-layers-and-one-file-that-writes-to-both) above.
+
+### `port` is the port, singular
+
+With **one** server instance, its `port` is what the gateway listens on and what
+voice binds its UDP socket to, because to a client those are one port on two
+protocols. It reached neither before: the gateway bound `[gateway] listen_tcp`
+and voice bound its own `udp_listen`, so moving a server off 64738 in the
+obvious place left it answering on 64738, and the two keys that would have moved
+it are in blocks an operator otherwise never opens.
+
+Saying either of those explicitly still wins, which is how you bind to loopback
+or put the two on different ports. With **several** server instances nothing is
+derived: they share one gateway listener, so picking one of their ports for it
+would be arbitrary, and those deployments state `listen_tcp` themselves.

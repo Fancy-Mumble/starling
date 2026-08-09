@@ -28,7 +28,7 @@ package "cluster" as K8S #F5F5F5 {
   node "**files/http** pods\nstateless" as fpod #E8F5E9
   node "**essential** pods\nsession · permissions\nmetadata · userdata" as epod #FFEBEE
   node "**optional** pods\npush · audit · polls · ..." as opod #E8F5E9
-  node "**directory**\nsingleton per virtual server\nno inbound port at all" as dpod #EDE7F6
+  node "**directory**\nsingleton per server instance\nno inbound port at all" as dpod #EDE7F6
 }
 
 cloud "**publist.mumble.info**" as publist #EDE7F6
@@ -95,7 +95,7 @@ note right of lbudp #FFCDD2
   **a legacy client sends UDP to the port it made TCP to**,
   so it cannot be redirected.
   So, in order of increasing capability:
-  · **one voice pod per virtual server** - vertical only, honest
+  · **one voice pod per server instance** - vertical only, honest
   · **a forwarding mesh between pods** - scales, costs a hop
   · **shard by channel + an explicit endpoint in `ServerSync`** for
     Fancy clients; legacy stays on the advertised pod

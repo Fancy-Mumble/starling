@@ -291,7 +291,7 @@ problem, no service to be down.
 **Operational config lives in the `server-config` service**, everything murmur
 lets an operator change live: `bandwidth`, `messagelimit`/`messageburst`, `users`,
 `welcometext`, `allowhtml`, `channelnestinglimit`, `imagemessagelength`,
-`listenersperchannel`, `certrequired`, `logdays`. One actor per virtual server,
+`listenersperchannel`, `certrequired`, `logdays`. One actor per server instance,
 published as a snapshot that readers cache, the same pattern as metadata's
 membership.
 
@@ -361,8 +361,8 @@ session and updates all of them on every change, unsharded, that is one actor
 performing every domain read, which is Discord's guild-process bottleneck
 relocated. It is also the hardest to fix later, because every service calls it.
 
-**`metadata` and `server-config` shard by virtual server**, the guild-process
-pattern, and simultaneously the answer to running several virtual servers.
+**`metadata` and `server-config` shard by server instance**, the guild-process
+pattern, and simultaneously the answer to running several server instances.
 
 ### Reliability mechanisms that are not optional
 
@@ -452,9 +452,9 @@ and fans out; guild state lives in separate processes rather than being read fro
 the database per event. That is the gateway + metadata split, and why voice caches
 membership instead of querying it.
 
-**One process per guild → one actor per virtual server.** Metadata runs one actor
-per virtual server, sharded by server id, a better answer to multiple virtual
-servers than either previous design had.
+**One process per guild → one actor per server instance.** Metadata runs one actor
+per server instance, sharded by server id, a better answer to multiple server
+instances than either previous design had.
 
 **Lazy subscriptions.** Discord clients declare what they are viewing and get
 only that. Mumble broadcasts all channel and user state to everyone, which is

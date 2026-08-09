@@ -469,8 +469,6 @@ learns the door is open by walking through it.
 
 ## 8. What is built
 
-Stated because a list of holes is not a description of a system.
-
 The gateway (TLS, framing, type-keyed routing, per-route rate limiting, circuit
 breakers, the resume ring). All twenty services, serving gRPC. The full handshake,
 end to end over a real socket, with an e2e test that drives it. Storage, `sqlx`
