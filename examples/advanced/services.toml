@@ -1,0 +1,107 @@
+# Services: where they run, what happens when one is down, and what they store.
+#
+#   include = ["examples/advanced/services.toml"]
+#
+# You almost certainly do not need this file. Starling ships a complete service
+# map -- every endpoint, tier and route -- and a configuration file overlays it
+# rather than replacing it, so nothing here has to be restated to be kept. This
+# is for splitting the server across hosts, switching a feature off, or moving a
+# service's data into a real database.
+#
+# Every block takes the same keys:
+#
+#   endpoint  where other services dial this one, and where it binds
+#   tier      what the gateway does while it is unhealthy
+#   types     the wire types the gateway routes here
+#   limits    which rate-limit bucket its inbound traffic is charged to
+#
+# `types` is the outer message type only; a service's own message types live in
+# its nested envelope, which the gateway never looks inside. That is why adding
+# a service needs no gateway release:
+#
+#   [services.whiteboard]
+#   endpoint = "http://whiteboard:50051"
+#   tier     = "optional"
+#   types    = [1018]
+
+
+# Nothing below is active: this file is a menu, so including it as it stands
+# changes nothing. Uncomment what you want.
+
+
+# -- Switching a feature off ------------------------------------------------
+#
+# A disabled service is a supported deployment, not a broken one: the gateway
+# treats it exactly as it treats an unhealthy one, by tier.
+
+# [services.link-preview]
+# enabled = false
+
+# `directory` announces this server to the public Mumble list. Nothing dials it
+# -- it dials out -- so it has no endpoint. It stays silent until the
+# `registry_*` settings are filled in, which is why it ships enabled.
+#
+# [services.directory.options]
+# Where the public list's certificate is verified. A missing bundle fails the
+# announcement rather than posting a shared secret unverified.
+# trust_store = "/etc/ssl/certs/ca-certificates.crt"
+
+
+# -- Spreading services across hosts ----------------------------------------
+#
+# `endpoint` is the only key that changes between one VPS and twenty-four pods:
+#
+#   http://text:50051              across hosts; Kubernetes DNS fills the name in
+#   unix:/run/starling/text.sock   co-located, and file permissions are the auth
+#   pipe:starling/text             the same on Windows, where the ACL is the auth
+#   inproc:text                    in-process, under --all-in-one
+#
+# A bare `host:port` is refused rather than assumed to be TCP: assuming would
+# make `unix` one typo away from silently opening a TCP socket where a
+# permission boundary was expected.
+
+# [services.text]
+# endpoint = "http://text:50051"
+
+# Set `bind` only when the dialled name is not bindable -- on Kubernetes,
+# `endpoint` names a Service whose virtual ClusterIP belongs to no interface, so
+# a pod cannot bind it.
+#
+# [services.text]
+# endpoint = "http://text.starling.svc:50051"
+# bind     = "http://0.0.0.0:50051"
+
+# Voice has a socket of its own, because audio skips the gateway entirely. It
+# follows the server instance's `port` unless you say otherwise here.
+#
+# [services.voice]
+# udp_listen = "0.0.0.0:64738"
+
+
+# -- Tiers ------------------------------------------------------------------
+#
+# What the gateway does while a service is unhealthy:
+#
+#   essential   logins are rejected while it is down
+#   core        the feature it owns is dead; everything else keeps working
+#   optional    nobody notices
+#
+# The shipped tiers are the considered ones. Raising a service's tier makes an
+# outage in it an outage for everybody, which is occasionally what you want:
+#
+# [services.audit]
+# tier = "essential"           # no audit trail -> no logins
+
+
+# -- Storage ----------------------------------------------------------------
+#
+# Each service owns its own schema and no service reads another's tables. With
+# no block, a SQLite file named after the service is used under `data_dir`,
+# which is the right answer well past the point people expect.
+#
+# In-memory SQLite is capped to one connection automatically: five connections
+# to `:memory:` are five different databases.
+
+# [services.pchat.storage]
+# url             = "postgres://starling:@db/starling_pchat"
+# max_connections = 16

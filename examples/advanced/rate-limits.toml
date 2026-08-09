@@ -1,0 +1,62 @@
+# The gateway: what it holds per client, and what it throttles.
+#
+#   include = ["examples/advanced/rate-limits.toml"]
+#
+# Every value below is already the default. The file exists to show what the
+# knobs are, not because they need setting.
+
+[gateway]
+# No `listen_tcp` here on purpose: the port lives on the server instance, and
+# stating it in this file would quietly override that -- a file that says a
+# thing wins, and this one is not about which port to bind.
+#
+# Per client; full means disconnect that client. Dropping a control message
+# desyncs a client silently, and unbounded queueing is a memory DoS.
+control_queue = 4096
+# Per client, tunnelled audio; full means drop the oldest and count it.
+audio_queue = 128
+default_deadline = "5s"
+# Shed a repeatedly-failing service at the door instead of waiting on it.
+breaker_failures = 5
+breaker_cooldown = "10s"
+
+# One bucket per route, never one shared, and a throttled message is reported
+# rather than silently dropped.
+
+[gateway.limits.control]
+# murmur's, and legacy clients are tuned against it.
+rate = "1/s"
+burst = 5
+
+[gateway.limits.chat]
+# A person typing. Losing a message somebody wrote is the worst failure here.
+rate = "5/s"
+burst = 20
+
+[gateway.limits.audio]
+# Speech is ~100 frames a second, so the control bucket would cut a client off
+# mid-sentence. This is the path used by everyone whose UDP is blocked.
+rate = "200/s"
+burst = 400
+
+[gateway.limits.acl]
+# The permission editor opens one query per channel, so a large tree arrives as
+# a burst rather than a flood.
+rate = "20/s"
+burst = 60
+
+[gateway.limits.signalling]
+# Screen sharing: a share start emits several messages back to back.
+rate = "10/s"
+burst = 20
+
+[gateway.limits.plugin]
+rate = "4/s"
+burst = 15
+
+# A reconnecting Fancy client replays only the gap rather than re-syncing the
+# whole server. Legacy clients cannot resume and are unaffected.
+[gateway.resume]
+enabled = true
+ring = 256                   # frames kept per session
+ttl = "120s"                 # how long a dropped session may still resume

@@ -110,9 +110,7 @@ impl Permit {
 
         let answer = PermissionsClient::new(transport)
             .check_session(SessionCheckRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 session,
                 channel,
                 permission,

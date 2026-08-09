@@ -475,9 +475,9 @@ const fn ok(kind: i32) -> AccountAck {
     }
 }
 
-/// The virtual server, in the shape every request carries it.
-const fn in_scope(virtual_server: u32) -> starling_proto_fancy::common::Scope {
-    starling_proto_fancy::common::Scope { virtual_server }
+/// The server instance, in the shape every request carries it.
+const fn in_scope(instance: u32) -> starling_proto_fancy::common::Scope {
+    starling_proto_fancy::common::Scope { instance }
 }
 
 #[cfg(test)]
@@ -529,8 +529,9 @@ mod tests {
                 logger: Logger::null(),
                 permit: starling_runtime::permit::Permit::new(nowhere.clone()),
                 resolver: nowhere.clone(),
-                trail: starling_runtime::trail::Trail::new(nowhere),
+                trail: starling_runtime::trail::Trail::new(nowhere.clone()),
                 enrolling: std::sync::Mutex::default(),
+                settings: starling_runtime::settings::Settings::new(nowhere),
             },
             account.id,
         )

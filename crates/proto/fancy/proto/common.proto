@@ -10,10 +10,10 @@ package starling.common.v1;
 // Nothing to say beyond "it happened".
 message Ack {}
 
-// Which virtual server an operation is scoped to. Every stored row and every
+// Which server instance an operation is scoped to. Every stored row and every
 // actor is keyed by this, docs/ARCHITECTURE.md §4.
 message Scope {
-  uint32 virtual_server = 1;
+  uint32 instance = 1;
 }
 
 // Who is asking, for authorisation and for the audit record.

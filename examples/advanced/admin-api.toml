@@ -1,0 +1,72 @@
+# The admin plane: REST with an OpenAPI description, your own authentication,
+# and every action recorded before it happens. The Ice replacement.
+#
+#   include = ["examples/advanced/admin-api.toml"]
+#
+# Off by default, and loopback-bound when on -- the opposite exposure to the
+# gateway. Put a reverse proxy in front of it before it leaves the box.
+
+[services.operator-api]
+enabled = true
+listen = "127.0.0.1:8081"    # never 0.0.0.0 without meaning it
+
+[services.operator-api.auth]
+mode = "token"               # oidc | jwt | mtls | token
+
+# `token`: a static bearer token, for a script or a one-box install. The weakest
+# option -- no identity, no expiry. It exists so nobody reinvents `icesecret`
+# badly. The config holds the variable's NAME, never the secret itself.
+[services.operator-api.auth.token]
+tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
+
+# `oidc`, for Keycloak, Authentik, Auth0 or Entra. The JWKS is discovered from
+# the issuer and cached, so key rotation needs no restart. An existing role in
+# your IdP becomes a Starling authorisation without writing code.
+#
+# [services.operator-api.auth.oidc]
+# issuer      = "https://keycloak.example.org/realms/starling"
+# audience    = "starling-admin"
+# scope_claim = "roles"
+# [services.operator-api.auth.oidc.map]
+# "starling-admin"   = ["*"]
+# "starling-auditor" = ["userdata:read", "audit:read"]
+
+# `jwt`, a token you sign yourself, for setups with no IdP.
+#
+# [services.operator-api.auth.jwt]
+# public_key  = "/etc/starling/operator/jwt.pub"
+# audience    = "starling-admin"
+# scope_claim = "scopes"
+
+# `mtls`, client certificates, when a PKI already exists. Scopes come from the
+# certificate subject.
+#
+# [services.operator-api.auth.mtls]
+# client_ca = "/etc/starling/operator/ca.pem"
+# [services.operator-api.auth.mtls.map]
+# "CN=admin-console" = ["*"]
+
+# operator-api writes this itself rather than calling the audit service: audit
+# is optional, and the highest-privilege plane must not depend on a service the
+# operator may not be running.
+[services.operator-api.audit]
+path = "/var/log/starling/operator-audit.log"
+# Cannot be recorded -> it does not happen.
+fail_closed = true
+
+# The live channel (users connecting and moving, messages as they are
+# delivered) is a WebSocket at GET /v1/events. It needs no configuration and
+# works through any reverse proxy.
+#
+# The same channel over WebTransport does need configuring, because a reverse
+# proxy generally cannot forward it: it is Extended CONNECT over HTTP/3, so
+# terminating it means terminating QUIC. This listener is the one a proxy is not
+# terminating, so it presents its own certificate; the self-signed pair
+# generated on first boot exists so a first boot starts, not so a deployment
+# ships on it -- a browser refuses it.
+#
+# [services.operator-api.webtransport]
+# enabled = true
+# listen  = "0.0.0.0:8443"   # UDP, and a different socket from `listen` above
+# cert    = "/etc/starling/wt/cert.pem"
+# key     = "/etc/starling/wt/key.pem"

@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use starling_runtime::config::{Config, VirtualServer};
+use starling_runtime::config::{Config, Instance, ServerSettings};
 use tracing::warn;
 
 /// Why an `.ini` could not be migrated.
@@ -165,28 +165,115 @@ impl Ini {
 
     /// The equivalent [`Config`].
     ///
-    /// Only the deployment-layer subset survives the translation: the listen
-    /// address and the virtual server's id, name and port. Everything else the
-    /// `.ini` configures is operational (`docs/ARCHITECTURE.md` §4) and is
-    /// reported by `Self::warn_about_unimplemented` instead, since it has no
-    /// field to land in yet.
+    /// Two layers land in two places, as they do everywhere else: the listen
+    /// address and the server instance's id, name and port are deployment, and
+    /// the limits, the welcome text and the public listing are operational and
+    /// go under `[instances.settings]`, which is where a deployment file
+    /// states the values a server starts with.
+    ///
+    /// Only keys the `.ini` actually contains are written, so a migrated file
+    /// says what the operator said and nothing more. What has no home at all is
+    /// reported by `Self::warn_about_unimplemented`.
     #[must_use]
     pub fn to_config(&self) -> Config {
         self.warn_about_unimplemented();
 
         let host = self.string("host", "0.0.0.0");
-        let port = self.number("port", VirtualServer::default().port);
+        let port = self.number("port", Instance::default().port);
 
         let mut config = Config {
-            virtual_servers: vec![VirtualServer {
+            instances: vec![Instance {
                 id: 1,
-                name: self.string("registerName", &VirtualServer::default().name),
+                name: self.string("registerName", &Instance::default().name),
                 port,
+                settings: self.to_settings(),
             }],
             ..Config::default()
         };
         config.gateway.listen_tcp = format!("{host}:{port}");
         config
+    }
+
+    /// The operational settings the `.ini` states, and only those.
+    ///
+    /// murmur's spellings are its own -- lowercase for the limits, camelCase
+    /// for the `register*` family -- and the parser is case-sensitive on
+    /// purpose, so both are written out rather than derived.
+    #[must_use]
+    pub fn to_settings(&self) -> ServerSettings {
+        let mut settings = ServerSettings::default();
+
+        macro_rules! text {
+            ($($ini:literal => $field:ident),* $(,)?) => {
+                $(settings.$field = self.get($ini).map(ToOwned::to_owned);)*
+            };
+        }
+        macro_rules! count {
+            ($($ini:literal => $field:ident),* $(,)?) => {
+                $(settings.$field = self.get($ini).map(|_| self.number($ini, 0));)*
+            };
+        }
+        macro_rules! flag {
+            ($($ini:literal => $field:ident),* $(,)?) => {
+                $(settings.$field = self.get($ini).map(|value| self.flag($ini, value)));*
+            };
+        }
+
+        text! {
+            "welcometext" => welcome_text,
+            "serverpassword" => password,
+            "registerName" => registry_name,
+            "registerPassword" => registry_password,
+            "registerUrl" => registry_url,
+            "registerHostname" => registry_hostname,
+            "registerLocation" => registry_location,
+        }
+        count! {
+            "users" => max_users,
+            "bandwidth" => max_bandwidth,
+            "textmessagelength" => text_message_length,
+            "imagemessagelength" => image_message_length,
+            "channelnestinglimit" => channel_nesting_limit,
+            "channelcountlimit" => channel_count_limit,
+            "listenersperchannel" => listeners_per_channel,
+            "listenersperuser" => listeners_per_user,
+            "usersperchannel" => users_per_channel,
+            "defaultchannel" => default_channel,
+            "rememberchannelduration" => remember_channel_duration,
+            "logdays" => log_days,
+            "messagelimit" => message_limit,
+            "messageburst" => message_burst,
+        }
+        flag! {
+            "allowhtml" => allow_html,
+            "allowrecording" => allow_recording,
+            "allowping" => allow_ping,
+            "certrequired" => cert_required,
+            "obfuscate" => obfuscate_ips,
+            "broadcastlistenervolumeadjustments" => broadcast_listener_volume_adjustments,
+            "rememberchannel" => remember_channel,
+        }
+        // The two name patterns, carried across verbatim. murmur's `.ini` has
+        // them double-escaped for its own parser (`\\w`), and `unquote` has
+        // already undone the quoting, so what lands here is the pattern
+        // upstream compiles rather than the pattern as typed.
+        text! {
+            "channelname" => channel_name_regex,
+            "username" => user_name_regex,
+        }
+        settings
+    }
+
+    /// murmur writes booleans as `true`/`false` and as `1`/`0`, both.
+    fn flag(&self, key: &str, value: &str) -> bool {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" | "" => false,
+            other => {
+                warn!(key, value = other, "not a boolean; reading it as false");
+                false
+            }
+        }
     }
 
     /// [`Self::to_config`], rendered as TOML text ready to write to
@@ -201,25 +288,19 @@ impl Ini {
     }
 }
 
-/// Keys murmur honours that have no deployment-config home yet, and the phase
-/// that will give them one. See `docs/PORTING-PLAN.md` §4.
+/// Keys murmur honours that have no config home yet, and the phase that will
+/// give them one. See `docs/PORTING-PLAN.md` §4.
+///
+/// The operational settings that used to be listed here -- `users`,
+/// `bandwidth`, `welcometext`, `messagelimit` and the rest -- now migrate into
+/// `[instances.settings]`, so they are gone from this list rather than
+/// reported at every migration.
 const UNIMPLEMENTED: &[(&str, &str)] = &[
     ("database", "2"),
-    ("certrequired", "2"),
     ("autobanAttempts", "2"),
     ("autobanTimeframe", "2"),
     ("autobanTime", "2"),
     ("opusthreshold", "1"),
-    ("messagelimit", "1"),
-    ("messageburst", "1"),
-    ("users", "2"),
-    ("bandwidth", "1"),
-    ("welcometext", "2"),
-    ("allowhtml", "2"),
-    ("serverpassword", "2"),
-    ("textmessagelength", "2"),
-    ("imagemessagelength", "2"),
-    ("allowrecording", "2"),
     ("ice", "6 (replaced by gRPC - see docs/PORTING-PLAN.md §6)"),
     ("webrtcsfuenabled", "6"),
     ("webrtcsfuport", "6"),
@@ -312,9 +393,77 @@ registerName=Fancy Mumble e2e
         let config = ini.to_config();
 
         assert_eq!(config.gateway.listen_tcp, "0.0.0.0:64738");
-        assert_eq!(config.virtual_servers.len(), 1);
-        assert_eq!(config.virtual_servers[0].name, "Fancy Mumble e2e");
-        assert_eq!(config.virtual_servers[0].port, 64738);
+        assert_eq!(config.instances.len(), 1);
+        assert_eq!(config.instances[0].name, "Fancy Mumble e2e");
+        assert_eq!(config.instances[0].port, 64738);
+
+        // The operational half, which used to be warned about and dropped: an
+        // operator migrating a tuned server got a file that quietly restored
+        // every limit to murmur's default.
+        let settings = &config.instances[0].settings;
+        assert_eq!(settings.max_users, Some(100));
+        assert_eq!(settings.max_bandwidth, Some(320_000));
+        assert_eq!(settings.text_message_length, Some(131_072));
+        assert_eq!(settings.allow_html, Some(true));
+        assert_eq!(settings.cert_required, Some(false));
+        assert_eq!(
+            settings.welcome_text.as_deref(),
+            Some("<b>Fancy Mumble e2e test server</b>")
+        );
+        assert_eq!(
+            settings.password.as_deref(),
+            Some(""),
+            "an empty password is a stated one: it means the server is open"
+        );
+    }
+
+    #[test]
+    fn a_setting_the_ini_never_mentions_is_left_unstated() {
+        // Writing every key would turn a migration into a decision about
+        // settings the operator never made, and freeze them at whatever
+        // murmur's default was on the day they migrated.
+        let settings = Ini::parse("port=64738\n").to_settings();
+        assert_eq!(settings.max_users, None);
+        assert_eq!(settings.allow_html, None);
+        assert!(settings.is_empty());
+    }
+
+    #[test]
+    fn murmurs_two_spellings_of_a_boolean_both_migrate() {
+        // `.ini` files in the wild carry both, and reading `1` as false would
+        // silently switch a setting off on migration.
+        assert_eq!(
+            Ini::parse("allowhtml=1\n").to_settings().allow_html,
+            Some(true)
+        );
+        assert_eq!(
+            Ini::parse("allowhtml=false\n").to_settings().allow_html,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_public_listing_migrates_as_a_whole() {
+        // Half of it is a server that stops being listed; murmur refuses to
+        // register without the name, the URL and the password together.
+        let settings = Ini::parse(
+            "registerName=Frog Pond\nregisterPassword=secret\n\
+             registerUrl=https://frogpond.example\nregisterHostname=frogpond.example\n\
+             registerLocation=DE\n",
+        )
+        .to_settings();
+
+        assert_eq!(settings.registry_name.as_deref(), Some("Frog Pond"));
+        assert_eq!(settings.registry_password.as_deref(), Some("secret"));
+        assert_eq!(
+            settings.registry_url.as_deref(),
+            Some("https://frogpond.example")
+        );
+        assert_eq!(
+            settings.registry_hostname.as_deref(),
+            Some("frogpond.example")
+        );
+        assert_eq!(settings.registry_location.as_deref(), Some("DE"));
     }
 
     #[test]
@@ -383,18 +532,15 @@ registerName=Fancy Mumble e2e
         // Better than refusing to boot on one malformed key, and the warning
         // says which one.
         let config = Ini::parse("port=not-a-number").to_config();
-        assert_eq!(
-            config.virtual_servers[0].port,
-            VirtualServer::default().port
-        );
+        assert_eq!(config.instances[0].port, Instance::default().port);
     }
 
     #[test]
     fn a_missing_file_yields_pure_defaults() {
         let config = Ini::parse("").to_config();
-        let defaults = VirtualServer::default();
-        assert_eq!(config.virtual_servers[0].port, defaults.port);
-        assert_eq!(config.virtual_servers[0].name, defaults.name);
+        let defaults = Instance::default();
+        assert_eq!(config.instances[0].port, defaults.port);
+        assert_eq!(config.instances[0].name, defaults.name);
     }
 
     #[test]

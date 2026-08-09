@@ -67,16 +67,19 @@ impl Resolver {
         }
     }
 
-    /// How `service` is reached, after the all-in-one override.
+    /// How `service` is **dialled**, after the all-in-one short-circuit.
+    ///
+    /// A callee already serving in this process is reached in-process whatever
+    /// the file says, because rewriting endpoints for a single box is exactly
+    /// the friction that mode removes. That only applies once the callee has
+    /// registered, which is why it cannot answer the serving question:
+    /// see [`Self::listener`].
     ///
     /// # Errors
     ///
     /// [`ChannelError::Unconfigured`] when no endpoint is configured, and
     /// [`ChannelError::Malformed`] when one is but cannot be parsed.
     pub fn transport(&self, service: &str) -> Result<Arc<dyn Transport>, ChannelError> {
-        // Configured endpoints are ignored on purpose here: the file is the
-        // same one a multi-process deployment uses, and rewriting it for a
-        // single box is exactly the friction this mode removes.
         let served_in_this_process = self.all_in_one && self.broker.has(service);
         if served_in_this_process {
             return Ok(transport::in_process(service));
@@ -86,6 +89,30 @@ impl Resolver {
             .services
             .get(service)
             .and_then(|s| s.endpoint.as_deref())
+            .ok_or_else(|| ChannelError::Unconfigured(service.to_owned()))?;
+        Ok(transport::parse(configured)?)
+    }
+
+    /// How `service` **serves**, which is not always where it is dialled.
+    ///
+    /// `bind` wins over `endpoint` when it is set, and that is the only
+    /// difference from [`Self::transport`]. The two are separate methods rather
+    /// than one with a flag because they answer to different sides of the same
+    /// name, and the all-in-one short-circuit belongs to only one of them: a
+    /// service asks this *before* it has registered with the broker, so
+    /// `broker.has` is false here by construction and consulting it would
+    /// silently mean "never".
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelError::Unconfigured`] when neither address is configured, and
+    /// [`ChannelError::Malformed`] when one is but cannot be parsed.
+    pub fn listener(&self, service: &str) -> Result<Arc<dyn Transport>, ChannelError> {
+        let configured = self
+            .config
+            .services
+            .get(service)
+            .and_then(|s| s.bind.as_deref().or(s.endpoint.as_deref()))
             .ok_or_else(|| ChannelError::Unconfigured(service.to_owned()))?;
         Ok(transport::parse(configured)?)
     }
@@ -148,6 +175,59 @@ mod tests {
             transport::local_endpoint(Path::new("/run/starling"), "voice"),
             "voice resolved to {}",
             resolved.describe()
+        );
+    }
+
+    #[test]
+    fn a_service_serves_where_bind_says_and_is_dialled_where_endpoint_says() {
+        // The Kubernetes case: `endpoint` names a Service, whose ClusterIP
+        // belongs to no interface, so binding it would fail to start. Without
+        // the split there is nowhere to say so.
+        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        let text = config.services.get_mut("text").expect("text is configured");
+        text.endpoint = Some("http://text.default.svc:50051".to_owned());
+        text.bind = Some("http://0.0.0.0:50051".to_owned());
+        let resolver = Resolver::new(Arc::new(config), Broker::new());
+
+        assert_eq!(
+            resolver.listener("text").expect("serve").describe(),
+            "http://0.0.0.0:50051"
+        );
+        assert_eq!(
+            resolver.transport("text").expect("dial").describe(),
+            "http://text.default.svc:50051"
+        );
+    }
+
+    #[test]
+    fn one_address_is_still_the_normal_case() {
+        // Absent `bind` must mean `endpoint` rather than nothing, or every
+        // deployment that has never heard of the split stops serving.
+        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        config
+            .services
+            .get_mut("text")
+            .expect("text is configured")
+            .endpoint = Some("http://text:50051".to_owned());
+        let resolver = Resolver::new(Arc::new(config), Broker::new());
+        assert_eq!(
+            resolver.listener("text").expect("serve").describe(),
+            "http://text:50051"
+        );
+    }
+
+    #[test]
+    fn a_service_serves_its_configured_endpoint_even_under_all_in_one() {
+        // The property `crates/starling/src/e2e.rs` waits on: under
+        // `--all-in-one` a service still binds what it was configured with, so
+        // there is a socket to watch for. Registration happens inside the bind,
+        // so the broker cannot be consulted here - it would answer "no" every
+        // time and make this depend on a race it always loses.
+        let broker = Broker::new();
+        let resolved = resolver(true, broker).listener("text").expect("resolve");
+        assert_eq!(
+            resolved.describe(),
+            transport::local_endpoint(Path::new("/run/starling"), "text")
         );
     }
 

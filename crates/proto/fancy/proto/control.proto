@@ -32,7 +32,7 @@ message ClientEvent {
 // a Send for a session another pod holds is dropped by this one.
 message GatewayHello {
   string gateway_id = 1;
-  uint32 virtual_server = 2;
+  uint32 instance = 2;
 }
 
 message Opened {
@@ -43,7 +43,7 @@ message Opened {
   bytes cert_hash = 3;
   // The chain validated against a configured CA, not merely presented.
   bool strong_cert = 4;
-  uint32 virtual_server = 5;
+  uint32 instance = 5;
   // The chain as presented, leaf first, DER-encoded.
   //
   // Carried in full as well as hashed because the two answer different

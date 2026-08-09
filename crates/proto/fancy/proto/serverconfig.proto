@@ -28,12 +28,12 @@ message SetRequest {
   Snapshot values = 4;
 }
 
-// One version per virtual server, bumped on every accepted Set.
+// One version per server instance, bumped on every accepted Set.
 //
 // A reader compares versions to know whether it missed an update; the value is
-// meaningless across virtual servers.
+// meaningless across server instances.
 message Snapshot {
-  uint32 virtual_server = 1;
+  uint32 instance = 1;
   uint64 version = 2;
 
   string welcome_text = 10;
@@ -88,7 +88,27 @@ message Snapshot {
   // Operators turn it on for overlays and talking-UI tooling that render other
   // people's listeners.
   bool broadcast_listener_volume_adjustments = 35;
+  // Occupants any one channel may hold, murmur's `usersperchannel`, zero for no
+  // limit. A channel carrying its own `max_users` is governed by that instead;
+  // this is the fallback for the ones that do not, never a second ceiling on
+  // top (`vendor/server/src/murmur/Server.cpp:2799`).
+  uint32 users_per_channel = 36;
+  // Where a user lands when nothing better is known, murmur's `defaultchannel`.
+  // Zero is the root, which is also what an id naming no channel falls back to.
+  uint32 default_channel = 37;
+  // Whether a registered user is put back where they were, murmur's
+  // `rememberchannel`, and **on** as it is there.
+  bool remember_channel = 38;
+  // How long that memory lasts, in seconds since they disconnected. Zero, the
+  // default, is forever.
+  uint32 remember_channel_duration = 39;
   // Settings a later service adds, so an operator-facing knob does not need a
   // proto release to exist.
   map<string, string> extra = 40;
+  // What a channel name and a user name may look like, murmur's `channelname`
+  // and `username`. Matched whole rather than anywhere in the name, as murmur
+  // anchors them (`Server.cpp:618`), and an **empty** pattern means no
+  // restriction, which is how an operator turns the rule off.
+  string channel_name_regex = 41;
+  string user_name_regex = 42;
 }

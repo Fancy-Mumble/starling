@@ -1,0 +1,440 @@
+# Every key Starling understands, with its built-in default.
+#
+# A reference sheet, not a starting point -- copy `starling.example.toml`
+# instead. Everything active below is already the default, so including this
+# file changes nothing; the keys that are a decision rather than a default are
+# commented out with a representative value.
+#
+# Unknown keys are refused at startup, so a typo here fails loudly.
+
+
+# ---------------------------------------------------------------------------
+# Top level
+# ---------------------------------------------------------------------------
+
+# Other files to read first, as a base for this one. A path is relative to the
+# file naming it, and a directory means every *.toml directly inside it in name
+# order. The file naming them is applied last, so it wins.
+include = []
+
+
+# ---------------------------------------------------------------------------
+# [runtime] -- the process
+# ---------------------------------------------------------------------------
+
+[runtime]
+# Run every service in this one process. `--all-in-one` on the command line sets
+# it too; the multi-process mode is for isolation or per-service scaling.
+all_in_one = false
+# Databases, the generated TLS certificate, and the sockets services talk over.
+# Back this up and you have backed up the server.
+data_dir = "starling-data"
+
+
+# ---------------------------------------------------------------------------
+# [[instances]] -- one entry per server this process runs
+# ---------------------------------------------------------------------------
+
+[[instances]]
+# Its id. Every stored row and every actor is keyed by this, so changing it on a
+# running server orphans that server's data.
+id = 1
+# Shown in the server browser, and the name of the root channel.
+name = "Starling"
+# The port clients connect to. With exactly one server instance this is also what
+# the gateway binds for TCP and what voice binds for UDP.
+port = 64738
+
+
+# [instances.settings] -- the operational half.
+#
+# These are the settings `server-config` owns at run time, so an operator can
+# also change them from the admin UI. What you write here is the value the
+# server *starts* with; a setting changed in the UI stops following this file,
+# and one nobody has touched keeps following it.
+
+[instances.settings]
+
+# Shown to each user once, on connect. Renders the basic HTML a Mumble client
+# supports.
+welcome_text = ""
+# Required to connect. Empty means the server is open. A server with a password
+# is never listed publicly.
+password = ""
+# Connections beyond this are refused as full.
+max_users = 100
+# Bits per second per speaking user. 72000 is Mumble's own default.
+max_bandwidth = 72000
+# Whether clients may record, and announce that they are recording.
+allow_recording = true
+# Tell everyone when a user changes a per-channel listening volume. Off, because
+# a listener's volume is their own business unless you opt into sharing it.
+broadcast_listener_volume_adjustments = false
+# Longest message in characters, measured after markup is stripped. 0 is
+# unlimited.
+text_message_length = 5000
+# Longest image in bytes, for a message that is an image rather than text.
+image_message_length = 131072
+# Whether messages may carry markup. Off means plain text everywhere.
+allow_html = true
+# How deep the channel tree may go.
+channel_nesting_limit = 10
+# How many channels may exist at all.
+channel_count_limit = 1000
+# How many people one channel may hold. 0 is unlimited. A channel that carries
+# its own limit uses that instead, even where it is the looser of the two.
+users_per_channel = 0
+# Where a user lands when nothing better is known. 0 is the root. A channel that
+# is full, structural, or one they may not enter is skipped.
+default_channel = 0
+# Put a registered user back in the channel they left. Guests are never
+# remembered, and neither are temporary channels: both are gone by the next
+# visit.
+remember_channel = true
+# How long that memory lasts, in seconds since they disconnected. 0 is forever.
+remember_channel_duration = 0
+# What a channel name and a user name may look like. These are murmur's own
+# patterns. The whole name must match, and an empty pattern turns the rule off.
+# A pattern that does not compile is reported and ignored, rather than refusing
+# every name on the server.
+channel_name_regex = '[ -=\w\#\[\]\{\}\(\)\@\|]+'
+user_name_regex = '[ -=\w\[\]\{\}\(\)\@\|\.]+'
+# Listeners one channel may hold. 0 is unlimited.
+listeners_per_channel = 0
+# Channels one user may listen to at once. 0 is unlimited.
+listeners_per_user = 0
+# Refuse connections from users whose client has no certificate. Certificates
+# are how Mumble recognises a returning user.
+cert_required = false
+# Days of chat history kept before it is deleted.
+log_days = 31
+# Sustained messages per second before a client is throttled, and how many may
+# arrive at once before that rate applies. These two are murmur's.
+message_limit = 1
+message_burst = 5
+# The same pair for plugin messages.
+plugin_message_limit = 4
+plugin_message_burst = 15
+# Write addresses to the operator log with the host part masked.
+obfuscate_ips = false
+# Answer unauthenticated pings from server browsers. Also gates public-list
+# registration: a listing the list cannot measure is a dead entry.
+allow_ping = true
+
+# The public listing. Empty means do not register, which is the default because
+# announcing a server is a decision you cannot take back. Registration needs the
+# name, the URL and the password together.
+#
+# How the server appears in the public list.
+registry_name = ""
+# Proves to the public list that a later update is still this server.
+registry_password = ""
+# The page the listing links to. Required.
+registry_url = ""
+# The DNS name the list should reach this server at. Empty means whatever
+# address the announcement arrived from.
+registry_hostname = ""
+# ISO country code, shown beside the listing.
+registry_location = ""
+
+
+# ---------------------------------------------------------------------------
+# [gateway] -- the front door every client connects to
+# ---------------------------------------------------------------------------
+
+[gateway]
+# Where the control plane listens; TLS terminates here. Follows the server
+# instance's `port` unless stated, which is how you bind loopback only.
+# listen_tcp = "0.0.0.0:64738"
+#
+# Control messages held per client. Full means disconnect that client: dropping
+# one desyncs it silently, and unbounded queueing is a memory DoS.
+control_queue = 4096
+# Tunnelled audio frames held per client. Full means drop the oldest and count
+# it, because a late audio frame is worthless.
+audio_queue = 128
+# How long the gateway waits on a service before giving up on one call.
+default_deadline = "5s"
+# Consecutive failures that trip a service's breaker, and how long it sheds
+# before probing again. Deadlines alone fail slowly.
+breaker_failures = 5
+breaker_cooldown = "10s"
+
+[gateway.tls]
+# Certificate chain and private key, PEM. Omit both and a self-signed pair is
+# generated in `data_dir` on first boot -- fine, because Mumble clients identify
+# a server by certificate fingerprint rather than by a public authority.
+# cert = "/etc/starling/tls/cert.pem"
+# key  = "/etc/starling/tls/key.pem"
+
+# [gateway.limits.<bucket>] -- one leaky bucket per named route. `rate` is
+# written per second and `burst` is how much may arrive at once. A service names
+# the bucket it is charged to with its `limits` key. A throttled message is
+# reported, never dropped in silence.
+
+[gateway.limits.control]
+# murmur's, and legacy clients are tuned against it.
+rate = "1/s"
+burst = 5
+
+[gateway.limits.chat]
+# A person typing. Losing a message somebody wrote is the worst failure here.
+rate = "5/s"
+burst = 20
+
+[gateway.limits.audio]
+# Speech is around 100 frames a second, so the control bucket would cut a
+# speaker off mid-sentence. This is the path used by everyone whose UDP is
+# blocked.
+rate = "200/s"
+burst = 400
+
+[gateway.limits.acl]
+# The permission editor opens one query per channel, so a large tree arrives as
+# a burst rather than a flood.
+rate = "20/s"
+burst = 60
+
+[gateway.limits.signalling]
+# Screen sharing: a share start emits several messages back to back.
+rate = "10/s"
+burst = 20
+
+[gateway.limits.plugin]
+rate = "4/s"
+burst = 15
+
+[gateway.resume]
+# Whether a reconnecting Fancy client may replay only the gap instead of
+# re-syncing the whole server. Legacy clients cannot resume either way.
+enabled = true
+# Frames kept per session. This bounds what a resuming client can cost; a longer
+# gap forces a full re-sync, and the client is told so.
+ring = 256
+# How long a dropped session may still resume.
+ttl = "120s"
+
+
+# ---------------------------------------------------------------------------
+# [telemetry] -- developer diagnostics, traces and metrics
+# ---------------------------------------------------------------------------
+
+[telemetry]
+# `text` for a terminal, `json` for a log collector.
+log_format = "text"
+# Where the metrics endpoint binds. Absent means no listener.
+# metrics = "0.0.0.0:9090"
+# An OTLP collector, if one is running.
+# otlp_endpoint = "http://otel-collector:4317"
+
+
+# ---------------------------------------------------------------------------
+# [logging] -- the operator record: who connected, what was refused
+# ---------------------------------------------------------------------------
+#
+# Distinct from [telemetry], which is a developer's dial driven by RUST_LOG.
+
+[logging]
+# Minimum severity recorded at all: debug | info | notice | warning | error.
+level = "info"
+# Categories to record; empty means all of them. The names are: server, session,
+# channel, message, permission, security, plugin, admin.
+categories = []
+# Records buffered before the writer starts dropping and counting them.
+queue = 4096
+
+[logging.console]
+# Write records to stderr.
+enabled = true
+
+[logging.file]
+# Where to append. Empty, the default, disables file logging.
+path = ""
+# Rotate past this many bytes; 0 disables rotation. Default 33554432 (32 MiB).
+# max_bytes = 33554432
+# How many rotated generations to keep. Default 5.
+# keep = 5
+
+[logging.memory]
+# The in-memory ring the admin API reads. Off means the admin log view is empty.
+enabled = true
+# How many records to retain.
+records = 1000
+
+
+# ---------------------------------------------------------------------------
+# [services.<name>] -- one block per service
+# ---------------------------------------------------------------------------
+#
+# Every service already has one of these, so write a block only for a service
+# you are changing. `text` is spelled out here as the worked example; every
+# other service takes exactly the same keys.
+#
+# The names: session-lifecycle, session-view, permissions, metadata, userdata,
+# server-config, voice, text, pchat, moderation, screenshare, files, plugins,
+# push, audit, onboarding, social, link-preview, context-actions, directory,
+# health, gateway, operator-api.
+
+[services.text]
+# Whether this service runs at all. A disabled service is a supported
+# deployment: the gateway treats it by tier, exactly as it treats an unhealthy
+# one.
+enabled = true
+# Where other services dial this one, and where it binds. One of
+# `http://host:port`, `unix:/path.sock`, `pipe:name` (Windows) or
+# `inproc:name`; a bare `host:port` is refused rather than assumed to be TCP.
+# The default is the platform's own local form under `data_dir/run` -- a Unix
+# socket, or a named pipe on Windows -- so it is left unstated here: writing one
+# both pins the transport and moves the socket.
+# endpoint = "http://text:50051"
+# What the gateway does while this service is unhealthy: `essential` rejects
+# logins, `core` kills the feature it owns, `optional` goes unnoticed.
+tier = "core"
+# The wire types the gateway routes here. The outer type only; a service's own
+# message types live in its nested envelope, which the gateway never opens.
+types = [11, 1005]
+# Which [gateway.limits] bucket this service's inbound traffic is charged to.
+# Absent means `control`, murmur's 1/s.
+limits = "chat"
+# The address this service's own gRPC server binds, when it differs from the one
+# others dial. Only needed when the dialled name is not bindable -- a Kubernetes
+# ClusterIP belongs to no interface, so a pod cannot bind it.
+# bind = "http://0.0.0.0:50051"
+
+# Voice's own UDP socket; audio skips the gateway entirely. Follows the server
+# instance's `port` unless stated here.
+# [services.voice]
+# udp_listen = "0.0.0.0:64738"
+
+[services.files]
+# An extra HTTP listener, for the services that have one. Note: nothing binds
+# this yet -- `files` signs URLs and does not serve them in this build.
+listen = "0.0.0.0:8080"
+# What signed URLs point at, which is what a client must reach rather than what
+# this process binds.
+public_url = "http://localhost:8080"
+# How long a signed URL stays valid.
+url_ttl = "15m"
+# Largest upload accepted.
+max_upload = "512MiB"
+
+# [services.<name>.storage] -- this service's own database. Each service owns its
+# schema and none reads another's. With no block, a SQLite file named after the
+# service is used under `data_dir`.
+#
+# [services.pchat.storage]
+# `sqlite://...`, `postgres://...` or `mysql://...`.
+# url = "postgres://starling:@db/starling_pchat"
+# Pool size. In-memory SQLite is capped to one automatically, because five
+# connections to `:memory:` are five different databases.
+# max_connections = 8
+
+# [services.<name>.options] -- string settings a service adds without a runtime
+# release. The ones in use today:
+#
+# [services.directory.options]
+# Where the public list's certificate is verified. A missing bundle fails the
+# announcement rather than posting a shared secret unverified.
+# trust_store = "/etc/ssl/certs/ca-certificates.crt"
+#
+# [services.link-preview.options]
+# How long to wait on a page, in milliseconds (default 5000), how much of it to
+# read (default 262144), how many redirects to follow (default 3), and how many
+# fetches may run at once (default 8). They bound work a stranger asks for
+# against a host the stranger picked, so the defaults are deliberately mean.
+# preview_timeout_ms = "5000"
+# preview_max_bytes = "262144"
+# preview_redirects = "3"
+# preview_concurrency = "8"
+#
+# [services.screenshare.options]
+# The UDP port the SFU binds for media; 0 lets the OS pick.
+# media_port = "0"
+#
+# [services.session-lifecycle.options]
+# How many session ids to mint (default 100), and how long a connection may go
+# unheard from before it is reaped, in milliseconds (default 30000, murmur's).
+# max_users = "100"
+# timeout_ms = "30000"
+
+
+# ---------------------------------------------------------------------------
+# [services.operator-api] -- the admin plane
+# ---------------------------------------------------------------------------
+#
+# REST with an OpenAPI description, your own authentication, every action
+# recorded before it happens. The one service with no built-in entry: a file
+# that never mentions it does not run it.
+
+[services.operator-api]
+enabled = false
+# Where the REST API listens. Loopback unless you mean otherwise -- the opposite
+# exposure to the gateway's.
+listen = "127.0.0.1:8081"
+tier = "optional"
+
+[services.operator-api.auth]
+# oidc | jwt | mtls | token.
+mode = "token"
+
+# `token`: a static bearer token, for a script or a one-box install. No identity
+# and no expiry; it exists so nobody reinvents `icesecret` badly. Each entry
+# names an environment variable rather than holding the secret, so the file can
+# be committed. `*` is every scope.
+[services.operator-api.auth.token]
+tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
+
+# `oidc`: Keycloak, Authentik, Auth0, Entra. The JWKS is discovered from the
+# issuer and cached, so key rotation needs no restart.
+#
+# [services.operator-api.auth.oidc]
+# The issuer URL; its JWKS is discovered from here.
+# issuer = "https://keycloak.example.org/realms/starling"
+# The audience every accepted token must carry.
+# audience = "starling-admin"
+# Which claim carries authorisation.
+# scope_claim = "roles"
+# An existing IdP role becomes a Starling authorisation, without code.
+# [services.operator-api.auth.oidc.map]
+# "starling-admin" = ["*"]
+# "starling-auditor" = ["userdata:read", "audit:read"]
+
+# `jwt`: a token you sign yourself, for setups with no IdP.
+#
+# [services.operator-api.auth.jwt]
+# PEM public key the token is verified against.
+# public_key = "/etc/starling/operator/jwt.pub"
+# audience = "starling-admin"
+# scope_claim = "scopes"
+
+# `mtls`: client certificates, when a PKI already exists. Scopes come from the
+# certificate subject.
+#
+# [services.operator-api.auth.mtls]
+# The CA client certificates are validated against.
+# client_ca = "/etc/starling/operator/ca.pem"
+# [services.operator-api.auth.mtls.map]
+# "CN=admin-console" = ["*"]
+
+[services.operator-api.audit]
+# Where the admin plane writes its own record. It writes this itself rather than
+# calling the audit service, which is optional and must not be a dependency of
+# the highest-privilege plane.
+path = "/var/log/starling/operator-audit.log"
+# A request that cannot be recorded is refused.
+fail_closed = true
+
+# The live channel is a WebSocket at GET /v1/events and needs no configuration.
+# The same channel over WebTransport does, because a reverse proxy generally
+# cannot forward HTTP/3.
+#
+# [services.operator-api.webtransport]
+# Off unless the deployment can terminate QUIC.
+# enabled = false
+# The UDP address to bind. A different socket from the API's TCP `listen`.
+# listen = "0.0.0.0:8443"
+# Certificate and key, PEM. Needed even behind a proxy, because this is the
+# listener the proxy is not terminating. The self-signed pair generated on first
+# boot lets a first boot start; a browser refuses it.
+# cert = "/etc/starling/wt/cert.pem"
+# key = "/etc/starling/wt/key.pem"

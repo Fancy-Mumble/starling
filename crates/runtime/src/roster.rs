@@ -71,6 +71,14 @@ pub struct Roster {
     /// certificate, and pchat's key ladder is keyed on exactly this, peer
     /// keys, channel originators and key holders are all `cert_hash`.
     certs: Mutex<HashMap<u32, Vec<u8>>>,
+    /// Session id to the display name it is using.
+    ///
+    /// A *label*, never an identity: it is chosen by the user, changes with a
+    /// rename, and two people can hold it in sequence. Anything deciding who
+    /// may do what reads [`Self::account_of`] or [`Self::cert_of`]; this is
+    /// for the copy a human reads, which otherwise costs a `session-view`
+    /// round trip per message.
+    names: Mutex<HashMap<u32, String>>,
     warm: AtomicBool,
 }
 
@@ -131,6 +139,12 @@ impl Roster {
                 .map(|session| (session.session, session.cert_hash.clone()))
                 .collect();
         }
+        if let Ok(mut held) = self.names.lock() {
+            *held = sessions
+                .iter()
+                .map(|session| (session.session, session.name.clone()))
+                .collect();
+        }
         if let Ok(mut held) = self.channels.lock() {
             *held = sessions
                 .into_iter()
@@ -154,6 +168,9 @@ impl Roster {
         if let Ok(mut held) = self.certs.lock() {
             let _ = held.insert(session.session, session.cert_hash.clone());
         }
+        if let Ok(mut held) = self.names.lock() {
+            let _ = held.insert(session.session, session.name.clone());
+        }
     }
 
     /// Forget one session.
@@ -168,6 +185,9 @@ impl Roster {
             let _ = held.remove(&session);
         }
         if let Ok(mut held) = self.certs.lock() {
+            let _ = held.remove(&session);
+        }
+        if let Ok(mut held) = self.names.lock() {
             let _ = held.remove(&session);
         }
     }
@@ -186,6 +206,39 @@ impl Roster {
             .ok()?
             .get(&session)
             .filter(|cert| !cert.is_empty())
+            .cloned()
+    }
+
+    /// The session holding `cert`, if one is connected.
+    ///
+    /// A linear scan, like [`Self::in_channel`]: this is read when something
+    /// durable has to find the live connection behind it (a message queued
+    /// before the sender reconnected, say), which is rare enough that a second
+    /// index would cost more to maintain than it saves.
+    ///
+    /// An empty `cert` matches nothing: every peer that presented no
+    /// certificate would otherwise match it, and they are not the same person.
+    #[must_use]
+    pub fn session_with_cert(&self, cert: &[u8]) -> Option<u32> {
+        if cert.is_empty() {
+            return None;
+        }
+        self.certs
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(_, held)| held.as_slice() == cert)
+            .map(|(session, _)| *session)
+    }
+
+    /// The display name `session` is using, if it is known.
+    #[must_use]
+    pub fn name_of(&self, session: u32) -> Option<String> {
+        self.names
+            .lock()
+            .ok()?
+            .get(&session)
+            .filter(|name| !name.is_empty())
             .cloned()
     }
 
@@ -261,7 +314,7 @@ impl Roster {
         gate: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let scope = ctx.virtual_servers().first().copied().unwrap_or(1);
+            let scope = ctx.instances().first().copied().unwrap_or(1);
             loop {
                 self.read(&ctx, scope, subscriber, gate).await;
                 tokio::time::sleep(RETRY).await;
@@ -283,9 +336,7 @@ impl Roster {
         };
         let Ok(stream) = SessionViewClient::new(channel)
             .subscribe(SubscribeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 subscriber: subscriber.to_owned(),
             })
             .await

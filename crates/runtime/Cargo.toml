@@ -14,8 +14,13 @@ starling-proto-fancy.workspace = true
 async-trait.workspace = true
 prost.workspace = true
 
-
 hyper-util.workspace = true
+
+# The operator's `channelname` and `username` patterns. This engine rather than
+# a backtracking one on purpose: the patterns come from a config file and are
+# matched against names a stranger chose, and a linear-time engine has no input
+# that turns a name check into a stall.
+regex.workspace = true
 
 serde.workspace = true
 # The admin API's configuration payloads, shared so both directions agree.

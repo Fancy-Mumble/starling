@@ -129,6 +129,22 @@ impl ServiceConfig {
     pub fn option<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
         self.options.get(key).and_then(|v| v.parse().ok())
     }
+
+    /// The literal IP in `public_url`, when it names one.
+    ///
+    /// The media-plane precondition: an SDP answer carries an address, not a
+    /// name, so a `public_url` whose host is a hostname cannot start an SFU.
+    /// Screenshare starts its SFU on this and the handshake advertises the SFU
+    /// on this; two parsers would let the advertisement and the media plane
+    /// disagree.
+    #[must_use]
+    pub fn media_ip(&self) -> Option<std::net::IpAddr> {
+        let (host, _) = self.public_url.as_deref()?.rsplit_once(':')?;
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()
+    }
 }
 
 /// A service's own database.
@@ -251,6 +267,26 @@ mod tests {
         // sockets and sharing the number would only look like they were not.
         assert_eq!(wt.listen, "0.0.0.0:8443");
         assert!(wt.cert.is_some() && wt.key.is_some());
+    }
+
+    #[test]
+    fn media_ip_is_the_literal_ip_and_never_a_name() {
+        let with = |url: &str| ServiceConfig {
+            public_url: Some(url.to_owned()),
+            ..ServiceConfig::default()
+        };
+        assert_eq!(
+            with("203.0.113.9:7000").media_ip(),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert_eq!(
+            with("[2001:db8::1]:7000").media_ip(),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        // A name is a valid public_url (files signs URLs with one) but not a
+        // valid SDP candidate, so it must not read as a media plane.
+        assert_eq!(with("sfu.example.org:7000").media_ip(), None);
+        assert_eq!(ServiceConfig::default().media_ip(), None);
     }
 
     #[test]

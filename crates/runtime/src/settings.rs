@@ -53,7 +53,7 @@ use crate::channel::Resolver;
 /// effect in the same minute an operator changed it.
 const RESUBSCRIBE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// murmur's defaults, for a virtual server nobody has configured.
+/// murmur's defaults, for a server instance nobody has configured.
 ///
 /// Named after the `.ini` key each replaces, so a server that has never been
 /// configured behaves the way an operator migrating from murmur expects rather
@@ -65,9 +65,9 @@ const RESUBSCRIBE_DELAY: std::time::Duration = std::time::Duration::from_secs(2)
 /// default table is one copy that is eventually wrong, and the symptom would be
 /// a limit that changes depending on which service was restarted last.
 #[must_use]
-pub fn defaults(virtual_server: u32) -> Snapshot {
+pub fn defaults(instance: u32) -> Snapshot {
     Snapshot {
-        virtual_server,
+        instance,
         version: 0,
         welcome_text: String::new(),
         password: String::new(),
@@ -105,9 +105,32 @@ pub fn defaults(virtual_server: u32) -> Snapshot {
         registry_url: String::new(),
         registry_hostname: String::new(),
         registry_location: String::new(),
+        // No per-channel ceiling, no configured landing channel: both are
+        // murmur's zero, and both read as "the rule does not apply" rather than
+        // as a limit of nought.
+        users_per_channel: 0,
+        default_channel: 0,
+        // **On**, as murmur has it (`Meta.cpp:77`). Somebody who was in a room
+        // yesterday expects to be in it today, and the operator who disagrees
+        // is the one who has to say so.
+        remember_channel: true,
+        // Forever. murmur's zero, and the reading that makes the setting above
+        // mean what it says.
+        remember_channel_duration: 0,
+        // murmur's own patterns, from `Meta.cpp:110`. The leading ` -=` is a
+        // **range**, space through `=`, not three literal characters: that is
+        // what upstream compiles, so it is what a server migrating from it gets.
+        channel_name_regex: CHANNEL_NAME_PATTERN.to_owned(),
+        user_name_regex: USER_NAME_PATTERN.to_owned(),
         extra: HashMap::new(),
     }
 }
+
+/// murmur's default channel-name pattern (`vendor/server/src/murmur/Meta.cpp:111`).
+pub const CHANNEL_NAME_PATTERN: &str = r"[ -=\w\#\[\]\{\}\(\)\@\|]+";
+
+/// murmur's default user-name pattern (`vendor/server/src/murmur/Meta.cpp:110`).
+pub const USER_NAME_PATTERN: &str = r"[ -=\w\[\]\{\}\(\)\@\|\.]+";
 
 /// A service's live view of the settings an operator can change.
 ///
@@ -228,9 +251,7 @@ impl Settings {
         let transport = self.resolver.channel("server-config").ok()?;
         ServerConfigClient::new(transport)
             .get(GetRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
             })
             .await
             .ok()
@@ -243,9 +264,7 @@ impl Settings {
             return;
         };
         let request = GetRequest {
-            scope: Some(Scope {
-                virtual_server: scope,
-            }),
+            scope: Some(Scope { instance: scope }),
         };
         let Ok(stream) = ServerConfigClient::new(transport).watch(request).await else {
             return;
@@ -262,18 +281,18 @@ impl Settings {
     }
 
     fn store(&self, snapshot: Snapshot) {
-        // The log policy follows the *first* virtual server's setting: one
-        // process has one log, so several virtual servers disagreeing about it
+        // The log policy follows the *first* server instance's setting: one
+        // process has one log, so several server instances disagreeing about it
         // cannot each have their own. Documented rather than silent, because
-        // "my second virtual server does not obfuscate" is otherwise a very
+        // "my second server instance does not obfuscate" is otherwise a very
         // confusing thing to observe.
         if let Some(logger) = &self.logger
-            && snapshot.virtual_server <= 1
+            && snapshot.instance <= 1
         {
             logger.set_obfuscate_addresses(snapshot.obfuscate_ips);
         }
         if let Ok(mut cache) = self.cache.write() {
-            let _ = cache.insert(snapshot.virtual_server, snapshot);
+            let _ = cache.insert(snapshot.instance, snapshot);
         }
     }
 }
@@ -334,6 +353,9 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "listeners_per_channel" => count(&mut snapshot.listeners_per_channel),
             "listeners_per_user" => count(&mut snapshot.listeners_per_user),
             "log_days" => count(&mut snapshot.log_days),
+            "users_per_channel" => count(&mut snapshot.users_per_channel),
+            "default_channel" => count(&mut snapshot.default_channel),
+            "remember_channel_duration" => count(&mut snapshot.remember_channel_duration),
             "message_limit" => count(&mut snapshot.message_limit),
             "message_burst" => count(&mut snapshot.message_burst),
             "plugin_message_limit" => count(&mut snapshot.plugin_message_limit),
@@ -360,6 +382,18 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             }),
             "allow_ping" => flag.is_some_and(|flag| {
                 snapshot.allow_ping = flag;
+                true
+            }),
+            "remember_channel" => flag.is_some_and(|flag| {
+                snapshot.remember_channel = flag;
+                true
+            }),
+            "channel_name_regex" => text.is_some_and(|text| {
+                snapshot.channel_name_regex = text.to_owned();
+                true
+            }),
+            "user_name_regex" => text.is_some_and(|text| {
+                snapshot.user_name_regex = text.to_owned();
                 true
             }),
             "registry_name" => text.is_some_and(|text| {
@@ -482,7 +516,7 @@ mod tests {
         // never chose.
         let settings = settings();
         settings.store(Snapshot {
-            virtual_server: 1,
+            instance: 1,
             message_limit: 42,
             ..defaults(1)
         });
@@ -493,11 +527,11 @@ mod tests {
 
     #[test]
     fn scopes_do_not_read_each_others_settings() {
-        // One process serves several virtual servers, and a limit set on one is
+        // One process serves several server instances, and a limit set on one is
         // not a limit on the others.
         let settings = settings();
         settings.store(Snapshot {
-            virtual_server: 2,
+            instance: 2,
             max_users: 7,
             ..defaults(2)
         });

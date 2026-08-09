@@ -41,7 +41,7 @@ pub struct PendingConnection {
     pub conn: u64,
     /// Which gateway holds it.
     pub gateway: String,
-    /// Its virtual server.
+    /// Its server instance.
     pub scope: u32,
     /// The peer's address, for the log and for a ban check.
     pub address: String,
@@ -286,7 +286,7 @@ impl Connections {
                 PendingConnection {
                     conn: opened.conn,
                     gateway: gateway.to_owned(),
-                    scope: opened.virtual_server.max(1),
+                    scope: opened.instance.max(1),
                     address: opened.peer_addr.clone(),
                     cert_hash: opened.cert_hash.clone(),
                     certificates: opened.certificates.clone(),
@@ -877,7 +877,7 @@ mod tests {
             cert_hash: Vec::new(),
             certificates: Vec::new(),
             strong_cert: false,
-            virtual_server: 1,
+            instance: 1,
         }
     }
 

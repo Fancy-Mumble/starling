@@ -40,6 +40,7 @@ use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::permit::Permit;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::settings::Settings;
 use starling_runtime::trail::{self, Record, Trail};
 use tonic::{Request, Response, Status};
 
@@ -73,6 +74,10 @@ pub struct UserdataService {
     /// In memory on purpose, see `selfservice`: an enrolment nobody finished
     /// should evaporate rather than sit in the database looking enabled.
     enrolling: std::sync::Mutex<selfservice::Enrolments>,
+    /// The operator's settings, of which this service reads one:
+    /// `user_name_regex`. Held here so [`Serve::run`] has something to keep
+    /// live; the copy that answers the question lives in [`Accounts`].
+    settings: Settings,
 }
 
 /// The client on `session`, as an audit actor.
@@ -239,9 +244,7 @@ impl UserData for UserdataRpc {
             .await
             .map(|bytes| {
                 Response::new(Blob {
-                    scope: Some(Scope {
-                        virtual_server: scope,
-                    }),
+                    scope: Some(Scope { instance: scope }),
                     hash: req.hash.clone(),
                     bytes,
                 })
@@ -391,7 +394,7 @@ impl UserdataService {
         actions
     }
 
-    /// Every live session on a virtual server, from `session-view`.
+    /// Every live session on a server instance, from `session-view`.
     ///
     /// Fetched per request rather than subscribed to: `RequestBlob` arrives
     /// once per avatar a client has never seen, which is rare and bursty, and a
@@ -403,9 +406,7 @@ impl UserdataService {
         };
         SessionViewClient::new(channel)
             .list(starling_proto_fancy::sessionview::SubscribeRequest {
-                scope: Some(Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(Scope { instance: scope }),
                 subscriber: "userdata".to_owned(),
             })
             .await
@@ -419,13 +420,19 @@ impl Serve for UserdataService {
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         ctx.health.gate("accounts loaded");
-        let accounts = Accounts::open(ctx.storage().await?).await?;
+        let settings = Settings::new(ctx.resolver.clone());
+        // Subscribed rather than fetched per login: `user_name_regex` is read on
+        // every authentication, and a `server-config` round trip on that path
+        // would put it in the way of every connect.
+        let accounts = Accounts::open(ctx.storage().await?)
+            .await?
+            .watching(settings.clone());
 
-        // Every virtual server gets an administrator on its first boot, because
+        // Every server instance gets an administrator on its first boot, because
         // a server with no way in is a server that has to be rebuilt. The
         // password is generated and announced exactly once, at creation, a
         // restart never repeats it, so this is safe to run unconditionally.
-        for scope in ctx.virtual_servers() {
+        for scope in ctx.instances() {
             if let Some(password) = accounts.ensure_superuser(scope).await {
                 announce_superuser(&ctx, scope, &password);
             }
@@ -440,7 +447,18 @@ impl Serve for UserdataService {
             trail: Trail::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
             enrolling: std::sync::Mutex::default(),
+            settings,
         }))
+    }
+
+    /// Follow the operator's settings until shutdown.
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let watchers = self.settings.watch(&ctx.instances());
+        ctx.shutdown.wait().await;
+        for watcher in watchers {
+            watcher.abort();
+        }
+        Ok(())
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
@@ -476,16 +494,16 @@ fn announce_superuser(ctx: &ServiceContext, scope: u32, password: &str) {
             Category::Server,
             "superuser account created; this password is shown once and cannot be recovered",
         )
-        .with("virtual_server", scope)
+        .with("instance", scope)
         .with("user", identity::SUPERUSER_NAME.to_owned())
         .with("password", password.to_owned()),
     );
 }
 
-/// The scope a request names, defaulting to the first virtual server.
+/// The scope a request names, defaulting to the first server instance.
 #[must_use]
 pub fn scope_of(scope: Option<Scope>) -> u32 {
-    scope.map_or(1, |scope| scope.virtual_server)
+    scope.map_or(1, |scope| scope.instance)
 }
 
 /// The outer type this service owns.

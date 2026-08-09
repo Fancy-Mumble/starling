@@ -9,13 +9,22 @@
 use starling_proto::proto::tcp;
 use starling_proto_fancy::metadata::Channel;
 
-use crate::tree_actor::{FLAG_HIDDEN, FLAG_TEMPORARY};
+use crate::tree_actor::{FLAG_DETACHED, FLAG_HIDDEN, FLAG_STRUCTURAL, FLAG_TEMPORARY, is_detached};
+
+/// Seconds in a millisecond, for turning a creation time into a deadline.
+const MILLIS: u64 = 1_000;
 
 /// The upstream `ChannelState` for a channel.
 #[must_use]
 pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
     let mut state = tcp::ChannelState {
         channel_id: Some(channel.id),
+        // A detached channel is parentless, and unlike the root it is not the
+        // one channel every client already has: it is sent as a channel with no
+        // parent, which is exactly what the DETACHED attribute below warns the
+        // client to expect. `Channel::parent` is already `None` for it, so this
+        // is the same line either way - stated because the two parentless cases
+        // reaching one field is the thing to know when reading it.
         parent: channel.parent,
         name: Some(channel.name.clone()),
         links: channel.links.clone(),
@@ -33,7 +42,47 @@ pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
     if channel.pchat_protocol != 0 {
         state.pchat_protocol = Some(channel.pchat_protocol as i32);
     }
+    // Hidden is only ever *observed* by somebody who may already see the
+    // channel - the announcement never reaches anybody else - so sending it
+    // discloses nothing and is what lets a client render the room as private.
+    if channel.flags & FLAG_HIDDEN != 0 {
+        state.hidden = Some(true);
+    }
+    // Expiry, with the deadline computed here rather than left to the client:
+    // `expires_at` is output-only, and a client counting down from a duration
+    // and a creation time it also has to be told is a countdown that drifts.
+    if channel.expiry_mode != 0 && channel.expiry_duration_s != 0 {
+        state.expiry_mode = Some(channel.expiry_mode);
+        state.expiry_duration_secs = Some(channel.expiry_duration_s);
+        state.expires_at =
+            Some(channel.created_at_ms / MILLIS + u64::from(channel.expiry_duration_s));
+    }
+    state.attributes = attributes(channel);
     state
+}
+
+/// The channel's own attributes, as `ChannelState.attributes` numbers them.
+///
+/// Only the two that are properties of the *channel*. The rest of
+/// `ChannelAttribute` (`CAN_ENTER`, `ENTER_RESTRICTED`, `HIDDEN`, `TEMPORARY`)
+/// is computed per recipient or duplicates a dedicated field, and this function
+/// has no recipient to compute them for.
+///
+/// `DETACHED` is the one that has to be here: a client that is not told a
+/// parentless channel is deliberately out of tree hangs it under the root,
+/// which is how every private room on the server ends up in somebody's channel
+/// list (`vendor/server/src/murmur/Server.cpp:3646`).
+fn attributes(channel: &Channel) -> Vec<i32> {
+    use tcp::ChannelAttribute;
+
+    let mut attributes = Vec::new();
+    if is_detached(channel) {
+        attributes.push(ChannelAttribute::Detached as i32);
+    }
+    if channel.flags & FLAG_STRUCTURAL != 0 {
+        attributes.push(ChannelAttribute::Structural as i32);
+    }
+    attributes
 }
 
 /// Write the deprecated `temporary` field.
@@ -151,12 +200,21 @@ pub fn to_proto(state: &tcp::ChannelState, id: u32) -> ChannelEdit {
         fields.push("expiry_mode".to_owned());
         fields.push("expiry_duration_s".to_owned());
     }
-    if let Some(hidden) = state.hidden {
-        channel.flags = if hidden {
-            channel.flags | FLAG_HIDDEN
-        } else {
-            channel.flags & !FLAG_HIDDEN
-        };
+    //
+    // `attributes` is read in the same breath, because both land in `flags` and
+    // a field named twice is a field the update loop writes twice, the second
+    // write undoing the first. DETACHED is the only settable one here: it is
+    // create-only, which `Trees::update` enforces rather than this function,
+    // so that the rule holds for every path into the tree and not just for
+    // clients.
+    let detached = state
+        .attributes
+        .contains(&(tcp::ChannelAttribute::Detached as i32));
+    if state.hidden.is_some() || detached {
+        let hidden = state.hidden.unwrap_or(false);
+        channel.flags = (channel.flags & !(FLAG_HIDDEN | FLAG_DETACHED))
+            | if hidden { FLAG_HIDDEN } else { 0 }
+            | if detached { FLAG_DETACHED } else { 0 };
         fields.push("flags".to_owned());
     }
     // Read for the third time for the reason `hidden` and expiry were: the
@@ -237,6 +295,67 @@ mod tests {
         assert!(
             !edit.fields.iter().any(|field| field.contains("link")),
             "links must not travel as a field, or the far end's ACL is never asked"
+        );
+    }
+
+    #[test]
+    fn a_detached_channel_says_so_rather_than_arriving_as_a_parentless_one() {
+        // Without the attribute a client has a channel with no parent and no
+        // explanation, and hangs it under the root; every meeting room and
+        // friend DM on the server then shows up in its channel list.
+        let channel = Channel {
+            id: 9,
+            parent: None,
+            name: "Standup [abc]".to_owned(),
+            flags: FLAG_DETACHED | FLAG_HIDDEN,
+            ..Channel::default()
+        };
+        let state = channel_state(&channel);
+        assert_eq!(state.parent, None);
+        assert!(
+            state
+                .attributes
+                .contains(&(tcp::ChannelAttribute::Detached as i32))
+        );
+        assert_eq!(state.hidden, Some(true));
+    }
+
+    #[test]
+    fn an_expiring_room_carries_the_deadline_and_not_just_the_duration() {
+        // `expires_at` is server-computed and output-only: a client counting
+        // down from a duration plus a creation time it also has to be told is
+        // a countdown that drifts.
+        let channel = Channel {
+            id: 9,
+            name: "Standup".to_owned(),
+            expiry_mode: 1,
+            expiry_duration_s: 600,
+            created_at_ms: 1_700_000_000_000,
+            ..Channel::default()
+        };
+        let state = channel_state(&channel);
+        assert_eq!(state.expiry_mode, Some(1));
+        assert_eq!(state.expiry_duration_secs, Some(600));
+        assert_eq!(state.expires_at, Some(1_700_000_000 + 600));
+    }
+
+    #[test]
+    fn a_room_asked_for_out_of_tree_is_read_that_way_off_the_wire() {
+        // And `hidden` travels in the same `flags` write rather than a second
+        // one: naming the field twice would have the update loop apply it
+        // twice, the second write undoing the first.
+        let state = tcp::ChannelState {
+            name: Some("Standup".to_owned()),
+            hidden: Some(true),
+            attributes: vec![tcp::ChannelAttribute::Detached as i32],
+            ..tcp::ChannelState::default()
+        };
+        let edit = to_proto(&state, 0);
+        assert_eq!(edit.channel.flags, FLAG_DETACHED | FLAG_HIDDEN);
+        assert_eq!(
+            edit.fields.iter().filter(|field| *field == "flags").count(),
+            1,
+            "one write, or the second undoes the first"
         );
     }
 

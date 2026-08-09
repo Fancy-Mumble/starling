@@ -64,6 +64,22 @@ pub mod category {
     pub const ACL: &str = "audit.acl";
     /// A server setting changed.
     pub const CONFIG: &str = "audit.config";
+
+    /// Every category, for the client's filter list.
+    ///
+    /// The admin tab builds its category filter from what the server sends
+    /// rather than a list compiled into the client, so a category added here
+    /// becomes filterable without shipping a new client.
+    pub const ALL: &[&str] = &[
+        CHANNEL,
+        MOVE,
+        MUTE_DEAFEN_SUPPRESS,
+        REGISTER,
+        KICK,
+        BAN,
+        ACL,
+        CONFIG,
+    ];
 }
 
 /// One thing worth recording, under construction.
@@ -156,9 +172,7 @@ impl Trail {
     pub fn record(&self, scope: u32, what: Record) {
         let resolver = self.resolver.clone();
         let mut entry = what.entry;
-        entry.scope = Some(Scope {
-            virtual_server: scope,
-        });
+        entry.scope = Some(Scope { instance: scope });
 
         drop(tokio::spawn(async move {
             let category = entry.category.clone();
@@ -291,7 +305,7 @@ mod tests {
             .await
             .expect("the record arrives")
             .expect("an entry");
-        assert_eq!(entry.scope.map(|s| s.virtual_server), Some(3));
+        assert_eq!(entry.scope.map(|s| s.instance), Some(3));
         assert_eq!(entry.category, category::CHANNEL);
         assert_eq!(entry.action, "created");
         assert_eq!(entry.target_channel, 7);
@@ -301,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn the_scope_is_the_caller_s_not_the_record_s() {
         // A Record is built without a scope on purpose: a builder that could
-        // carry one would let a service record into a virtual server it is not
+        // carry one would let a service record into a server instance it is not
         // serving.
         let record = Record::new(category::REGISTER, "registered").target_account(42);
         assert!(record.entry.scope.is_none());

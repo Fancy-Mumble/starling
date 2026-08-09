@@ -1,0 +1,34 @@
+# The operator log, and observability.
+#
+#   include = ["examples/advanced/logging.toml"]
+#
+# Two different things with similar names. [logging] is the record you keep: who
+# connected, what was refused, what an admin changed. [telemetry] is developer
+# diagnostics, driven by RUST_LOG, plus where traces and metrics go.
+
+[logging]
+level = "info"               # debug | info | notice | warning | error
+# Empty records every category. Named, it records only these:
+#   server | session | channel | message | permission | security | plugin | admin
+categories = []
+# Records buffered before the writer starts dropping and counting them.
+queue = 4096
+
+[logging.console]
+enabled = true               # to stderr
+
+# Uncomment to keep the record on disk as well. The path must be writable by
+# the user Starling runs as, or startup says so.
+# [logging.file]
+# path = "/var/log/starling/server.log"
+# max_bytes = 33554432       # rotate past this; 0 disables rotation
+# keep = 5                   # rotated generations to retain
+
+[logging.memory]
+enabled = true               # the ring the admin API reads
+records = 1000
+
+[telemetry]
+log_format = "text"          # json for a log collector, text for a terminal
+# metrics = "0.0.0.0:9090"
+# otlp_endpoint = "http://otel-collector:4317"

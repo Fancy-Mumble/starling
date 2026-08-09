@@ -43,7 +43,7 @@ pub struct Inbound {
     pub payload: Vec<u8>,
     /// Which gateway holds the connection.
     pub gateway: String,
-    /// Which virtual server it belongs to.
+    /// Which server instance it belongs to.
     pub scope: u32,
 }
 
@@ -315,11 +315,11 @@ async fn handle<S: ClientService>(
             tracing::debug!(
                 service = name,
                 gateway = %hello.gateway_id,
-                scope = hello.virtual_server,
+                scope = hello.instance,
                 "hello"
             );
             *gateway = hello.gateway_id;
-            *scope = hello.virtual_server;
+            *scope = hello.instance;
             Actions::new()
         }
         Some(client_event::Event::Opened(opened)) => {

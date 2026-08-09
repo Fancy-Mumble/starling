@@ -43,6 +43,7 @@ use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn, to_sessions,
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::trail::{self, Record, Trail};
 
 /// Upstream types this service answers for.
 const VERSION: u16 = 0;
@@ -128,6 +129,15 @@ pub struct SessionLifecycleService {
     fanout: Fanout,
     /// Asks `permissions` before a client is moved into a channel.
     permit: Permit,
+    /// Records the moderator powers exercised here.
+    ///
+    /// Muting somebody and dragging them into another channel are the two
+    /// moderator actions that happen most and were the two this service never
+    /// recorded: `moderation` audited its bans and kicks, `metadata` its
+    /// channel edits, and the whole `UserState` surface in between wrote
+    /// nothing. An operator asking "who muted them" got an empty log, which
+    /// reads exactly like "nobody did".
+    trail: Trail,
 }
 
 impl SessionLifecycleService {
@@ -135,6 +145,33 @@ impl SessionLifecycleService {
     #[must_use]
     pub fn connections(&self) -> &Connections {
         &self.connections
+    }
+
+    /// Record one moderator action against `target`.
+    ///
+    /// The actor is named as well as numbered because a session id is meaningless
+    /// by the time anybody reads the log: the session is long gone, and "who did
+    /// this" has to survive the disconnect that usually follows it.
+    fn audit(&self, inbound: &Inbound, category: &str, action: &str, target: &PendingConnection) {
+        let actor = self.connections.by_session(inbound.session);
+        self.trail.record(
+            inbound.scope,
+            Record::new(category, action)
+                .actor(
+                    session_actor(inbound.session),
+                    actor.map_or_else(|| format!("session {}", inbound.session), |who| who.name),
+                )
+                .target_account(target.account.unwrap_or_default())
+                .target_channel(target.channel)
+                .detail(target.name.clone()),
+        );
+    }
+}
+
+/// The client on `session`, as an audit actor.
+fn session_actor(session: u32) -> starling_proto_fancy::common::Actor {
+    starling_proto_fancy::common::Actor {
+        who: Some(actor::Who::Session(session)),
     }
 }
 
@@ -180,11 +217,12 @@ impl ClientService for SessionLifecycleService {
 
     async fn closed(&self, conn: u64, reason: &str) -> Actions {
         // Asked before the close, which is what drops the entry the name lives
-        // in, afterwards there is only a session number to report.
-        let name = self
-            .connections
-            .get(conn)
-            .map(|pending| pending.name)
+        // in, afterwards there is only a session number to report. The account
+        // goes with it, and it is needed after the close, so both are taken now.
+        let departing = self.connections.get(conn);
+        let name = departing
+            .as_ref()
+            .map(|pending| pending.name.clone())
             .unwrap_or_default();
         let Some(session) = self.connections.close(conn) else {
             // No session means the connection never finished the handshake, so
@@ -200,6 +238,13 @@ impl ClientService for SessionLifecycleService {
                 .with("reason", reason.to_owned()),
         );
         self.handshake.announce_down(session, reason).await;
+        // The other half of leaving, and the one that was missing: `metadata`
+        // holds the membership, and nothing had ever told it the visit ended.
+        if let Some(pending) = &departing {
+            self.handshake
+                .leave(pending.scope, session, pending.account)
+                .await;
+        }
 
         // Everyone else is told, because a client that never hears a
         // `UserRemove` renders a ghost for the rest of its connection.
@@ -241,7 +286,7 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
         use starling_proto_fancy::sessioncontrol::SetStateResult;
 
         let req = request.into_inner();
-        let scope = req.scope.map_or(1, |scope| scope.virtual_server);
+        let scope = req.scope.map_or(1, |scope| scope.instance);
         let refused = |why: &str| {
             Ok(tonic::Response::new(SetStateResult {
                 applied: false,
@@ -262,7 +307,17 @@ impl starling_proto_fancy::sessioncontrol::session_control_server::SessionContro
         if let Some(wanted) = req.channel
             && wanted != target.channel
         {
-            match self.0.handshake.enter(scope, req.session, wanted).await {
+            // No `bypass_full`, for the same reason the surrounding comment
+            // gives: the exemption is the *moved* user's `Write` on the room,
+            // and an operator holding the admin API is not that. A full channel
+            // refuses this move and says so, rather than seating somebody the
+            // next client to look is told there is no room for.
+            match self
+                .0
+                .handshake
+                .enter(scope, req.session, wanted, target.account, false)
+                .await
+            {
                 None => return refused("metadata is unreachable; cannot move"),
                 Some(result) if !result.applied => {
                     return refused(&format!(
@@ -362,9 +417,16 @@ impl SessionLifecycleService {
     /// The client's `Version`.
     ///
     /// Starling already sent its own `Version` first, on TLS establishment
-    /// (`opened`, matching `Server.cpp:1679`), so the client's copy is recorded
-    /// and not answered. The next thing the client sends is `Authenticate`, and
-    /// answering twice confuses a stock client.
+    /// (`opened`, matching `Server.cpp:1679`). A **stock** client's copy is
+    /// recorded and not answered: the next thing it sends is `Authenticate`, and
+    /// answering twice confuses it.
+    ///
+    /// A peer that names our wire epoch is answered, because this is the first
+    /// moment we know it is safe to state a product version at all
+    /// ([`handshake::fancy_announcement`], which is where the reasoning lives).
+    /// It arrives before `CryptSetup`, which matters: the client picks its voice
+    /// cipher from this number, and a version landing after the keys would leave
+    /// the two ends on different ciphers.
     fn on_version(&self, inbound: &Inbound) -> Actions {
         let Ok(version) = tcp::Version::decode(inbound.payload.as_slice()) else {
             tracing::debug!(conn = inbound.conn, "undecodable Version");
@@ -376,10 +438,19 @@ impl SessionLifecycleService {
             conn = inbound.conn,
             release = version.release.as_deref().unwrap_or("unknown"),
             os = version.os.as_deref().unwrap_or("unknown"),
+            fancy_protocol = ?version.fancy_protocol,
             "client version"
         );
         self.connections.record_version(inbound.conn, &version);
-        Actions::new()
+
+        let Some(announcement) = handshake::fancy_announcement(&version) else {
+            return Actions::new();
+        };
+        tracing::debug!(
+            conn = inbound.conn,
+            "peer speaks our epoch; announcing the Fancy feature version"
+        );
+        vec![to_conn(inbound.conn, VERSION, announcement.encode_to_vec())]
     }
 
     /// `Ping` is echoed with the counters murmur reports.
@@ -455,7 +526,7 @@ impl SessionLifecycleService {
         let answer = VoiceClient::new(channel)
             .resync(ResyncRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
                 session: inbound.session,
                 // Forwarded as it arrived, absence and all: whether this field is
@@ -553,7 +624,7 @@ impl SessionLifecycleService {
         let decision = PermissionsClient::new(channel)
             .check(CheckRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
                 subject: Some(Subject {
                     session: asker.session,
@@ -677,6 +748,46 @@ impl SessionLifecycleService {
                 .with("deaf", applied.deaf)
                 .with("priority_speaker", applied.priority_speaker),
         );
+
+        // One record per flag that actually moved, not one per message.
+        //
+        // Per *changed* flag rather than per flag *present*: deafening also
+        // mutes, so a client that asks for one arrives carrying both, and a
+        // record per present field would report a mute that was already in
+        // force. Per changed flag, the log reads as the operator experienced
+        // it, and the coupled mute still appears because it genuinely changed.
+        for (changed, action) in [
+            (
+                applied.mute != target.mute,
+                if applied.mute { "muted" } else { "unmuted" },
+            ),
+            (
+                applied.deaf != target.deaf,
+                if applied.deaf {
+                    "deafened"
+                } else {
+                    "undeafened"
+                },
+            ),
+            (
+                applied.priority_speaker != target.priority_speaker,
+                if applied.priority_speaker {
+                    "priority-speaker granted"
+                } else {
+                    "priority-speaker revoked"
+                },
+            ),
+        ] {
+            if changed {
+                self.audit(
+                    inbound,
+                    trail::category::MUTE_DEAFEN_SUPPRESS,
+                    action,
+                    &applied,
+                );
+            }
+        }
+
         self.handshake
             .announce_changed(&self.connections, target.conn)
             .await;
@@ -782,7 +893,7 @@ impl SessionLifecycleService {
         let registered = UserDataClient::new(channel)
             .register(RegisterRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
                 // Whose action this was, for userdata's own record. Self- and
                 // other-registration are the same call, and only this
@@ -917,7 +1028,20 @@ impl SessionLifecycleService {
             return vec![permission_denied(inbound, Perm::ENTER, target)];
         }
 
-        let Some(result) = self.handshake.enter(inbound.scope, moved, target).await else {
+        // murmur lets `Write` on the destination past a full channel
+        // (`Server.cpp:2800`), and asks it of the *person entering* rather than
+        // of whoever pushed them: the exemption is "this room is mine", which is
+        // not something a moderator can lend to somebody else.
+        let bypass_full = self
+            .permit
+            .allows_session_with_tokens(inbound.scope, moved, target, Perm::WRITE.bits(), Vec::new())
+            .await;
+
+        let Some(result) = self
+            .handshake
+            .enter(inbound.scope, moved, target, subject.account, bypass_full)
+            .await
+        else {
             // metadata is unreachable. Not a refusal, saying "you lack Enter"
             // would blame the user for an outage.
             tracing::error!(
@@ -941,6 +1065,25 @@ impl SessionLifecycleService {
         // tree about where this session is. `set_channel` existed and was never
         // called, which is why every session read as being in the root.
         self.connections.set_channel(subject.conn, target);
+
+        // Recorded after `metadata` accepted it, so the log carries moves that
+        // happened rather than moves that were asked for. `subject` still holds
+        // the channel they came *from*, which is the half of a move that cannot
+        // be recovered afterwards.
+        self.trail.record(
+            inbound.scope,
+            Record::new(trail::category::MOVE, "moved")
+                .actor(
+                    session_actor(inbound.session),
+                    self.connections
+                        .by_session(inbound.session)
+                        .map_or_else(|| format!("session {}", inbound.session), |who| who.name),
+                )
+                .target_account(subject.account.unwrap_or_default())
+                .target_channel(target)
+                .detail(format!("{}: {} -> {target}", subject.name, subject.channel)),
+        );
+
         self.handshake
             .announce_changed(&self.connections, subject.conn)
             .await;
@@ -1336,7 +1479,7 @@ impl SessionLifecycleService {
         let update = UserDataClient::new(channel)
             .update(UpdateRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
                 actor: None,
                 id: account,
@@ -1444,7 +1587,7 @@ impl SessionLifecycleService {
         use starling_proto_fancy::userdata::{Account, Blob, UpdateRequest};
 
         let scope = Some(starling_proto_fancy::common::Scope {
-            virtual_server: inbound.scope,
+            instance: inbound.scope,
         });
         let channel = self.handshake.resolver().channel("userdata").ok()?;
         let mut userdata = UserDataClient::new(channel);
@@ -1554,6 +1697,7 @@ impl Serve for SessionLifecycleService {
             handshake: Handshake::new(Resolver::clone(&ctx.resolver), fanout.clone(), ctx.clone()),
             fanout,
             permit: Permit::new(ctx.resolver.clone()),
+            trail: Trail::new(ctx.resolver.clone()),
         }))
     }
 

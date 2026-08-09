@@ -50,6 +50,16 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
             "registry_url" => current.registry_url = values.registry_url.clone(),
             "registry_hostname" => current.registry_hostname = values.registry_hostname.clone(),
             "registry_location" => current.registry_location = values.registry_location.clone(),
+            "users_per_channel" => current.users_per_channel = values.users_per_channel,
+            "default_channel" => current.default_channel = values.default_channel,
+            "remember_channel" => current.remember_channel = values.remember_channel,
+            "remember_channel_duration" => {
+                current.remember_channel_duration = values.remember_channel_duration;
+            }
+            "channel_name_regex" => {
+                current.channel_name_regex = values.channel_name_regex.clone();
+            }
+            "user_name_regex" => current.user_name_regex = values.user_name_regex.clone(),
             other => {
                 // Unknown keys land in `extra` rather than being dropped: a
                 // service that adds an operator-facing knob should not need a
@@ -219,6 +229,51 @@ const SCHEMA: &[Row] = &[
         read: |s| s.channel_nesting_limit.to_string(),
     },
     Row {
+        key: "users_per_channel",
+        kind: Kind::Int,
+        group: "Channels",
+        label: "Users per channel",
+        help: "Occupants any one channel may hold. Zero is unlimited, and a channel with its own limit uses that instead.",
+        secret: false,
+        read: |s| s.users_per_channel.to_string(),
+    },
+    Row {
+        key: "channel_name_regex",
+        kind: Kind::String,
+        group: "Channels",
+        label: "Channel name pattern",
+        help: "A channel name must match this whole. Empty means no restriction.",
+        secret: false,
+        read: |s| s.channel_name_regex.clone(),
+    },
+    Row {
+        key: "default_channel",
+        kind: Kind::Int,
+        group: "Channels",
+        label: "Default channel",
+        help: "Where a user lands when nothing better is known. Zero is the root.",
+        secret: false,
+        read: |s| s.default_channel.to_string(),
+    },
+    Row {
+        key: "remember_channel",
+        kind: Kind::Bool,
+        group: "Channels",
+        label: "Remember last channel",
+        help: "Put a registered user back in the channel they left.",
+        secret: false,
+        read: |s| s.remember_channel.to_string(),
+    },
+    Row {
+        key: "remember_channel_duration",
+        kind: Kind::Int,
+        group: "Channels",
+        label: "Remember for",
+        help: "Seconds since they disconnected before that memory expires. Zero is forever.",
+        secret: false,
+        read: |s| s.remember_channel_duration.to_string(),
+    },
+    Row {
         key: "message_limit",
         kind: Kind::Int,
         group: "Rate limits",
@@ -244,6 +299,15 @@ const SCHEMA: &[Row] = &[
         help: "Refuse connections from users without one.",
         secret: false,
         read: |s| s.cert_required.to_string(),
+    },
+    Row {
+        key: "user_name_regex",
+        kind: Kind::String,
+        group: "Access",
+        label: "User name pattern",
+        help: "A user name must match this whole, at login and at registration. Empty means no restriction.",
+        secret: false,
+        read: |s| s.user_name_regex.clone(),
     },
     Row {
         key: "allow_ping",

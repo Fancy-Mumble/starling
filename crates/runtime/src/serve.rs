@@ -72,13 +72,13 @@ impl ServiceContext {
             .unwrap_or_default()
     }
 
-    /// The virtual servers this deployment runs.
+    /// The server instances this deployment runs.
     #[must_use]
-    pub fn virtual_servers(&self) -> Vec<u32> {
-        if self.config.virtual_servers.is_empty() {
+    pub fn instances(&self) -> Vec<u32> {
+        if self.config.instances.is_empty() {
             return vec![1];
         }
-        self.config.virtual_servers.iter().map(|v| v.id).collect()
+        self.config.instances.iter().map(|v| v.id).collect()
     }
 
     /// Open this service's own database.
@@ -274,7 +274,7 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         };
     }
 
-    let transport = ctx.resolver.transport(&ctx.name)?;
+    let transport = ctx.resolver.listener(&ctx.name)?;
     let result = serve_routes(
         &ctx.name,
         transport.as_ref(),
@@ -387,10 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn a_deployment_with_no_virtual_servers_still_has_one() {
-        // Everything is keyed by virtual server; an empty list would mean a
+    fn a_deployment_with_no_server_instances_still_has_one() {
+        // Everything is keyed by server instance; an empty list would mean a
         // server that stores nothing anywhere.
-        assert_eq!(ctx("metadata").virtual_servers(), vec![1]);
+        assert_eq!(ctx("metadata").instances(), vec![1]);
     }
 
     #[test]

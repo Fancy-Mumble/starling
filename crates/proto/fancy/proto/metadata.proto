@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-// The channel tree and who is in it. One actor per virtual server, the
+// The channel tree and who is in it. One actor per server instance, the
 // guild-process pattern of docs/ARCHITECTURE.md §6, so the order it applies
 // mutations is a total order.
 package starling.metadata.v1;
@@ -18,12 +18,23 @@ service Metadata {
   rpc Remove(RemoveRequest) returns (ChannelResult);
   rpc Link(LinkRequest) returns (ChannelResult);
 
+  // Admit one account to a private channel, and drop it again. The two halves
+  // of an invitee-gated room's life after creation: a meeting room admits the
+  // participant who asks to join it, and a participant who leaves stops being
+  // told the room exists.
+  rpc GrantAccess(AccessRequest) returns (AccessResult);
+  rpc RevokeAccess(AccessRequest) returns (AccessResult);
+
   // Membership. Metadata owns it because it owns the tree the answer is about.
   rpc Enter(EnterRequest) returns (EnterResult);
   rpc Leave(LeaveRequest) returns (starling.common.v1.Ack);
   rpc Listen(ListenRequest) returns (ListenResult);
   // Put a returning user's stored listeners back, at the start of a session.
   rpc RestoreListeners(RestoreListenersRequest) returns (ListenResult);
+  // Where a returning user was last seen, for `remember_channel`. Here rather
+  // than in `userdata` because it is a fact about the tree: the channel may
+  // have been deleted since, and only this service can say so.
+  rpc LastChannel(LastChannelRequest) returns (LastChannelResult);
 }
 
 message TreeRequest {
@@ -38,14 +49,22 @@ message Tree {
 
 message Channel {
   uint32 id = 1;
-  // Absent on the root channel, and only there.
+  // Absent on the root channel and on a *detached* one; the DETACHED flag is
+  // what tells the two apart. Anything walking the tree by parent id must test
+  // it, or every meeting room and friend DM renders as a child of the root.
   optional uint32 parent = 2;
   string name = 3;
   string description = 4;
   bytes description_hash = 5;
   int32 position = 6;
   uint32 max_users = 7;
-  // hidden | temporary | detached (inherit_acl off) | structural
+  // 1 hidden | 2 temporary | 4 detached | 8 structural.
+  //
+  // *detached* is out-of-tree, not "inheritance off": the channel is
+  // parentless like the root, is in nobody's channel tree, and is sent only to
+  // clients that understand a parentless channel. Meeting rooms and friend DMs
+  // are detached. Dropping its parents' ACL entries is a consequence of having
+  // no parents, not the meaning of the flag.
   uint32 flags = 8;
   repeated uint32 links = 9;
   uint32 expiry_mode = 10;
@@ -89,6 +108,18 @@ message CreateRequest {
   // Temporary channels vanish when the last member leaves; murmur signals them
   // with the deprecated ChannelState.temporary, which stock clients still read.
   bool temporary = 4;
+  // Registered accounts to admit, which makes the new channel a private room:
+  // @all is denied see|enter|traverse and each account listed is granted them.
+  // Creation only, so a later hand edit of the table is never overwritten.
+  repeated uint32 invitee_user_ids = 5;
+  // Return the channel that is already here instead of refusing the name.
+  //
+  // What makes provisioning a room idempotent. A meeting room is created by
+  // whichever of "the start time arrived" and "a participant asked to join"
+  // happens first, and both may run twice - across a restart, or at once - so
+  // the second attempt has to find the first one's room rather than fail or
+  // mint a duplicate. `ChannelResult.created` says which happened.
+  bool reuse_existing = 6;
 }
 
 message UpdateRequest {
@@ -118,12 +149,43 @@ message ChannelResult {
   string refused = 2;
   Channel channel = 3;
   uint64 version = 4;
+  // Whether this call is what brought the channel into being.
+  //
+  // Only `reuse_existing` can make it false while `applied` is true, and the
+  // difference is load-bearing: the invitee ACL is written on creation and
+  // never on reuse, so a second provisioning attempt cannot overwrite a table
+  // somebody has since edited.
+  bool created = 5;
+}
+
+message AccessRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  uint32 channel = 3;
+  // The registered account being admitted or dropped. Guests have no identity
+  // an ACL entry can name, so there is nothing to grant them.
+  uint64 account = 4;
+}
+
+message AccessResult {
+  bool applied = 1;
+  string refused = 2;
 }
 
 message EnterRequest {
   starling.common.v1.Scope scope = 1;
   uint32 session = 2;
   uint32 channel = 3;
+  // The account to remember this channel under, absent for a guest. Same rule
+  // as `ListenRequest.account`: an unregistered user has no identity a later
+  // visit could be matched against, so nothing is stored for one.
+  optional uint64 account = 4;
+  // Let this entry past a full channel. murmur exempts a user holding `Write`
+  // on the destination (`Server.cpp:2800`), the authority to edit a room being
+  // the authority to be in it. Decided by the caller because the tree holds no
+  // permissions; `metadata` would have to ask the same service the caller
+  // already asked.
+  bool bypass_full = 5;
 }
 
 message EnterResult {
@@ -139,6 +201,9 @@ message EnterResult {
 message LeaveRequest {
   starling.common.v1.Scope scope = 1;
   uint32 session = 2;
+  // Whose visit is ending, absent for a guest. Leaving is when the clock on
+  // `remember_channel_duration` starts, so the account is needed to stamp it.
+  optional uint64 account = 3;
 }
 
 message ListenRequest {
@@ -188,4 +253,21 @@ message ListenRefusal {
     // `listeners_per_user` is reached for that session.
     USER_FULL = 1;
   }
+}
+
+message LastChannelRequest {
+  starling.common.v1.Scope scope = 1;
+  uint64 account = 2;
+  // How stale the memory may be, in seconds since the account last left a
+  // channel. Zero is murmur's default and means it never expires.
+  uint32 max_age_s = 3;
+}
+
+message LastChannelResult {
+  // Whether there is a remembered channel that is still within `max_age_s` and
+  // still exists. False leaves `channel` unset rather than zero-meaning-root:
+  // "we forgot" and "they were last in the root" are different answers, and the
+  // caller falls through to `default_channel` for only one of them.
+  bool known = 1;
+  uint32 channel = 2;
 }

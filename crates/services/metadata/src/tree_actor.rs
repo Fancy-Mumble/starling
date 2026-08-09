@@ -1,6 +1,6 @@
-//! One tree per virtual server, and every mutation that touches it.
+//! One tree per server instance, and every mutation that touches it.
 //!
-//! Sharded by virtual server because that is the unit of a Mumble deployment;
+//! Sharded by server instance because that is the unit of a Mumble deployment;
 //! within one, mutation is serialised, which is what makes the order channels
 //! change in a total order rather than a race between callers.
 
@@ -12,16 +12,52 @@ use starling_proto_fancy::serverconfig::Snapshot;
 use starling_runtime::ids::now_ms;
 use starling_runtime::storage::Store;
 
-use crate::channel::is_full;
+use crate::channel::is_full_for;
 
 /// Flags packed into `Channel::flags`, in the order `docs/STORAGE.md` lists.
 pub const FLAG_HIDDEN: u32 = 1;
 /// The channel disappears when its last member leaves.
 pub const FLAG_TEMPORARY: u32 = 2;
-/// ACL inheritance is off for this channel.
+/// The channel is **out of the tree**: parentless like the root, in nobody's
+/// channel list, and sent only to clients that understand a parentless channel.
+///
+/// What meeting rooms and friend DMs are made of (`vendor/server/src/Channel.h`,
+/// `ChannelAttribute::Detached`). It is not "ACL inheritance off", which is what
+/// this said while nothing set it: dropping its parents' ACL entries is a
+/// consequence of having no parents, and a channel that merely stopped
+/// inheriting would still be somewhere in the tree.
+///
+/// Fixed at creation. A channel that gained the flag later would keep a parent
+/// while claiming to have none; one that lost it would surface in every
+/// client's tree under the root.
 pub const FLAG_DETACHED: u32 = 4;
 /// A grouping node nobody can enter.
 pub const FLAG_STRUCTURAL: u32 = 8;
+
+/// `flags` with detachment forced to what the channel already was.
+///
+/// [`FLAG_DETACHED`] is fixed at creation, so a `flags` write carries the old
+/// value rather than the new one. Carried rather than refused: an edit that
+/// sets `hidden` on a meeting room has to apply, and refusing the whole write
+/// for a bit it never meant to touch would stop it.
+#[must_use]
+pub const fn with_detachment(flags: u32, detached: bool) -> u32 {
+    if detached {
+        flags | FLAG_DETACHED
+    } else {
+        flags & !FLAG_DETACHED
+    }
+}
+
+/// Whether `channel` is out of the tree.
+///
+/// A free function on the record rather than a method, because `parent: None`
+/// is true of the root as well and every caller that walks by parent id has to
+/// tell the two apart. Named so that the test reads as the question.
+#[must_use]
+pub const fn is_detached(channel: &Channel) -> bool {
+    channel.flags & FLAG_DETACHED != 0
+}
 
 /// The operator's ceilings on the tree.
 ///
@@ -39,12 +75,40 @@ pub const FLAG_STRUCTURAL: u32 = 8;
 pub struct TreeLimits {
     /// How deep a channel may sit below the root (`channel_nesting_limit`).
     pub nesting: u32,
-    /// How many channels a virtual server may hold (`channel_count_limit`).
+    /// How many channels a server instance may hold (`channel_count_limit`).
     pub count: u32,
     /// How many listeners one channel may carry (`listeners_per_channel`).
     pub listeners_per_channel: u32,
     /// How many channels one session may listen to (`listeners_per_user`).
     pub listeners_per_user: u32,
+    /// How many people one channel may hold (`users_per_channel`).
+    ///
+    /// The fallback for a channel that states no `max_users` of its own, never a
+    /// second ceiling on top of one that does. See [`is_full_for`].
+    pub users_per_channel: u32,
+}
+
+/// What a creation asks for beyond the channel record itself.
+///
+/// A struct rather than three more positional arguments, because two of them
+/// are booleans: a call reading `create(scope, channel, true, false, limits)`
+/// is one nobody can check and eventually one somebody writes the wrong way
+/// round.
+///
+/// [`Default`] is the ordinary client creation: permanent, refuse a name that
+/// is taken, and no ceilings ([`TreeLimits`] is zero-means-unlimited).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Creation {
+    /// The channel vanishes when its last member leaves.
+    pub temporary: bool,
+    /// Return the channel that already holds this name instead of refusing it.
+    ///
+    /// What makes provisioning a room idempotent: a meeting room is created by
+    /// whichever of "the start time arrived" and "somebody asked to join"
+    /// happens first, and both may run twice.
+    pub reuse_existing: bool,
+    /// The ceilings in force for the caller.
+    pub limits: TreeLimits,
 }
 
 impl TreeLimits {
@@ -60,6 +124,7 @@ impl TreeLimits {
         count: 0,
         listeners_per_channel: 0,
         listeners_per_user: 0,
+        users_per_channel: 0,
     };
 }
 
@@ -70,6 +135,7 @@ impl From<&Snapshot> for TreeLimits {
             count: snapshot.channel_count_limit,
             listeners_per_channel: snapshot.listeners_per_channel,
             listeners_per_user: snapshot.listeners_per_user,
+            users_per_channel: snapshot.users_per_channel,
         }
     }
 }
@@ -105,6 +171,15 @@ pub struct Removal {
     pub result: ChannelResult,
     /// Listeners cancelled by the removal, one entry per affected session.
     pub unlistened: Vec<Unlistened>,
+    /// Occupants the removal displaced, and where they landed.
+    ///
+    /// Carried for the same reason `unlistened` is, and it was the half that
+    /// was missing: the tree moved them to the root and nothing told them, so a
+    /// client whose channel was deleted under it went on rendering itself
+    /// inside a room the server had forgotten, with no way to leave a channel
+    /// that no longer exists. murmur sends a `UserState` per displaced user
+    /// (`vendor/server/src/murmur/Server.cpp:2180`).
+    pub moved: Vec<Relocated>,
 }
 
 impl Removal {
@@ -112,6 +187,7 @@ impl Removal {
         Self {
             result: refused(why),
             unlistened: Vec::new(),
+            moved: Vec::new(),
         }
     }
 }
@@ -141,7 +217,7 @@ impl Listened {
     }
 }
 
-/// Every virtual server's tree.
+/// Every server instance's tree.
 #[derive(Debug, Clone, Default)]
 pub struct Trees {
     inner: Arc<Mutex<HashMap<u32, TreeState>>>,
@@ -164,7 +240,7 @@ struct TreeState {
 }
 
 impl Trees {
-    /// One tree per virtual server, each with a root channel named `root_name`.
+    /// One tree per server instance, each with a root channel named `root_name`.
     #[must_use]
     pub fn new(scopes: &[u32], root_name: &str) -> Self {
         let mut inner = HashMap::new();
@@ -260,6 +336,17 @@ impl Trees {
         .unwrap_or_default()
     }
 
+    /// Whether `channel` is a channel this server instance still has.
+    ///
+    /// For the callers holding an id that came from storage rather than from
+    /// the tree: a remembered channel may have been deleted while its owner was
+    /// away, and an id that names nothing is worse than no id at all.
+    #[must_use]
+    pub fn exists(&self, scope: u32, channel: u32) -> bool {
+        self.with(scope, |state| state.channels.contains_key(&channel))
+            .unwrap_or(false)
+    }
+
     /// Put a returning user's stored listeners back on `session`.
     ///
     /// Applied without the ceilings: they bound what a user may *ask for*, and
@@ -307,22 +394,27 @@ impl Trees {
         .unwrap_or_default()
     }
 
-    /// Create a channel, within `limits`.
+    /// Create a channel, as `how` asks for it.
     ///
-    /// A name that is taken under the same parent is refused rather than
-    /// silently renamed: murmur refuses too, and two channels with one name in
-    /// one place is a UI nobody can use.
+    /// A name that is taken in the same place is refused rather than silently
+    /// renamed: murmur refuses too, and two channels with one name in one place
+    /// is a UI nobody can use. `Creation::reuse_existing` turns that refusal
+    /// into the existing channel, which is what makes provisioning idempotent.
     ///
     /// The two ceilings are murmur's, in murmur's order, nesting is checked
     /// against the parent before the count, so a client that is both too deep
     /// and on a full server is told the more specific of the two.
-    pub fn create(
-        &self,
-        scope: u32,
-        channel: Option<Channel>,
-        temporary: bool,
-        limits: TreeLimits,
-    ) -> ChannelResult {
+    ///
+    /// A **detached** channel ([`FLAG_DETACHED`]) is created parentless, as
+    /// `createChannelForPlugin` does (`vendor/server/src/murmur/Server.cpp:3544`,
+    /// which severs it from the root again straight after creating it there).
+    /// Whatever the caller put in `parent` is dropped rather than honoured: a
+    /// detached channel that kept one would be an ordinary channel wearing the
+    /// flag, and every rule below that reads the tree would then disagree with
+    /// every rule that reads the flag. It has no siblings to be unique among,
+    /// so its name is checked against the other detached channels, and no depth
+    /// to measure, so the nesting limit does not apply to it.
+    pub fn create(&self, scope: u32, channel: Option<Channel>, how: Creation) -> ChannelResult {
         let Some(mut channel) = channel else {
             return refused("no channel was described");
         };
@@ -330,30 +422,58 @@ impl Trees {
             if channel.name.trim().is_empty() {
                 return refused("a channel must have a name");
             }
+            let detached = is_detached(&channel);
             let parent = channel.parent.unwrap_or(0);
-            if !state.channels.contains_key(&parent) {
+            if !detached && !state.channels.contains_key(&parent) {
                 return refused("no such parent channel");
             }
-            let taken = state
+            // Detached channels are matched against each other and tree
+            // channels against their siblings, and neither set sees the other:
+            // a parentless channel reads as `parent == 0` here, so without the
+            // split a meeting room would collide with a room at the root.
+            let existing = state
                 .channels
                 .values()
-                .any(|other| other.parent.unwrap_or(0) == parent && other.name == channel.name);
-            if taken {
-                return refused("a channel with that name already exists here");
+                .find(|other| {
+                    other.name == channel.name
+                        && if detached {
+                            is_detached(other)
+                        } else {
+                            !is_detached(other) && other.parent.unwrap_or(0) == parent
+                        }
+                })
+                .cloned();
+            if let Some(existing) = existing {
+                if !how.reuse_existing {
+                    return refused("a channel with that name already exists here");
+                }
+                // Applied, but not `created`: the caller must be able to tell
+                // that it found somebody else's room rather than minting one,
+                // because the invitee ACL is written only on a real creation.
+                return ChannelResult {
+                    applied: true,
+                    refused: String::new(),
+                    channel: Some(existing),
+                    version: state.version,
+                    created: false,
+                };
             }
             // murmur's `canNest` (`Server.cpp:2801`), with a subtree depth of
             // zero because a channel being created has nothing under it yet.
-            if !can_nest(state, parent, 0, limits.nesting) {
+            if !detached && !can_nest(state, parent, 0, how.limits.nesting) {
                 return refused(NESTING_REFUSED);
             }
-            if limits.count != 0 && state.channels.len() >= limits.count as usize {
+            if how.limits.count != 0 && state.channels.len() >= how.limits.count as usize {
                 return refused(COUNT_REFUSED);
             }
 
             channel.id = state.next_id;
             state.next_id += 1;
             channel.created_at_ms = now_ms();
-            if temporary {
+            if detached {
+                channel.parent = None;
+            }
+            if how.temporary {
                 channel.flags |= FLAG_TEMPORARY;
             }
             let _ = state.channels.insert(channel.id, channel.clone());
@@ -363,6 +483,7 @@ impl Trees {
                 refused: String::new(),
                 channel: Some(channel),
                 version: state.version,
+                created: true,
             }
         })
     }
@@ -380,8 +501,17 @@ impl Trees {
             return refused("no values were given");
         };
         self.mutate(scope, |state| {
-            if !state.channels.contains_key(&id) {
+            let Some(before) = state.channels.get(&id) else {
                 return refused("no such channel");
+            };
+            // A detached channel has no place in the tree to be moved to or
+            // from, so a `parent` write on one is refused outright rather than
+            // measured against the nesting limit below. Accepting it would give
+            // a parentless channel a parent while it kept the flag saying it
+            // has none, which is the state every walk here reads two ways.
+            let was_detached = is_detached(before);
+            if was_detached && fields.iter().any(|field| field == "parent") {
+                return refused("a detached channel cannot be moved into the tree");
             }
             // Re-parenting is the other way a tree gets too deep, and the one
             // that moves a whole subtree at once: murmur measures the new
@@ -415,7 +545,12 @@ impl Trees {
                     "description" => channel.description = values.description.clone(),
                     "position" => channel.position = values.position,
                     "max_users" => channel.max_users = values.max_users,
-                    "flags" => channel.flags = values.flags,
+                    // Detachment is carried over rather than taken from the
+                    // write: it is fixed at creation (see [`FLAG_DETACHED`]),
+                    // and preserving it here means an edit that sets `hidden`
+                    // on a meeting room still applies instead of being refused
+                    // for touching a bit it never meant to change.
+                    "flags" => channel.flags = with_detachment(values.flags, was_detached),
                     "parent" => channel.parent = values.parent,
                     "expiry_mode" => channel.expiry_mode = values.expiry_mode,
                     "expiry_duration_s" => channel.expiry_duration_s = values.expiry_duration_s,
@@ -430,6 +565,7 @@ impl Trees {
                 refused: String::new(),
                 channel: Some(updated),
                 version: state.version,
+                created: false,
             }
         })
     }
@@ -437,6 +573,15 @@ impl Trees {
     /// Remove a channel, and everything under it.
     ///
     /// The root is refused: a server with no root has nowhere to put anyone.
+    ///
+    /// A **detached** channel is removable like any other, and its occupants go
+    /// to the root. That is the one case worth naming, because it is where the
+    /// C++ server crashed: `Server::removeChannel` took the parent as the
+    /// destination for displaced users and then dereferenced it, so deleting a
+    /// meeting room or a friend DM - the two parentless kinds - took the server
+    /// down (`vendor/server/src/murmur/Server.cpp:2161`). Here the destination
+    /// is the root by construction rather than by fallback, so there is no
+    /// parent to be missing.
     pub fn remove(&self, scope: u32, id: u32) -> Removal {
         self.mutate(scope, |state| {
             if id == 0 {
@@ -452,12 +597,20 @@ impl Trees {
             forget_links_to(state, &doomed);
 
             let mut unlistened = Vec::new();
+            let mut moved = Vec::new();
             // An iterator chain rather than a `for`: the sessions are walked in
             // whatever order the map holds them, and the result is sorted below
             // so the shape says the order is not observed.
             state.members.values_mut().for_each(|membership| {
                 if doomed.contains(&membership.channel) {
+                    // The root, not the removed channel's parent: the parent is
+                    // being removed too when the whole subtree goes, and a
+                    // detached channel has none at all.
                     membership.channel = 0;
+                    moved.push(Relocated {
+                        session: membership.session,
+                        to: 0,
+                    });
                 }
                 // A listener on a channel that no longer exists would be a
                 // subscription to nothing that the owning client still shows in
@@ -485,6 +638,7 @@ impl Trees {
             // Sorted so the broadcast order does not depend on a hash seed: the
             // messages are independent, but a test that reads them is not.
             unlistened.sort_by_key(|entry| entry.session);
+            moved.sort_by_key(|entry: &Relocated| entry.session);
 
             state.version += 1;
             Removal {
@@ -493,8 +647,10 @@ impl Trees {
                     refused: String::new(),
                     channel: None,
                     version: state.version,
+                    created: false,
                 },
                 unlistened,
+                moved,
             }
         })
     }
@@ -543,6 +699,7 @@ impl Trees {
                 refused: String::new(),
                 channel: updated,
                 version: state.version,
+                created: false,
             }
         })
     }
@@ -553,7 +710,18 @@ impl Trees {
     /// move is collected, both are reported rather than done silently, because
     /// a client that renders a channel the server has deleted is a client
     /// showing a world that does not exist.
-    pub fn enter(&self, scope: u32, session: u32, channel: u32) -> EnterResult {
+    ///
+    /// `bypass_full` is the caller's `Write` answer, and only fullness listens
+    /// to it: a structural channel holds nobody at all, so no permission makes
+    /// one enterable.
+    pub fn enter(
+        &self,
+        scope: u32,
+        session: u32,
+        channel: u32,
+        limits: TreeLimits,
+        bypass_full: bool,
+    ) -> EnterResult {
         self.mutate(scope, |state| {
             let Some(target) = state.channels.get(&channel) else {
                 return EnterResult {
@@ -575,9 +743,14 @@ impl Trees {
                 .filter(|member| member.channel == channel)
                 .count();
             // The rule the entity models, called rather than re-stated: see
-            // `channel::is_full`, and `GAP-ANALYSIS.md` C4 for what having two
-            // copies of it cost.
-            if is_full(target.max_users, occupants) {
+            // `channel::is_full_for`, and `GAP-ANALYSIS.md` C4 for what having
+            // two copies of it cost.
+            if is_full_for(
+                target.max_users,
+                limits.users_per_channel,
+                occupants,
+                bypass_full,
+            ) {
                 return EnterResult {
                     applied: false,
                     refused: FULL_REFUSED.to_owned(),
@@ -968,6 +1141,10 @@ impl Trees {
 /// Occupants go to the parent rather than being disconnected, and so do child
 /// channels: a child left pointing at a removed parent is orphaned, and a
 /// client building a tree from parent ids never renders it again.
+///
+/// A parentless channel - the root, or a detached room whose expiry has come -
+/// sends them to the root instead. The C++ server had no such fallback and
+/// dereferenced the null parent (`Server.cpp:2161`).
 fn evict(state: &mut TreeState, id: u32) -> Vec<Relocated> {
     let parent = state
         .channels
@@ -1029,6 +1206,7 @@ fn refused(reason: &str) -> ChannelResult {
         refused: reason.to_owned(),
         channel: None,
         version: 0,
+        created: false,
     }
 }
 
@@ -1051,7 +1229,7 @@ mod tests {
     /// Create under `parent` with no ceilings, returning the new id.
     fn create(trees: &Trees, name: &str, parent: u32) -> u32 {
         trees
-            .create(1, named(name, parent), false, TreeLimits::UNLIMITED)
+            .create(1, named(name, parent), Creation::default())
             .channel
             .map(|channel| channel.id)
             .unwrap_or_default()
@@ -1077,10 +1255,10 @@ mod tests {
         let trees = trees();
         assert!(
             trees
-                .create(1, named("General", 0), false, TreeLimits::UNLIMITED)
+                .create(1, named("General", 0), Creation::default())
                 .applied
         );
-        let second = trees.create(1, named("General", 0), false, TreeLimits::UNLIMITED);
+        let second = trees.create(1, named("General", 0), Creation::default());
         assert!(!second.applied);
         assert!(second.refused.contains("already exists"));
     }
@@ -1097,7 +1275,7 @@ mod tests {
         let trees = trees();
         let parent_id = create(&trees, "Parent", 0);
         let child_id = create(&trees, "Child", parent_id);
-        let _ = trees.enter(1, 42, child_id);
+        let _ = trees.enter(1, 42, child_id, TreeLimits::UNLIMITED, false);
 
         assert!(trees.remove(1, parent_id).result.applied);
         let snapshot = trees.snapshot(1);
@@ -1123,11 +1301,10 @@ mod tests {
                 flags: FLAG_STRUCTURAL,
                 ..Channel::default()
             }),
-            false,
-            TreeLimits::UNLIMITED,
+            Creation::default(),
         );
         let id = created.channel.map(|c| c.id).unwrap_or_default();
-        let result = trees.enter(1, 1, id);
+        let result = trees.enter(1, 1, id, TreeLimits::UNLIMITED, false);
         assert!(!result.applied);
         assert!(result.refused.contains("structural"));
     }
@@ -1135,10 +1312,17 @@ mod tests {
     #[test]
     fn a_temporary_channel_is_collected_when_its_last_member_leaves() {
         let trees = trees();
-        let created = trees.create(1, named("Scratch", 0), true, TreeLimits::UNLIMITED);
+        let created = trees.create(
+            1,
+            named("Scratch", 0),
+            Creation {
+                temporary: true,
+                ..Creation::default()
+            },
+        );
         let id = created.channel.map(|c| c.id).unwrap_or_default();
-        let _ = trees.enter(1, 1, id);
-        let moved = trees.enter(1, 1, 0);
+        let _ = trees.enter(1, 1, id, TreeLimits::UNLIMITED, false);
+        let moved = trees.enter(1, 1, 0, TreeLimits::UNLIMITED, false);
         assert_eq!(moved.collected, Some(id));
         assert!(!trees.snapshot(1).channels.iter().any(|c| c.id == id));
     }
@@ -1154,12 +1338,11 @@ mod tests {
                 max_users: 1,
                 ..Channel::default()
             }),
-            false,
-            TreeLimits::UNLIMITED,
+            Creation::default(),
         );
         let id = created.channel.map(|c| c.id).unwrap_or_default();
-        assert!(trees.enter(1, 1, id).applied);
-        assert!(!trees.enter(1, 2, id).applied);
+        assert!(trees.enter(1, 1, id, TreeLimits::UNLIMITED, false).applied);
+        assert!(!trees.enter(1, 2, id, TreeLimits::UNLIMITED, false).applied);
     }
 
     /// The ceilings, with nesting and count set and the listener caps off.
@@ -1171,21 +1354,299 @@ mod tests {
         }
     }
 
+    /// An ordinary creation under `limits`.
+    fn within(limits: TreeLimits) -> Creation {
+        Creation {
+            limits,
+            ..Creation::default()
+        }
+    }
+
+    /// A meeting room as the calendar provisions one: out of the tree, hidden,
+    /// end-to-end encrypted and on an absolute deadline.
+    fn room(name: &str) -> Option<Channel> {
+        Some(Channel {
+            name: name.to_owned(),
+            // Deliberately set, and deliberately ignored: the caller has no
+            // meaningful parent to name and murmur's own host callback passes
+            // the root here too.
+            parent: Some(0),
+            flags: FLAG_DETACHED | FLAG_HIDDEN,
+            pchat_protocol: 4,
+            expiry_mode: EXPIRY_ABSOLUTE,
+            expiry_duration_s: 60,
+            ..Channel::default()
+        })
+    }
+
+    /// The tree's record for `id`.
+    fn record(trees: &Trees, id: u32) -> Channel {
+        trees
+            .snapshot(1)
+            .channels
+            .into_iter()
+            .find(|channel| channel.id == id)
+            .expect("the channel is in the tree")
+    }
+
+    #[test]
+    fn a_detached_channel_is_created_parentless_rather_than_under_the_root() {
+        // The whole of what "out of tree" means on the wire: a client builds
+        // its tree from parent ids, so a meeting room that kept `parent: 0`
+        // would render in everyone's channel list.
+        let trees = trees();
+        let created = trees.create(1, room("Standup [abc]"), Creation::default());
+        assert!(created.applied && created.created);
+        let id = created.channel.map(|c| c.id).unwrap_or_default();
+
+        let room = record(&trees, id);
+        assert_eq!(room.parent, None, "the parent the caller named is dropped");
+        assert!(is_detached(&room));
+        assert_ne!(id, 0, "and it is still not the root");
+    }
+
+    #[test]
+    fn a_detached_channel_shares_a_name_with_a_channel_in_the_tree() {
+        // They are not in the same place, so they are not siblings. A meeting
+        // called "Standup" must not be refused because a room at the root
+        // happens to be called that, in either order.
+        let trees = trees();
+        assert!(
+            trees
+                .create(1, named("Standup", 0), Creation::default())
+                .applied
+        );
+        assert!(
+            trees
+                .create(1, room("Standup"), Creation::default())
+                .applied
+        );
+        assert_eq!(trees.snapshot(1).channels.len(), 3);
+    }
+
+    #[test]
+    fn two_detached_channels_cannot_share_a_name() {
+        // The only uniqueness rule a parentless channel can have, and what
+        // makes `reuse_existing` able to find the room it is looking for.
+        let trees = trees();
+        assert!(
+            trees
+                .create(1, room("Standup"), Creation::default())
+                .applied
+        );
+        let second = trees.create(1, room("Standup"), Creation::default());
+        assert!(!second.applied);
+        assert!(second.refused.contains("already exists"));
+    }
+
+    #[test]
+    fn provisioning_the_same_room_twice_returns_the_first_one() {
+        // Idempotency, which is what lets the two triggers for a meeting room -
+        // its start time arriving and somebody asking to join - both run
+        // without minting a second room or failing.
+        let trees = trees();
+        let how = Creation {
+            reuse_existing: true,
+            ..Creation::default()
+        };
+        let first = trees.create(1, room("Standup"), how);
+        let second = trees.create(1, room("Standup"), how);
+
+        assert!(first.created, "the first call made it");
+        assert!(second.applied, "the second call succeeds");
+        assert!(!second.created, "but it did not create anything");
+        assert_eq!(
+            first.channel.map(|c| c.id),
+            second.channel.map(|c| c.id),
+            "both callers hold the same room"
+        );
+        assert_eq!(trees.snapshot(1).channels.len(), 2, "root plus one room");
+    }
+
+    #[test]
+    fn a_detached_channel_cannot_be_moved_into_the_tree() {
+        // It would then have a parent while carrying the flag that says it has
+        // none, and every walk here reads one or the other.
+        let trees = trees();
+        let id = trees
+            .create(1, room("Standup"), Creation::default())
+            .channel
+            .map(|c| c.id)
+            .unwrap_or_default();
+
+        let moved = trees.update(
+            1,
+            id,
+            Some(Channel {
+                parent: Some(0),
+                ..Channel::default()
+            }),
+            &["parent".to_owned()],
+            TreeLimits::UNLIMITED,
+        );
+        assert!(!moved.applied);
+        assert_eq!(record(&trees, id).parent, None);
+    }
+
+    #[test]
+    fn an_edit_cannot_detach_a_channel_or_reattach_one() {
+        // DETACHED is create-only, and the guard is here rather than in the
+        // wire decoder so that it holds for gRPC and clients alike. The rest of
+        // the flags in the same write still apply, or setting `hidden` on a
+        // meeting room would be refused for touching a bit it never named.
+        let trees = trees();
+        let ordinary = create(&trees, "Lobby", 0);
+        let detach = trees.update(
+            1,
+            ordinary,
+            Some(Channel {
+                flags: FLAG_DETACHED | FLAG_HIDDEN,
+                ..Channel::default()
+            }),
+            &["flags".to_owned()],
+            TreeLimits::UNLIMITED,
+        );
+        assert!(detach.applied, "the hidden half of the write still lands");
+        let after = record(&trees, ordinary);
+        assert!(!is_detached(&after), "but it is still in the tree");
+        assert_eq!(after.flags & FLAG_HIDDEN, FLAG_HIDDEN);
+
+        let room_id = trees
+            .create(1, room("Standup"), Creation::default())
+            .channel
+            .map(|c| c.id)
+            .unwrap_or_default();
+        let reattach = trees.update(
+            1,
+            room_id,
+            Some(Channel {
+                flags: 0,
+                ..Channel::default()
+            }),
+            &["flags".to_owned()],
+            TreeLimits::UNLIMITED,
+        );
+        assert!(reattach.applied);
+        let after = record(&trees, room_id);
+        assert!(
+            is_detached(&after),
+            "a room cannot be dragged into the tree"
+        );
+        assert_eq!(
+            after.flags & FLAG_HIDDEN,
+            0,
+            "the rest of the write applied"
+        );
+    }
+
+    #[test]
+    fn deleting_a_detached_channel_sends_its_occupants_to_the_root() {
+        // The C++ server's crash: `removeChannel` took the parent as the
+        // destination for displaced users and dereferenced it, so deleting a
+        // meeting room or a friend DM took the server down
+        // (`Server.cpp:2161`). There is no parent here to be missing.
+        let trees = trees();
+        let id = trees
+            .create(1, room("Standup"), Creation::default())
+            .channel
+            .map(|c| c.id)
+            .unwrap_or_default();
+        assert!(trees.enter(1, 42, id, TreeLimits::UNLIMITED, false).applied);
+
+        let removal = trees.remove(1, id);
+        assert!(removal.result.applied);
+        let snapshot = trees.snapshot(1);
+        assert!(!snapshot.channels.iter().any(|c| c.id == id));
+        assert_eq!(
+            snapshot
+                .members
+                .iter()
+                .find(|m| m.session == 42)
+                .map(|m| m.channel),
+            Some(0),
+            "a displaced occupant lands at the root, not nowhere"
+        );
+    }
+
+    #[test]
+    fn an_expired_detached_room_relocates_to_the_root_as_well() {
+        // The same absent parent, by the path that runs unattended: a meeting
+        // room reaches its deadline while somebody is still sitting in it.
+        let trees = trees();
+        let id = trees
+            .create(1, room("Standup"), Creation::default())
+            .channel
+            .map(|c| c.id)
+            .unwrap_or_default();
+        assert!(trees.enter(1, 7, id, TreeLimits::UNLIMITED, false).applied);
+
+        let reaped = trees.reap_expired(1, now_ms() + 61 * 1_000);
+        assert_eq!(reaped.channels, vec![id]);
+        assert_eq!(reaped.moved.len(), 1);
+        assert_eq!(reaped.moved[0].to, 0);
+    }
+
+    #[test]
+    fn a_removal_reports_who_it_displaced_and_not_only_who_it_unsubscribed() {
+        // The tree moved them and nothing told them, so a client whose channel
+        // was deleted under it went on rendering itself inside a room the
+        // server had forgotten - and there is no way to leave a channel that
+        // does not exist. The caller can only send the `UserState` murmur sends
+        // (`Server.cpp:2180`) if the removal hands back the list.
+        let trees = trees();
+        let parent_id = create(&trees, "Parent", 0);
+        let child_id = create(&trees, "Child", parent_id);
+        let _ = trees.enter(1, 42, child_id, TreeLimits::UNLIMITED, false);
+        let _ = trees.enter(1, 7, parent_id, TreeLimits::UNLIMITED, false);
+
+        let removal = trees.remove(1, parent_id);
+        let moved: Vec<(u32, u32)> = removal
+            .moved
+            .iter()
+            .map(|entry| (entry.session, entry.to))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![(7, 0), (42, 0)],
+            "both occupants, from the channel and from its descendant, sorted"
+        );
+    }
+
+    #[test]
+    fn a_detached_channel_is_not_a_child_of_the_root() {
+        // `parent: None` is true of the root too, so a walk that read it as
+        // "belongs to the root" would delete every meeting room on the server
+        // the first time an operator removed a channel near the top.
+        let trees = trees();
+        let lobby = create(&trees, "Lobby", 0);
+        let room_id = trees
+            .create(1, room("Standup"), Creation::default())
+            .channel
+            .map(|c| c.id)
+            .unwrap_or_default();
+
+        assert!(trees.remove(1, lobby).result.applied);
+        assert!(
+            trees.snapshot(1).channels.iter().any(|c| c.id == room_id),
+            "removing a channel in the tree left the out-of-tree room alone"
+        );
+    }
+
     #[test]
     fn the_nesting_limit_refuses_the_channel_one_past_it() {
         // C2. A limit of 2 admits root → A → B and refuses a third level,
         // which is murmur's `canNest`: the deepest channel sits *at* the limit.
         let trees = trees();
         let limits = depth_limit(2, 0);
-        let first = trees.create(1, named("A", 0), false, limits);
+        let first = trees.create(1, named("A", 0), within(limits));
         let first_id = first.channel.map(|c| c.id).unwrap_or_default();
         assert!(first.applied);
 
-        let second = trees.create(1, named("B", first_id), false, limits);
+        let second = trees.create(1, named("B", first_id), within(limits));
         let second_id = second.channel.map(|c| c.id).unwrap_or_default();
         assert!(second.applied, "a channel at the limit is allowed");
 
-        let third = trees.create(1, named("C", second_id), false, limits);
+        let third = trees.create(1, named("C", second_id), within(limits));
         assert!(
             !third.applied,
             "the tree must not get deeper than the limit"
@@ -1201,12 +1662,12 @@ mod tests {
         let trees = trees();
         let a = create(&trees, "A", 0);
         let b = trees
-            .create(1, named("B", a), false, depth_limit(1, 0))
+            .create(1, named("B", a), within(depth_limit(1, 0)))
             .applied;
         assert!(!b, "a limit of 1 refuses a second level");
         assert!(
             trees
-                .create(1, named("B", a), false, depth_limit(2, 0))
+                .create(1, named("B", a), within(depth_limit(2, 0)))
                 .applied,
             "raising the limit admits the identical request"
         );
@@ -1222,8 +1683,7 @@ mod tests {
             let result = trees.create(
                 1,
                 named(&format!("deep{step}"), parent),
-                false,
-                depth_limit(0, 0),
+                within(depth_limit(0, 0)),
             );
             assert!(result.applied, "step {step} was refused");
             parent = result.channel.map(|c| c.id).unwrap_or_default();
@@ -1285,9 +1745,9 @@ mod tests {
         // C3. The root counts, as it does in murmur, `qhChannels` holds it.
         let trees = trees();
         let limits = depth_limit(0, 3);
-        assert!(trees.create(1, named("A", 0), false, limits).applied);
-        assert!(trees.create(1, named("B", 0), false, limits).applied);
-        let over = trees.create(1, named("C", 0), false, limits);
+        assert!(trees.create(1, named("A", 0), within(limits)).applied);
+        assert!(trees.create(1, named("B", 0), within(limits)).applied);
+        let over = trees.create(1, named("C", 0), within(limits));
         assert!(!over.applied, "the fourth channel is one past the limit");
         assert_eq!(over.refused, COUNT_REFUSED);
     }
@@ -1301,13 +1761,13 @@ mod tests {
         let _ = create(&trees, "B", 0);
         assert!(
             !trees
-                .create(1, named("C", 0), false, depth_limit(0, 2))
+                .create(1, named("C", 0), within(depth_limit(0, 2)))
                 .applied
         );
         assert_eq!(trees.snapshot(1).channels.len(), 3, "nothing was removed");
         assert!(
             trees
-                .create(1, named("C", 0), false, depth_limit(0, 9))
+                .create(1, named("C", 0), within(depth_limit(0, 9)))
                 .applied
         );
     }
@@ -1379,13 +1839,20 @@ mod tests {
         let trees = trees();
         let lobby = create(&trees, "Lobby", 0);
         let scratch = trees
-            .create(1, named("Scratch", 0), true, TreeLimits::UNLIMITED)
+            .create(
+                1,
+                named("Scratch", 0),
+                Creation {
+                    temporary: true,
+                    ..Creation::default()
+                },
+            )
             .channel
             .map(|channel| channel.id)
             .unwrap_or_default();
         let _ = trees.link(1, lobby, &[scratch], &[]);
-        let _ = trees.enter(1, 7, scratch);
-        assert_eq!(trees.enter(1, 7, 0).collected, Some(scratch));
+        let _ = trees.enter(1, 7, scratch, TreeLimits::UNLIMITED, false);
+        assert_eq!(trees.enter(1, 7, 0, TreeLimits::UNLIMITED, false).collected, Some(scratch));
         assert!(links_of(&trees, lobby).is_empty());
     }
 
@@ -1501,7 +1968,7 @@ mod tests {
         let trees = trees();
         let lobby = create(&trees, "Lobby", 0);
         let annex = create(&trees, "Annex", 0);
-        let _ = trees.enter(1, 5, lobby);
+        let _ = trees.enter(1, 5, lobby, TreeLimits::UNLIMITED, false);
         let _ = trees.listen(
             1,
             5,
@@ -1511,7 +1978,7 @@ mod tests {
             TreeLimits::UNLIMITED,
         );
 
-        assert!(trees.enter(1, 5, annex).applied);
+        assert!(trees.enter(1, 5, annex, TreeLimits::UNLIMITED, false).applied);
         assert_eq!(listening(&trees, 5), vec![annex]);
         assert_eq!(gain(&trees, 5, annex), Some(0.4));
     }

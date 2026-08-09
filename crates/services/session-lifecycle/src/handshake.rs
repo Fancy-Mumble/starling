@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
+use starling_gate::FancyVersion;
 use starling_proto::proto::tcp;
 use starling_proto_fancy::control::{ServerAction, SessionUp, server_action};
 use starling_proto_fancy::fancy::session::{SessionEnvelope, session_envelope};
@@ -73,6 +74,14 @@ const ROOT_CHANNEL: u32 = 0;
 /// and the layout is documented on `Channel.flags` in `metadata.proto`.
 const FLAG_HIDDEN: u32 = 1;
 
+/// `Channel.flags` bit for a channel that is out of the tree, from the same
+/// place, and written out here for the same reason.
+///
+/// A parentless channel that is not the root. A client that does not understand
+/// one hangs it under the root, so every meeting room and friend DM on the
+/// server would appear in its channel list.
+const FLAG_DETACHED: u32 = 4;
+
 /// The Fancy wire epoch Starling speaks (`Mumble.proto`, `Version.fancy_protocol`).
 ///
 /// Epoch 1: upstream 0-99 flat and frozen, every Fancy service behind one outer
@@ -80,6 +89,21 @@ const FLAG_HIDDEN: u32 = 1;
 /// and cannot, `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
 /// unroutable, and §3 is the scheme this number names.
 const FANCY_PROTOCOL: u32 = 1;
+
+/// The Fancy feature level Starling serves, announced only to epoch-1 peers.
+///
+/// A *product* version: it answers "which Fancy features exist here", which is a
+/// different question from `FANCY_PROTOCOL`'s "which numbering are they spoken
+/// in". Both have to be answered, and answering only the second is what this
+/// constant fixes -- see [`fancy_announcement`].
+///
+/// 0.4.2 is the level whose feature set this server actually serves: the native
+/// message sets (0.2.12), onboarding (0.3.1), the modern voice cipher (0.4.0)
+/// and the audit record (0.4.2), each behind a service in `crates/services`.
+/// The one thing a client unlocks here that Starling does not answer is the
+/// self-service account editor (0.4.1, `FancyAccountSettings`), which the client
+/// cannot send anyway -- it has no canon form, so it never leaves the client.
+const FANCY_VERSION: FancyVersion = FancyVersion::new(0, 4, 2);
 
 /// Everything the handshake needs to reach.
 #[derive(Debug, Clone)]
@@ -91,10 +115,14 @@ pub struct Handshake {
 
 /// The `Version` Starling sends first, before the client has said anything.
 ///
-/// `fancy_version` is deliberately absent: a client reads it as "Fancy features
-/// up to X" and then sends them on epoch 0's numbering, which routes nowhere.
-/// Absent, clients fall back to `PluginDataTransmission`, which is
-/// epoch-independent and relayed correctly.
+/// `fancy_version` is absent here because at this point the peer has not said
+/// which numbering it speaks, and to an epoch-0 client a product version reads
+/// as licence to send epoch-0 natives, which this server routes nowhere. Silence
+/// keeps that client on `PluginDataTransmission`: epoch-independent, and relayed
+/// correctly.
+///
+/// It stays absent only for as long as that is unknown. Once the peer's own
+/// `Version` names epoch 1, [`fancy_announcement`] answers the other half.
 #[must_use]
 pub fn server_version() -> tcp::Version {
     tcp::Version {
@@ -105,6 +133,53 @@ pub fn server_version() -> tcp::Version {
         os_version: Some(std::env::consts::ARCH.to_owned()),
         ..tcp::Version::default()
     }
+}
+
+/// The second `Version`, carrying `fancy_version`, for a peer that just told us
+/// it speaks our epoch. `None` for anyone else.
+///
+/// # Why a second `Version` at all
+///
+/// Because the two questions are answered at different times. The epoch can go
+/// out first and unprompted; the product version cannot, because whether it is
+/// safe to state depends on something only the peer's own `Version` says.
+///
+/// Withholding it from *everyone* was the safe half of a decision that has been
+/// costing the epoch-1 client real features, silently, and in a shape that looks
+/// exactly like a broken server. A client reads `fancy_version` as "the Fancy
+/// features exist here" and gates on it: absent, `mumble-tauri`'s `send_message`
+/// leaves `message_id` unset, and the encrypted-channel path is keyed on that id
+/// -- so it builds no ciphertext, sends no `PchatMessage`, and the channel goes
+/// on rendering the placeholder body of the plaintext half of the pair. The
+/// channel is correctly encrypted at both ends and no message ever crosses it.
+/// The admin tabs gated on the same number (audit at 0.4.2) are dark for the
+/// same reason.
+///
+/// # Why this is not the thing the doc warned about
+///
+/// The warning was that a client takes a product version as licence to send
+/// epoch-0 natives. A peer that announced `fancy_protocol = 1` has already
+/// committed to epoch-1 numbering, and decides its framing from the epoch alone
+/// (`mumble-protocol/src/fancy_codec.rs`, `select_codec`, which does not consult
+/// `fancy_version`). So the hazard is exactly the set this refuses to answer:
+/// silence for epoch 0, both halves for epoch 1.
+#[must_use]
+pub fn fancy_announcement(peer: &tcp::Version) -> Option<tcp::Version> {
+    // Absent means epoch 0 -- every Fancy build shipped before the renumbering
+    // (`docs/PROTOCOL-COMPATIBILITY.md` §2a), and the client this must stay
+    // silent for.
+    if peer.fancy_protocol.unwrap_or_default() != FANCY_PROTOCOL {
+        return None;
+    }
+    // Built from `server_version()` rather than beside it: a second `Version`
+    // replaces what the client stored for the first, so a field dropped here is
+    // a field the client forgets. `version_v2` is the one that bites -- the
+    // client reads protobuf-audio support off it, and re-sending it as absent
+    // would demote the peer to legacy UDP framing mid-handshake.
+    Some(tcp::Version {
+        fancy_version: Some(FANCY_VERSION.to_wire()),
+        ..server_version()
+    })
 }
 
 /// The whole of what a connection is, in the shape `session-view` stores.
@@ -275,12 +350,40 @@ impl Handshake {
                 .with("fancy", pending.fancy_version != 0),
         );
 
-        let mut actions = self
-            .welcome(inbound, session, &identity, &config, &pending)
-            .await;
-
+        // **Before** the landing, and before `welcome`, which is a change of
+        // order rather than a preference: choosing where this user lands asks
+        // `permissions` whether they may enter each candidate, and that question
+        // is resolved through `session-view`. Asked any earlier it is answered
+        // "the session could not be identified", which denies, so every server
+        // with a `default_channel` would quietly seat everybody in the root.
         self.announce_up(connections, inbound.conn).await;
-        self.enter_root(inbound.scope, session).await;
+
+        let Some(channel) = self
+            .landing(inbound.scope, session, account, &config)
+            .await
+        else {
+            // The root refused them, which it does only when it is full: there
+            // is nowhere left to put this user, and admitting them to nowhere
+            // would put a session in the tree that is in no channel. murmur
+            // rejects here too (`Messages.cpp:552`).
+            return self.refuse(
+                inbound.conn,
+                name,
+                tcp::reject::RejectType::ServerFull,
+                "the server channels are full",
+            );
+        };
+        // The record every later question about this session reads: the tokens
+        // check in `retoken`, the permission push below, and `session-view`'s
+        // own copy, which is what `voice` and `permissions` see.
+        connections.set_channel(inbound.conn, channel);
+        if channel != ROOT_CHANNEL {
+            self.announce_changed(connections, inbound.conn).await;
+        }
+
+        let mut actions = self
+            .welcome(inbound, session, &identity, &config, &pending, channel)
+            .await;
 
         // After , which  has already queued: murmur is
         // explicit that a client may need its own session id before it can make
@@ -291,10 +394,10 @@ impl Handshake {
         );
 
         // Told, not asked. Sent after the announce so `permissions` can resolve
-        // the session, and after entering root so the answer is about the
-        // channel the client is actually in, the one its menus are drawn from.
+        // the session, and after the landing so the answer is about the channel
+        // the client is actually in, the one its menus are drawn from.
         if let Some(pending) = connections.get(inbound.conn) {
-            actions.extend(self.push_permissions(&pending, ROOT_CHANNEL).await);
+            actions.extend(self.push_permissions(&pending, channel).await);
         }
 
         // After the new session is up, as murmur does (`Messages.cpp:506`):
@@ -412,6 +515,7 @@ impl Handshake {
         identity: &Identity,
         config: &Snapshot,
         pending: &PendingConnection,
+        channel: u32,
     ) -> Actions {
         let account = identity.account;
         let name = identity.name.as_str();
@@ -419,9 +523,12 @@ impl Handshake {
         let mut actions = Vec::new();
         actions.push(self.crypt_setup(inbound, session, pending).await);
         actions.push(to_conn(inbound.conn, 21, codec_version().encode_to_vec()));
-        actions.extend(self.channel_flood(inbound).await);
         actions.extend(
-            self.user_states(inbound, session, identity, pending, config)
+            self.channel_flood(inbound, pending.fancy_version != 0)
+                .await,
+        );
+        actions.extend(
+            self.user_states(inbound, session, identity, pending, config, channel)
                 .await,
         );
         actions.push(to_conn(
@@ -432,7 +539,7 @@ impl Handshake {
         actions.push(to_conn(
             inbound.conn,
             24,
-            server_config(config).encode_to_vec(),
+            server_config(config, sfu_available(&self.ctx.config)).encode_to_vec(),
         ));
         actions.push(to_conn(
             inbound.conn,
@@ -456,7 +563,7 @@ impl Handshake {
                 // here makes a permission decision from it.
                 account: identity::wire(account).0,
                 name: name.to_owned(),
-                channel: 0,
+                channel,
                 fancy_version: pending.fancy_version,
             })),
         });
@@ -469,7 +576,11 @@ impl Handshake {
         let joined = tcp::UserState {
             session: Some(session),
             name: Some(name.to_owned()),
-            channel_id: Some(0),
+            // The channel they actually landed in, not the root: this is the
+            // only message a legacy client builds its user tree from, so a user
+            // put back in yesterday's channel would otherwise be drawn in the
+            // root by everyone except themselves.
+            channel_id: Some(channel),
             // Everyone else's user list is built from this one message, so it
             // needs the same markers as the copy above.
             user_id: account.map(|id| id as u32),
@@ -544,9 +655,7 @@ impl Handshake {
         };
         let result = UserDataClient::new(channel)
             .authenticate(AuthRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 name: name.to_owned(),
                 password: request.password.clone().unwrap_or_default(),
                 cert_hash: pending.cert_hash.clone(),
@@ -631,7 +740,7 @@ impl Handshake {
             Ok(channel) => VoiceClient::new(channel)
                 .mint(MintRequest {
                     scope: Some(starling_proto_fancy::common::Scope {
-                        virtual_server: inbound.scope,
+                        instance: inbound.scope,
                     }),
                     session,
                     fancy_version: pending.fancy_version,
@@ -667,7 +776,7 @@ impl Handshake {
         let Ok(answer) = PermissionsClient::new(transport)
             .effective(EffectiveRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: pending.scope,
+                    instance: pending.scope,
                 }),
                 subject: Some(Subject {
                     session: pending.session,
@@ -725,9 +834,7 @@ impl Handshake {
         };
         PermissionsClient::new(transport)
             .check_session(SessionCheckRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 session,
                 channel,
                 permission: Perm::SEE_CHANNEL.bits(),
@@ -742,14 +849,18 @@ impl Handshake {
     }
 
     /// Every channel the client may see, breadth-first from the root.
-    async fn channel_flood(&self, inbound: &Inbound) -> Actions {
+    ///
+    /// `fancy` is whether the client understands out-of-tree channels. A stock
+    /// client is sent none of them, because a parentless channel is one it
+    /// would root under the tree (`ServerUser::supportsOutOfTreeChannels`).
+    async fn channel_flood(&self, inbound: &Inbound, fancy: bool) -> Actions {
         let Ok(channel) = self.resolver.channel("metadata") else {
             return Actions::new();
         };
         let Ok(tree) = MetadataClient::new(channel)
             .get_tree(TreeRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
             })
             .await
@@ -768,6 +879,12 @@ impl Handshake {
         // put a round trip on the handshake to answer "no" almost every time.
         let mut visible = Vec::with_capacity(channels.len());
         for channel in channels {
+            // Before the ACL check, and without one: whether a client can
+            // render a parentless channel at all is a property of the client,
+            // not a permission, and skipping it here saves the round trip.
+            if !fancy && channel.flags & FLAG_DETACHED != 0 {
+                continue;
+            }
             let is_hidden = channel.flags & FLAG_HIDDEN != 0;
             if is_hidden
                 && !self
@@ -803,11 +920,12 @@ impl Handshake {
         identity: &Identity,
         pending: &PendingConnection,
         config: &Snapshot,
+        channel: u32,
     ) -> Actions {
         let own = tcp::UserState {
             session: Some(session),
             name: Some(identity.name.clone()),
-            channel_id: Some(0),
+            channel_id: Some(channel),
             // Hex-encoded as murmur sends it (`Server.cpp:1686`). Omitting it
             // greys out "Register" for everybody, the administrator included:
             // registration binds an account to a certificate, and a client
@@ -836,7 +954,7 @@ impl Handshake {
         let Ok(sessions) = SessionViewClient::new(channel)
             .list(starling_proto_fancy::sessionview::SubscribeRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: inbound.scope,
+                    instance: inbound.scope,
                 }),
                 subscriber: "session-lifecycle".to_owned(),
             })
@@ -970,7 +1088,7 @@ impl Handshake {
         };
         self.announce(Announcement {
             scope: Some(starling_proto_fancy::common::Scope {
-                virtual_server: pending.scope,
+                instance: pending.scope,
             }),
             what: Some(announcement::What::Up(session_record(&pending))),
         })
@@ -984,7 +1102,7 @@ impl Handshake {
         };
         self.announce(Announcement {
             scope: Some(starling_proto_fancy::common::Scope {
-                virtual_server: pending.scope,
+                instance: pending.scope,
             }),
             what: Some(announcement::What::Changed(session_record(&pending))),
         })
@@ -994,7 +1112,7 @@ impl Handshake {
     /// Tell session-view a session has gone.
     pub async fn announce_down(&self, session: u32, reason: &str) {
         self.announce(Announcement {
-            scope: Some(starling_proto_fancy::common::Scope { virtual_server: 1 }),
+            scope: Some(starling_proto_fancy::common::Scope { instance: 1 }),
             what: Some(announcement::What::Down(Gone {
                 session,
                 reason: reason.to_owned(),
@@ -1012,9 +1130,131 @@ impl Handshake {
         }
     }
 
-    /// Put a new session in the root channel.
-    async fn enter_root(&self, scope: u32, session: u32) {
-        let _ = self.enter(scope, session, 0).await;
+    /// Drop a session's membership, at the end of its visit.
+    ///
+    /// Nothing called this before, and the tree kept a membership per session
+    /// that had ever connected: a channel's occupancy therefore counted the
+    /// dead, which is invisible until an occupancy *limit* reads it, and then
+    /// it is a room that says it is full and looks empty. `account` is what
+    /// starts the clock on `remember_channel_duration`.
+    pub async fn leave(&self, scope: u32, session: u32, account: Option<u64>) {
+        let Ok(transport) = self.resolver.channel("metadata") else {
+            return;
+        };
+        if let Err(status) = MetadataClient::new(transport)
+            .leave(starling_proto_fancy::metadata::LeaveRequest {
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
+                session,
+                account,
+            })
+            .await
+        {
+            tracing::warn!(%status, session, "metadata did not accept a leave");
+        }
+    }
+
+    /// Where a session logging in should land, and put it there.
+    ///
+    /// murmur's cascade, from `vendor/server/src/murmur/Messages.cpp:537`: the
+    /// channel this account was last in, else the operator's
+    /// `default_channel`, else the root. A candidate is skipped when it does
+    /// not exist, cannot be entered, or is full, and the *last* of those is why
+    /// this tries rather than asks, the tree answers all three questions at
+    /// once and answering them separately would race the answer.
+    ///
+    /// A full **root** is where the cascade runs out, and upstream rejects the
+    /// login as `ServerFull` rather than admitting somebody to nowhere. Same
+    /// here: `None` means there is no channel to put this user in.
+    async fn landing(
+        &self,
+        scope: u32,
+        session: u32,
+        account: Option<u64>,
+        config: &Snapshot,
+    ) -> Option<u32> {
+        let mut tried = Vec::new();
+        if config.remember_channel
+            && let Some(account) = account
+            && let Some(remembered) = self
+                .last_channel(scope, account, config.remember_channel_duration)
+                .await
+        {
+            tried.push(remembered);
+        }
+        // Zero is the root, which is already the last candidate, so an
+        // unconfigured `default_channel` adds nothing rather than a duplicate.
+        if config.default_channel != ROOT_CHANNEL {
+            tried.push(config.default_channel);
+        }
+        tried.push(ROOT_CHANNEL);
+
+        for channel in tried {
+            // The permission first, because entering is what a refusal here is
+            // about: a user who was moved out of a room, or had `Enter` revoked
+            // while they were away, must not be walked back into it by their
+            // own login. murmur asks the same question in the same order.
+            if channel != ROOT_CHANNEL && !self.may_enter(scope, session, channel).await {
+                continue;
+            }
+            match self.enter(scope, session, channel, account, false).await {
+                Some(result) if result.applied => return Some(result.channel),
+                Some(result) => tracing::debug!(
+                    session,
+                    channel,
+                    refused = %result.refused,
+                    "landing candidate refused; trying the next"
+                ),
+                // metadata is unreachable, so no candidate will work either.
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether this session may enter `channel`, for the landing cascade.
+    ///
+    /// Denies on failure like [`Self::may_see`] does, and the fallback that
+    /// makes that safe is the root: a login is never refused because this
+    /// question could not be answered, it just lands where it would have landed
+    /// before any of this existed.
+    async fn may_enter(&self, scope: u32, session: u32, channel: u32) -> bool {
+        use starling_proto_fancy::permissions::SessionCheckRequest;
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+
+        let Ok(transport) = self.resolver.channel("permissions") else {
+            return false;
+        };
+        PermissionsClient::new(transport)
+            .check_session(SessionCheckRequest {
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
+                session,
+                channel,
+                permission: Perm::ENTER.bits(),
+                // The session's own standing tokens, which it presented in
+                // `Authenticate` and which are already on its `session-view`
+                // record. A channel opened by a password the user knows is one
+                // they should land back in.
+                temporary_tokens: Vec::new(),
+            })
+            .await
+            .is_ok_and(|decision| decision.into_inner().allowed)
+    }
+
+    /// The channel `account` was last in, if it is still worth returning to.
+    async fn last_channel(&self, scope: u32, account: u64, max_age_s: u32) -> Option<u32> {
+        use starling_proto_fancy::metadata::LastChannelRequest;
+
+        let transport = self.resolver.channel("metadata").ok()?;
+        let answer = MetadataClient::new(transport)
+            .last_channel(LastChannelRequest {
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
+                account,
+                max_age_s,
+            })
+            .await
+            .ok()?
+            .into_inner();
+        answer.known.then_some(answer.channel)
     }
 
     /// Move `session` into `channel`, if metadata allows it.
@@ -1022,20 +1262,26 @@ impl Handshake {
     /// `None` when metadata could not be reached, which is different from a
     /// refusal: the caller tells the user nothing happened rather than telling
     /// them they lack a permission they may well hold.
+    ///
+    /// `account` is whose memory of "where I was" this updates, absent for a
+    /// guest. `bypass_full` says the caller has established `Write` on the
+    /// destination, which murmur treats as licence to enter a full channel.
     pub async fn enter(
         &self,
         scope: u32,
         session: u32,
         channel: u32,
+        account: Option<u64>,
+        bypass_full: bool,
     ) -> Option<starling_proto_fancy::metadata::EnterResult> {
         let transport = self.resolver.channel("metadata").ok()?;
         MetadataClient::new(transport)
             .enter(EnterRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 session,
                 channel,
+                account,
+                bypass_full,
             })
             .await
             .ok()
@@ -1059,9 +1305,7 @@ impl Handshake {
         let transport = self.resolver.channel("metadata").ok()?;
         MetadataClient::new(transport)
             .listen(ListenRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 session,
                 listen,
                 unlisten,
@@ -1087,9 +1331,7 @@ impl Handshake {
         let transport = self.resolver.channel("metadata").ok()?;
         MetadataClient::new(transport)
             .restore_listeners(RestoreListenersRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
                 session,
                 account,
             })
@@ -1260,7 +1502,7 @@ impl Handshake {
     /// The operational settings, or the shipped defaults if it is unreachable.
     pub async fn config(&self, scope: u32) -> Snapshot {
         let fallback = Snapshot {
-            virtual_server: scope,
+            instance: scope,
             max_users: 100,
             max_bandwidth: 72_000,
             ..Snapshot::default()
@@ -1270,9 +1512,7 @@ impl Handshake {
         };
         ServerConfigClient::new(channel)
             .get(GetRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    virtual_server: scope,
-                }),
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
             })
             .await
             .map(tonic::Response::into_inner)
@@ -1541,7 +1781,11 @@ fn server_sync(session: u32, config: &Snapshot) -> tcp::ServerSync {
 }
 
 /// `ServerConfig`: the limits a client must respect.
-fn server_config(config: &Snapshot) -> tcp::ServerConfig {
+///
+/// `sfu` mirrors murmur (`Messages.cpp:882`): set only when true, absent
+/// otherwise, and the client defaults it to false. Without it the client warns
+/// on every share that the server has no relay, on a server that has one.
+fn server_config(config: &Snapshot, sfu: bool) -> tcp::ServerConfig {
     tcp::ServerConfig {
         max_bandwidth: Some(config.max_bandwidth),
         welcome_text: Some(config.welcome_text.clone()),
@@ -1550,8 +1794,26 @@ fn server_config(config: &Snapshot) -> tcp::ServerConfig {
         image_message_length: Some(config.image_message_length),
         max_users: Some(config.max_users),
         recording_allowed: Some(config.allow_recording),
+        webrtc_sfu_available: sfu.then_some(true),
         ..tcp::ServerConfig::default()
     }
+}
+
+/// Whether this deployment forwards screen-share media.
+///
+/// Read from the deployment file rather than asked of `screenshare`, because
+/// the answer has to exist while that service is down: the flag describes the
+/// deployment, and a handshake that skipped it during a screenshare restart
+/// would leave those clients warning for their whole session. The predicate is
+/// [`ServiceConfig::media_ip`], the same call `screenshare` starts its SFU
+/// from, so the two cannot read the field differently.
+///
+/// [`ServiceConfig::media_ip`]: starling_runtime::ServiceConfig::media_ip
+fn sfu_available(config: &starling_runtime::Config) -> bool {
+    config
+        .services
+        .get("screenshare")
+        .is_some_and(|service| service.enabled && service.media_ip().is_some())
 }
 
 #[cfg(test)]
@@ -1676,24 +1938,89 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_epoch_is_announced_and_the_product_version_is_not() {
-        // Both halves matter and they pull in opposite directions.
-        //
-        // The epoch has to be present, or a client cannot tell Starling from a
-        // plain Mumble server and never offers a Fancy feature at all.
-        //
-        // `fancy_version` has to be absent, and that is the counter-intuitive
-        // one: it reads as "this server implements the Fancy features up to X",
-        // and a client acting on it sends those features on epoch 0's
-        // numbering, which this server routes nowhere. Claiming it would break
-        // clients that work today, because with it absent they fall back to
-        // `PluginDataTransmission`: epoch-independent, and relayed correctly.
+    fn the_opening_version_states_the_epoch_and_not_the_product_version() {
+        // The opening `Version` goes out before the peer has said anything, so
+        // it cannot know whether a product version is safe to state. The epoch
+        // has to be there, or a client cannot tell Starling from a plain Mumble
+        // server and never offers a Fancy feature at all; `fancy_version` has to
+        // wait, because to an epoch-0 client it reads as licence to send epoch-0
+        // natives, which this server routes nowhere.
         let version = server_version();
         assert_eq!(version.fancy_protocol, Some(FANCY_PROTOCOL));
         assert_eq!(
             version.fancy_version, None,
-            "announcing a product version would make clients speak the numbering we do not"
+            "the opening version cannot know who it is talking to yet"
         );
+    }
+
+    /// A peer's `Version` announcing `epoch`, or nothing at all for `None`.
+    fn peer_version(epoch: Option<u32>) -> tcp::Version {
+        tcp::Version {
+            fancy_protocol: epoch,
+            ..tcp::Version::default()
+        }
+    }
+
+    #[test]
+    fn a_peer_on_our_epoch_is_told_which_features_exist() {
+        // The whole point. Absent, the epoch-1 client leaves `message_id` unset,
+        // and its encrypted-channel path is keyed on that id -- so it sends no
+        // ciphertext at all and an E2E channel carries nothing, while looking
+        // perfectly configured at both ends.
+        let announcement =
+            fancy_announcement(&peer_version(Some(FANCY_PROTOCOL))).expect("an epoch-1 peer");
+        assert_eq!(announcement.fancy_version, Some(FANCY_VERSION.to_wire()));
+        assert_eq!(
+            announcement.fancy_protocol,
+            Some(FANCY_PROTOCOL),
+            "the epoch is restated, not dropped, on the second version"
+        );
+    }
+
+    #[test]
+    fn an_epoch_zero_peer_is_told_nothing_and_keeps_its_relay() {
+        // The hazard the silence exists for, and the only set it still applies
+        // to: a client that never named an epoch speaks the 100-999 layout, and
+        // a product version would send it there instead of through
+        // `PluginDataTransmission`, which this server does relay.
+        assert!(
+            fancy_announcement(&peer_version(None)).is_none(),
+            "a stock or epoch-0 peer must not be given a product version"
+        );
+        assert!(fancy_announcement(&peer_version(Some(0))).is_none());
+        // And a peer from an epoch we have never heard of is not one of ours.
+        assert!(fancy_announcement(&peer_version(Some(99))).is_none());
+    }
+
+    #[test]
+    fn the_second_version_repeats_everything_the_first_one_carried() {
+        // A `Version` replaces what the client stored for the last one, so a
+        // field dropped here is a field the client forgets. `version_v2` is the
+        // one that bites: the client reads protobuf-audio support off it, and
+        // re-sending it absent would demote the peer to legacy UDP framing in
+        // the middle of the handshake.
+        let first = server_version();
+        let second = fancy_announcement(&peer_version(Some(FANCY_PROTOCOL))).expect("epoch 1");
+        assert_eq!(second.version_v2, first.version_v2);
+        assert_eq!(second.release, first.release);
+        assert_eq!(second.os, first.os);
+        assert_eq!(second.os_version, first.os_version);
+    }
+
+    #[test]
+    fn the_announced_feature_version_clears_the_gates_it_exists_to_open() {
+        // Each of these is a client-side gate on this number, and each names a
+        // service this server actually runs. Written as the parts rather than
+        // the encoding, because the encoding is what `FancyVersion` is for.
+        assert_eq!(FANCY_VERSION.parts(), (0, 4, 2));
+        // Native message sets: below this the client tunnels everything.
+        assert!(FANCY_VERSION >= FancyVersion::new(0, 2, 12));
+        // The modern voice cipher. Starling already selects it for a 0.4.0
+        // client from *its* announced version; until this constant existed the
+        // client picked OCB2 from our silence, and the two disagreed.
+        assert!(FANCY_VERSION >= FancyVersion::new(0, 4, 0));
+        // The audit record, whose admin tab is gated on exactly this version.
+        assert!(FANCY_VERSION >= FancyVersion::new(0, 4, 2));
     }
 
     #[test]
@@ -1849,5 +2176,48 @@ mod tests {
         let sync = server_sync(7, &config);
         assert_eq!(sync.max_bandwidth, Some(96_000));
         assert_eq!(sync.welcome_text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn the_relay_is_advertised_as_murmur_does_present_or_absent() {
+        // Set only when true (`Messages.cpp:882`): the client defaults the
+        // field to false and resets it on disconnect, so absence is the "no
+        // relay" answer, and `Some(false)` would only be a third state for
+        // handlers to mishandle.
+        let config = Snapshot::default();
+        assert_eq!(
+            server_config(&config, true).webrtc_sfu_available,
+            Some(true)
+        );
+        assert_eq!(server_config(&config, false).webrtc_sfu_available, None);
+    }
+
+    #[test]
+    fn a_media_plane_is_a_screenshare_block_with_a_literal_ip() {
+        use starling_runtime::{Config, ServiceConfig};
+
+        let deployment = |public_url: Option<&str>, enabled: bool| {
+            let mut config = Config::default();
+            let _ = config.services.insert(
+                "screenshare".to_owned(),
+                ServiceConfig {
+                    public_url: public_url.map(str::to_owned),
+                    enabled,
+                    ..ServiceConfig::default()
+                },
+            );
+            config
+        };
+
+        assert!(sfu_available(&deployment(Some("203.0.113.9:7000"), true)));
+        // A hostname signs URLs but cannot sit in an SDP answer, so it must
+        // not be advertised as a relay the SFU will never start on.
+        assert!(!sfu_available(&deployment(
+            Some("sfu.example.org:7000"),
+            true
+        )));
+        assert!(!sfu_available(&deployment(Some("203.0.113.9:7000"), false)));
+        assert!(!sfu_available(&deployment(None, true)));
+        assert!(!sfu_available(&Config::default()));
     }
 }

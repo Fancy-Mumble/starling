@@ -13,6 +13,8 @@ use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, BlobRef, UpdateRequest, auth_result,
 };
 use starling_runtime::ids::now_ms;
+use starling_runtime::names::{NameRule, is_user_name};
+use starling_runtime::settings::{Settings, USER_NAME_PATTERN};
 use starling_runtime::storage::{Migration, Store, StoreError};
 
 use crate::secret::{Secret, verify_totp};
@@ -69,6 +71,22 @@ pub struct Accounts {
     store: Store,
     cache: Arc<Mutex<HashMap<(u32, u64), Record>>>,
     next_id: Arc<Mutex<u64>>,
+    /// The operator's `user_name_regex`, compiled once and re-used.
+    ///
+    /// Here rather than in the service above because the rule has four callers
+    /// that each decide a name, login, registration, an administrator's rename
+    /// and a user's own, and murmur checks all four
+    /// (`Messages.cpp:428`, `:3220`, `:4918`, `Server.cpp:3372`). A check in the
+    /// service would be a check each of those four could forget, and three of
+    /// them do not go through the service at all.
+    names: Arc<NameRule>,
+    /// Where the live pattern is read from, when this is running in a server.
+    ///
+    /// `None` for the callers that have no `server-config` to ask, the first-run
+    /// path, the `set-superuser-password` command and the tests. Those fall back
+    /// to murmur's own pattern rather than to "no rule": a name this build would
+    /// refuse at login must not be creatable from the command line either.
+    settings: Option<Settings>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +122,8 @@ impl Accounts {
             store,
             cache: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(2)),
+            names: Arc::new(NameRule::new()),
+            settings: None,
         };
         accounts.warm().await;
         Ok(accounts)
@@ -165,6 +185,26 @@ impl Accounts {
         }
     }
 
+    /// Read the operator's name rule from `server-config` from now on.
+    ///
+    /// Not a constructor argument: `Accounts::open` has four callers and only
+    /// one of them is a running server, so the setting is opted into by the one
+    /// that has somewhere to read it from.
+    #[must_use]
+    pub fn watching(mut self, settings: Settings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// Whether `name` satisfies the operator's `user_name_regex`.
+    fn name_allowed(&self, scope: u32, name: &str) -> bool {
+        let pattern = self.settings.as_ref().map_or_else(
+            || USER_NAME_PATTERN.to_owned(),
+            |settings| settings.get(scope).user_name_regex,
+        );
+        is_user_name(&self.names, &pattern, name)
+    }
+
     /// Decide whether a peer may in, and as whom.
     ///
     /// The name-taken case is murmur's impersonation guard: a registered name
@@ -174,6 +214,14 @@ impl Accounts {
         use auth_result::Outcome;
 
         if request.name.trim().is_empty() {
+            return outcome(Outcome::InvalidName, None);
+        }
+        // The operator's name rule, and the SuperUser is exempt from it for the
+        // same reason `cert_required` exempts them (`handshake.rs`): a pattern
+        // that happens to exclude the administrator's name locks out the only
+        // account that could change the pattern back, and the way in is then to
+        // edit the database by hand.
+        if request.name != identity::SUPERUSER_NAME && !self.name_allowed(scope, &request.name) {
             return outcome(Outcome::InvalidName, None);
         }
         let by_cert = if request.cert_hash.is_empty() {
@@ -391,6 +439,9 @@ impl Accounts {
         mut account: Account,
         password: &str,
     ) -> Result<Account, String> {
+        if !self.name_allowed(scope, &account.name) {
+            return Err(format!("the name {:?} is not allowed here", account.name));
+        }
         if self.record_by_name(scope, &account.name).is_some() {
             return Err(format!("the name {:?} is already registered", account.name));
         }
@@ -443,6 +494,13 @@ impl Accounts {
         if name.is_empty() {
             return Err("a name cannot be empty".to_owned());
         }
+        // After the trim, as murmur checks it (`Messages.cpp:3219` trims before
+        // calling `validateUserName`), so a rename with an edge space is
+        // accepted and stored trimmed rather than refused for a space the user
+        // cannot see.
+        if !self.name_allowed(scope, name) {
+            return Err(format!("the name {name:?} is not allowed here"));
+        }
         let Some(mut record) = self
             .cache
             .lock()
@@ -467,7 +525,7 @@ impl Accounts {
         Ok(record.account)
     }
 
-    /// Create the SuperUser for this virtual server if it has none.
+    /// Create the SuperUser for this server instance if it has none.
     ///
     /// Returns the password it generated, and **only** when it generated one.
     /// `None` means the account was already there, which is what makes this safe
@@ -661,7 +719,7 @@ impl Accounts {
         Ok(())
     }
 
-    /// Whether this virtual server's SuperUser has a password set.
+    /// Whether this server instance's SuperUser has a password set.
     ///
     /// For the operator surface, which should be able to say "the administrator
     /// login exists" without being able to read what it is.
@@ -1229,8 +1287,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_virtual_server_gets_its_own_administrator() {
-        // One password across every virtual server would make them one server
+    async fn each_server_instance_gets_its_own_administrator() {
+        // One password across every server instance would make them one server
         // for the only purpose that matters.
         let accounts = accounts().await;
         let first = accounts.ensure_superuser(1).await.expect("created");
@@ -1455,7 +1513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_virtual_servers_names_do_not_block_anothers() {
+    async fn one_server_instances_names_do_not_block_anothers() {
         // The name index is per server, and a rename that consulted it globally
         // would make every account name on a shared deployment first-come.
         let accounts = accounts().await;
