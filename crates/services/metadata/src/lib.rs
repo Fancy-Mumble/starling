@@ -1436,6 +1436,10 @@ impl MetadataService {
 
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one create path and one update path, both read from the same message"
+    )]
     async fn on_channel_state(&self, inbound: &Inbound) -> Actions {
         let Ok(state) =
             starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())

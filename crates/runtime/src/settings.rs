@@ -316,6 +316,10 @@ impl Settings {
 /// `extra`, which is how a service can add an operator-facing knob without a
 /// proto release.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per setting; the list has to stay parallel to server-config's merge"
+)]
 pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
     let mut snapshot = defaults(1);
     let mut fields = Vec::new();

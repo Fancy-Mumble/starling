@@ -657,6 +657,10 @@ impl SessionLifecycleService {
     /// the actor's. That is what makes it a moderator power over a room rather
     /// than a property of the person exercising it, and it is why this is
     /// refused for a user's own session too unless they hold it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per speak-state bit, each with the permission it needs"
+    )]
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
         let Some(target) = self.connections.by_session(target_session) else {
