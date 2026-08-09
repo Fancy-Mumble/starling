@@ -18,7 +18,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::pchat::{
-    Ack, Fetch, FetchResponse, Message, PchatEnvelope, ack, pchat_envelope,
+    Ack, Fetch, FetchResponse, Message, PchatEnvelope, Protocol, ack, pchat_envelope,
 };
 use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::perm::Perm;
@@ -91,7 +91,45 @@ const SCHEMA: &[Migration<'static>] = &[
             "ALTER TABLE pchat_message ADD COLUMN protocol INTEGER NULL",
         ],
     ),
+    // The id the *sender* minted, which is not the same thing as where this
+    // server files the row - and the archive used to keep only the latter.
+    //
+    // A sender seals a message under `AAD = channel ‖ message_id ‖ sent_at_ms`
+    // (client `persistent/protocol/fancy_v1/aad.rs`), so an archive that hands
+    // back its own id, or its own clock, hands back a ciphertext that nobody -
+    // not even the author - can open. murmur never had the problem because it
+    // stores what the sender sent (`PchatProtocolHandlers.cpp:58`).
+    //
+    // The uuid7 `id` stays the primary key and the cursor, because it is what
+    // makes a page a backwards range scan (`docs/STORAGE.md` L3); this column
+    // is the identity on the wire, and the two are now allowed to differ.
+    Migration::new(
+        "0004_pchat_client_id",
+        &[
+            "ALTER TABLE pchat_message ADD COLUMN client_id TEXT NULL",
+            "CREATE INDEX IF NOT EXISTS ix_pchat_client_id \
+             ON pchat_message(server_id, channel_id, client_id)",
+        ],
+    ),
 ];
+
+/// Whether a message of this protocol belongs in the archive at all.
+///
+/// `signal_v1` keeps **no server-side history**, which is a property of the
+/// mode rather than a client's preference: a late joiner must never read what
+/// was said before it arrived, and it is inside the channel ACL, so "who may
+/// fetch" cannot express the rule. Storing it bought nothing - nothing here
+/// redelivers an offline queue, and the only reader of a stored row is
+/// `on_fetch` - and cost the one guarantee the mode exists for.
+///
+/// This reads the protocol the frame declared, so a client that mislabels its
+/// own message still gets it archived. That is a client lying about its own
+/// history rather than reading somebody else's, and the airtight form - asking
+/// `metadata` for the channel's `pchat_protocol` - is a cross-service call this
+/// path does not otherwise need.
+const fn archivable(protocol: i32) -> bool {
+    protocol != Protocol::SignalV1 as i32
+}
 
 /// The service.
 #[derive(Debug)]
@@ -120,13 +158,23 @@ impl PchatService {
         let result = sqlx::query(
             "INSERT INTO pchat_message \
                  (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, \
-                  supersedes, sender_cert, epoch_fingerprint, chain_index, protocol) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  supersedes, sender_cert, epoch_fingerprint, chain_index, protocol, \
+                  client_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(message.channel))
         .bind(id.to_vec())
-        .bind(now_ms() as i64)
+        // The sender's clock, not this server's. It is half of the AAD the
+        // message was sealed under, so overwriting it makes the row
+        // undecryptable exactly as overwriting the id does. A message that
+        // names no time at all still gets one, because a page has to be
+        // orderable for a reader.
+        .bind(if message.sent_at_ms == 0 {
+            now_ms() as i64
+        } else {
+            message.sent_at_ms as i64
+        })
         .bind(i64::from(message.sender))
         .bind(i64::from(message.epoch))
         .bind(message.ciphertext.as_slice())
@@ -135,6 +183,7 @@ impl PchatService {
         .bind((!message.epoch_fingerprint.is_empty()).then(|| message.epoch_fingerprint.clone()))
         .bind(i64::from(message.chain_index))
         .bind(i64::from(message.protocol))
+        .bind((!message.message_id.is_empty()).then(|| message.message_id.clone()))
         .execute(self.store.pool())
         .await;
         match result {
@@ -146,22 +195,57 @@ impl PchatService {
         }
     }
 
+    /// Where a wire id sits in this channel's storage order.
+    ///
+    /// A cursor arrives as an id a client holds, and what a client holds is the
+    /// *sender's* id - so it is looked up rather than parsed. Falling back to
+    /// parsing covers rows written before `client_id` existed, whose only
+    /// identity is this server's own uuid7.
+    async fn cursor_of(&self, scope: u32, channel: u32, wire_id: &str) -> Option<Vec<u8>> {
+        use sqlx::Row as _;
+        if wire_id.is_empty() {
+            return None;
+        }
+        let found = sqlx::query(
+            "SELECT id FROM pchat_message \
+             WHERE server_id = ? AND channel_id = ? AND client_id = ?",
+        )
+        .bind(i64::from(scope))
+        .bind(i64::from(channel))
+        .bind(wire_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<Vec<u8>, _>("id").ok());
+
+        found.or_else(|| Uuid7::parse(wire_id).map(Uuid7::to_vec))
+    }
+
     /// A page of ciphertexts, newest first.
     async fn fetch(&self, scope: u32, request: &Fetch) -> FetchResponse {
         use sqlx::Row as _;
         let page = request.page.clone().unwrap_or_default();
         let limit = page.page_size(50, 200);
-        let before = Uuid7::parse(&page.before_id).map(Uuid7::to_vec);
+        let before = self.cursor_of(scope, request.channel, &page.before_id).await;
+        // The protocol predicate is here as well as in `on_message` on purpose:
+        // refusing to write only protects a database that has always run this
+        // build, and a deployment that upgraded into it still has yesterday's
+        // signal_v1 rows on disk. This is what keeps them unreadable without a
+        // data migration.
         let sql = if before.is_some() {
-            "SELECT id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
-             WHERE server_id = ? AND channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
+            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
+             WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
+             AND id < ? ORDER BY id DESC LIMIT ?"
         } else {
-            "SELECT id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
-             WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
+            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
+             WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
+             ORDER BY id DESC LIMIT ?"
         };
         let mut query = sqlx::query(sql)
             .bind(i64::from(scope))
-            .bind(i64::from(request.channel));
+            .bind(i64::from(request.channel))
+            .bind(i64::from(Protocol::SignalV1 as i32));
         if let Some(cursor) = &before {
             query = query.bind(cursor.as_slice());
         }
@@ -171,20 +255,17 @@ impl PchatService {
             .await
             .unwrap_or_default();
 
+        // The id a page is addressed by is the one the client will send back as
+        // the next cursor, so it has to be the same identity the messages
+        // themselves carry.
         let page_info = PageInfo::after(rows.len(), limit, || {
-            rows.get(limit as usize - 1)
-                .and_then(|row| row.try_get::<Vec<u8>, _>("id").ok())
-                .and_then(|id| Uuid7::from_slice(&id))
-                .map(|id| id.to_string())
-                .unwrap_or_default()
+            rows.get(limit as usize - 1).map(wire_id).unwrap_or_default()
         });
         let messages = rows
             .into_iter()
             .take(limit as usize)
             .map(|row| Message {
-                message_id: Uuid7::from_slice(&row.try_get::<Vec<u8>, _>("id").unwrap_or_default())
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
+                message_id: wire_id(&row),
                 channel: request.channel,
                 sender: row.try_get::<i64, _>("sender").unwrap_or_default() as u32,
                 ciphertext: row.try_get("ciphertext").unwrap_or_default(),
@@ -216,10 +297,12 @@ impl PchatService {
     async fn count(&self, scope: u32, channel: u32) -> u64 {
         use sqlx::Row as _;
         sqlx::query(
-            "SELECT COUNT(*) AS n FROM pchat_message WHERE server_id = ? AND channel_id = ?",
+            "SELECT COUNT(*) AS n FROM pchat_message \
+             WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(channel))
+        .bind(i64::from(Protocol::SignalV1 as i32))
         .fetch_optional(self.store.pool())
         .await
         .ok()
@@ -237,6 +320,26 @@ impl PchatService {
         .execute(self.store.pool())
         .await;
     }
+}
+
+/// The identity a stored row carries on the wire.
+///
+/// The sender's own id, because that is what its AEAD is sealed against and
+/// what every other client files it under - pins, reactions and deletes all
+/// name it. Rows written before `client_id` existed, and senders that mint no
+/// id at all, fall back to this server's uuid7, which is the only identity
+/// those rows have.
+fn wire_id(row: &sqlx::any::AnyRow) -> String {
+    use sqlx::Row as _;
+    row.try_get::<Option<String>, _>("client_id")
+        .ok()
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            Uuid7::from_slice(&row.try_get::<Vec<u8>, _>("id").unwrap_or_default())
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        })
 }
 
 /// What a relayed body is, for routing and authorisation.
@@ -436,17 +539,53 @@ impl PchatService {
         // is keyed on.
         message.sender = inbound.session;
         message.sender_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
-        let Some(id) = self.store_message(inbound.scope, &message).await else {
-            return vec![self.ack(
-                inbound,
-                &message.message_id,
-                ack::Status::Refused,
-                "the message could not be stored",
-            )];
+        // Relayed either way; this decides whether a row outlives the relay.
+        let archived = if archivable(message.protocol) {
+            let Some(id) = self.store_message(inbound.scope, &message).await else {
+                return vec![self.ack(
+                    inbound,
+                    &message.message_id,
+                    ack::Status::Refused,
+                    "the message could not be stored",
+                )];
+            };
+            Some(id)
+        } else {
+            None
         };
+        let id = archived.unwrap_or_else(Uuid7::now);
 
-        message.message_id = id.to_string();
+        // The sender's id is left alone. It used to be replaced with `id`, the
+        // key this server files the row under, and that made every archive
+        // message undecryptable: a sender seals under
+        // `AAD = channel ‖ message_id ‖ sent_at_ms`, so a recipient - including
+        // the author after a reconnect - authenticated a different id than was
+        // sealed and the AEAD refused it. It also split the identity of a
+        // message in two, since the author's own copy kept the id it minted
+        // while everyone else got this one, so a pin or a reaction named a
+        // message the other end did not have. murmur stores what the sender
+        // sent for the same reason (`PchatProtocolHandlers.cpp:58`).
+        //
+        // A sender that minted no id gets this server's, which is the only
+        // identity such a message has.
+        if message.message_id.is_empty() {
+            message.message_id = id.to_string();
+        }
         let channel = message.channel;
+        // The one line that answers "did the ciphertext ever leave the client",
+        // which is the question every silent-encrypted-channel report turns out
+        // to be. A client that thinks a channel is unencrypted, or that cannot
+        // seal a message, sends nothing at all -- and that is indistinguishable
+        // from a broken relay unless the arrival itself is on record. The body
+        // stays out of it; a length and a destination are enough.
+        tracing::debug!(
+            session = inbound.session,
+            channel,
+            bytes = message.ciphertext.len(),
+            protocol = message.protocol,
+            archived = archived.is_some(),
+            "stored an encrypted message"
+        );
         let acknowledgement = self.ack(inbound, &message.message_id, ack::Status::Stored, "");
         let relay = PchatEnvelope {
             body: Some(pchat_envelope::Body::Message(message)),
@@ -723,6 +862,152 @@ mod tests {
             stored.sender_cert,
             SPEAKER_CERT.to_vec(),
             "the certificate must survive the round trip through the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_archive_gives_back_the_id_and_the_time_the_sender_sealed_under() {
+        // The bug this replaced made every archive message undecryptable, and
+        // it looked like a delivery failure: the store minted its own uuid7
+        // over the sender's id and stamped its own clock over `sent_at_ms`,
+        // and both are inside the AAD the message was sealed with
+        // (`AAD = channel ‖ message_id ‖ sent_at_ms`). The ciphertext came
+        // back intact and the AEAD refused it, for the author as much as for
+        // anyone else - which is why "history replay" and "decrypt on the
+        // other member" failed together.
+        let service = service().await;
+        let sealed = Message {
+            message_id: "8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a".to_owned(),
+            sent_at_ms: 1_700_000_000_000,
+            ..message(4, b"x")
+        };
+        let _ = service.store_message(1, &sealed).await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let stored = page.messages.first().expect("the message is on record");
+        assert_eq!(
+            stored.message_id, sealed.message_id,
+            "the archive must hand back the id the sender sealed under"
+        );
+        assert_eq!(
+            stored.sent_at_ms, sealed.sent_at_ms,
+            "and the time it sealed under, not this server's clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signal_message_is_never_archived_and_never_served() {
+        // signal_v1's whole point is that a late joiner cannot read what was
+        // said before it arrived. The joiner is inside the channel ACL by
+        // then, so `on_fetch`'s Enter check cannot express the rule - the
+        // archive simply must not hold the message.
+        //
+        // The client also declines to ask, but a client-side skip is an
+        // agreement rather than a guarantee: the frame is one a modified peer
+        // can still send, and forward secrecy is exactly the property that
+        // must not depend on the reader's good manners.
+        let service = service().await;
+        let _ = service
+            .store_message(
+                1,
+                &Message {
+                    protocol: Protocol::SignalV1 as i32,
+                    ..message(4, b"said before carol arrived")
+                },
+            )
+            .await;
+        assert_eq!(
+            service.fetch(1, &fetch(4, 10)).await.messages.len(),
+            0,
+            "a signal_v1 message must not come back out of the archive"
+        );
+
+        // And the same row written by yesterday's build, which stored it
+        // before this rule existed. Refusing to write is not enough on a
+        // database that upgraded into this version.
+        let _ = sqlx::query(
+            "INSERT INTO pchat_message \
+                 (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, protocol) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(1_i64)
+        .bind(4_i64)
+        .bind(Uuid7::now().to_vec())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(b"legacy row".as_slice())
+        .bind(i64::from(Protocol::SignalV1 as i32))
+        .execute(service.store.pool())
+        .await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages.len(), 0, "nor one an older build stored");
+        assert_eq!(page.total_stored, 0, "and it is not counted either");
+
+        // The mode that *does* keep history still does.
+        let _ = service
+            .store_message(
+                1,
+                &Message {
+                    protocol: Protocol::FancyV1FullArchive as i32,
+                    ..message(4, b"archived on purpose")
+                },
+            )
+            .await;
+        assert_eq!(
+            service.fetch(1, &fetch(4, 10)).await.messages.len(),
+            1,
+            "fancy_v1_full_archive is an archive and must still be one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_is_addressed_by_the_same_id_its_messages_carry() {
+        // A cursor is an id the client read off a previous page, so it is the
+        // sender's - `WHERE id < ?` against the storage key could never match
+        // one, and scroll-back silently returned the newest page forever.
+        let service = service().await;
+        for n in 0..3u8 {
+            let _ = service
+                .store_message(
+                    1,
+                    &Message {
+                        message_id: format!("0000000{n}-0000-4000-8000-000000000000"),
+                        ..message(5, b"x")
+                    },
+                )
+                .await;
+        }
+
+        let first = service.fetch(1, &fetch(5, 2)).await;
+        let cursor = first.page.expect("a page reports its tail").next_before_id;
+        assert_eq!(
+            cursor,
+            first.messages.last().expect("two messages").message_id,
+            "the cursor names the oldest message on the page"
+        );
+
+        let second = service
+            .fetch(
+                1,
+                &Fetch {
+                    channel: 5,
+                    page: Some(Cursor {
+                        before_id: cursor,
+                        limit: 2,
+                        ..Cursor::default()
+                    }),
+                },
+            )
+            .await;
+        assert_eq!(second.messages.len(), 1, "the page behind the cursor");
+        assert!(
+            !first
+                .messages
+                .iter()
+                .any(|m| m.message_id == second.messages[0].message_id),
+            "a second page must not repeat the first"
         );
     }
 
