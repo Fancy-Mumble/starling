@@ -8,8 +8,14 @@
 # workspace version, is a release and publishes `:X.Y.Z`, `:X.Y` and `:latest`.
 # Every push to main publishes a rolling `:edge` and a `:sha-<short>` to pin to.
 # See docs/RELEASING.md.
+#
+# **amd64 and arm64**, each built on a runner of its own architecture and then
+# joined into one manifest list. The obvious alternative — one job with
+# `platforms: linux/amd64,linux/arm64` — cross-builds the second one under QEMU,
+# and this release profile is thin-LTO with `codegen-units=1`: emulating that is
+# not a slower build, it is a different order of magnitude. Native arm64 runners
+# are free for public repositories, so the emulator buys nothing.
 name: docker
-
 on:
   push:
     branches: [main]
@@ -24,14 +30,96 @@ env:
   IMAGE: ghcr.io/fancy-mumble/starling
 
 jobs:
-  image:
-    name: Build and push image
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read # check out the tree; the release itself is release.yml's
       packages: write # push to the org's GHCR, via GITHUB_TOKEN
+    strategy:
+      fail-fast: false # one architecture failing should still show the other
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only: the tags belong to the manifest, and this job runs once
+      # per architecture where no tag could name just one of them anyway.
+      - name: Labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      # Pushed **by digest**, with no tags at all: a tag can only point at one
+      # thing, so two jobs pushing `:edge` would race and the loser's
+      # architecture would vanish from it. Each job publishes an untagged image
+      # and hands its digest to `merge`, which is what names them together.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Scoped per architecture. One shared scope has the two jobs evicting
+          # each other's layers, so both rebuild from scratch every run and the
+          # cache costs time instead of saving it.
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # The digest, as a file named after itself. Artifact names cannot contain
+      # a slash, hence the platform is flattened.
+      - name: Export the digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+        shell: bash
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish the manifest
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # `metadata-action` needs the tree for the semver tags, and the version
+      # step below reads Cargo.toml.
+      - uses: actions/checkout@v6
+
+      - name: Download the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,25 +154,35 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=edge,branch=main
-            type=raw,value=${{ steps.dev.outputs.tag }},enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=${{ steps.dev.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
           flavor: |
             latest=auto
 
-      # amd64 only: the release profile is thin-LTO with codegen-units=1, and
-      # cross-building arm64 under QEMU turns a slow build into a very slow one.
-      # Add `linux/arm64` here (and a native or well-cached builder) when it is
-      # actually needed.
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # One manifest list per tag, over both digests. This is the step that
+      # makes `docker pull` on an arm64 host get an arm64 image rather than
+      # nothing at all.
+      - name: Create the manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      # Proof, not hope: a manifest that is missing an architecture still
+      # pushes cleanly, and the first anyone hears of it is a pull failing on a
+      # Raspberry Pi.
+      - name: Verify both architectures are in it
+        run: |
+          set -euo pipefail
+          for tag in $(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            echo "== $tag"
+            docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
+              | jq -r '.manifests[]?.platform | select(.os == "linux") | "\(.os)/\(.architecture)"' \
+              | sort -u | tee /tmp/arches
+            grep -qx 'linux/amd64' /tmp/arches
+            grep -qx 'linux/arm64' /tmp/arches
+          done
 
       # The GitHub release for a tag is cut by `release.yml`, which is also
       # what attaches the .deb, .rpm, .AppImage, .dmg and .exe to it. This
