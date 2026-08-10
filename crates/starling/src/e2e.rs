@@ -4346,7 +4346,7 @@ async fn a_typing_indicator_names_the_typist_and_is_not_echoed_to_them() {
         loop {
             let (type_id, _) = alice.recv().await;
             if type_id == SOCIAL {
-                return ();
+                return;
             }
         }
     })
@@ -4578,7 +4578,7 @@ async fn a_scheduled_message_can_be_cancelled_and_then_never_arrives() {
                 && tcp::TextMessage::decode(payload.as_slice())
                     .is_ok_and(|message| message.message == "never mind")
             {
-                return ();
+                return;
             }
         }
     })

@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn a_name_is_measured_in_characters_and_capped_before_the_pattern() {
         let rule = NameRule::new();
-        let long: String = "a".repeat(MAX_NAME_LEN + 1);
+        let long = "a".repeat(MAX_NAME_LEN + 1);
         assert!(!rule.accepts(r".*", &long, "test"));
         assert!(rule.accepts(r".*", &"a".repeat(MAX_NAME_LEN), "test"));
     }

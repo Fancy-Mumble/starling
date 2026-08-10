@@ -10,7 +10,7 @@ use starling_proto::proto::tcp;
 use starling_proto_fancy::metadata::Channel;
 
 pub use starling_proto_fancy::channel::channel_state;
-use starling_proto_fancy::channel::{FLAG_DETACHED, FLAG_HIDDEN, FLAG_TEMPORARY};
+use starling_proto_fancy::channel::{FLAG_DETACHED, FLAG_HIDDEN};
 
 /// A `ChannelState` announcing only a change of links.
 ///
@@ -159,6 +159,7 @@ pub fn is_hidden(channel: &Channel) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_proto_fancy::channel::FLAG_TEMPORARY;
 
     #[test]
     fn a_stock_client_is_still_told_a_channel_is_temporary() {
