@@ -85,7 +85,20 @@ fn from_environment(var: &dyn Fn(&str) -> Option<String>, platform: Platform) ->
     };
     // The XDG specification says a relative value must be ignored rather than
     // resolved, for the same reason.
-    let absolute = |name: &str| read(name).filter(|path| path.is_absolute());
+    //
+    // Judged by the convention being modelled, not by the host's. `is_absolute`
+    // answers for the machine running the code: on Windows `/etc/xdg-user` is
+    // *relative*, because Windows wants a drive letter. The XDG branch exists
+    // precisely to model a Unix machine, so letting the host overrule it made
+    // `platform` a half-truth - it chose the branch and then had its answer
+    // thrown away, which is only visible when the tests run on Windows.
+    let absolute = |name: &str| {
+        read(name).filter(|path| match platform {
+            // Both POSIX conventions: a leading slash and nothing else.
+            Platform::Xdg | Platform::Macos => path.starts_with("/"),
+            Platform::Windows => path.is_absolute(),
+        })
+    };
     let home = |suffix: &str| read("HOME").map(|home| home.join(suffix));
 
     match platform {

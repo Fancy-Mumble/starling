@@ -7,7 +7,7 @@
 //! A file is an **overlay on the built-in defaults**, not a replacement for
 //! them: it names what it changes and stays silent about the rest, so a working
 //! configuration is six lines rather than three hundred. It may be split across
-//! files with `include`. Both live in [`merge`].
+//! files with `include`. Both live in `merge`, which is private.
 //!
 //! Unknown keys are **rejected**, so a typo fails loudly.
 

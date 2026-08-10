@@ -455,6 +455,10 @@ mod tests {
     }
 
     #[test]
+    // Unix only, like the check itself: `socket_paths` returns early off
+    // Unix because no Windows deployment binds one, so there is no finding
+    // here to assert either way.
+    #[cfg(unix)]
     fn a_socket_path_longer_than_the_kernel_allows_is_refused() {
         // The failure this command exists for. The path is generated from
         // `data_dir`, so nothing in the file looks wrong.
@@ -470,6 +474,10 @@ mod tests {
     }
 
     #[test]
+    // Unix only, like the check itself: `socket_paths` returns early off
+    // Unix because no Windows deployment binds one, so there is no finding
+    // here to assert either way.
+    #[cfg(unix)]
     fn a_socket_path_that_fits_exactly_is_allowed() {
         // Off-by-one here would reject working deployments, which is worse than
         // the check not existing: the operator cannot argue with it.
