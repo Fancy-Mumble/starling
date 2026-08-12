@@ -16,9 +16,11 @@ pub mod perm;
 pub mod coalesce;
 pub mod evaluate;
 pub mod group;
+pub mod import;
 
 pub use coalesce::Coalescer;
 pub use evaluate::{Acls, evaluate};
+pub use import::import;
 pub use perm::{AllowAll, Perm, Permissions};
 
 use std::sync::Arc;
@@ -61,7 +63,7 @@ const EVENT_BUFFER: usize = 256;
 /// `SetAcl` and is never queried by parts, the evaluator reads the whole set
 /// for a channel, so a row per entry would buy a join and cost the ordering
 /// within a set, which is load-bearing: deny beats allow *at the same level*.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
+pub(crate) const SCHEMA: &[Migration<'static>] = &[Migration::new(
     "0001_channel_acl",
     &["CREATE TABLE IF NOT EXISTS channel_acl (\
            server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, \
@@ -286,35 +288,14 @@ impl PermissionsService {
     /// for evaluation (`docs/STORAGE.md` L7): a permission check that touched
     /// the disk would put I/O inside the hot path of every frame.
     async fn warm(&self) {
-        use sqlx::Row as _;
         let Some(store) = &self.store else {
             return;
         };
-        let rows = sqlx::query("SELECT server_id, acls FROM channel_acl")
-            .fetch_all(store.pool())
-            .await
-            .unwrap_or_default();
-
-        let mut loaded = 0_usize;
-        for row in rows {
-            let scope = row.try_get::<i64, _>("server_id").unwrap_or(1) as u32;
-            let Ok(bytes) = row.try_get::<Vec<u8>, _>("acls") else {
-                continue;
-            };
-            // A row that will not decode is skipped rather than fatal, and said
-            // out loud: refusing to start would take the whole server down over
-            // one channel's table, and starting silently would apply an ACL set
-            // nobody can see.
-            match AclSet::decode(bytes.as_slice()) {
-                Ok(set) => {
-                    self.acls.set(scope, set);
-                    loaded += 1;
-                }
-                Err(error) => {
-                    tracing::error!(%error, scope, "skipping an unreadable ACL row");
-                }
-            }
-        }
+        // The query lives on `Acls` so that the one place stored bytes become a
+        // live table is the one place, whether the caller is a boot or the
+        // migration's own check that an imported server evaluates the way the
+        // one it came from did.
+        let loaded = self.acls.load(store).await;
         tracing::info!(loaded, "acl tables loaded");
     }
 

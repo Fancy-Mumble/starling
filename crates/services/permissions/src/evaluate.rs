@@ -74,6 +74,48 @@ impl Acls {
         Self::default()
     }
 
+    /// Load every stored ACL set, returning how many arrived.
+    ///
+    /// Read once at boot, and once again by anything that needs to know what is
+    /// actually on disk -- the import's own tests, which check that a migrated
+    /// server *evaluates* the way the one it came from did, rather than merely
+    /// that a row went in.
+    ///
+    /// On [`Acls`] rather than on the service, so the one query that turns
+    /// stored bytes into a live table has one home: a second copy of it is how
+    /// a store and its reader come to disagree about an encoding.
+    pub async fn load(&self, store: &starling_runtime::storage::Store) -> usize {
+        use prost::Message as _;
+        use sqlx::Row as _;
+
+        let rows = sqlx::query("SELECT server_id, acls FROM channel_acl")
+            .fetch_all(store.pool())
+            .await
+            .unwrap_or_default();
+
+        let mut loaded = 0_usize;
+        for row in rows {
+            let scope = row.try_get::<i64, _>("server_id").unwrap_or(1) as u32;
+            let Ok(bytes) = row.try_get::<Vec<u8>, _>("acls") else {
+                continue;
+            };
+            // A row that will not decode is skipped rather than fatal, and said
+            // out loud: refusing to start would take the whole server down over
+            // one channel's table, and starting silently would apply an ACL set
+            // nobody can see.
+            match AclSet::decode(bytes.as_slice()) {
+                Ok(set) => {
+                    self.set(scope, set);
+                    loaded += 1;
+                }
+                Err(error) => {
+                    tracing::error!(%error, scope, "skipping an unreadable ACL row");
+                }
+            }
+        }
+        loaded
+    }
+
     /// Replace a channel's ACL set.
     ///
     /// **Temporary memberships for groups the new table still declares are
