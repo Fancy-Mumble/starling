@@ -13,11 +13,13 @@
 
 pub mod channel;
 pub mod ids;
+pub mod import;
 pub mod serialize;
 pub mod tree_actor;
 
 pub use channel::{Channel, ChannelStore, ChannelTree};
 pub use ids::{ChannelId, ROOT_CHANNEL};
+pub use import::{Tree as ImportedTree, Written, import};
 pub use serialize::{ChannelEdit, channel_state, to_proto};
 pub use tree_actor::{Creation, ListenRefusal, Listened, Removal, TreeLimits, Trees, Unlistened};
 
@@ -54,7 +56,7 @@ use tonic::{Request, Response, Status};
 
 /// The schema. Typed columns, one row per channel, and the index the parent
 /// lookup actually uses (`docs/STORAGE.md` L1, L2).
-const SCHEMA: &[Migration<'static>] = &[
+pub(crate) const SCHEMA: &[Migration<'static>] = &[
     Migration::new(
         "0001_channel",
         &[
