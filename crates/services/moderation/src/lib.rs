@@ -7,6 +7,8 @@
 //! The gateway asks [`Moderation::check_ban`] on accept, before anything is
 //! spent on a peer that is not allowed in.
 
+pub mod import;
+
 // The async test harness, and nothing else in this crate, needs tokio.
 #[cfg(test)]
 use tokio as _;
@@ -43,7 +45,7 @@ const ROOT_CHANNEL: u32 = 0;
 const BAN_LIST: u16 = 10;
 
 /// The schema.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
+pub(crate) const SCHEMA: &[Migration<'static>] = &[Migration::new(
     "0001_ban",
     &[
         "CREATE TABLE IF NOT EXISTS ban (\
