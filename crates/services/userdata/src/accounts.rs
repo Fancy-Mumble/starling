@@ -65,6 +65,38 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
     ],
 )];
 
+/// One account as a migration hands it over.
+///
+/// Deliberately not [`Account`]: that is the wire type, and three of the things
+/// an import must carry never appear on a wire. The password is one (it is a
+/// stored hash, not a plaintext), the TOTP secret is another (it never leaves
+/// the server), and the comment and avatar are the third -- they arrive as
+/// *bytes* here and are content-addressed on the way in, whereas the wire only
+/// ever names them by hash.
+#[derive(Debug, Clone, Default)]
+pub struct Import {
+    /// The id murmur gave this account. Kept, see [`Accounts::import`].
+    pub id: u64,
+    /// The registered name.
+    pub name: String,
+    /// The address, if the account has one.
+    pub email: String,
+    /// The profile text, as bytes to store rather than as a hash.
+    pub comment: String,
+    /// The certificate fingerprint, decoded from murmur's hex.
+    pub cert_hash: Vec<u8>,
+    /// The stored password, in whatever form murmur left it.
+    pub password: Option<Secret>,
+    /// The second factor's shared secret, decoded from base32.
+    pub totp_secret: Option<Vec<u8>>,
+    /// The avatar, as bytes to store.
+    pub texture: Vec<u8>,
+    /// When the account was created, as far as murmur recorded it.
+    pub created_at_ms: u64,
+    /// When it was last seen.
+    pub last_active_ms: u64,
+}
+
 /// Accounts, cached in memory and written through.
 #[derive(Debug, Clone)]
 pub struct Accounts {
@@ -725,6 +757,184 @@ impl Accounts {
     /// login exists" without being able to read what it is.
     pub fn has_superuser(&self, scope: u32) -> bool {
         self.by_id(scope, identity::SUPERUSER).is_some()
+    }
+
+    /// Whether this account's password came from murmur and is still in
+    /// murmur's form.
+    ///
+    /// The question `starling migrate-db` leaves behind: an imported hash
+    /// verifies, but it is not the hash this server would have made, so the
+    /// next successful login re-derives it. Answered from the cache, because
+    /// the caller asks it on the login path.
+    #[must_use]
+    pub fn password_is_carried(&self, scope: u32, id: u64) -> bool {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(&(scope, id))
+                    .map(|record| record.password.as_ref().is_some_and(|s| !s.is_native()))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Replace an imported password with `secret`, which was derived natively.
+    ///
+    /// Called after a login that already succeeded, so this neither decides nor
+    /// influences one: if it does nothing, the account keeps the hash it came in
+    /// with and still works. It is how murmur's unsalted SHA-1 leaves a migrated
+    /// database rather than living in it forever.
+    ///
+    /// Takes an already-derived [`Secret`] rather than the plaintext, so the
+    /// expensive half runs wherever the caller decided blocking was allowed and
+    /// this half is a write.
+    pub async fn store_password(&self, scope: u32, id: u64, secret: Secret) {
+        let Some(mut record) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).cloned())
+        else {
+            return;
+        };
+        // Checked again here rather than trusted from the caller: two logins for
+        // one account can race, and the loser would otherwise overwrite a
+        // password the winner had already upgraded.
+        if record.password.as_ref().is_none_or(Secret::is_native) {
+            return;
+        }
+        record.password = Some(secret);
+        self.write(scope, &record).await;
+        if let Ok(mut cache) = self.cache.lock() {
+            let _ = cache.insert((scope, id), record);
+        }
+        tracing::info!(
+            account = id,
+            instance = scope,
+            "an imported password was re-derived on login"
+        );
+    }
+
+    /// Write accounts that came from a murmur database, ids and all.
+    ///
+    /// Returns what it **refused**, one line each, so a migration can report
+    /// its losses rather than count a silent failure as a success
+    /// (`docs/STORAGE.md` §4, requirement 4).
+    ///
+    /// Three things make this different from [`Self::register`], and each of
+    /// them is the point:
+    ///
+    /// * **The id is kept.** Every ACL entry, group membership and channel
+    ///   listener in the rest of the migration names an account by murmur's id,
+    ///   so an account that arrived with a new one would silently lose every
+    ///   permission it had.
+    /// * **The password is taken as given**, in whichever form murmur left it.
+    ///   See [`Secret`]: a hash cannot be re-derived, and dropping it would lock
+    ///   out every user on the day the server moved.
+    /// * **It upserts.** A migration that has to be run twice -- because it was
+    ///   interrupted, or because the first pass was a rehearsal -- must be able
+    ///   to be (`docs/STORAGE.md` §4, requirement 3).
+    pub async fn import(&self, scope: u32, accounts: &[Import]) -> Vec<String> {
+        let mut refused = Vec::new();
+        for account in accounts {
+            if account.name.trim().is_empty() {
+                refused.push(format!("account {} has no name", account.id));
+                continue;
+            }
+            // Exactly, not by fold: murmur's own index is case-sensitive, so a
+            // server can genuinely hold `Alice` and `alice`, and refusing the
+            // second would take somebody's login away in the name of tidiness.
+            // A collision on the *same* spelling is a different matter: the
+            // unique index would refuse it anyway, and doing so here says which
+            // two accounts collided.
+            if let Some(owner) = self.exact_name_owner(scope, &account.name)
+                && owner != account.id
+            {
+                refused.push(format!(
+                    "account {} is called {:?}, which account {owner} already has",
+                    account.id, account.name
+                ));
+                continue;
+            }
+
+            let comment_hash = self.store_content(scope, account.comment.as_bytes()).await;
+            let texture_hash = self.store_content(scope, &account.texture).await;
+
+            let record = Record {
+                account: Account {
+                    id: account.id,
+                    name: account.name.clone(),
+                    email: account.email.clone(),
+                    cert_hash: account.cert_hash.clone(),
+                    texture_hash,
+                    comment_hash,
+                    created_at_ms: account.created_at_ms,
+                    last_active_ms: account.last_active_ms,
+                    totp_enabled: account.totp_secret.is_some(),
+                    settings: HashMap::new(),
+                },
+                password: account.password.clone(),
+                totp: account.totp_secret.clone(),
+            };
+            self.write(scope, &record).await;
+            if let Ok(mut cache) = self.cache.lock() {
+                let _ = cache.insert((scope, account.id), record);
+            }
+            if let Ok(mut next) = self.next_id.lock() {
+                // Or the first account registered after a migration would be
+                // handed an id an imported account already has, and the two
+                // would be one account with two owners.
+                *next = (*next).max(account.id + 1);
+            }
+        }
+        refused
+    }
+
+    /// Store `bytes` as a blob and return its hash, or nothing for nothing.
+    ///
+    /// An empty comment and an absent avatar are the same thing here, and both
+    /// must leave the hash empty: a hash of zero bytes is a perfectly valid hash
+    /// that clients would then ask for.
+    async fn store_content(&self, scope: u32, bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        self.put_blob(scope, bytes).await.hash
+    }
+
+    /// Which account holds `name` exactly, if any.
+    fn exact_name_owner(&self, scope: u32, name: &str) -> Option<u64> {
+        let cache = self.cache.lock().ok()?;
+        cache
+            .iter()
+            .find(|((server, _), record)| *server == scope && record.account.name == name)
+            .map(|((_, id), _)| *id)
+    }
+
+    /// How many accounts `scope` holds, read from the table.
+    ///
+    /// Deliberately **not** `list(...).accounts.len()`. `list` paginates with
+    /// `after`, which starts at zero and is exclusive, so it can never return
+    /// account 0 -- and account 0 is the SuperUser, on every Mumble server there
+    /// has ever been. Counting that way makes a migration of *n* accounts report
+    /// *n - 1* and look as though it lost one.
+    ///
+    /// Read through a query rather than from the cache, because a caller asking
+    /// how many there are is asking what is in the database.
+    pub async fn count(&self, scope: u32) -> usize {
+        use sqlx::Row as _;
+        match sqlx::query("SELECT COUNT(*) AS n FROM account WHERE server_id = ?")
+            .bind(i64::from(scope))
+            .fetch_one(self.store.pool())
+            .await
+        {
+            Ok(row) => row.try_get::<i64, _>("n").unwrap_or_default().max(0) as usize,
+            Err(error) => {
+                tracing::error!(%error, "could not count accounts");
+                0
+            }
+        }
     }
 
     /// Delete an account.
@@ -1554,5 +1764,182 @@ mod tests {
             accounts.blob(1, &first.hash).await,
             Some(b"an avatar".to_vec())
         );
+    }
+
+    /// One account as `starling migrate-db` would hand it over.
+    fn imported(id: u64, name: &str, password: Option<Secret>) -> Import {
+        Import {
+            id,
+            name: name.to_owned(),
+            email: format!("{name}@example.test"),
+            comment: "hello".to_owned(),
+            password,
+            texture: b"an avatar".to_vec(),
+            created_at_ms: 1_700_000_000_000,
+            last_active_ms: 1_700_000_001_000,
+            ..Import::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_imported_account_keeps_the_id_murmur_gave_it() {
+        // Every ACL entry, group membership and listener in the rest of a
+        // migration names an account by that id. Renumbering here would leave
+        // each of them pointing at somebody else.
+        let accounts = accounts().await;
+        assert!(
+            accounts
+                .import(1, &[imported(97, "alice", None)])
+                .await
+                .is_empty()
+        );
+
+        let alice = accounts.by_id(1, 97).expect("the imported account");
+        assert_eq!(alice.name, "alice");
+        assert_eq!(alice.email, "alice@example.test");
+        assert_eq!(alice.created_at_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_password_imported_from_murmur_logs_in() {
+        // The whole point of carrying the hash: without it, the day a server
+        // moves is the day every registered user is locked out of it.
+        let accounts = accounts().await;
+        let secret = Secret::MurmurLegacy {
+            digest: crate::secret::sha1(b"hunter2").to_vec(),
+        };
+        let _ = accounts
+            .import(1, &[imported(5, "bob", Some(secret))])
+            .await;
+
+        let result = accounts.authenticate(1, &auth("bob", "hunter2"));
+        assert_eq!(result.outcome, auth_result::Outcome::Ok as i32);
+        assert_eq!(
+            accounts.authenticate(1, &auth("bob", "wrong")).outcome,
+            auth_result::Outcome::WrongPassword as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_password_is_re_derived_once_and_then_left_alone() {
+        // How murmur's unsalted SHA-1 leaves a migrated database. The account
+        // must still log in afterwards, which is the half that would fail
+        // silently if the upgrade wrote the wrong thing.
+        let accounts = accounts().await;
+        let _ = accounts
+            .import(
+                1,
+                &[imported(
+                    5,
+                    "bob",
+                    Some(Secret::MurmurLegacy {
+                        digest: crate::secret::sha1(b"hunter2").to_vec(),
+                    }),
+                )],
+            )
+            .await;
+        assert!(accounts.password_is_carried(1, 5));
+
+        accounts.store_password(1, 5, Secret::new("hunter2")).await;
+        assert!(!accounts.password_is_carried(1, 5));
+        assert_eq!(
+            accounts.authenticate(1, &auth("bob", "hunter2")).outcome,
+            auth_result::Outcome::Ok as i32
+        );
+
+        // A second upgrade must not overwrite the first, or two logins racing
+        // would let the loser install a secret derived from a stale plaintext.
+        accounts
+            .store_password(1, 5, Secret::new("something else"))
+            .await;
+        assert_eq!(
+            accounts.authenticate(1, &auth("bob", "hunter2")).outcome,
+            auth_result::Outcome::Ok as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_count_includes_the_administrator() {
+        // murmur's SuperUser is account 0, and `list` cannot return it: it
+        // paginates with an exclusive `after` that starts at zero. A migration
+        // verified that way reports one account short of what it moved.
+        let accounts = accounts().await;
+        let _ = accounts
+            .import(
+                1,
+                &[imported(0, "SuperUser", None), imported(1, "alice", None)],
+            )
+            .await;
+
+        assert_eq!(accounts.count(1).await, 2);
+        assert_eq!(
+            accounts.list(1, "", 50, 0).accounts.len(),
+            1,
+            "this is the trap the count exists to avoid"
+        );
+    }
+
+    #[tokio::test]
+    async fn importing_twice_writes_the_same_account_rather_than_two() {
+        // A migration that was interrupted has to be runnable again
+        // (`docs/STORAGE.md` §4, requirement 3).
+        let accounts = accounts().await;
+        for _ in 0..2 {
+            assert!(
+                accounts
+                    .import(1, &[imported(97, "alice", None)])
+                    .await
+                    .is_empty(),
+                "a re-run must not collide with what the first run wrote"
+            );
+        }
+        assert_eq!(accounts.list(1, "", 50, 0).accounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_imported_name_that_is_already_taken_is_refused_and_said_so() {
+        // Silently skipping it would report a migration that moved every
+        // account, having dropped one.
+        let accounts = accounts().await;
+        let _ = accounts.import(1, &[imported(1, "alice", None)]).await;
+        let refused = accounts.import(1, &[imported(2, "alice", None)]).await;
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused.first().is_some_and(|note| note.contains("alice")));
+    }
+
+    #[tokio::test]
+    async fn an_imported_comment_and_avatar_are_content_addressed() {
+        let accounts = accounts().await;
+        let _ = accounts.import(1, &[imported(3, "carol", None)]).await;
+        let carol = accounts.by_id(1, 3).expect("carol");
+        assert_eq!(
+            accounts.blob(1, &carol.comment_hash).await,
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            accounts.blob(1, &carol.texture_hash).await,
+            Some(b"an avatar".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_registered_after_a_migration_gets_a_free_id() {
+        // Without this the first registration after an import is handed an id
+        // an imported account already has, and the two are one account with two
+        // owners.
+        let accounts = accounts().await;
+        let _ = accounts.import(1, &[imported(400, "alice", None)]).await;
+        let fresh = accounts
+            .register(
+                1,
+                Account {
+                    name: "dave".to_owned(),
+                    ..Account::default()
+                },
+                "pw",
+            )
+            .await
+            .expect("registered");
+        assert!(fresh.id > 400, "id {} collides with an import", fresh.id);
     }
 }

@@ -19,7 +19,7 @@ pub mod secret;
 
 pub mod selfservice;
 
-pub use accounts::Accounts;
+pub use accounts::{Accounts, Import};
 pub use ids::UserId;
 pub use secret::{Secret, verify_totp};
 
@@ -131,6 +131,9 @@ impl UserData for UserdataRpc {
         let name = req.name.clone();
         let strong_cert = req.strong_cert;
         let scope = scope_of(req.scope);
+        // Kept for the upgrade below, which needs the plaintext and can only
+        // have it here. Dropped with this function either way.
+        let offered = req.password.clone();
 
         let service = Arc::clone(&self.0);
         let result =
@@ -142,6 +145,36 @@ impl UserData for UserdataRpc {
                     tracing::error!(%error, "the password check could not be run");
                     Status::internal("the account service could not decide this login")
                 })?;
+
+        // A password imported from murmur retires itself here. The login has
+        // already been decided, so this changes no outcome; what it changes is
+        // that the account stops being stored under murmur's hash -- an
+        // unsalted SHA-1, for anything registered before Mumble 1.3 -- the
+        // first time its owner signs in.
+        //
+        // Only when a password was actually offered and checked. An account
+        // reached by certificate alone proves nothing about the plaintext, and
+        // re-deriving from an empty string there would replace a working
+        // password with one nobody knows.
+        if result.outcome == auth_result::Outcome::Ok as i32
+            && !offered.is_empty()
+            && let Some(account) = result.account.as_ref()
+            && self.0.accounts.password_is_carried(scope, account.id)
+        {
+            let id = account.id;
+            // The same hop the check itself makes, and for the same reason:
+            // deriving a full-strength secret blocks for as long as verifying
+            // one does, and an async worker holding it serves nobody.
+            match tokio::task::spawn_blocking(move || Secret::new(&offered)).await {
+                Ok(secret) => self.0.accounts.store_password(scope, id, secret).await,
+                // Reported, not refused: the login has already succeeded, and
+                // failing it now because a bookkeeping write did not happen
+                // would lock out exactly the accounts this exists to let in.
+                Err(error) => {
+                    tracing::warn!(%error, account = id, "an imported password was not upgraded");
+                }
+            }
+        }
 
         // The refusal reason is decided here and only the enum reaches
         // session-lifecycle, so this is the one place that can say which
