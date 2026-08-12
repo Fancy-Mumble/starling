@@ -73,7 +73,7 @@ pub use profile::{
     spec_for,
 };
 pub use session::{MASTER_KEY_LEN, SALT_LEN, VoiceError, VoiceSession};
-pub use stream::VoiceCipher;
+pub use stream::{CryptStats, VoiceCipher};
 pub use suite::{FancySuite, LegacySuite, SecuritySuite};
 pub use tls::TlsFloor;
 pub use voice::{CounterExhausted, Direction, PacketCounter, Rejected, Sequence, SequenceWindow};

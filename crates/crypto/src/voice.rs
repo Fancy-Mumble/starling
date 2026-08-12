@@ -203,6 +203,17 @@ impl SequenceWindow {
         self.highest
     }
 
+    /// Whether any packet has been accepted yet.
+    ///
+    /// Distinct from `highest() == 0`, which is also true after accepting the
+    /// very first packet of a stream. The caller keeping arrival statistics
+    /// needs the difference: the first packet is neither late nor evidence of
+    /// loss, whatever counter it carries.
+    #[must_use]
+    pub const fn started(&self) -> bool {
+        self.started
+    }
+
     /// Reconstruct the full counter from the truncated wire value and record it.
     ///
     /// Reconstruction picks the candidate nearest the highest value seen, so a

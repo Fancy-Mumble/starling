@@ -81,6 +81,8 @@ pub struct VoiceSession {
     counter: PacketCounter,
     window: SequenceWindow,
     direction: Direction,
+    /// Receive-side counters, murmur's `uiGood`/`uiLate`/`uiLost`.
+    stats: crate::stream::CryptStats,
 }
 
 impl std::fmt::Debug for VoiceSession {
@@ -133,7 +135,14 @@ impl VoiceSession {
             counter: PacketCounter::new(),
             window: SequenceWindow::new(),
             direction,
+            stats: crate::stream::CryptStats::default(),
         }
+    }
+
+    /// The receive-side counters accumulated so far.
+    #[must_use]
+    pub const fn stats(&self) -> crate::stream::CryptStats {
+        self.stats
     }
 
     /// Which way this session encrypts.
@@ -199,7 +208,24 @@ impl VoiceSession {
 
         // Authentic: now it may advance the real window. This second call cannot
         // fail, because the clone above already accepted the same value.
+        let first = !self.window.started();
+        let previous = self.window.highest();
         let _ = self.window.accept(truncated)?;
+
+        // The window has no per-packet arrival report the way OCB2's IV does,
+        // but the same facts are derivable from where the counter sat: above
+        // the previous highest with a gap means the gap was lost, below it
+        // means this packet arrived late. The first packet of the stream is
+        // neither, whatever counter it starts at.
+        let sequence = candidate.value();
+        if first {
+            self.stats.record(false, 0);
+        } else if sequence > previous {
+            let lost = u32::try_from(sequence - previous - 1).unwrap_or(u32::MAX);
+            self.stats.record(false, lost);
+        } else {
+            self.stats.record(true, 0);
+        }
         Ok(frame)
     }
 
@@ -243,6 +269,10 @@ impl crate::stream::VoiceCipher for VoiceSession {
     /// Refused, for the same reason.
     fn adopt_recv_nonce(&mut self, _nonce: &[u8]) -> bool {
         false
+    }
+
+    fn stats(&self) -> crate::stream::CryptStats {
+        Self::stats(self)
     }
 }
 

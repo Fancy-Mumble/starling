@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use crate::ports::SessionId;
 use crate::ports::{ConnId, FrameSink};
 use bytes::Bytes;
-use starling_crypto::{VoiceCipher, VoiceError};
+use starling_crypto::{CryptStats, VoiceCipher, VoiceError};
 use starling_gate::UdpFormat;
 use starling_proto::ControlMessage;
 
@@ -39,6 +39,15 @@ pub struct VoicePeer {
     /// frame for this peer is tunnelled, which is what makes a client behind a
     /// UDP-blocking firewall work at all.
     udp: Option<SocketAddr>,
+    /// Counters carried over from a predecessor this peer replaced.
+    ///
+    /// A re-key builds a fresh cipher, and a fresh cipher counts from zero. The
+    /// totals must not: the TCP `Ping` reply reports them, and a client that is
+    /// suddenly told `good == 0` again concludes its UDP stopped arriving and
+    /// falls back to the tunnel, over a resync that worked.
+    carried: CryptStats,
+    /// How many times this session's UDP crypt was resynchronised.
+    resyncs: u32,
 }
 
 impl VoicePeer {
@@ -58,7 +67,42 @@ impl VoicePeer {
             cipher,
             tunnel,
             udp: None,
+            carried: CryptStats::default(),
+            resyncs: 0,
         }
+    }
+
+    /// The receive-side counters, including what predecessors accumulated.
+    ///
+    /// These go to the client in the TCP `Ping` reply, and a stock Mumble
+    /// client steers by them: told `good == 0` twenty seconds in, it declares
+    /// "UDP packets cannot be sent to the server" and abandons a working UDP
+    /// path for the tunnel, permanently, because the way back also reads this
+    /// number.
+    #[must_use]
+    pub fn crypt_stats(&self) -> CryptStats {
+        self.carried.plus(self.cipher.stats())
+    }
+
+    /// How many times this session's UDP crypt was resynchronised.
+    #[must_use]
+    pub const fn resyncs(&self) -> u32 {
+        self.resyncs
+    }
+
+    /// Count one resynchronisation.
+    pub const fn note_resync(&mut self) {
+        self.resyncs = self.resyncs.saturating_add(1);
+    }
+
+    /// Carry a replaced predecessor's totals into this peer.
+    ///
+    /// A re-key builds a fresh cipher that counts from zero; without this the
+    /// client would be told `good == 0` again mid-session and read it as its
+    /// UDP having died, over a resync that worked.
+    pub const fn inherit(&mut self, stats: CryptStats, resyncs: u32) {
+        self.carried = stats;
+        self.resyncs = resyncs;
     }
 
     /// Which connection this is.

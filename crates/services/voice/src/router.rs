@@ -95,6 +95,68 @@ pub struct RouterStats {
     pub by_speaker: Vec<(SessionId, u64)>,
 }
 
+/// One peer's receive-side crypt counters, as the `Stats` RPC reports them.
+///
+/// These end up in the TCP `Ping` reply, which is not decoration: a stock
+/// Mumble client compares the `good` it is told against the `good` it measured
+/// itself, and a server that reports zero while the client's own receive works
+/// is read as "my datagrams never arrive". Twenty seconds in, the client prints
+/// "UDP packets cannot be sent to the server", tunnels its audio over TCP, and
+/// never returns, because the way back is gated on this number exceeding three
+/// (upstream `ServerHandler.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCrypt {
+    /// Packets that authenticated, arrived late, or were inferred lost.
+    pub stats: starling_crypto::CryptStats,
+    /// How many times this session's crypt was resynchronised.
+    pub resyncs: u32,
+    /// Whether the peer's UDP path is currently proven.
+    pub udp: bool,
+}
+
+/// At most one report per interval, counting what was suppressed in between.
+///
+/// The previous shape was a lifetime budget: report the first five, then
+/// silence for the life of the process. On a public UDP port that budget is
+/// spent on internet background noise within minutes of startup, which leaves
+/// the diagnostic exhausted by noise precisely when a real event needs it. A
+/// rate keeps the line available forever and still caps what a hostile sender
+/// can make the server write.
+#[derive(Debug)]
+struct ReportGate {
+    interval_ms: u64,
+    last_ms: Option<u64>,
+    suppressed: u64,
+}
+
+impl ReportGate {
+    const fn new(interval_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            last_ms: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Whether to report now. `Some` carries how many events this gate
+    /// swallowed since the last report, so the line can say what it stands for.
+    fn admit(&mut self, now: u64) -> Option<u64> {
+        match self.last_ms {
+            Some(last) if now.saturating_sub(last) < self.interval_ms => {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                self.last_ms = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
+/// How often each rate-limited report may fire.
+const REPORT_INTERVAL_MS: u64 = 10_000;
+
 /// The voice service's whole state, and the packet path over it.
 #[derive(Debug)]
 pub struct Router {
@@ -129,6 +191,19 @@ pub struct Router {
     /// operator sets is enforced with the same number a browser is told, and
     /// there is no second path for the two to disagree along.
     bandwidth: Bandwidth,
+    /// When each peer that has not yet proven a UDP address attached.
+    ///
+    /// The state [`Self::report_never_bound`] reads. A peer missing from here
+    /// either proved its path or has already been reported; either way it is
+    /// not waited on any more.
+    unbound_since: HashMap<ConnId, u64>,
+    /// Rate gate for the reports background noise can drive.
+    noise_gate: ReportGate,
+    /// Rate gate for the desynchronised-peer warning, which a spoofed source
+    /// address can drive just as cheaply.
+    desync_gate: ReportGate,
+    /// Rate gate for the decrypted-but-unparseable report.
+    malformed_gate: ReportGate,
 }
 
 impl Router {
@@ -149,6 +224,10 @@ impl Router {
             stats: RouterStats::default(),
             heard_from: HashMap::new(),
             bandwidth: Bandwidth::default(),
+            unbound_since: HashMap::new(),
+            noise_gate: ReportGate::new(REPORT_INTERVAL_MS),
+            desync_gate: ReportGate::new(REPORT_INTERVAL_MS),
+            malformed_gate: ReportGate::new(REPORT_INTERVAL_MS),
         }
     }
 
@@ -198,17 +277,29 @@ impl Router {
     ///
     /// `host` is where its control connection came from, which is the hint that
     /// makes the first datagram cheap to attribute.
-    pub fn attach(&mut self, peer: VoicePeer, host: IpAddr) {
+    pub fn attach(&mut self, mut peer: VoicePeer, host: IpAddr) {
         let conn = peer.conn();
         // The host is the hint every unbound datagram is matched against, so a
         // mismatch between this and the address audio actually arrives from is
         // silent and total. Logged once per peer, which is rare.
         debug!(%conn, session = %peer.session(), %host, "voice peer attached, expecting audio from this host");
+        // Replacing an existing peer is a resync's re-key. The fresh cipher
+        // counts from zero, and the totals must not: the TCP `Ping` reply
+        // reports them, and a client suddenly told `good == 0` mid-session
+        // reads it as its UDP having died, over a resync that worked.
+        if let Some(previous) = self.peers.get(&conn) {
+            peer.inherit(previous.crypt_stats(), previous.resyncs());
+            peer.note_resync();
+        }
         let _ = self.by_session.insert(peer.session(), conn);
         let known = self.by_host.entry(host).or_default();
         if !known.contains(&conn) {
             known.push(conn);
         }
+        // Armed on a re-key too, not just the first attach: the fresh cipher
+        // drops the peer back to tunnelling until a datagram re-proves the
+        // path, so "never bound since" starts over.
+        let _ = self.unbound_since.insert(conn, now_ms());
         let _ = self.peers.insert(conn, peer);
     }
 
@@ -222,6 +313,7 @@ impl Router {
         };
         let _ = self.by_session.remove(&peer.session());
         let _ = self.heard_from.remove(&peer.session());
+        let _ = self.unbound_since.remove(&conn);
         self.bandwidth.forget(conn);
         self.by_addr.retain(|_, bound| *bound != conn);
         self.by_host.retain(|_, known| {
@@ -275,11 +367,38 @@ impl Router {
     /// this peer resynchronises by being re-keyed instead, and the caller has
     /// that path.
     pub fn adopt_recv_nonce(&mut self, session: SessionId, nonce: &[u8]) -> bool {
-        self.by_session
+        let Some(peer) = self
+            .by_session
             .get(&session)
             .copied()
             .and_then(|conn| self.peers.get_mut(&conn))
-            .is_some_and(|peer| peer.adopt_recv_nonce(nonce))
+        else {
+            return false;
+        };
+        if !peer.adopt_recv_nonce(nonce) {
+            return false;
+        }
+        // murmur's `uiResync`: the client renders this in its own statistics,
+        // and an operator reads it as "how often has this link lost step".
+        peer.note_resync();
+        true
+    }
+
+    /// A session's crypt counters, for the TCP `Ping` reply and `UserStats`.
+    ///
+    /// `None` when the session has no peer here, which the caller answers with
+    /// zeroes: honest for a connection that has no voice path yet.
+    #[must_use]
+    pub fn crypt_of(&self, session: SessionId) -> Option<PeerCrypt> {
+        let peer = self
+            .by_session
+            .get(&session)
+            .and_then(|conn| self.peers.get(conn))?;
+        Some(PeerCrypt {
+            stats: peer.crypt_stats(),
+            resyncs: peer.resyncs(),
+            udp: peer.udp_addr().is_some(),
+        })
     }
 
     /// Counters, for the admin surface.
@@ -382,36 +501,35 @@ impl Router {
         true
     }
 
-    /// Say why a frame that decrypted could not be parsed, but not every time.
+    /// Say why a frame that decrypted could not be parsed, at a bounded rate.
     ///
     /// The failure with no other symptom worth having: the peer is attributed,
     /// its cipher works, its packets are counted as received, and the audio is
     /// silently dropped. Every aggregate looks healthy and the person is
-    /// inaudible.
+    /// inaudible. Rate-limited rather than budgeted, because a budget is spent
+    /// exactly when the failure repeats forever, which this one does.
     ///
     /// It is nearly always the two sides disagreeing about the wire format, so
     /// the peer's negotiated codec and the frame's leading byte are what
     /// identify it: `protobuf` against a leading `4` is a legacy Opus packet on
     /// a protobuf peer, and `legacy` against a leading `0` is the reverse.
-    fn report_malformed(&self, conn: ConnId, plain: &[u8], error: &crate::packet::PacketError) {
-        /// How many to report before falling silent.
-        const LOUD_UNTIL: u64 = 5;
-
-        if self.stats.malformed > LOUD_UNTIL {
-            return;
-        }
+    fn report_malformed(&mut self, conn: ConnId, plain: &[u8], error: &crate::packet::PacketError) {
         let Some(peer) = self.peers.get(&conn) else {
             return;
         };
-        debug!(
-            %conn,
-            session = %peer.session(),
-            codec = peer.codec().name(),
-            lead = plain.first().copied().unwrap_or_default(),
-            len = plain.len(),
-            %error,
-            "voice frame decrypted but did not parse; this peer is inaudible"
-        );
+        let (session, codec) = (peer.session(), peer.codec().name());
+        if let Some(suppressed) = self.malformed_gate.admit(now_ms()) {
+            debug!(
+                %conn,
+                session = %session,
+                codec,
+                lead = plain.first().copied().unwrap_or_default(),
+                len = plain.len(),
+                suppressed,
+                %error,
+                "voice frame decrypted but did not parse; this peer is inaudible"
+            );
+        }
     }
 
     /// Reply to an anonymous ping, and report whether it was one.
@@ -437,38 +555,65 @@ impl Router {
         self.report_unattributed(from, len);
     }
 
-    /// Say something about a datagram nobody claimed, but not every time.
+    /// Say something about a datagram nobody claimed, at a bounded rate.
     ///
     /// An open UDP port receives whatever the internet sends it, so a line per
-    /// stray datagram is a denial of service anyone can trigger. The first few
-    /// are what matter anyway: a misconfiguration shows up immediately and then
-    /// repeats forever, so the interesting information is entirely in the start.
+    /// stray datagram is a denial of service anyone can trigger. Rate-limited
+    /// rather than budgeted: a budget is spent on background noise within
+    /// minutes of startup, and the diagnostic is then exhausted by noise
+    /// precisely when a real event needs it.
     ///
-    /// The address and the candidates it was tried against are both here because
-    /// the two failures look identical from a counter and have opposite fixes:
-    /// *no candidates* means the datagram came from somewhere no session is
-    /// known at, and *candidates that all failed* means the keys disagree.
-    fn report_unattributed(&self, from: AudioSource, len: usize) {
-        /// How many to report before falling silent.
-        const LOUD_UNTIL: u64 = 5;
-
-        if self.stats.unattributed > LOUD_UNTIL {
-            return;
-        }
+    /// The two failures that meet here look identical from a counter and have
+    /// opposite meanings, so they are not one log line. A datagram from an
+    /// address no session is known at is a stranger, the ordinary weather of an
+    /// open port. A datagram from a host a connected client's audio is
+    /// *expected* from, which no key could open, is a crypt desynchronisation
+    /// on a real user, and it warns, because at any lower level it is invisible
+    /// exactly when an operator is asking why somebody's UDP does not work.
+    fn report_unattributed(&mut self, from: AudioSource, len: usize) {
         let AudioSource::Datagram(addr) = from else {
-            debug!(?from, len, "tunnelled audio could not be decrypted");
+            if let Some(suppressed) = self.noise_gate.admit(now_ms()) {
+                debug!(?from, len, suppressed, "tunnelled audio could not be decrypted");
+            }
             return;
         };
 
-        let candidates = self.by_host.get(&addr.ip()).map_or(0, Vec::len);
-        debug!(
-            %addr,
-            len,
-            candidates,
-            bound_addresses = self.by_addr.len(),
-            known_hosts = ?self.by_host.keys().collect::<Vec<_>>(),
-            "voice datagram matched no session"
-        );
+        // The sessions whose keys were tried, not just how many: "which user's
+        // crypt is broken" is the question the warning exists to answer.
+        let tried: Vec<SessionId> = self
+            .by_host
+            .get(&addr.ip())
+            .map(|conns| {
+                conns
+                    .iter()
+                    .filter_map(|conn| self.peers.get(conn).map(VoicePeer::session))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tried.is_empty() {
+            if let Some(suppressed) = self.noise_gate.admit(now_ms()) {
+                debug!(
+                    %addr,
+                    len,
+                    suppressed,
+                    bound_addresses = self.by_addr.len(),
+                    known_hosts = ?self.by_host.keys().collect::<Vec<_>>(),
+                    "voice datagram matched no session"
+                );
+            }
+            return;
+        }
+
+        if let Some(suppressed) = self.desync_gate.admit(now_ms()) {
+            tracing::warn!(
+                %addr,
+                len,
+                suppressed,
+                tried = ?tried,
+                "datagram from a known client's host authenticated against no session; a voice crypt may have desynchronised"
+            );
+        }
     }
 
     /// Work out which peer sent `frame`, and decrypt it.
@@ -543,9 +688,56 @@ impl Router {
             // otherwise inherit.
             self.by_addr.retain(|_, bound| *bound != conn);
             peer.bind(addr);
+            // The edge worth a line: this is the moment a peer's UDP path went
+            // from configured to proven, and its absence is the symptom the
+            // never-bound report exists for. Once per peer per address, so it
+            // cannot flood.
+            debug!(%conn, session = %peer.session(), %addr, "peer proved its UDP address");
+            let _ = self.unbound_since.remove(&conn);
         }
         let _ = self.by_addr.insert(addr, conn);
         self.by_host.entry(addr.ip()).or_default().push(conn);
+    }
+
+    /// How long a fresh peer gets to prove a UDP address before it is reported.
+    ///
+    /// Clients probe every five seconds or so; three missed opportunities means
+    /// the path is not going to prove itself.
+    const NEVER_BOUND_AFTER_MS: u64 = 15_000;
+
+    /// Report each peer that attached and never proved a UDP address, once.
+    ///
+    /// The reported symptom this covers is otherwise the *absence* of a line: a
+    /// peer that had UDP and lost it says "fell back to the tunnel", but a peer
+    /// whose UDP never worked at all said nothing, and its state had to be
+    /// inferred from hand-built probe packets. At `info`, because it is a real
+    /// degradation an operator can act on: the client's UDP is blocked
+    /// somewhere upstream, or this server's is.
+    ///
+    /// Driven from the details timer rather than the packet path, because this
+    /// is a clock question and the packet path does not consult clocks for
+    /// peers that are behaving.
+    pub fn report_never_bound(&mut self, now: u64) {
+        let overdue: Vec<ConnId> = self
+            .unbound_since
+            .iter()
+            .filter(|(_, since)| now.saturating_sub(**since) >= Self::NEVER_BOUND_AFTER_MS)
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in overdue {
+            let _ = self.unbound_since.remove(&conn);
+            let Some(peer) = self.peers.get(&conn) else {
+                continue;
+            };
+            if peer.udp_addr().is_some() {
+                continue; // Proved it since the sweep began.
+            }
+            tracing::info!(
+                %conn,
+                session = %peer.session(),
+                "peer never proved a UDP address; its audio is tunnelling over TCP"
+            );
+        }
     }
 
     /// Fan one decoded frame out to everyone who should hear it.
@@ -1426,6 +1618,103 @@ mod tests {
             starling_proto::TcpMessageType::UdpTunnel.id(),
             "tunnelled audio is not framed as a UDPTunnel message"
         );
+    }
+
+    #[test]
+    fn the_crypt_counters_report_what_authenticated() {
+        // The numbers the TCP `Ping` reply carries. A router that cannot count
+        // is read by every stock client as "my datagrams never arrive", and
+        // they all abandon a working UDP path at the twenty-second mark.
+        let (mut router, _sent, mut alice, _bob) = lobby_on_udp();
+        for opus in [b"one".as_slice(), b"two", b"three"] {
+            let frame = alice.speak(opus);
+            router.accept(AudioSource::Datagram(addr(ALICE_AT)), &frame);
+        }
+
+        let crypt = router.crypt_of(ALICE).expect("alice is attached");
+        assert!(crypt.udp, "her path was proven in the setup");
+        // Three frames here plus the one datagram the setup proved the path
+        // with.
+        assert_eq!(crypt.stats.good, 4);
+        assert_eq!(crypt.stats.lost, 0);
+        assert_eq!(crypt.resyncs, 0);
+        assert!(
+            router.crypt_of(SessionId(99)).is_none(),
+            "a session nobody minted has no counters to report"
+        );
+    }
+
+    #[test]
+    fn a_re_key_carries_the_counters_rather_than_resetting_them() {
+        // A resync replaces the peer, and the replacement's cipher counts from
+        // zero. The totals must not: the client is told them in the `Ping`
+        // reply, and `good` dropping back to zero mid-session reads as its UDP
+        // having died, over a resync that worked.
+        let (mut router, _sent, mut alice, _bob) = lobby_on_udp();
+        router.accept(AudioSource::Datagram(addr(ALICE_AT)), &alice.speak(b"x"));
+        let before = router.crypt_of(ALICE).expect("attached");
+
+        let rekeyed = TestPeer::new(1, ALICE, UdpFormat::Protobuf);
+        router.attach(rekeyed.attach(), addr(0).ip());
+
+        let after = router.crypt_of(ALICE).expect("still attached");
+        assert_eq!(after.stats.good, before.stats.good, "the totals reset");
+        assert_eq!(
+            after.resyncs,
+            before.resyncs + 1,
+            "the re-key was not counted"
+        );
+        assert!(!after.udp, "a fresh cipher must re-prove the path");
+    }
+
+    #[test]
+    fn adopting_a_nonce_counts_as_a_resync() {
+        // murmur's `uiResync`, the number an operator reads as "how often has
+        // this link lost step".
+        let (mut router, _sent, _alice, _bob) = lobby();
+        assert!(router.adopt_recv_nonce(ALICE, &[0x5A; 16]));
+        assert_eq!(router.crypt_of(ALICE).expect("attached").resyncs, 1);
+    }
+
+    #[test]
+    fn a_peer_that_never_binds_is_reported_once_and_a_proven_one_is_not() {
+        // The reported symptom of the 2026-08-10 investigation was the
+        // *absence* of a line: a peer that attaches and never proves a UDP
+        // address said nothing. The report fires once per peer, so a sweep
+        // cannot flood, and a peer that proved its path is never reported.
+        let (mut router, _sent, mut alice, _bob) = lobby();
+        router.accept(AudioSource::Datagram(addr(ALICE_AT)), &alice.speak(b"x"));
+        assert!(
+            !router.unbound_since.contains_key(&1),
+            "a proven peer is still being waited on"
+        );
+        assert!(
+            router.unbound_since.contains_key(&2),
+            "an unproven peer is not being waited on"
+        );
+
+        router.report_never_bound(now_ms().saturating_add(Router::NEVER_BOUND_AFTER_MS));
+        assert!(
+            router.unbound_since.is_empty(),
+            "the report must fire once, not once per sweep"
+        );
+    }
+
+    #[test]
+    fn a_report_gate_admits_at_a_bounded_rate_and_counts_the_rest() {
+        // The previous shape was a lifetime budget, spent on background noise
+        // within minutes of startup and then silent for the life of the
+        // process, exhausted by noise precisely when a real event needed it.
+        let mut gate = ReportGate::new(10_000);
+        assert_eq!(gate.admit(1), Some(0), "the first event reports at once");
+        assert_eq!(gate.admit(2), None);
+        assert_eq!(gate.admit(3), None);
+        assert_eq!(
+            gate.admit(10_001),
+            Some(2),
+            "the next report carries what was suppressed"
+        );
+        assert_eq!(gate.admit(10_002), None, "and the count starts over");
     }
 
     #[test]

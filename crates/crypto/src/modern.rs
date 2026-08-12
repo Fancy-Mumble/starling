@@ -120,6 +120,12 @@ impl VoiceCipher for XChaCha20Voice {
     fn adopt_recv_nonce(&mut self, _nonce: &[u8]) -> bool {
         false
     }
+
+    /// The receiving half's counters: what this end received from the peer is
+    /// the direction the TCP `Ping` reply reports on.
+    fn stats(&self) -> crate::stream::CryptStats {
+        self.receiving.stats()
+    }
 }
 
 impl std::fmt::Debug for XChaCha20Voice {
@@ -166,6 +172,34 @@ mod tests {
                 .open(&packet, b"")
                 .expect("the client could not open it"),
             b"server speaking"
+        );
+    }
+
+    #[test]
+    fn the_counters_follow_the_arrival_pattern() {
+        // The same arithmetic OCB2 keeps, derived from the replay window
+        // instead of a per-packet arrival report: a gap charges `lost`, a late
+        // arrival refunds it, because the packet was delayed, not dropped.
+        let (mut server, mut client) = pair();
+        let first = client.seal(b"1", b"").expect("sealed");
+        let second = client.seal(b"2", b"").expect("sealed");
+        let third = client.seal(b"3", b"").expect("sealed");
+
+        let _ = server.open(&first, b"").expect("opened");
+        let _ = server.open(&third, b"").expect("opened");
+        let after_gap = server.stats();
+        assert_eq!(
+            (after_gap.good, after_gap.late, after_gap.lost),
+            (2, 0, 1),
+            "a skipped packet is a loss until it turns up"
+        );
+
+        let _ = server.open(&second, b"").expect("late but new");
+        let caught_up = server.stats();
+        assert_eq!(
+            (caught_up.good, caught_up.late, caught_up.lost),
+            (3, 1, 0),
+            "a late arrival is not a loss"
         );
     }
 

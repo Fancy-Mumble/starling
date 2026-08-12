@@ -42,7 +42,7 @@ pub use bandwidth::Bandwidth;
 pub use packet::{AudioCodec, AudioPacket, Datagram, PacketError, Ping, ServerDetails, codec_for};
 pub use peer::VoicePeer;
 pub use ports::{AudioSource, ChannelId, ConnId, Datagrams, FrameSink, SessionId, Stuck};
-pub use router::{Router, RouterStats};
+pub use router::{PeerCrypt, Router, RouterStats};
 pub use routing::{REGULAR_SPEECH, RoutingSnapshot, SERVER_LOOPBACK, Target};
 pub use service::VoiceService;
 pub use socket::VoiceSocket;

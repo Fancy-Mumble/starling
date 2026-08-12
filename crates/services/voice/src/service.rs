@@ -422,6 +422,9 @@ impl VoiceService {
                 let mut router = self.router();
                 router.set_details(details);
                 router.set_allow_ping(allow_ping);
+                // Piggybacked on this timer because it is a clock question, and
+                // this is the one periodic visit the router already gets.
+                router.report_never_bound(starling_runtime::ids::now_ms());
             }
         })
     }
@@ -614,11 +617,25 @@ impl Voice for VoiceRpc {
         // Asked of the router and not the socket: an address is recorded when a
         // datagram from it authenticates, so the router is the only thing that
         // knows whether this peer's UDP path was ever *proven* rather than
-        // merely configured. That distinction is what a client's own
-        // connection indicator shows.
-        let udp = self.0.router().on_udp(SessionId(req.session));
+        // merely configured, and its ciphers are the only things that counted
+        // what authenticated.
+        //
+        // The counters are load-bearing, not decorative. session-lifecycle
+        // repeats them in the TCP `Ping` reply, and a stock Mumble client
+        // compares the `good` it is told against its own: reported zero for
+        // twenty seconds, it prints "UDP packets cannot be sent to the server",
+        // tunnels its audio, and never comes back, because the way back is
+        // gated on this number exceeding three (upstream `ServerHandler.cpp`).
+        let Some(crypt) = self.0.router().crypt_of(SessionId(req.session)) else {
+            // No peer minted for this session: zeroes, honestly.
+            return Ok(Response::new(PeerStats::default()));
+        };
         Ok(Response::new(PeerStats {
-            udp,
+            good: crypt.stats.good,
+            late: crypt.stats.late,
+            lost: crypt.stats.lost,
+            resync: crypt.resyncs,
+            udp: crypt.udp,
             ..PeerStats::default()
         }))
     }
@@ -1198,6 +1215,46 @@ mod tests {
         assert_ne!(first.crypt_setup, second.crypt_setup, "fresh material");
         let _ = FancyVersion::from_wire(0);
         let _ = CipherChoice::Ocb2Aes128;
+    }
+
+    #[tokio::test]
+    async fn the_stats_rpc_reports_the_counters_the_ping_reply_needs() {
+        // The regression this pins: `Stats` once filled nothing but `udp`,
+        // session-lifecycle repeated the zeroes in every TCP `Ping` reply, and
+        // every stock client on a *working* UDP path printed "UDP packets
+        // cannot be sent to the server" at the twenty-second mark and tunnelled
+        // for the rest of its session, with no way back.
+        let service = service();
+        let material = service.mint(&mint_request(1, 77, 0, MUMBLE_1_6));
+        let mut cipher = client_cipher(&material);
+
+        // Two datagrams, sealed as the client would seal them, from the host
+        // the mint said to expect audio from.
+        let from = "203.0.113.7:60000".parse().expect("a valid address");
+        for opus in [b"one".as_slice(), b"two"] {
+            let sealed = cipher
+                .seal(&as_client_sends(UdpFormat::Protobuf, opus), &[])
+                .expect("client sealing");
+            service
+                .router()
+                .accept(AudioSource::Datagram(from), &sealed);
+        }
+
+        let rpc = VoiceRpc(Arc::clone(&service));
+        let stats = rpc
+            .stats(Request::new(StatsRequest {
+                scope: None,
+                session: 77,
+            }))
+            .await
+            .expect("stats is answered")
+            .into_inner();
+
+        assert_eq!(stats.good, 2, "both datagrams authenticated");
+        assert_eq!(stats.late, 0);
+        assert_eq!(stats.lost, 0);
+        assert_eq!(stats.resync, 0);
+        assert!(stats.udp, "the path was proven by the first datagram");
     }
 
     /// A `CryptSetup` a peer would send to ask for a resync.

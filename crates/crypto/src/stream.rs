@@ -21,6 +21,52 @@
 
 use crate::session::VoiceError;
 
+/// Cumulative receive-side counters: murmur's `CryptState` statistics.
+///
+/// These are not merely diagnostic. The TCP `Ping` reply repeats them to the
+/// peer, and a stock Mumble client steers by `good`: twenty seconds after
+/// connecting, a client whose *own* UDP receive works but which is told
+/// `good == 0` decides its datagrams never arrive, reports "UDP packets cannot
+/// be sent to the server" and abandons a working UDP path for the tunnel
+/// (upstream `ServerHandler.cpp`). A server that cannot count is a server every
+/// client tunnels to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CryptStats {
+    /// Packets that decrypted and authenticated.
+    pub good: u32,
+    /// Packets that arrived after one that superseded them.
+    pub late: u32,
+    /// Packets inferred lost from gaps in the sequence.
+    pub lost: u32,
+}
+
+impl CryptStats {
+    /// Fold in one packet that authenticated.
+    ///
+    /// A late arrival *decrements* `lost`, as murmur does: the gap it left was
+    /// already charged to `lost` when a newer packet revealed it, and a packet
+    /// that eventually turned up was delayed, not dropped.
+    pub const fn record(&mut self, late: bool, lost: u32) {
+        self.good = self.good.saturating_add(1);
+        if late {
+            self.late = self.late.saturating_add(1);
+            self.lost = self.lost.saturating_sub(1);
+        } else {
+            self.lost = self.lost.saturating_add(lost);
+        }
+    }
+
+    /// These counters plus another set, for carrying totals across a re-key.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self {
+            good: self.good.saturating_add(other.good),
+            late: self.late.saturating_add(other.late),
+            lost: self.lost.saturating_add(other.lost),
+        }
+    }
+}
+
 /// One direction of an encrypted voice stream.
 ///
 /// `&mut self` on both halves is deliberate: a cipher that could seal through a
@@ -77,6 +123,18 @@ pub trait VoiceCipher: std::fmt::Debug + Send {
     /// authenticate afterwards. The nonce is a hint about where to look, not a
     /// credential, and a wrong one costs the peer nothing but another resync.
     fn adopt_recv_nonce(&mut self, nonce: &[u8]) -> bool;
+
+    /// The receive-side counters accumulated so far.
+    ///
+    /// Only packets that authenticated are counted; a failed trial decryption
+    /// against the wrong peer's key must leave no trace here, or the router's
+    /// candidate search would inflate every peer's figures.
+    ///
+    /// Deliberately not defaulted, like [`Self::send_nonce`]: a cipher that
+    /// inherited `CryptStats::default()` would report `good == 0` forever, and
+    /// that is precisely the answer that talks every stock client out of a
+    /// working UDP path.
+    fn stats(&self) -> CryptStats;
 }
 
 /// The properties every [`VoiceCipher`] must have.
@@ -96,12 +154,29 @@ pub(crate) fn assert_voice_cipher_contract(
     let name = sender.name();
 
     // 1. A sealed frame opens to exactly what went in.
+    assert_eq!(
+        receiver.stats(),
+        CryptStats::default(),
+        "{name}: counters started non-zero"
+    );
     let frame = b"a frame of audio";
     let packet = sender.seal(frame, AAD).expect("sealing must succeed");
     assert_eq!(
         receiver.open(&packet, AAD).expect("opening must succeed"),
         frame,
         "{name}: a sealed frame must round-trip"
+    );
+    // The packet that just authenticated was counted. This is the number the
+    // TCP `Ping` reply repeats, and a client told zero abandons a working UDP
+    // path, so a cipher that cannot count fails the contract, not just a test.
+    assert_eq!(
+        receiver.stats(),
+        CryptStats {
+            good: 1,
+            late: 0,
+            lost: 0
+        },
+        "{name}: an authenticated packet was not counted as good"
     );
 
     // 2. Overhead is reported honestly, so the UDP path can size a buffer.
@@ -128,9 +203,15 @@ pub(crate) fn assert_voice_cipher_contract(
     }
 
     // 5. A replay of an already-opened packet is refused.
+    let before_replay = receiver.stats();
     assert!(
         receiver.open(&packet, AAD).is_err(),
         "{name}: a replayed packet was accepted"
+    );
+    assert_eq!(
+        receiver.stats(),
+        before_replay,
+        "{name}: a refused packet moved the counters"
     );
 
     // 6. Short input is refused rather than indexed into.

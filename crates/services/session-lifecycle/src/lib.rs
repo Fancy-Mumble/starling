@@ -198,7 +198,7 @@ impl ClientService for SessionLifecycleService {
                     .authenticate(&self.connections, &inbound)
                     .await
             }
-            PING => self.on_ping(&inbound),
+            PING => self.on_ping(&inbound).await,
             USER_STATS => self.on_user_stats(&inbound).await,
             // `CodecVersion` travels server→client only. A client never sends
             // one, so there is nothing to handle, reading Opus support from it
@@ -457,7 +457,17 @@ impl SessionLifecycleService {
     ///
     /// The timestamp is echoed verbatim: the client measures the round trip
     /// from it, and rewriting it makes every client's latency graph wrong.
-    fn on_ping(&self, inbound: &Inbound) -> Actions {
+    ///
+    /// The crypt counters are the server's own, fetched from `voice`, and they
+    /// are the one part of this reply a client acts on rather than displays.
+    /// A stock Mumble client compares the `good` it is told against the `good`
+    /// it measured: told zero for twenty seconds while its own receive works,
+    /// it prints "UDP packets cannot be sent to the server", tunnels its audio
+    /// over TCP, and never returns, because switching back is gated on the
+    /// same number exceeding three (upstream `ServerHandler.cpp`). This reply
+    /// hard-coded zeroes once, and every stock client on a working UDP path
+    /// dutifully abandoned it.
+    async fn on_ping(&self, inbound: &Inbound) -> Actions {
         let Ok(ping) = tcp::Ping::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
@@ -484,15 +494,44 @@ impl SessionLifecycleService {
                 tcp_ping_var: ping.tcp_ping_var.unwrap_or_default(),
             },
         );
+        let crypt = self.voice_crypt(inbound.scope, inbound.session).await;
         let reply = tcp::Ping {
             timestamp: ping.timestamp,
-            good: Some(0),
-            late: Some(0),
-            lost: Some(0),
-            resync: Some(0),
+            good: Some(crypt.good),
+            late: Some(crypt.late),
+            lost: Some(crypt.lost),
+            resync: Some(crypt.resync),
             ..tcp::Ping::default()
         };
         vec![to_conn(inbound.conn, PING, reply.encode_to_vec())]
+    }
+
+    /// The server-side crypt counters for one session, asked of `voice`.
+    ///
+    /// `voice` owns them because its ciphers are the only things that counted
+    /// what authenticated; asking per `Ping` mirrors `on_crypt_setup`, which
+    /// already crosses the same boundary for the same reason. Zeroes when
+    /// `voice` is unreachable or has never minted this session, which is the
+    /// honest answer both times: no cipher, nothing counted.
+    async fn voice_crypt(
+        &self,
+        scope: u32,
+        session: u32,
+    ) -> starling_proto_fancy::voice::PeerStats {
+        use starling_proto_fancy::voice::StatsRequest;
+        use starling_proto_fancy::voice::voice_client::VoiceClient;
+
+        let Ok(channel) = self.handshake.resolver().channel("voice") else {
+            return starling_proto_fancy::voice::PeerStats::default();
+        };
+        VoiceClient::new(channel)
+            .stats(StatsRequest {
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
+                session,
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .unwrap_or_default()
     }
 
     /// `CryptSetup` arriving *from* a client: a request to resynchronise.
@@ -593,7 +632,22 @@ impl SessionLifecycleService {
         // appear for an ordinary user looking at somebody else.
         let local = extend || target.channel == self.channel_of(inbound.session);
 
-        let reply = user_stats(&target, details, local, now_ms());
+        // The server's own crypt counters for the target, murmur's
+        // `from_client` half. Fetched only when the disclosure gate would show
+        // them: `voice` should not be asked about sessions the asker may not
+        // see into.
+        let from_client = if local {
+            let crypt = self.voice_crypt(inbound.scope, wanted).await;
+            tcp::user_stats::Stats {
+                good: Some(crypt.good),
+                late: Some(crypt.late),
+                lost: Some(crypt.lost),
+                resync: Some(crypt.resync),
+            }
+        } else {
+            tcp::user_stats::Stats::default()
+        };
+        let reply = user_stats(&target, from_client, details, local, now_ms());
         tracing::debug!(
             conn = inbound.conn,
             session = wanted,
@@ -1768,7 +1822,13 @@ const SWEEP_INTERVAL_MS: u64 = 5_000;
 /// worth testing: the client shows each half of the dialog only if the fields
 /// that fill it arrived (`UserInformation.cpp:154`), so an omission hides the
 /// whole box rather than rendering a blank row.
-fn user_stats(target: &PendingConnection, details: bool, local: bool, now: u64) -> tcp::UserStats {
+fn user_stats(
+    target: &PendingConnection,
+    from_client: tcp::user_stats::Stats,
+    details: bool,
+    local: bool,
+    now: u64,
+) -> tcp::UserStats {
     tcp::UserStats {
         session: Some(target.session),
         onlinesecs: Some(seconds_since(target.connected_at_ms, now)),
@@ -1808,17 +1868,16 @@ fn user_stats(target: &PendingConnection, details: bool, local: bool, now: u64) 
         tcp_ping_var: Some(target.reported.tcp_ping_var),
         // `from_server` is what the client reports having received *from* the
         // server, so it is the client's figures. `from_client` is the mirror,
-        // the server's own crypt counters for packets it received, and those
-        // live in the voice service, which does not report them here yet. It is
-        // sent zeroed rather than omitted because the client hides the whole
-        // statistics box unless both halves are present.
+        // the server's own crypt counters for packets it received; they live in
+        // the voice service, so the caller fetches them and passes them in,
+        // this function stays a pure disclosure rule.
         from_server: local.then_some(tcp::user_stats::Stats {
             good: Some(target.reported.good),
             late: Some(target.reported.late),
             lost: Some(target.reported.lost),
             resync: Some(target.reported.resync),
         }),
-        from_client: local.then(tcp::user_stats::Stats::default),
+        from_client: local.then_some(from_client),
         ..tcp::UserStats::default()
     }
 }
@@ -2190,7 +2249,7 @@ mod tests {
 
     #[test]
     fn asking_about_yourself_fills_both_halves_of_the_dialog() {
-        let stats = user_stats(&somebody(), true, true, 9_000);
+        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
         assert!(connection_box_shown(&stats));
         assert!(statistics_box_shown(&stats));
         let version = stats.version.expect("the client build is the point of it");
@@ -2204,7 +2263,7 @@ mod tests {
         // murmur extends the full record to whoever holds Ban on the root
         // channel (`Messages.cpp:3206`). Without this the admin's window is
         // the empty one that started this.
-        let stats = user_stats(&somebody(), true, true, 9_000);
+        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
         assert!(stats.address.is_some(), "an admin is shown the address");
         assert!(connection_box_shown(&stats));
     }
@@ -2214,7 +2273,7 @@ mod tests {
         // No details for somebody else (murmur withholds those too) but the
         // statistics half must still arrive, or the window opens blank. This
         // is the exact regression: correct data, nothing rendered.
-        let stats = user_stats(&somebody(), false, true, 9_000);
+        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), false, true, 9_000);
         assert!(
             !connection_box_shown(&stats),
             "another user's address and client build are not public"
@@ -2243,7 +2302,13 @@ mod tests {
             tcp_ping_avg: 21.25,
             ..ReportedStats::default()
         };
-        let stats = user_stats(&peer, true, true, 9_000);
+        let measured_by_server = tcp::user_stats::Stats {
+            good: Some(900),
+            late: Some(2),
+            lost: Some(5),
+            resync: Some(0),
+        };
+        let stats = user_stats(&peer, measured_by_server, true, true, 9_000);
 
         assert_eq!(stats.tcp_packets, Some(52));
         assert_eq!(stats.udp_packets, Some(4_110));
@@ -2256,14 +2321,13 @@ mod tests {
         let from_server = stats.from_server.expect("local");
         assert_eq!(from_server.good, Some(4_100));
         assert_eq!(from_server.lost, Some(3));
-        // Present but empty: the server's own crypt counters live in voice and
-        // are not reported here yet. What matters is that the message *exists*,
-        // because the client hides the whole statistics box without it and
-        // reads an unset counter as zero regardless.
-        assert!(
-            stats.from_client.is_some(),
-            "omitting this hides the statistics box the other half fills"
-        );
+        // The mirror half: what the *server* counted receiving from this
+        // client, fetched from voice by the caller. It must arrive distinct
+        // from the client's own figures, or the dialog shows one direction
+        // twice and calls it two.
+        let from_client = stats.from_client.expect("local");
+        assert_eq!(from_client.good, Some(900));
+        assert_eq!(from_client.lost, Some(5));
     }
 
     #[test]
@@ -2272,7 +2336,7 @@ mod tests {
         // Zero is the honest answer here, unlike `bandwidth` below, these are
         // counters whose true value at this moment *is* zero, and the panel
         // that displays them is already visible.
-        let stats = user_stats(&somebody(), true, true, 9_000);
+        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
         assert_eq!(stats.tcp_packets, Some(0));
         assert_eq!(stats.tcp_ping_avg, Some(0.0));
     }
@@ -2494,7 +2558,7 @@ mod tests {
         // The one field with no source at all: it is neither measured here nor
         // reported by the client. Absent leaves the client's label blank, which
         // is true; a zero would claim the peer is sending nothing.
-        let stats = user_stats(&somebody(), true, true, 9_000);
+        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
         assert_eq!(stats.bandwidth, None);
     }
 }

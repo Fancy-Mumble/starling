@@ -37,7 +37,7 @@ use subtle::ConstantTimeEq as _;
 use zeroize::Zeroize as _;
 
 use crate::session::VoiceError;
-use crate::stream::VoiceCipher;
+use crate::stream::{CryptStats, VoiceCipher};
 use crate::voice::Rejected;
 use block::BlockCipher;
 use iv::{RecvNonce, SendNonce};
@@ -59,6 +59,8 @@ pub struct Ocb2 {
     /// Counted rather than logged per packet: an attacker who can trigger a log
     /// line per datagram has a denial of service.
     suspected_forgeries: u64,
+    /// Receive-side counters, murmur's `uiGood`/`uiLate`/`uiLost`.
+    stats: CryptStats,
 }
 
 impl Ocb2 {
@@ -72,6 +74,7 @@ impl Ocb2 {
             send: SendNonce::new(server_nonce),
             recv: RecvNonce::new(client_nonce),
             suspected_forgeries: 0,
+            stats: CryptStats::default(),
         }
     }
 
@@ -170,6 +173,11 @@ impl VoiceCipher for Ocb2 {
         }
 
         self.recv.accept(&candidate);
+        // Counted only after the tag verified: the router tries candidate keys
+        // against unattributed datagrams, and a failed trial must not inflate
+        // this peer's figures.
+        self.stats
+            .record(candidate.arrival.late, candidate.arrival.lost);
         Ok(opened.plain)
     }
 
@@ -195,6 +203,10 @@ impl VoiceCipher for Ocb2 {
         };
         self.resync_to(Block(block));
         true
+    }
+
+    fn stats(&self) -> CryptStats {
+        self.stats
     }
 }
 
@@ -260,6 +272,35 @@ mod tests {
         let frame = b"a frame of opus data";
         let packet = sender.seal(frame, b"").expect("sealed");
         assert_eq!(receiver.open(&packet, b"").expect("opened"), frame);
+    }
+
+    #[test]
+    fn the_counters_follow_the_arrival_pattern() {
+        // good/late/lost feed the TCP `Ping` reply, and a stock client steers
+        // by them, so the arithmetic is murmur's: a gap charges `lost`, and a
+        // late arrival is one `late` and one `lost` refunded, because the
+        // packet turned out to be delayed rather than dropped.
+        let (mut sender, mut receiver) = pair();
+        let first = sender.seal(b"1", b"").expect("sealed");
+        let second = sender.seal(b"2", b"").expect("sealed");
+        let third = sender.seal(b"3", b"").expect("sealed");
+
+        let _ = receiver.open(&first, b"").expect("opened");
+        let _ = receiver.open(&third, b"").expect("opened");
+        let after_gap = receiver.stats();
+        assert_eq!(
+            (after_gap.good, after_gap.late, after_gap.lost),
+            (2, 0, 1),
+            "a skipped packet is a loss until it turns up"
+        );
+
+        let _ = receiver.open(&second, b"").expect("late but new");
+        let caught_up = receiver.stats();
+        assert_eq!(
+            (caught_up.good, caught_up.late, caught_up.lost),
+            (3, 1, 0),
+            "a late arrival is not a loss"
+        );
     }
 
     #[test]
