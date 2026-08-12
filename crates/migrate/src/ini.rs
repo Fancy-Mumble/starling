@@ -75,6 +75,32 @@ impl Ini {
         Self { entries }
     }
 
+    /// The same reader, over key/value pairs that did not come from a file.
+    ///
+    /// murmur's `config` **table** holds the settings an operator changed while
+    /// the server was running, under the same key names the `.ini` uses, and it
+    /// overrides the file key for key. A database migration therefore reads its
+    /// settings through this rather than through a second table of key names,
+    /// which would be a second thing to keep in step with [`Self::to_settings`]
+    /// and would fall behind it the first time a setting was added.
+    ///
+    /// Values arrive as murmur stored them, so they are **not** unquoted: the
+    /// quoting `parse` strips is a property of the file format, and a value in
+    /// the table that begins and ends with a quote contains those quotes.
+    #[must_use]
+    pub fn from_pairs<K, V>(pairs: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self {
+            entries: pairs
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+
     /// A raw value.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {

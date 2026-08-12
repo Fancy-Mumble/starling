@@ -2640,8 +2640,10 @@ dependencies = [
 name = "starling-migrate"
 version = "0.2.0"
 dependencies = [
+ "sqlx",
  "starling-runtime",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
 ]

@@ -1,6 +1,6 @@
 [package]
 name = "starling-migrate"
-description = "murmur compatibility: read a mumble-server.ini, and the migrate-config command"
+description = "murmur compatibility: read a mumble-server.ini, or a whole murmur database"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,16 @@ starling-runtime.workspace = true
 tracing.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+# The database half. murmur supports the same three backends Starling does, so
+# the reader connects through the same `Any` driver rather than assuming SQLite:
+# a migration from a MySQL murmur is exactly the deployment least able to export
+# its data by hand.
+sqlx.workspace = true
+
+[dev-dependencies]
+# The reader is tested against real murmur databases, built in memory from
+# upstream's own table definitions. Real queries need a runtime to run on.
+tokio.workspace = true
 
 [lints]
 workspace = true
