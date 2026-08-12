@@ -50,12 +50,14 @@ use starling_runtime::storage::{Migration, Store};
 use tokio::sync::{RwLock, broadcast};
 use tonic::{Request, Response, Status};
 
+pub mod import;
 pub mod snapshot;
 
+pub use import::import;
 pub use snapshot::{apply_fields, defaults, redact};
 
 /// The schema: one row per server instance, typed columns, no EAV.
-const SCHEMA: &[Migration<'static>] = &[
+pub(crate) const SCHEMA: &[Migration<'static>] = &[
     Migration::new(
         "0001_server_config",
         &["CREATE TABLE IF NOT EXISTS server_config (\
