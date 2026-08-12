@@ -62,7 +62,18 @@ cargo run --bin starling -- text --config starling.toml
 
 # Convert an existing murmur config.
 cargo run --bin starling -- migrate-config /path/to/mumble-server.ini > starling.toml
+
+# Move an existing murmur server across: channels, accounts and their
+# passwords, ACLs and groups, bans, listeners. It reads murmur's database
+# without writing to it, so the old server keeps working either way.
+cargo run --bin starling -- migrate-db --from sqlite:/path/to/murmur.sqlite --dry-run
 ```
+
+`migrate-db` prints what it would move and what it could not carry, and writes
+nothing until `--dry-run` is dropped; `--verify` re-reads both sides afterwards
+and says whether they agree. murmur numbers its virtual servers from zero and
+Starling's shipped deployment has instance 1, so a single-server migration is
+usually `--server-id 0 --instance 1`.
 
 With no `--config`, Starling uses this platform's own configuration directory
 and writes a starter file there the first time it runs — except in a directory

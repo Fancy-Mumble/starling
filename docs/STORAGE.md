@@ -270,31 +270,79 @@ important line in the schema, it turns the O(n) fetch of L3 into a range scan.
 
 ## 4. The migration tool
 
+**Built.** `crates/migrate/src/db/` reads murmur; `crates/starling/src/migrate_db.rs`
+maps it onto the services and writes it.
+
 ```sh
-starling migrate-db --from sqlite:///data/mumble-server.sqlite \
-                    --to   sqlite://starling-data/starling.db \
-                    [--dry-run] [--server-id N] [--verify]
+starling migrate-db --from sqlite:/data/mumble-server.sqlite \
+                    [--server-id N] [--instance N] [--table-prefix P] \
+                    [--dry-run] [--verify] [--config starling.toml]
 ```
 
-Requirements, in priority order:
+There is no `--to`. Each service owns its own database (§1), so the targets are
+the five this touches — `userdata`, `metadata`, `permissions`, `moderation`,
+`server-config` — resolved from the deployment config through exactly the
+`ServiceContext::storage` a start would use. A tool that derived those paths
+itself would eventually write a database nobody loads.
 
-1. **Non-destructive.** Reads murmur's database, never writes to it. The old
+Requirements, in priority order, and where each is met:
+
+1. **Non-destructive.** Reads murmur's database, never writes to it: SQLite is
+   opened `?mode=ro` and nothing but `SELECT` is issued on any backend. The old
    server keeps working, which is what makes the greenfield choice safe.
-2. **Verifying.** `--verify` re-reads both sides and compares row counts per
-   entity plus a content sample. A migration you cannot check is a migration you
-   cannot trust.
-3. **Resumable and idempotent**, so a large pchat history can be migrated in
-   passes and a failure does not mean starting over.
+2. **Verifying.** `--verify` re-reads *both* sides and compares counts per
+   entity, through the services' own count queries rather than from what the
+   writes returned. A migration you cannot check is a migration you cannot trust.
+3. **Resumable and idempotent.** Every write is an upsert keyed the way the
+   owning service keys its table, so a second run converges. murmur has no ban
+   id, so one is derived from the ban's own contents — its primary key — for
+   exactly this reason.
 4. **Loud about what it could not map.** Every dropped or approximated value is
    reported, never silently discarded, the same rule the `.ini` reader follows.
-5. **Per-tenant.** `--server-id` migrates one server instance; omitted, it
-   migrates all of them.
+5. **Per-tenant.** `--server-id` migrates one virtual server; omitted, it
+   migrates all of them. `--instance` says which Starling instance it lands on,
+   which matters more than it sounds: **murmur numbers its virtual servers from
+   zero and Starling's shipped deployment has instance 1**, so the commonest
+   single-server migration needs it. Writing into an instance the deployment
+   does not have is refused rather than performed, because every row is keyed by
+   instance and the server would come up empty with nothing to say why.
 
-The interesting cases are EAV → typed columns (L1), where a malformed `TEXT`
-value has no typed equivalent and must be reported, and TEXT-UUID → UUIDv7 BLOB
-(L3), where existing UUIDv4 message ids are **not** time-sortable. For those, the
-tool assigns UUIDv7 ids derived from the stored timestamp, preserving order, and
-keeps a `legacy_id` mapping column so any client cursor still resolves.
+### What is interesting about it
+
+* **Two schemas.** murmur rewrote its storage for 1.5 and migrates a database in
+  place on first start, so both shapes are in the wild and neither operator
+  thinks of theirs as "a schema version". The layout is detected, not asked for.
+  The mapping between the two is not guessed: it is upstream's own `migrate()`
+  per table in `vendor/server/src/murmur/database/`.
+* **EAV → typed columns** (L1). A malformed `TEXT` value has no typed
+  equivalent, so it is reported against the channel it came from and the field
+  keeps its default rather than becoming a silent zero.
+* **Password hashes cannot be converted.** They are re-derived from a plaintext
+  nobody has, so dropping them would lock every registered user out on the day
+  the server moved. `userdata`'s `Secret` therefore also holds murmur's two
+  forms — PBKDF2-HMAC-SHA384, and the unsalted SHA-1 of anything registered
+  before Mumble 1.3 — and verifies against them. They are transitional: a login
+  that succeeds against one has just supplied the plaintext, so it is re-derived
+  natively and written back, and a migrated server converts itself account by
+  account as people sign in.
+* **Two spellings of one setting.** murmur's `.ini` says `registerName` and its
+  `config` table says `registername`. The public listing is the block an operator
+  is most likely to have set from the admin interface rather than the file, so it
+  lives in the table and nowhere else; unmapped, a migrated server silently stops
+  being listed.
+* **Parentless is two different things.** The root and a detached channel are
+  both parentless, and murmur stores both as self-parents. Without the
+  `DETACHED` flag every meeting room and friend chat arrives as a second root.
+
+Persistent chat is not carried. It is becoming a plugin (§6), so its history
+belongs to plugin storage rather than to the core schema, and the TEXT-UUID →
+UUIDv7 problem below is that migration's to solve. What is reported today is that
+the four persistent-chat channel properties have nowhere to go yet.
+
+The remaining interesting case, for when it does: TEXT-UUID → UUIDv7 BLOB (L3),
+where existing UUIDv4 message ids are **not** time-sortable. There the tool
+should assign UUIDv7 ids derived from the stored timestamp, preserving order,
+and keep a `legacy_id` mapping column so any client cursor still resolves.
 
 ---
 

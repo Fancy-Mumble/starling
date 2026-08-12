@@ -185,8 +185,12 @@ Three additional hard requirements this plan commits to:
    Starling does *not* reuse murmur's schema. murmur's is EAV-based, nearly
    index-free, and stores the unbounded chat table's pagination cursor as an
    unindexed `TEXT` UUID, see `docs/STORAGE.md` for the measurements. Rollback
-   safety comes instead from `starling migrate-db`, which reads murmur's database
-   **non-destructively**, so the C++ server keeps working off the original file.
+   safety comes instead from `starling migrate-db` (built; `docs/STORAGE.md` §4),
+   which reads murmur's database **non-destructively**, so the C++ server keeps
+   working off the original file. Password hashes cannot be re-derived, so they
+   are carried across as they are and verified in murmur's own form until each
+   owner's next login re-derives one natively; without that, moving would lock
+   out every registered user at once.
    Backends: SQLite (default), PostgreSQL, MySQL. Multi-tenancy (`server_id`) is
    retained. The event log stays behind `LogSink`, not in the relational schema.
 
