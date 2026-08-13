@@ -87,7 +87,8 @@ pub(crate) fn blob(row: &AnyRow, column: &str) -> Option<Vec<u8>> {
     if let Ok(value) = row.try_get::<Vec<u8>, _>(column) {
         return Some(value);
     }
-    row.try_get::<Option<Vec<u8>>, _>(column).unwrap_or_default()
+    row.try_get::<Option<Vec<u8>>, _>(column)
+        .unwrap_or_default()
 }
 
 /// A boolean. murmur writes `0`/`1`, and `NULL` where it means the default.
