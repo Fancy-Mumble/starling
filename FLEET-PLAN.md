@@ -49,10 +49,10 @@ bugs**, confirmed by re-running every distinct failing suite standalone:
 | **A — signal cross-client** | 3 | Root cause fixed (SKDM `sender_hash` self-identification, verified via client log `decrypted OK`) + a real forward-secrecy leak closed at 4 client call sites (`forward secrecy for late joiners` passed clean). 3/4 passed once, pre-rebuild. **Not re-verified against the current artifact.** |
 | **B — archive pchat** | 2 | Root cause found and fixed (§4). Unit-verified everywhere; **never got a rig slot, so never e2e-verified.** |
 | **C — media** | 5 suites | Four harness-side causes proven and fixed (§5), **none transport**. **No media suite has been observed green** — two rig slots were lost to the config mismatch. Do not score as passing. |
-| **D — scheduled messages** | 1 (+3 cancelled) | **DONE — 3/3 twice** against the rebuilt artifact. Found and fixed one real bug: `ScheduledMessagesPanel`'s header button sat under `ResizableSplitPanel`'s close (×) overlay (`position:absolute; top/right:8px; z-index:25`) and intercepted its click — same class as C's reaction interception. Fixed with the `padding: 44px` right-inset convention `DownloadsPanel` already uses. |
+| **D — scheduled messages** | 1 (+3 cancelled) | **DONE — 3/3 twice** against the rebuilt artifact. Found and fixed one real bug: `ScheduledMessagesPanel`'s header button sat under `ResizableSplitPanel`'s close (×) overlay (`position:absolute; top/right:8px; z-index:25`) and intercepted its click — same class as C's reaction interception. Fixed with the `padding: 44px` right-inset convention `DownloadsPanel` already uses. **Confirmed on Windows too (2026-08-09): 3/3 twice.** The Windows red ("kebab never appears", reproducible standalone) was never the panel — it was a week-old `ui/dist` embedded in a fresh exe (§10); `npm run build` + cargo rebuild dissolved it. |
 | **Server: murmur-settings parity** | — | **COMPLETE and green** (§6.1). |
-| **Server: virtual_server → instance rename** | — | Code complete, verified in its own worktree, **rollout not scheduled** (§6.2). |
-| **Server: `starling check-config`** | — | Complete, verified, uncommitted (§6.3). |
+| **Server: virtual_server → instance rename** | — | **DONE and landed** — committed (`daf58f7`), pinned by the e2e repo, and the harness now asks the binary which vocabulary it speaks, so the cutover no longer needs scheduling (§6.2). |
+| **Server: `starling check-config`** | — | Complete, verified, **committed** (`edd7374`) (§6.3). |
 
 **Correction to earlier doctrine (A and B agree):** nobody is blocked on
 `FeaturePchatE2ee`. B's replace rule is unconditional on it; the flag only stops
@@ -329,11 +329,13 @@ of the landing cascade. `LastChannel` has no operator-api surface. Migration `00
 upgrade path is untested — the suite only ever migrates from zero, because
 `StarlingServer.start()` mkdtemps a fresh data dir per run.
 
-## 6.2 virtual_server → instance rename — NOT ROLLED OUT
+## 6.2 virtual_server → instance rename — LANDED
 
-Code complete and verified, uncommitted. At the user's request: a deliberate clean
-break, no back-compat aliases, 336 occurrences across 66 files. Identifiers are
-`instance`/`instances`/`Instance`; prose reads "server instance".
+Committed as `daf58f7` on `main` and pinned by the e2e repo's submodule pointer
+(`b220738`). At the user's request: a deliberate clean break, no back-compat
+aliases, 336 occurrences across 66 files. Identifiers are
+`instance`/`instances`/`Instance`; prose reads "server instance". `grep -ri
+virtual_server` over the tree now returns hits in this file only.
 
 | Surface | Before | After |
 |---|---|---|
@@ -353,7 +355,11 @@ external input; k8s "virtual ClusterIP", positional-audio "virtual world" and Ca
 tests at the time), fmt/clippy clean, `tsc --noEmit` clean, and a real boot against
 the harness's generated config.
 
-### The rollout hazard — see §8, and it is the user's call
+### The rollout hazard — resolved, see §8
+
+The harness no longer has to be flipped in step with the binary: it reads the
+binary it is about to spawn and writes whichever table name that binary knows.
+An old binary and a new one both start.
 
 ## 6.3 `starling check-config` — complete, uncommitted
 
@@ -386,9 +392,15 @@ expected one of ..., `instances`` — a one-line diagnosis instead of a failed b
 
 # 7. ⚠ Uncommitted work at risk
 
-**Nothing below is committed**, and most of the sessions that wrote it have ended:
-A's SKDM + forward-secrecy fixes, B's archive/canon/`inbound.rs` work, C's harness
-work, D's client UI, the six-settings feature, the rename, and `check-config`.
+**Partly superseded as of 2026-08-09.** The Starling tree is now clean at `b220738`
+— the rename (`daf58f7`), `check-config` (`edd7374`) and the six settings
+(`777ff00`) are committed, and so is C's harness work in the e2e repo (`55898c0`
+and earlier). Re-check `git status` in both trees before trusting the list below.
+
+What the section was written about, and what may still be uncommitted elsewhere:
+A's SKDM + forward-secrecy fixes, B's archive/canon/`inbound.rs` work, and D's
+client UI — `vendor/client` is still dirty (regenerated proto modules) on a
+detached HEAD.
 
 **Do not `git checkout`, `stash`, or reset either vendor tree** — commit first, per
 owner, or the day's diagnosis is lost. All of it is absent from `HEAD`, so
@@ -404,9 +416,19 @@ If you need a green build while something is mid-edit, build the crate you care 
 (`cargo test -p starling-pchat`) rather than the workspace — do not stash or revert
 someone's live editor buffer.
 
+**Windows-tree addendum (2026-08-09 evening).** The scheduled-messages
+investigation's speculative e2e edits (channel creation + SuperUser connect in
+`scheduled-messages.multiclient.test.ts`, the `zz-probe-header` probe) are
+reverted/deleted — neither was justified once the stale-dist trap (§10) was
+found. Newly uncommitted and wanted: `src/config.ts` now falls back to
+`.tools/msedgedriver.exe` when `E2E_NATIVE_DRIVER` is unset — the auto-use the
+README always promised, which `run-local.ps1` had and `scripts/e2e.mts` lost;
+without it tauri-driver exits before writing a single log line. The client's
+`ui/dist` and `target/release/mumble-tauri.exe` were rebuilt from `0afc91d`.
+
 ---
 
-# 8. The coupled pair: harness config ↔ server binary
+# 8. Harness config ↔ server binary — decoupled
 
 `src/util/starling.ts` in the e2e repo writes a config a specific binary must parse.
 Config structs use `deny_unknown_fields`, so an unknown key is **fatal, not ignored**:
@@ -417,19 +439,26 @@ Config structs use `deny_unknown_fields`, so an unknown key is **fatal, not igno
 This cost the rig two outages in one day, and once landed mid-run, where one agent
 read the resulting timeouts as flakiness.
 
-- **Current state:** harness is on `[[virtual_servers]]`, matching the shared 13:16
-  binary. Reverted deliberately. **Do not flip it back on its own.**
-- **The cutover is the USER's call to schedule, not an agent's.** It replaces the
-  shared binary and flips the harness, affects every other agent, and is hard to
-  reverse. The rename can wait indefinitely. Do not roll it out because you happen to
-  be holding the lock.
-- **When it happens:** one atomic event under the lock — build post-rename binary,
-  put it in place, flip `starling.ts`, announce, then everyone re-runs.
-- **Permanent fix (approved, unstarted):** have `config()` probe the binary it will
-  actually run (`E2E_STARLING_BIN`) for which vocabulary it speaks, the same way
-  `preconditions.ts` probes the client for `presence_set_enabled`. Memoise it. A
-  harness that writes a config its own binary cannot parse is a footgun independent
-  of who renames what.
+**This is fixed — the pair is no longer coupled.** The permanent fix landed as
+`55898c0` in the e2e repo: `instancesTable()` in `src/util/starling.ts` scans
+`E2E_STARLING_BIN` for the string `virtual_servers` and writes whichever table
+name that binary knows, memoised per runner. The rename left no alias behind, so
+the old name's *presence in the binary* is an exact discriminator; a binary too new
+to contain it, or no binary at all, gets `[[instances]]`.
+
+What that means in practice:
+
+- **No scheduled cutover, no atomic swap, no announcement.** Replace the shared
+  binary whenever you like — with a pre-rename or a post-rename build — and the
+  next `StarlingServer.start()` writes a config it can parse.
+- **Do not hand-edit the table name in `starling.ts`.** Both literals in that
+  function are load-bearing; pinning either one re-creates the outage.
+- **Mixed builds are fine.** Two agents on two binaries of different vintage each
+  get a correct config, because the probe reads the binary rather than the tree.
+- **Current rig binary:** `vendor/starling/target/debug/starling.exe` is from
+  Aug 2 and is *pre*-rename, so the harness is writing `[[virtual_servers]]` today
+  and the rig is green on it. Rebuilding from the pinned commit is now an ordinary
+  rebuild, not an event.
 
 ---
 
@@ -478,6 +507,26 @@ client windows share one display.
   `.tmp/tauri-driver-*.log`, where the harness blames a missing WebDriver. inotify
   exhausts at the default 128 with several sessions: use `E2E_BUILD_NO_CLI=1`, or
   persist `fs.inotify.max_user_instances=512`.
+- **The exe's timestamp lies about the UI inside it.** `cargo build -p
+  mumble-tauri` embeds `ui/dist` *as it finds it* — it never rebuilds the
+  frontend. A week-old dist inside a minutes-old exe cost half a day on Windows:
+  the scheduled-messages kebab was in `ChatHeader.tsx`, provably unconditional,
+  and still absent at runtime, because the running UI predated it. The signature
+  is a mounted component carrying every *old* testid and none of the *new* ones —
+  when source archaeology says "this cannot be missing", check the dist's mtime
+  (`ui/dist/index.html`) against the commit before anything else. `npm run build`
+  in `crates/mumble-tauri/ui`, then cargo. (Grepping the exe for a testid proves
+  nothing either way: release builds embed assets brotli-compressed.)
+- **The harness config is a delta; a pre-`check-config` binary is not.** Current
+  `starling.ts` writes a partial TOML and relies on `Config::load` overlaying it
+  on the defaults. A binary older than that behavior (the Aug 2 debug builds)
+  treats the file as the whole config and dies with `the routing table is empty`
+  after every service logs `has no endpoint in the configuration`. The §8
+  vocabulary probe does not cover this — it picks the right table name for a
+  binary whose config semantics are still wrong. Windows note: the harness
+  default is `target/debug/starling.exe`, which is exactly such a binary; point
+  `E2E_STARLING_BIN` at a build of the pinned commit (`target/release` from
+  Aug 9 works) or rebuild debug.
 - **Re-measure before debugging.** Three separate "bugs" in one day were already
   fixed, or were the environment. Re-run before you dig.
 
@@ -486,7 +535,8 @@ client windows share one display.
 # 11. Open items nobody owns
 
 - The `E2E-STATUS.md` §3 rewrite after the checkpoint sweep.
-- The binary-vocabulary probe (§8), blocked on the rename landing.
+- ~~The binary-vocabulary probe (§8), blocked on the rename landing.~~ **Done** —
+  the rename landed (`daf58f7`) and the probe with it (`55898c0`).
 - A stub screencast portal on a private D-Bus (§5) — the only route to covering the
   real PipeWire/DMA-BUF path.
 - `docs/GAP-ANALYSIS.md` C5 and A4 are closed but still listed as open.
