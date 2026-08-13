@@ -240,8 +240,22 @@ impl PermissionsService {
             };
 
             let mut events = stream.into_inner();
-            while let Ok(Some(event)) = events.message().await {
-                self.apply_tree_event(scope, event);
+            loop {
+                match events.message().await {
+                    Ok(Some(event)) => self.apply_tree_event(scope, event),
+                    Ok(None) => break,
+                    // Named, because the silent form of this cost a day once
+                    // already: a stream that failed on its opening snapshot
+                    // and one that ended normally look identical from here,
+                    // and the retry reproduces the failure rather than
+                    // clearing it. What is at stake is a permissions service
+                    // evaluating inheritance against a tree it stopped
+                    // following, which is a wrong answer and not an outage.
+                    Err(status) => {
+                        tracing::warn!(%status, "the metadata subscription failed; retrying");
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(RETRY).await;
         }

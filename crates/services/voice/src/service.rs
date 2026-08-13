@@ -400,8 +400,19 @@ impl VoiceService {
         };
 
         let mut events = stream.into_inner();
-        while let Ok(Some(event)) = events.message().await {
-            self.apply_tree_event(event);
+        loop {
+            match events.message().await {
+                Ok(Some(event)) => self.apply_tree_event(event),
+                Ok(None) => break,
+                // A warning where the line below is a debug: a stream that
+                // *failed* is a subscription that will fail again on the next
+                // attempt, and one whose opening snapshot is too large to
+                // decode fails every time, silently, forever.
+                Err(status) => {
+                    tracing::warn!(%status, "the metadata subscription failed");
+                    return;
+                }
+            }
         }
         tracing::debug!("the metadata subscription ended; channel links are now stale");
     }
