@@ -2249,7 +2249,13 @@ mod tests {
 
     #[test]
     fn asking_about_yourself_fills_both_halves_of_the_dialog() {
-        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
+        let stats = user_stats(
+            &somebody(),
+            tcp::user_stats::Stats::default(),
+            true,
+            true,
+            9_000,
+        );
         assert!(connection_box_shown(&stats));
         assert!(statistics_box_shown(&stats));
         let version = stats.version.expect("the client build is the point of it");
@@ -2263,7 +2269,13 @@ mod tests {
         // murmur extends the full record to whoever holds Ban on the root
         // channel (`Messages.cpp:3206`). Without this the admin's window is
         // the empty one that started this.
-        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
+        let stats = user_stats(
+            &somebody(),
+            tcp::user_stats::Stats::default(),
+            true,
+            true,
+            9_000,
+        );
         assert!(stats.address.is_some(), "an admin is shown the address");
         assert!(connection_box_shown(&stats));
     }
@@ -2273,7 +2285,13 @@ mod tests {
         // No details for somebody else (murmur withholds those too) but the
         // statistics half must still arrive, or the window opens blank. This
         // is the exact regression: correct data, nothing rendered.
-        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), false, true, 9_000);
+        let stats = user_stats(
+            &somebody(),
+            tcp::user_stats::Stats::default(),
+            false,
+            true,
+            9_000,
+        );
         assert!(
             !connection_box_shown(&stats),
             "another user's address and client build are not public"
@@ -2336,7 +2354,13 @@ mod tests {
         // Zero is the honest answer here, unlike `bandwidth` below, these are
         // counters whose true value at this moment *is* zero, and the panel
         // that displays them is already visible.
-        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
+        let stats = user_stats(
+            &somebody(),
+            tcp::user_stats::Stats::default(),
+            true,
+            true,
+            9_000,
+        );
         assert_eq!(stats.tcp_packets, Some(0));
         assert_eq!(stats.tcp_ping_avg, Some(0.0));
     }
@@ -2558,7 +2582,13 @@ mod tests {
         // The one field with no source at all: it is neither measured here nor
         // reported by the client. Absent leaves the client's label blank, which
         // is true; a zero would claim the peer is sending nothing.
-        let stats = user_stats(&somebody(), tcp::user_stats::Stats::default(), true, true, 9_000);
+        let stats = user_stats(
+            &somebody(),
+            tcp::user_stats::Stats::default(),
+            true,
+            true,
+            9_000,
+        );
         assert_eq!(stats.bandwidth, None);
     }
 }

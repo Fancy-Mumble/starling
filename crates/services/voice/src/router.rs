@@ -573,7 +573,10 @@ impl Router {
     fn report_unattributed(&mut self, from: AudioSource, len: usize) {
         let AudioSource::Datagram(addr) = from else {
             if let Some(suppressed) = self.noise_gate.admit(now_ms()) {
-                debug!(?from, len, suppressed, "tunnelled audio could not be decrypted");
+                debug!(
+                    ?from,
+                    len, suppressed, "tunnelled audio could not be decrypted"
+                );
             }
             return;
         };
