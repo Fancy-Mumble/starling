@@ -186,8 +186,8 @@ impl Secret {
     /// Native is `salt ‖ iterations ‖ key`, unchanged and untagged, because
     /// every account row already written is in that form and a tag would make
     /// them all unreadable. A carried secret is
-    /// `0xff ‖ kind ‖ iterations ‖ salt_len ‖ salt ‖ key`, which cannot be
-    /// [`NATIVE_LEN`] bytes long for either of murmur's two shapes.
+    /// `0xff ‖ kind ‖ iterations ‖ salt_len ‖ salt ‖ key`, which cannot come
+    /// out at the native form's length for either of murmur's two shapes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
