@@ -367,6 +367,29 @@ async fn attaching<T>(
     }
 }
 
+/// The next message on `stream`, or `None` once there are no more.
+///
+/// The reason this is a function rather than `while let Ok(Some(event))` at
+/// each of the four bridges: that pattern spells a stream that *ended* and one
+/// that *failed* the same way, so a subscription refused on every attach
+/// reattaches forever and the only line in the log is the one saying it
+/// re-attached. That is how a tree larger than a client's decode limit
+/// presented - a live channel that never carried a channel event, with nothing
+/// anywhere naming the message that could not be decoded.
+///
+/// The status is logged here rather than returned because no caller can do
+/// anything else with it: a broken stream is re-attached either way, and what
+/// was missing was the sentence, not the branch.
+async fn next<T>(stream: &mut tonic::Streaming<T>, service: &str) -> Option<T> {
+    match stream.message().await {
+        Ok(message) => message,
+        Err(status) => {
+            tracing::warn!(%status, service, "the subscription failed");
+            None
+        }
+    }
+}
+
 /// `session-view` → `userConnected` / `userStateChanged` / `userDisconnected`.
 async fn bridge_sessions(
     hub: EventHub,
@@ -415,7 +438,7 @@ async fn bridge_sessions(
             }
         };
 
-        while let Ok(Some(event)) = stream.message().await {
+        while let Some(event) = next(&mut stream, "session-view").await {
             match event.event {
                 Some(ViewEvent::Snapshot(sessions)) => {
                     // Seeded silently. Everyone already connected when the
@@ -517,7 +540,7 @@ async fn bridge_channels(
                 }
             };
 
-        while let Ok(Some(event)) = stream.message().await {
+        while let Some(event) = next(&mut stream, "metadata").await {
             match event.event {
                 Some(TreeEvent::Upsert(c)) => {
                     let json = channel_json(&c);
@@ -584,7 +607,7 @@ async fn bridge_text(hub: EventHub, resolver: starling_runtime::channel::Resolve
             }
         };
 
-        while let Ok(Some(message)) = stream.message().await {
+        while let Some(message) = next(&mut stream, "text").await {
             hub.publish(Event::UserTextMessage {
                 // What `text` knows about the sender. A consumer wanting the
                 // rest joins on `session`.
@@ -664,7 +687,7 @@ async fn bridge_context(
             }
         };
 
-        while let Ok(Some(trigger)) = stream.message().await {
+        while let Some(trigger) = next(&mut stream, "context-actions").await {
             hub.publish(Event::ContextAction {
                 action: trigger.action,
                 owner: trigger.owner,
