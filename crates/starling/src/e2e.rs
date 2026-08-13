@@ -234,6 +234,15 @@ impl Deployment {
     /// creating a channel takes `MakeChannel` and the default ACL deliberately
     /// withholds it; this is deployment set-up, not the behaviour under test.
     async fn create_channel(&self, name: &str) -> u32 {
+        self.create_described_channel(name, String::new()).await
+    }
+
+    /// The same, with a description.
+    ///
+    /// Separate because a description is what a channel carries *artwork* in,
+    /// and one test is about a server whose artwork outgrew what a service
+    /// would accept; every other caller wants the plain form above.
+    async fn create_described_channel(&self, name: &str, description: String) -> u32 {
         use starling_proto_fancy::metadata::metadata_client::MetadataClient;
         use starling_proto_fancy::metadata::{Channel, CreateRequest};
 
@@ -255,6 +264,7 @@ impl Deployment {
                         channel: Some(Channel {
                             name: name.to_owned(),
                             parent: Some(0),
+                            description: description.clone(),
                             ..Channel::default()
                         }),
                         temporary: false,
@@ -1243,6 +1253,95 @@ async fn a_server_without_a_media_plane_does_not_claim_one() {
     assert_eq!(config.webrtc_sfu_available, None);
 
     deployment.stop();
+}
+
+/// Channels in the tree this test builds, and bytes of artwork in each.
+///
+/// The shape of a real server rather than round numbers: 47 channels totalling
+/// 5.75 MiB is the murmur import that found the bug, and 128 KiB is murmur's
+/// own `image_message_length`, which is the size of image its clients were
+/// allowed to paste into a description in the first place.
+const ARTWORK_CHANNELS: usize = 47;
+/// Bytes of "image" in one channel description.
+const ARTWORK_BYTES: usize = 128 * 1024;
+
+#[tokio::test]
+async fn a_channel_tree_too_large_for_the_grpc_default_still_reaches_a_client() {
+    // The whole tree crosses between services as **one** gRPC message, and gRPC
+    // caps what a client will decode at 4 MiB unless it says otherwise. Nothing
+    // about that is gradual: past the limit the reply is refused whole, so the
+    // handshake completes and admits the client to a server with no channels in
+    // it, which is not a failure anybody reads as "a message was too large".
+    //
+    // A fresh server never approaches it. A server imported from murmur can
+    // arrive over it on day one, because descriptions are HTML and murmur has
+    // always allowed an image inside one, stored inline as base64.
+    let data_dir = TempDir::new("large-tree");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let artwork = format!(
+        "<img src=\"data:image/png;base64,{}\">",
+        "A".repeat(ARTWORK_BYTES)
+    );
+    for index in 0..ARTWORK_CHANNELS {
+        let _ = deployment
+            .create_described_channel(&format!("Gallery {index}"), artwork.clone())
+            .await;
+    }
+
+    let mut viewer = Client::connect(deployment.port).await;
+    let announced = channels_announced(&mut viewer, "viewer").await;
+    assert_eq!(
+        announced,
+        ARTWORK_CHANNELS + 1,
+        "every channel and the root must be announced; a client that is told \
+         about fewer has been admitted to a server it cannot see"
+    );
+
+    deployment.stop();
+}
+
+/// Log in and count the channels announced before `ServerSync`.
+///
+/// Its own handshake rather than [`handshake`]: that one asserts *that* the
+/// tree arrived before the sync, and the question here is how much of it did.
+async fn channels_announced(client: &mut Client, username: &str) -> usize {
+    let (greeting, _) = client.recv().await;
+    assert_eq!(greeting, 0, "the server speaks Version first");
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    client
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some(username.to_owned()),
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+
+    let mut announced = 0;
+    loop {
+        let (type_id, payload) = client.recv().await;
+        match type_id {
+            // `ChannelState`. Decoded rather than counted blind, so a frame
+            // that arrived truncated is a failure here and not a mystery later.
+            7 => {
+                let _ = tcp::ChannelState::decode(payload.as_slice()).expect("a well-formed frame");
+                announced += 1;
+            }
+            // `ServerSync`: the tree is complete by contract once this lands.
+            5 => return announced,
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
