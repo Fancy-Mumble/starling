@@ -1257,13 +1257,26 @@ async fn a_server_without_a_media_plane_does_not_claim_one() {
 
 /// Channels in the tree this test builds, and bytes of artwork in each.
 ///
-/// The shape of a real server rather than round numbers: 47 channels totalling
-/// 5.75 MiB is the murmur import that found the bug, and 128 KiB is murmur's
-/// own `image_message_length`, which is the size of image its clients were
-/// allowed to paste into a description in the first place.
-const ARTWORK_CHANNELS: usize = 47;
+/// 128 KiB is murmur's own `image_message_length`, which is the size of image
+/// its clients were allowed to paste into a description in the first place; the
+/// count is the smallest that clears 4 MiB with room to spare. The server that
+/// found the bug carried more (5.75 MiB over 47 channels) and the test used to
+/// match it, which cost a slow runner more than it bought: every byte over the
+/// limit proves the same thing, and all of them are encoded, permission-checked
+/// and written by a debug build before the assertion can run.
+const ARTWORK_CHANNELS: usize = 36;
 /// Bytes of "image" in one channel description.
 const ARTWORK_BYTES: usize = 128 * 1024;
+
+/// How long the whole channel flood may take to arrive.
+///
+/// Not [`FRAME_TIMEOUT`], which bounds *one* frame on a server with nothing to
+/// do. The handshake computes its entire reply before sending any of it, so the
+/// gap this covers contains a multi-MiB tree being decoded, turned into one
+/// `ChannelState` per channel and permission-checked, in an unoptimised build.
+/// Ten seconds is comfortable on a developer's machine and not on a
+/// two-core runner, which is where this first came apart.
+const FLOOD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 async fn a_channel_tree_too_large_for_the_grpc_default_still_reaches_a_client() {
@@ -1329,7 +1342,13 @@ async fn channels_announced(client: &mut Client, username: &str) -> usize {
 
     let mut announced = 0;
     loop {
-        let (type_id, payload) = client.recv().await;
+        // The count goes into the panic, because "a frame did not arrive" says
+        // nothing about whether the flood never started or stopped halfway, and
+        // those have different causes.
+        let (type_id, payload) = client
+            .next_frame(FLOOD_TIMEOUT)
+            .await
+            .unwrap_or_else(|| panic!("the flood stalled after {announced} channels"));
         match type_id {
             // `ChannelState`. Decoded rather than counted blind, so a frame
             // that arrived truncated is a failure here and not a mystery later.
