@@ -135,6 +135,22 @@ impl Resolver {
         Ok(channel)
     }
 
+    /// The decode limit a client reading `metadata`'s tree is given.
+    ///
+    /// On the resolver because every reader of the tree already holds one to
+    /// dial `metadata` with, and because the limit belongs to *the deployment*
+    /// rather than to any one service: it comes from `[runtime]
+    /// max_tree_message`, and readers that disagree about it are readers that
+    /// disagree about how large a server may be.
+    #[must_use]
+    pub fn max_tree_message(&self) -> usize {
+        // Saturating rather than refusing: a 32-bit build handed a file that
+        // asks for 8 GiB gets the largest message it can address, which is
+        // already more than it can allocate. Nothing is served by failing the
+        // dial over the arithmetic.
+        usize::try_from(self.config.runtime.max_tree_message.get()).unwrap_or(usize::MAX)
+    }
+
     fn cached(&self, service: &str) -> Result<Option<Channel>, ChannelError> {
         let cache = self.cache.lock().map_err(|_| ChannelError::Poisoned)?;
         Ok(cache.get(service).cloned())
@@ -228,6 +244,33 @@ mod tests {
         assert_eq!(
             resolved.describe(),
             transport::local_endpoint(Path::new("/run/starling"), "text")
+        );
+    }
+
+    #[test]
+    fn the_tree_limit_readers_are_given_is_the_one_the_file_names() {
+        // Every reader of the tree takes it from here, so an operator raising
+        // the key raises it for the handshake, the admin API and the event
+        // bridge at once; a reader that read its own number would be the one
+        // that still refuses the tree everyone else can see.
+        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        config.runtime.max_tree_message = crate::config::ByteSize(9 * 1024 * 1024);
+        let resolver = Resolver::new(Arc::new(config), Broker::new());
+        assert_eq!(resolver.max_tree_message(), 9 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_default_tree_limit_clears_the_one_grpc_would_have_imposed() {
+        // 4 MiB is gRPC's own default for what a client will decode, and a
+        // murmur import lands over it on day one: 5.75 MiB of channel artwork
+        // across 47 channels is the server this default was measured against.
+        // A default that did not clear it would leave the shipped server
+        // broken for exactly the deployments that migrate to it.
+        let resolver = resolver(false, Broker::new());
+        assert!(
+            resolver.max_tree_message() > 4 * 1024 * 1024,
+            "the default is {} bytes, which gRPC would have refused anyway",
+            resolver.max_tree_message()
         );
     }
 

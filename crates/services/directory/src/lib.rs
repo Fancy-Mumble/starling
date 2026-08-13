@@ -205,6 +205,7 @@ impl DirectoryService {
             return 0;
         };
         let tree = MetadataClient::new(channel)
+            .max_decoding_message_size(ctx.resolver.max_tree_message())
             .get_tree(TreeRequest {
                 scope: Some(self.scope()),
             })

@@ -74,6 +74,21 @@ pub struct RuntimeConfig {
     pub all_in_one: bool,
     /// Where generated certificates and default databases live.
     pub data_dir: PathBuf,
+    /// The largest channel tree a service will accept from `metadata`.
+    ///
+    /// Here, and not next to the service that sends it, because it is the
+    /// **reader** that enforces it: gRPC caps what a client will decode, says
+    /// nothing to the sender about it, and every service that reads the tree
+    /// has to agree. One key in the file every process already loads is what
+    /// makes them agree (`starling_proto_fancy::limits::MAX_TREE_MESSAGE` is
+    /// the default and carries the reasoning for the number).
+    ///
+    /// Raise it on a server whose channel descriptions carry artwork -- the
+    /// default is generous, but "generous" is a guess about somebody else's
+    /// server, and the failure if the guess is wrong is the whole tree rather
+    /// than the one channel that overran. Lowering it is a memory bound and
+    /// nothing else: the sender is a service on the same mesh, not a client.
+    pub max_tree_message: ByteSize,
 }
 
 impl Default for RuntimeConfig {
@@ -81,6 +96,7 @@ impl Default for RuntimeConfig {
         Self {
             all_in_one: false,
             data_dir: PathBuf::from("starling-data"),
+            max_tree_message: ByteSize(starling_proto_fancy::limits::MAX_TREE_MESSAGE as u64),
         }
     }
 }

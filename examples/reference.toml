@@ -29,6 +29,12 @@ all_in_one = false
 # Databases, the generated TLS certificate, and the sockets services talk over.
 # Back this up and you have backed up the server.
 data_dir = "starling-data"
+# The largest channel tree a service will accept from `metadata`. The whole tree
+# travels as one message and descriptions are HTML with images inline, so a
+# server imported from murmur can be several MiB of channel artwork. Past the
+# limit it is refused whole, not trimmed: clients are admitted to a server with
+# no channels in it. Every process that reads the tree needs the same value.
+max_tree_message = "64MiB"
 
 
 # ---------------------------------------------------------------------------

@@ -854,7 +854,13 @@ impl Handshake {
         let Ok(channel) = self.resolver.channel("metadata") else {
             return Actions::new();
         };
+        // The decode limit is raised off gRPC's 4 MiB default because this is
+        // the reply that outgrows it first, and the cost of hitting it is the
+        // whole flood: a client whose server carries more channel artwork than
+        // that would be admitted to a server with no channels in it at all.
+        // `[runtime] max_tree_message` is what an operator raises further.
         let Ok(tree) = MetadataClient::new(channel)
+            .max_decoding_message_size(self.resolver.max_tree_message())
             .get_tree(TreeRequest {
                 scope: Some(starling_proto_fancy::common::Scope {
                     instance: inbound.scope,

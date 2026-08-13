@@ -222,6 +222,7 @@ impl PermissionsService {
             let stream = match resolver.channel("metadata") {
                 Ok(transport) => {
                     MetadataClient::new(transport)
+                        .max_decoding_message_size(resolver.max_tree_message())
                         .watch(TreeRequest {
                             scope: Some(Scope { instance: scope }),
                         })

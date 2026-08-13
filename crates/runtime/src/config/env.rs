@@ -45,6 +45,13 @@ pub fn apply_environment(
     if let Some(value) = lookup(&env_key(&["runtime", "data_dir"])) {
         config.runtime.data_dir = value.into();
     }
+    // Overridable from the environment like the rest, and for a sharper reason
+    // than most: the server that needs it raised is one already running, whose
+    // channel tree has just outgrown the default, and an operator reaching for
+    // a variable is not editing a `ConfigMap` under a server that is down.
+    if let Some(value) = lookup(&env_key(&["runtime", "max_tree_message"])) {
+        config.runtime.max_tree_message = parse(value, "runtime.max_tree_message")?;
+    }
     if let Some(value) = lookup(&env_key(&["gateway", "listen_tcp"])) {
         config.gateway.listen_tcp = value.to_owned();
     }
@@ -142,5 +149,22 @@ mod tests {
         )
         .expect_err("a non-numeric queue size must fail");
         assert!(matches!(err, ConfigError::Environment { .. }));
+    }
+
+    #[test]
+    fn the_tree_limit_can_be_raised_without_editing_a_file() {
+        // The server that needs it raised is one already running, whose channel
+        // tree has just outgrown the default; a variable is what a `ConfigMap`
+        // or a compose file has to hand.
+        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        apply_environment(
+            &mut config,
+            &[(
+                "STARLING_RUNTIME_MAX_TREE_MESSAGE".to_owned(),
+                "128MiB".to_owned(),
+            )],
+        )
+        .expect("a well-formed size applies");
+        assert_eq!(config.runtime.max_tree_message.get(), 128 * 1024 * 1024);
     }
 }

@@ -479,17 +479,29 @@ async fn bridge_channels(
             tokio::time::sleep(REATTACH).await;
             continue;
         };
-        let mut client = MetadataClient::new(channel);
+        // The tree is the one reply here that outgrows gRPC's 4 MiB decode
+        // default, and a server imported from murmur arrives that way. Left at
+        // the default it is not a degraded bridge but a dead one: the snapshot
+        // that opens every `Watch` is the message that cannot be decoded, so
+        // re-attaching produces it again, forever.
+        let mut client =
+            MetadataClient::new(channel).max_decoding_message_size(resolver.max_tree_message());
 
         // Seeded from the tree before watching, because `Watch` sends changes
         // and not a snapshot: without this every existing channel's first edit
         // would be reported as a creation.
-        if let Ok(tree) = client.get_tree(TreeRequest { scope: Some(scope) }).await {
-            for c in tree.into_inner().channels {
-                let json = channel_json(&c);
-                let _ = known.insert(c.id);
-                let _ = last.insert(c.id, json);
+        match client.get_tree(TreeRequest { scope: Some(scope) }).await {
+            Ok(tree) => {
+                for c in tree.into_inner().channels {
+                    let json = channel_json(&c);
+                    let _ = known.insert(c.id);
+                    let _ = last.insert(c.id, json);
+                }
             }
+            // Not fatal - the watch below still reports every later change - but
+            // it is why the first edit to an existing channel would arrive as a
+            // creation, and an unexplained one of those is a bug hunt.
+            Err(status) => tracing::warn!(%status, "could not seed from the channel tree"),
         }
 
         let mut stream =

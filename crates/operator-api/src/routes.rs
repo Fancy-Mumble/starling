@@ -1406,6 +1406,7 @@ async fn list_channels(
         .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
 
     let tree = MetadataClient::new(channel)
+        .max_decoding_message_size(api.resolver().max_tree_message())
         .get_tree(TreeRequest {
             scope: Some(Scope { instance: 1 }),
         })

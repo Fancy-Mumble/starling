@@ -425,6 +425,29 @@ Every service runs in one process with in-process calls instead of gRPC. Same
 binary, same config file, `endpoint` values are ignored. This is the mode for a
 single VPS; the multi-process mode is for isolation or per-service scaling.
 
+## How large the channel tree may be
+
+```toml
+[runtime]
+max_tree_message = "64MiB"
+```
+
+The whole channel tree travels between services as one message, and gRPC's own
+default caps what a **reader** will decode at 4 MiB. Channel descriptions are
+HTML and murmur has always allowed images inside them, stored inline as base64,
+so a server imported from murmur can arrive with several MiB of channel
+artwork: 5.75 MiB across 47 channels on the deployment this key was added for.
+
+Past the limit nothing degrades gracefully: the tree is one message, so the
+whole of it is refused. Clients complete the handshake and see a server with no
+channels, `GET /v1/channels` answers 502, and the live event channel re-attaches
+forever. The default is ten times the largest tree anyone has reported; raise it
+if a server outgrows even that, and expect the reply to be held in memory once
+per reader while it is decoded.
+
+Every process that reads the tree needs the same value, so set it in a file they
+all include, or in the environment as `STARLING_RUNTIME_MAX_TREE_MESSAGE`.
+
 ## Server instances
 
 ```toml

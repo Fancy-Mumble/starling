@@ -219,6 +219,7 @@ impl TextService {
             return wanted;
         };
         let Ok(reply) = MetadataClient::new(channel)
+            .max_decoding_message_size(self.resolver.max_tree_message())
             .get_tree(TreeRequest {
                 scope: Some(Scope { instance: scope }),
             })

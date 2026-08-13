@@ -390,6 +390,7 @@ impl VoiceService {
             return;
         };
         let Ok(stream) = MetadataClient::new(channel)
+            .max_decoding_message_size(ctx.resolver.max_tree_message())
             .watch(TreeRequest {
                 scope: Some(Scope { instance: scope }),
             })

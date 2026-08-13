@@ -17,6 +17,7 @@
 
 pub mod channel;
 pub mod identity;
+pub mod limits;
 pub mod page;
 pub mod perm;
 pub mod types;
