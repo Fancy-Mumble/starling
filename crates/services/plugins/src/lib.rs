@@ -322,6 +322,17 @@ impl PluginsService {
             }
         }
         if receivers.is_empty() {
+            // Named nobody, so there is nobody to send it to. Said out loud
+            // because this is the one silent path in the bridge every Fancy
+            // extension without a canon form rides: a sender key, a typing
+            // indicator or a watch-sync that lists no receiver is dropped here
+            // and looks, from both ends, exactly like a message that was
+            // delivered and ignored.
+            tracing::debug!(
+                session = inbound.session,
+                id = data_id.len(),
+                "a plugin message named no receiver; dropped"
+            );
             return Actions::new();
         }
 
