@@ -704,6 +704,67 @@ impl SessionLifecycleService {
             .map_or(ROOT_CHANNEL, |pending| pending.channel)
     }
 
+    /// Log and audit a speak-state change, one record per flag that moved.
+    ///
+    /// Per *changed* flag rather than per flag *present*: deafening also mutes,
+    /// so a client that asks for one arrives carrying both, and a record per
+    /// present field would report a mute that was already in force.
+    fn record_speak_change(
+        &self,
+        inbound: &Inbound,
+        target: &PendingConnection,
+        applied: &PendingConnection,
+    ) {
+        self.handshake.context().logger.log(
+            LogEvent::notice(Category::Admin, "speak state changed")
+                .with("actor", inbound.session)
+                .with("session", applied.session)
+                .with("name", applied.name.clone())
+                .with("mute", applied.mute)
+                .with("deaf", applied.deaf)
+                .with("priority_speaker", applied.priority_speaker),
+        );
+
+        // One record per flag that actually moved, not one per message.
+        //
+        // Per *changed* flag rather than per flag *present*: deafening also
+        // mutes, so a client that asks for one arrives carrying both, and a
+        // record per present field would report a mute that was already in
+        // force. Per changed flag, the log reads as the operator experienced
+        // it, and the coupled mute still appears because it genuinely changed.
+        for (changed, action) in [
+            (
+                applied.mute != target.mute,
+                if applied.mute { "muted" } else { "unmuted" },
+            ),
+            (
+                applied.deaf != target.deaf,
+                if applied.deaf {
+                    "deafened"
+                } else {
+                    "undeafened"
+                },
+            ),
+            (
+                applied.priority_speaker != target.priority_speaker,
+                if applied.priority_speaker {
+                    "priority-speaker granted"
+                } else {
+                    "priority-speaker revoked"
+                },
+            ),
+        ] {
+            if changed {
+                self.audit(
+                    inbound,
+                    trail::category::MUTE_DEAFEN_SUPPRESS,
+                    action,
+                    applied,
+                );
+            }
+        }
+    }
+
     /// Mute, deafen, suppress or make a priority speaker.
     ///
     /// murmur treats these as one group with one rule
@@ -711,10 +772,6 @@ impl SessionLifecycleService {
     /// the actor's. That is what makes it a moderator power over a room rather
     /// than a property of the person exercising it, and it is why this is
     /// refused for a user's own session too unless they hold it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per speak-state bit, each with the permission it needs"
-    )]
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
         let Some(target) = self.connections.by_session(target_session) else {
@@ -797,54 +854,7 @@ impl SessionLifecycleService {
             return Actions::new();
         };
 
-        self.handshake.context().logger.log(
-            LogEvent::notice(Category::Admin, "speak state changed")
-                .with("actor", inbound.session)
-                .with("session", session)
-                .with("name", applied.name.clone())
-                .with("mute", applied.mute)
-                .with("deaf", applied.deaf)
-                .with("priority_speaker", applied.priority_speaker),
-        );
-
-        // One record per flag that actually moved, not one per message.
-        //
-        // Per *changed* flag rather than per flag *present*: deafening also
-        // mutes, so a client that asks for one arrives carrying both, and a
-        // record per present field would report a mute that was already in
-        // force. Per changed flag, the log reads as the operator experienced
-        // it, and the coupled mute still appears because it genuinely changed.
-        for (changed, action) in [
-            (
-                applied.mute != target.mute,
-                if applied.mute { "muted" } else { "unmuted" },
-            ),
-            (
-                applied.deaf != target.deaf,
-                if applied.deaf {
-                    "deafened"
-                } else {
-                    "undeafened"
-                },
-            ),
-            (
-                applied.priority_speaker != target.priority_speaker,
-                if applied.priority_speaker {
-                    "priority-speaker granted"
-                } else {
-                    "priority-speaker revoked"
-                },
-            ),
-        ] {
-            if changed {
-                self.audit(
-                    inbound,
-                    trail::category::MUTE_DEAFEN_SUPPRESS,
-                    action,
-                    &applied,
-                );
-            }
-        }
+        self.record_speak_change(inbound, &target, &applied);
 
         self.handshake
             .announce_changed(&self.connections, target.conn)

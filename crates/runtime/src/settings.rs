@@ -316,10 +316,6 @@ impl Settings {
 /// `extra`, which is how a service can add an operator-facing knob without a
 /// proto release.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per setting; the list has to stay parallel to server-config's merge"
-)]
 pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
     let mut snapshot = defaults(1);
     let mut fields = Vec::new();
@@ -339,15 +335,25 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
                 false
             }
         };
+        let write_text = |target: &mut String| {
+            if let Some(text) = text {
+                *target = text.to_owned();
+                true
+            } else {
+                false
+            }
+        };
+        let write_flag = |target: &mut bool| {
+            if let Some(flag) = flag {
+                *target = flag;
+                true
+            } else {
+                false
+            }
+        };
         let named = match key.as_str() {
-            "welcome_text" => text.is_some_and(|text| {
-                snapshot.welcome_text = text.to_owned();
-                true
-            }),
-            "password" => text.is_some_and(|text| {
-                snapshot.password = text.to_owned();
-                true
-            }),
+            "welcome_text" => write_text(&mut snapshot.welcome_text),
+            "password" => write_text(&mut snapshot.password),
             "max_users" => count(&mut snapshot.max_users),
             "max_bandwidth" => count(&mut snapshot.max_bandwidth),
             "text_message_length" => count(&mut snapshot.text_message_length),
@@ -364,62 +370,22 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "message_burst" => count(&mut snapshot.message_burst),
             "plugin_message_limit" => count(&mut snapshot.plugin_message_limit),
             "plugin_message_burst" => count(&mut snapshot.plugin_message_burst),
-            "allow_html" => flag.is_some_and(|flag| {
-                snapshot.allow_html = flag;
-                true
-            }),
-            "allow_recording" => flag.is_some_and(|flag| {
-                snapshot.allow_recording = flag;
-                true
-            }),
-            "broadcast_listener_volume_adjustments" => flag.is_some_and(|flag| {
-                snapshot.broadcast_listener_volume_adjustments = flag;
-                true
-            }),
-            "cert_required" => flag.is_some_and(|flag| {
-                snapshot.cert_required = flag;
-                true
-            }),
-            "obfuscate_ips" => flag.is_some_and(|flag| {
-                snapshot.obfuscate_ips = flag;
-                true
-            }),
-            "allow_ping" => flag.is_some_and(|flag| {
-                snapshot.allow_ping = flag;
-                true
-            }),
-            "remember_channel" => flag.is_some_and(|flag| {
-                snapshot.remember_channel = flag;
-                true
-            }),
-            "channel_name_regex" => text.is_some_and(|text| {
-                snapshot.channel_name_regex = text.to_owned();
-                true
-            }),
-            "user_name_regex" => text.is_some_and(|text| {
-                snapshot.user_name_regex = text.to_owned();
-                true
-            }),
-            "registry_name" => text.is_some_and(|text| {
-                snapshot.registry_name = text.to_owned();
-                true
-            }),
-            "registry_password" => text.is_some_and(|text| {
-                snapshot.registry_password = text.to_owned();
-                true
-            }),
-            "registry_url" => text.is_some_and(|text| {
-                snapshot.registry_url = text.to_owned();
-                true
-            }),
-            "registry_hostname" => text.is_some_and(|text| {
-                snapshot.registry_hostname = text.to_owned();
-                true
-            }),
-            "registry_location" => text.is_some_and(|text| {
-                snapshot.registry_location = text.to_owned();
-                true
-            }),
+            "allow_html" => write_flag(&mut snapshot.allow_html),
+            "allow_recording" => write_flag(&mut snapshot.allow_recording),
+            "broadcast_listener_volume_adjustments" => {
+                write_flag(&mut snapshot.broadcast_listener_volume_adjustments)
+            }
+            "cert_required" => write_flag(&mut snapshot.cert_required),
+            "obfuscate_ips" => write_flag(&mut snapshot.obfuscate_ips),
+            "allow_ping" => write_flag(&mut snapshot.allow_ping),
+            "remember_channel" => write_flag(&mut snapshot.remember_channel),
+            "channel_name_regex" => write_text(&mut snapshot.channel_name_regex),
+            "user_name_regex" => write_text(&mut snapshot.user_name_regex),
+            "registry_name" => write_text(&mut snapshot.registry_name),
+            "registry_password" => write_text(&mut snapshot.registry_password),
+            "registry_url" => write_text(&mut snapshot.registry_url),
+            "registry_hostname" => write_text(&mut snapshot.registry_hostname),
+            "registry_location" => write_text(&mut snapshot.registry_location),
             // A knob some service owns. Carried as text, because `extra` is a
             // string map and the operator's intent survives the round trip.
             _ => {

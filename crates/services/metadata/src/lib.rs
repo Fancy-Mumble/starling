@@ -1436,12 +1436,44 @@ impl MetadataService {
         }
     }
 
+    /// The refusal a disallowed channel name earns, if the client set one.
+    ///
+    /// Only where the client actually set a name: an edit that moves a channel
+    /// or changes its description carries no `name`, and measuring the one it
+    /// already has would make an operator's new pattern retroactively
+    /// un-editable for every channel that predates it. murmur gates it on
+    /// `msg.has_name()` for the same reason
+    /// (`vendor/server/src/murmur/Messages.cpp:1773`).
+    fn name_refusal(
+        &self,
+        inbound: &Inbound,
+        state: &starling_proto::proto::tcp::ChannelState,
+        channel_asked_about: u32,
+    ) -> Option<Actions> {
+        let name = state.name.as_ref()?;
+        if is_channel_name(
+            &self.channel_names,
+            &self.settings.get(inbound.scope).channel_name_regex,
+            name,
+        ) {
+            return None;
+        }
+        self.logger.log(
+            LogEvent::notice(Category::Channel, "channel name refused")
+                .with("session", inbound.session)
+                .with("name", name.clone())
+                .with("scope", inbound.scope),
+        );
+        Some(vec![refused(
+            inbound,
+            starling_proto::proto::tcp::permission_denied::DenyType::ChannelName,
+            channel_asked_about,
+            "that channel name is not allowed on this server",
+        )])
+    }
+
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one create path and one update path, both read from the same message"
-    )]
     async fn on_channel_state(&self, inbound: &Inbound) -> Actions {
         let Ok(state) =
             starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())
@@ -1481,31 +1513,8 @@ impl MetadataService {
             return vec![permission_denied(inbound, needed, channel_asked_about)];
         }
 
-        // The name rule, and only where the client actually set a name: an edit
-        // that moves a channel or changes its description carries no `name`, and
-        // measuring the one it already has would make an operator's new pattern
-        // retroactively un-editable for every channel that predates it. murmur
-        // gates it on `msg.has_name()` for the same reason
-        // (`vendor/server/src/murmur/Messages.cpp:1773`).
-        if let Some(name) = &state.name
-            && !is_channel_name(
-                &self.channel_names,
-                &self.settings.get(inbound.scope).channel_name_regex,
-                name,
-            )
-        {
-            self.logger.log(
-                LogEvent::notice(Category::Channel, "channel name refused")
-                    .with("session", inbound.session)
-                    .with("name", name.clone())
-                    .with("scope", inbound.scope),
-            );
-            return vec![refused(
-                inbound,
-                starling_proto::proto::tcp::permission_denied::DenyType::ChannelName,
-                channel_asked_about,
-                "that channel name is not allowed on this server",
-            )];
+        if let Some(refusal) = self.name_refusal(inbound, &state, channel_asked_about) {
+            return refusal;
         }
 
         let edit = to_proto(&state, state.channel_id.unwrap_or_default());
