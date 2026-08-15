@@ -1,0 +1,37 @@
+name: Upstream protobuf
+
+# CI's compatibility step is pinned to an upstream tag, so that upstream landing
+# a field cannot turn an unrelated PR red. That pin leaves nobody watching
+# upstream itself, which is this workflow's whole job: the same check against
+# the head of mumble-voip/mumble's 1.6.x, daily.
+#
+# A failure here is not a regression in this repo. It means upstream moved and
+# our copy of their surface needs a look: adopt the new fields, then bump the
+# pin in `scripts/fetch-upstream-proto.sh` so PR CI compares against them too.
+
+on:
+  schedule:
+    # Off the hour; GitHub drops scheduled runs at popular minutes under load.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit in mumble-voip/mumble
+        default: 1.6.x
+
+jobs:
+  compat:
+    name: Compatible with upstream Mumble
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch upstream Mumble's protobuf definitions
+        # Through the environment rather than interpolated into the command, so
+        # the dispatch input cannot become shell.
+        env:
+          REF: ${{ inputs.ref || '1.6.x' }}
+        run: scripts/fetch-upstream-proto.sh "$REF"
+
+      - name: Check upstream compatibility
+        run: python3 scripts/check-proto-compat.py --upstream-dir target/upstream-proto

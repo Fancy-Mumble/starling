@@ -42,15 +42,25 @@ jobs:
       - name: Check protobuf hygiene
         run: python3 scripts/check-proto-hygiene.py
 
-      # Compatibility: our upstream surface against *actual* upstream Mumble.
-      # The only one of the three that can fail with a released client on the
-      # other end, the other two prove our trees agree, not that they are
-      # right. Needs the upstream remote, and skips loudly without it.
-      - name: Fetch upstream Mumble for the compatibility check
-        run: git -C vendor/server fetch --no-tags --depth=1 upstream 1.6.x || true
+      # Compatibility: our upstream surface against *actual* upstream Mumble,
+      # downloaded from mumble-voip/mumble. The only one of the three that can
+      # fail with a released client on the other end, the other two prove our
+      # trees agree, not that they are right.
+      #
+      # This used to read the `upstream` remote in `vendor/server`, which is a
+      # submodule of the *superproject*: this repo has none, so the fetch failed
+      # into `|| true` and the check skipped every run since it was added. It
+      # was the one step here that could catch a released-client break, and it
+      # had never once looked at upstream. Downloading is what makes it real.
+      #
+      # Pinned to a tag rather than a branch head, so that upstream landing a
+      # field cannot turn every open PR red for something outside its diff.
+      # `upstream-proto.yml` watches the branch head daily instead.
+      - name: Fetch upstream Mumble's protobuf definitions
+        run: scripts/fetch-upstream-proto.sh
 
       - name: Check upstream compatibility
-        run: python3 scripts/check-proto-compat.py
+        run: python3 scripts/check-proto-compat.py --upstream-dir target/upstream-proto
 
       # Citations: the comments point at murmur by line number, and line
       # numbers rot. When vendor/server moved on 2026-08-02 it took three of

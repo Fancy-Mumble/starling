@@ -316,8 +316,8 @@ the check verified Fancy-consistency and said nothing about Mumble
 compatibility, which is how §1's numbering drift survived.
 
 There are now three scripts asking five distinct questions, hygiene carries
-three of them, because they share nothing but the file they live in. All are
-offline, take seconds, and run in CI:
+three of them, because they share nothing but the file they live in. All take
+seconds; all but the compatibility check are offline:
 
 | check | question it answers | a failure means |
 |---|---|---|
@@ -326,6 +326,24 @@ offline, take seconds, and run in CI:
 | `check-proto-hygiene.py`, numbering | is any Fancy field in the burned 100–999 range? | a future upstream field collides with ours, silently |
 | `check-proto-hygiene.py`, frozen tags | did a shipped L2 message renumber? | every peer on the old build reads the wrong fields |
 | `check-proto-hygiene.py`, outer types | does the client's copy of the type table match `ServiceKind`? | a well-formed frame arrives at the wrong service and is skipped |
+
+**Where upstream's text comes from.** The compatibility check reads
+`vendor/server`'s `upstream` remote when run from the superproject, and
+otherwise `scripts/fetch-upstream-proto.sh`, which downloads `Mumble.proto` and
+`MumbleUDP.proto` from `mumble-voip/mumble`. CI takes the second path: this
+repo has no submodules, so the fork is not on disk there, and for as long as the
+check only knew the first one it skipped every run rather than ever looking at
+upstream. It now fails on a missing download instead of skipping, which is the
+distinction that failure turned on.
+
+CI pins the download to a **tag**. Upstream adding a field is a real finding but
+not the finding of whoever opened the next PR, so the branch head is watched
+separately by `.github/workflows/upstream-proto.yml`, daily. A failure there
+means adopt upstream's new fields, then bump the pin.
+
+Note also that the drift and citation checks compare against `vendor/server` and
+`vendor/client`, which do not exist in this repo either; both skip in CI and are
+run from the superproject.
 
 Two things to know about how they divide the work.
 

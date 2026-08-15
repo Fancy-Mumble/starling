@@ -204,8 +204,18 @@ trees, so it catches one that fell behind but never a rule all of
 them break identically. Both such rules did, see
 [`docs/PROTOCOL-MIGRATION.md`](docs/PROTOCOL-MIGRATION.md) M6. Hygiene covers
 those. Neither compares against Mumble itself, so neither can see a break with a
-released client; compat reads `mumble-voip/mumble` from the `upstream` remote in
-`vendor/server` and is the only one that can.
+released client; compat reads `mumble-voip/mumble` itself and is the only one
+that can. It uses the `upstream` remote in `vendor/server` when run from the
+superproject, and downloads from GitHub otherwise, which is what CI does:
+
+```sh
+scripts/fetch-upstream-proto.sh        # defaults to the pinned upstream tag
+python3 scripts/check-proto-compat.py --upstream-dir target/upstream-proto
+```
+
+Without either it skips rather than passing. `.github/workflows/upstream-proto.yml`
+runs the same check daily against upstream's `1.6.x` head; when that fails,
+upstream has moved and the pin in `fetch-upstream-proto.sh` needs bumping.
 
 Lint configuration is deliberately mirrored from `vendor/client` and
 `vendor/server/3rdparty/mumble-plugin-host`; keep the three in sync.
