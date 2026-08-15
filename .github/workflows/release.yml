@@ -245,7 +245,7 @@ jobs:
             ## Container image
 
             ```
-            docker pull ghcr.io/fancy-mumble/starling:${{ github.ref_name }}
+            docker pull ghcr.io/fancy-mumble/starling:${{ steps.version.outputs.version }}
             ```
 
             Also tagged `:latest`. Running it — the all-in-one box or the
