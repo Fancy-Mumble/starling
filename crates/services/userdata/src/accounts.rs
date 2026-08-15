@@ -291,12 +291,36 @@ impl Accounts {
             // one account's certificate to take another's name.
             _ => match by_name {
                 Some(record) => {
-                    if record.account.cert_hash.is_empty() {
-                        // Only a name was offered, so only the password can
-                        // prove it belongs to this peer.
-                        self.finish(record, request, Proof::PasswordOnly)
-                    } else {
+                    // A stored password is a credential in its own right, so it
+                    // decides this login whatever certificate the peer holds.
+                    // murmur does the same and in the same order: it verifies
+                    // the password first and only falls through to certificate
+                    // authentication when no password path applied
+                    // (`Server.cpp:2944`).
+                    //
+                    // This branch used to refuse *before* looking at the
+                    // password whenever the account had a certificate on file.
+                    // `migrate-db` is what made that catastrophic rather than
+                    // obscure: murmur records a certificate hash for everyone
+                    // who registered through the client, so a migration fills
+                    // the column for the whole account table at once, and every
+                    // migrated user connecting from a client whose certificate
+                    // murmur never saw -- a reinstall, a second device, any
+                    // client not sending one -- was locked out of a password
+                    // that had imported perfectly.
+                    if record.password.is_none() && !record.account.cert_hash.is_empty() {
+                        // The certificate is this account's only credential and
+                        // the peer is not holding it. Refusing by name is the
+                        // impersonation guard: without it, a registered name
+                        // reached by certificate alone could be worn by anyone
+                        // who typed it.
                         outcome(Outcome::NameTaken, None)
+                    } else {
+                        // Only a name was offered, so only the password can
+                        // prove it belongs to this peer. An account with no
+                        // password at all is refused inside `finish` rather
+                        // than admitted.
+                        self.finish(record, request, Proof::PasswordOnly)
                     }
                 }
                 // An unregistered name is a guest, which is what a Mumble
@@ -1817,6 +1841,72 @@ mod tests {
         assert_eq!(
             accounts.authenticate(1, &auth("bob", "wrong")).outcome,
             auth_result::Outcome::WrongPassword as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_password_logs_in_from_a_certificate_murmur_never_saw() {
+        // The migration failure this is here for: murmur stores a certificate
+        // hash for everyone who registered through the client, so an import
+        // fills that column for the whole account table, and this path used to
+        // refuse by name *before* checking the password. Every migrated user
+        // connecting from a reinstall, a second device or a client sending no
+        // certificate was locked out of a password that had imported perfectly.
+        //
+        // murmur verifies the password first and only falls through to
+        // certificate authentication when no password path applied
+        // (`Server.cpp:2944`).
+        let accounts = accounts().await;
+        let mut account = imported(5, "bob", Some(Secret::new("hunter2")));
+        account.cert_hash = vec![0xaa; 20];
+        let _ = accounts.import(1, &[account]).await;
+
+        for cert in [Vec::new(), vec![0xbb; 20], vec![0xaa; 20]] {
+            let mut request = auth("bob", "hunter2");
+            request.cert_hash = cert.clone();
+            assert_eq!(
+                accounts.authenticate(1, &request).outcome,
+                auth_result::Outcome::Ok as i32,
+                "the right password must be enough, holding {} certificate",
+                if cert.is_empty() { "no" } else { "some other" }
+            );
+
+            let mut wrong = auth("bob", "wrong");
+            wrong.cert_hash = cert;
+            assert_eq!(
+                accounts.authenticate(1, &wrong).outcome,
+                auth_result::Outcome::WrongPassword as i32,
+                "and a wrong one must say so rather than blame the certificate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_registered_to_a_certificate_alone_is_still_not_claimable() {
+        // The other half: an account whose *only* credential is its
+        // certificate. Admitting a peer who merely types the name would hand
+        // over the account, so the guard the fix above narrowed must survive
+        // for exactly this case.
+        let accounts = accounts().await;
+        let mut account = imported(6, "carol", None);
+        account.cert_hash = vec![0xcc; 20];
+        let _ = accounts.import(1, &[account]).await;
+
+        assert_eq!(
+            accounts.authenticate(1, &auth("carol", "")).outcome,
+            auth_result::Outcome::NameTaken as i32
+        );
+        assert_eq!(
+            accounts.authenticate(1, &auth("carol", "guessing")).outcome,
+            auth_result::Outcome::NameTaken as i32
+        );
+
+        let mut holder = auth("carol", "");
+        holder.cert_hash = vec![0xcc; 20];
+        assert_eq!(
+            accounts.authenticate(1, &holder).outcome,
+            auth_result::Outcome::Ok as i32,
+            "the certificate's owner still gets in"
         );
     }
 
