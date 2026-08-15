@@ -1,4 +1,4 @@
-<img src=".github/images/starling2.png" alt="Sterling, the Starling mascot" width="200" align="right">
+<img src=".github/images/starling2.png" alt="Dusk, the Starling mascot" width="200" align="right">
 
 # Starling
 
@@ -8,8 +8,7 @@ Fancy fork).
 Starlings fly in *murmurations*, which keeps the name in the Mumble/Murmur
 family, and describes the job.
 
-The bird is Sterling. One letter off the project, and by the usual etymology
-"little star", after the star struck on early Norman pennies.
+The bird is Dusk, for the hour the murmurations happen.
 
 **A gateway in front, independent gRPC services behind it, and media planes that
 bypass the gateway entirely.** Architecture:
