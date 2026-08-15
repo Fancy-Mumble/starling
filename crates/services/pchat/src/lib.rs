@@ -359,6 +359,9 @@ struct Relay {
     /// Deliver to this one session instead of the channel, when the body names
     /// its recipient.
     unicast: Option<u32>,
+    /// A recipient named by certificate, to be resolved against the roster when
+    /// `unicast` carries no usable session.
+    recipient_cert: Option<Vec<u8>>,
     /// The certificate this body claims for its own sender, when it names one.
     ///
     /// Read so the relay can refuse a body claiming somebody else's identity.
@@ -378,6 +381,7 @@ impl Relay {
                 channel,
                 needs,
                 unicast: None,
+                recipient_cert: None,
                 claims: None,
             })
         };
@@ -386,6 +390,7 @@ impl Relay {
                 channel,
                 needs,
                 unicast: None,
+                recipient_cert: None,
                 claims: Some(cert.to_vec()),
             })
         };
@@ -400,7 +405,15 @@ impl Relay {
             Body::KeyDeliver(deliver) => Some(Self {
                 channel: deliver.channel,
                 needs: Perm::ENTER,
+                // Zero means "resolve it from the certificate below". A sender
+                // addresses an identity, and only this server holds the
+                // identity-to-connection map: a client that has never seen the
+                // recipient's `UserState` knows the hash it sealed to and not
+                // the number to send it to.
                 unicast: Some(deliver.recipient),
+                recipient_cert: (deliver.recipient == 0)
+                    .then(|| deliver.recipient_cert.clone())
+                    .filter(|cert| !cert.is_empty()),
                 claims: None,
             }),
             Body::KeyAnnounce(announce) => {
@@ -677,13 +690,31 @@ impl PchatService {
             return vec![permission_denied(inbound, relay.needs, relay.channel)];
         }
 
-        match relay.unicast {
-            Some(recipient) => vec![to_sessions(
-                vec![recipient],
+        // Resolved here rather than at classification, because it needs the
+        // roster and classification is a pure read of the body.
+        let recipient = match (relay.unicast, relay.recipient_cert.as_deref()) {
+            (Some(0) | None, Some(cert)) => self.roster.session_with_cert(cert),
+            (session, _) => session,
+        };
+
+        match (relay.unicast, recipient) {
+            // Addressed to somebody, and we know where they are.
+            (Some(_), Some(session)) => vec![to_sessions(
+                vec![session],
                 ServiceKind::Pchat.outer_type(),
                 inbound.payload.clone(),
             )],
-            None => self.to_channel(inbound, relay.channel, inbound.payload.clone()),
+            // Addressed to somebody who is not here. Dropped rather than
+            // broadcast: this arm carries a key sealed to one identity, and
+            // "recipient unknown" must never degrade into "everyone gets it".
+            (Some(_), None) => {
+                tracing::debug!(
+                    channel = relay.channel,
+                    "a sealed delivery names a recipient this server cannot place"
+                );
+                Actions::new()
+            }
+            _ => self.to_channel(inbound, relay.channel, inbound.payload.clone()),
         }
     }
 }
