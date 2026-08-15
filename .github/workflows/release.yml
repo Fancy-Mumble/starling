@@ -9,7 +9,7 @@
 #
 #   Linux     .tar.gz  .deb  .rpm  .AppImage      x86_64 and aarch64
 #   Windows   .zip (with the bare .exe alongside) x86_64
-#   macOS     .tar.gz  .dmg                       Intel and Apple silicon
+#   macOS     .tar.gz  .dmg                       Apple silicon
 #
 # Native runners throughout, no cross-compilation: the release profile is
 # thin-LTO with codegen-units=1, and cross-linking that under QEMU turns a slow
@@ -57,7 +57,12 @@ jobs:
           # Needs the free arm64 runners, which are public-repository only.
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, kind: linux, arch: aarch64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows, arch: x86_64 }
-          - { os: macos-13, target: x86_64-apple-darwin, kind: macos, arch: x86_64 }
+          # Apple silicon only. Intel macOS built on `macos-13`, which GitHub
+          # retired in December 2025, so the job sat queued for a runner that no
+          # longer exists and `publish` waited on it forever. The surviving
+          # Intel images (`macos-15-intel`, `macos-26-intel`) would work, and
+          # cross-compiling from arm64 would too; shipping arm64 alone is the
+          # deliberate choice, so an Intel Mac has no download here.
           - { os: macos-14, target: aarch64-apple-darwin, kind: macos, arch: arm64 }
 
     steps:
@@ -266,7 +271,7 @@ jobs:
             | | |
             |---|---|
             | Windows | `starling-${{ steps.version.outputs.version }}-x86_64-windows.exe`, or the `.zip` for the example configuration and a double-clickable launcher |
-            | macOS | the `.dmg` — `arm64` for Apple silicon, `x86_64` for Intel |
+            | macOS | the `arm64` `.dmg`, for Apple silicon. Intel Macs are not built for this release |
             | Debian, Ubuntu | `.deb` — `sudo apt install ./starling_*.deb`, then `sudo systemctl enable --now starling` |
             | Fedora, RHEL, openSUSE | `.rpm` |
             | Any Linux | the `.AppImage` — one file, `chmod +x` and run |

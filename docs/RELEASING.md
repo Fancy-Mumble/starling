@@ -27,7 +27,13 @@ understands, on native runners, no cross-compilation.
 |---|---|
 | Linux `x86_64`, `aarch64` | `.tar.gz`, `.deb`, `.rpm`, `.AppImage` |
 | Windows `x86_64` | `.exe`, `.zip` |
-| macOS Intel, Apple silicon | `.tar.gz`, `.dmg` |
+| macOS Apple silicon | `.tar.gz`, `.dmg` |
+
+There is no Intel macOS build. It ran on `macos-13`, which GitHub retired in
+December 2025, and the job then blocked every release by queueing forever for a
+runner that no longer exists. Restoring it means either `macos-15-intel` /
+`macos-26-intel`, or cross-compiling from the arm64 runner and giving up the
+native-runner rule above.
 
 Plus `SHA256SUMS.txt` over all of them.
 
