@@ -112,6 +112,33 @@ url_ttl = "15m"
 # options = { media_port = "64740" }
 
 
+# -- Push notifications -----------------------------------------------------
+#
+# Telling a phone that is not connected that something happened. Off unless
+# `fcm_credentials` names a Firebase service-account key: without it the
+# service still runs, still tracks which devices registered and which channels
+# they muted, and delivers nothing.
+#
+# The key is the file the Firebase console downloads. It names its own project,
+# so `fcm_project` is only needed to override it.
+#
+# `fcm_topic_prefix` is for the other deployment shape: clients subscribe to
+# FCM topics themselves and the server never learns a device token. Then a
+# notification goes to `<prefix>_server<N>_channel<C>` - and, since the server
+# does not know who is subscribed, nobody's mute preference applies to it. A
+# device that both subscribes to the topic and registers a token is notified
+# twice, which is why this is off unless you ask for it.
+
+# [services.push]
+# options = { fcm_credentials = "/etc/starling/fcm-service-account.json" }
+# options = { fcm_credentials = "...", fcm_project = "my-firebase-project" }
+# options = { fcm_credentials = "...", fcm_topic_prefix = "mumble" }
+#
+# Which events are worth a phone buzzing. Messages yes, the other two no,
+# which is murmur's default and the one most people want.
+# options = { notify_text_message = "true", notify_reaction = "false", notify_user_join = "false" }
+
+
 # -- TLS --------------------------------------------------------------------
 #
 # With neither key set, a self-signed certificate is generated on first boot and

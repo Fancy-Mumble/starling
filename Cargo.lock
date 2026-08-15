@@ -2767,13 +2767,27 @@ dependencies = [
 name = "starling-push"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
  "prost",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
  "sqlx",
  "starling-proto-fancy",
  "starling-runtime",
+ "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

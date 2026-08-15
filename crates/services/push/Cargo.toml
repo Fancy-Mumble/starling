@@ -12,9 +12,25 @@ starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 sqlx.workspace = true
 
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+httpdate.workspace = true
+# `client`: delivery is an outbound request to Google, not one this answers.
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
 prost.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -134,6 +134,14 @@ hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# Mozilla's roots, bundled, for the outbound calls to hosts nobody in the
+# deployment controls. Not the platform store: a push that works for one
+# operator and fails for another because of what is in /etc/ssl is a bug report
+# nobody can act on.
+webpki-roots = "1"
+# Parsing a `Date` response header, which is how the clock skew that breaks
+# signed assertions is detected.
+httpdate = "1"
 
 # -- data -------------------------------------------------------------------
 sqlx = { version = "0.9", default-features = false, features = [
@@ -164,6 +172,11 @@ sha2 = "0.11"
 rand = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+# RS256, for the assertion a service account is authenticated by. Already in the
+# tree as the one rustls provider the workspace enables, so this is the signer
+# that is here anyway rather than a second RSA implementation beside it.
+ring = "0.17"
+base64 = "0.22"
 
 # -- diagnostics ------------------------------------------------------------
 thiserror = "2"
