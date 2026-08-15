@@ -90,7 +90,11 @@ jobs:
                 aarch64) arch=aarch_64 ;;
                 *) echo "::error::unhandled Linux arch $(uname -m)" >&2; exit 1 ;;
               esac
-              curl -fsSL -o /tmp/protoc.zip \
+              # Retried: release-assets.githubusercontent.com resets a
+              # connection often enough to have broken this build once already,
+              # and a whole release should not fail on one bad TLS handshake.
+              curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+                -o /tmp/protoc.zip \
                 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${arch}.zip"
               sudo unzip -oq /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
               sudo chmod +x /usr/local/bin/protoc
