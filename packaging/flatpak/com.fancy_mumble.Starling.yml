@@ -1,0 +1,119 @@
+# Flathub manifest for Starling.
+#
+# Starling is a server, not a desktop app, so this is submitted as a Flathub
+# console application: no window, no .desktop entry, run with
+#
+#   flatpak run com.fancy_mumble.Starling --all-in-one
+#
+# App ID: the reverse-DNS of fancy-mumble.com with the hyphen replaced by an
+# underscore, because a Flatpak app ID has to be a valid D-Bus name. Same
+# mapping as the client, and the same one Flathub's website verification uses.
+id: com.fancy_mumble.Starling
+
+# No GUI toolkit is needed, so the base runtime rather than the GNOME one.
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  # rust-toolchain.toml pins 1.95.0 and the workspace sets rust-version = 1.95
+  # with resolver v3, so the floor is real. 25.08 ships 1.97.1.
+  #
+  # The pin itself is inert here: rustup is what reads rust-toolchain.toml, and
+  # the SDK extension installs a bare toolchain with no rustup in front of it.
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: starling
+
+finish-args:
+  # The gateway's control/voice port (64738 TCP+UDP by default), plus whatever
+  # the SFU and the operator API are configured onto. Flatpak has no way to
+  # narrow this to specific ports.
+  - --share=network
+
+  # Deliberately nothing else. Starling reads $XDG_CONFIG_HOME/starling and
+  # writes $XDG_DATA_HOME/starling, straight from the environment
+  # (crates/starling/src/paths.rs), and inside the sandbox those already point
+  # at ~/.var/app/com.fancy_mumble.Starling/{config,data}. So the databases,
+  # the TLS identity and the service sockets land somewhere sensible with no
+  # filesystem permission at all.
+  #
+  # In particular there is no --filesystem=host. It would let an operator point
+  # --config at a file anywhere on the machine, and Flathub reviewers ask
+  # projects to justify blanket host access; for the common case - a server
+  # someone runs for themselves - the per-app directory is the right home.
+  # Anyone who needs a config outside the sandbox can grant it per-install:
+  #
+  #   flatpak override --user --filesystem=/srv/starling com.fancy_mumble.Starling
+
+modules:
+  # protoc, for the build scripts in crates/proto/{classic,fancy}. The SDK has
+  # no protobuf at all.
+  #
+  # 21.12 rather than a current release on purpose: from 22 onwards protobuf
+  # needs abseil-cpp built alongside it, which is two more modules and several
+  # minutes, and buys nothing here. Every .proto in the tree is plain proto3
+  # (no editions), and proto3 `optional` has been supported since 3.15. It never
+  # ships - `cleanup: ['*']` takes the module back out of the finished app.
+  - name: protobuf
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz
+        sha256: 4eab9b524aa5913c6fffb20b2a8abf5ef7f95a80bc0701f3a6dbb4c607f73460
+    cleanup:
+      - '*'
+
+  - name: starling
+    buildsystem: simple
+
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/starling/cargo
+        CARGO_NET_OFFLINE: 'true'
+
+    build-commands:
+      - cargo build --offline --release --locked --bin starling
+      - install -Dm755 target/release/starling /app/bin/starling
+
+      - install -Dm644 packaging/flatpak/com.fancy_mumble.Starling.metainfo.xml
+          /app/share/metainfo/com.fancy_mumble.Starling.metainfo.xml
+
+      # Reference material, reachable inside the sandbox at
+      # /app/share/doc/starling/ (`flatpak run --command=cat ...`).
+      - install -Dm644 starling.example.toml
+          /app/share/doc/starling/starling.example.toml
+      - install -Dm644 examples/reference.toml
+          /app/share/doc/starling/examples/reference.toml
+      - install -Dm644 packaging/README-archive.txt
+          /app/share/doc/starling/README.txt
+      - install -Dm644 LICENSE /app/share/licenses/starling/LICENSE
+
+      # packaging/starling.service is deliberately NOT installed. A Flatpak
+      # cannot ship a systemd unit - nothing outside the sandbox reads
+      # /app/lib/systemd - and `flatpak run` is not a service manager. Someone
+      # who wants Starling supervised at boot wants the AUR package, the .deb or
+      # the container image, not this.
+
+    sources:
+      - type: git
+        url: https://github.com/Fancy-Mumble/starling.git
+        tag: v0.2.2
+        commit: 3caf9f820eff39d664ab3c3269c4f4f83dd693b4
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$
+
+      # Generated - see packaging/flatpak/generate-sources.sh. Regenerate it in
+      # the same commit that moves the tag above, or the offline build fails on
+      # a lockfile mismatch.
+      - cargo-sources.json
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - '*.a'
+  - '*.la'

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>com.fancy_mumble.Starling</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Starling</name>
+  <summary>Run a Mumble voice server on this machine</summary>
+
+  <developer id="com.fancy_mumble">
+    <name>Fancy Mumble</name>
+  </developer>
+
+  <description>
+    <p>
+      Starling is a Mumble server written in Rust. It speaks the standard
+      Mumble protocol, so any Mumble client can connect to it, and it runs as a
+      single process with no database server or web stack to set up first.
+    </p>
+    <p>
+      Start it with the all-in-one flag and it writes a configuration file,
+      creates the administrator account, and prints a SuperUser password once.
+      Point a Mumble client at localhost:64738 and log in.
+    </p>
+    <p>
+      Configuration lives in the application's own config directory and the
+      databases, TLS identity and service sockets in its data directory. The TLS
+      certificate is how clients recognise this server, so that directory is
+      worth backing up: replacing it looks, to every client that has connected
+      before, like a different server.
+    </p>
+    <p>
+      This package runs the server in the foreground, under your user account.
+      For a server supervised by systemd at boot, use the distribution packages
+      or the container image instead.
+    </p>
+  </description>
+
+  <url type="homepage">https://fancy-mumble.com/</url>
+  <url type="bugtracker">https://github.com/Fancy-Mumble/starling/issues</url>
+  <url type="vcs-browser">https://github.com/Fancy-Mumble/starling</url>
+
+  <categories>
+    <category>Network</category>
+  </categories>
+
+  <keywords>
+    <keyword>mumble</keyword>
+    <keyword>voice</keyword>
+    <keyword>voip</keyword>
+    <keyword>server</keyword>
+  </keywords>
+
+  <provides>
+    <binary>starling</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.2.2" date="2026-08-15"/>
+  </releases>
+</component>

@@ -25,3 +25,6 @@ Thumbs.db
 # Run logs from `starling --all-in-one` in this directory. Two of these were
 # committed once; the server writes them wherever it is started from.
 /starling-local*.log
+
+# flatpak-builder scratch (packaging/flatpak/README.md)
+.flatpak-builder/
