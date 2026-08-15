@@ -28,10 +28,10 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::identity;
+use starling_proto_fancy::metadata::TreeRequest;
+use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
-use starling_proto_fancy::metadata::metadata_client::MetadataClient;
-use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::userdata::user_data_server::{UserData, UserDataServer};
 use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, Blob, BlobRef, BlobRequest, DeleteRequest,

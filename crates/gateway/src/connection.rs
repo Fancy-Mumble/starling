@@ -656,7 +656,8 @@ mod tests {
         // a dashboard that never comes back down is one nobody believes.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
-        let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, CONTROL_BYTE_BUDGET, gauge);
+        let (handle, mut rx) =
+            super::channel(1, "tok".to_owned(), 16, 4, CONTROL_BYTE_BUDGET, gauge);
 
         handle
             .send(
