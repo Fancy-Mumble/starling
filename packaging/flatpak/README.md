@@ -1,18 +1,10 @@
 # Starling on Flathub
 
-> **Not submittable as it stands - one step is missing, and it is not optional.**
->
-> The manifest pins tag `v0.2.2`, but two things are true of that tag:
->
-> 1. It does not contain this directory, so the build fails at
->    `install ... packaging/flatpak/...: No such file or directory`.
-> 2. Its `Cargo.lock` differs from the working tree `cargo-sources.json` was
->    generated from, so the offline build would not match it anyway.
->
-> Both are fixed by the same move: **cut a release that contains this
-> directory** (0.2.3 is already the workspace version), point `tag:`/`commit:`
-> at it, and re-run `generate-sources.sh`. Until then the packaging is verified
-> but not shippable. See "Releasing a new version" below.
+> **Ready to submit.** The manifest pins `v0.2.3`, that tag contains this
+> directory, and `cargo-sources.json` was regenerated from its `Cargo.lock`
+> (verified identical). The one thing left is outside this repository: serve
+> the token at `https://fancy-mumble.com/.well-known/org.flathub.VerifiedApps.txt`
+> so Flathub can verify the app ID against the domain.
 
 Starling is a server, so it is packaged as a Flathub **console application**:
 no window, no menu entry, run from a terminal.
@@ -101,8 +93,7 @@ flatpak run org.flatpak.Builder --user --install-deps-from=flathub \
       Flathub maps the app ID `com.fancy_mumble.Starling` back to the domain
       `fancy-mumble.com` (underscore for hyphen), which is what earns the
       verified badge.
-- [ ] Decide which tag to ship. The manifest currently pins **v0.2.2**, the
-      newest tag on GitHub, while the workspace version is already 0.2.3 - so
-      cut and tag 0.2.3 first if that is what should go out.
+- [x] Tag to ship: **v0.2.3** (commit `e5d6977`), pinned in the manifest, with
+      `cargo-sources.json` regenerated from that tag's `Cargo.lock`.
 - [ ] `LICENSE` says MIT and GitHub does not detect it. Worth checking the file
       is where GitHub looks, since Flathub reviewers read the same metadata.
