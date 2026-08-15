@@ -1363,6 +1363,175 @@ async fn channels_announced(client: &mut Client, username: &str) -> usize {
     }
 }
 
+/// Bytes of artwork that force the lazy path: well over murmur's 128-byte inline
+/// threshold, small enough to stay quick in a debug build.
+const LAZY_DESCRIPTION_BYTES: usize = 200 * 1024;
+
+/// Log in, and hand back the flood's `ChannelState` for one channel id.
+///
+/// Its own handshake rather than [`handshake`]: this one keeps a channel's
+/// state to look inside it, where that one asserts the ordering and moves on.
+async fn flood_channel_state(client: &mut Client, username: &str, id: u32) -> tcp::ChannelState {
+    let (greeting, _) = client.recv().await;
+    assert_eq!(greeting, 0, "the server speaks Version first");
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    client
+        .send(
+            2,
+            &tcp::Authenticate {
+                username: Some(username.to_owned()),
+                ..tcp::Authenticate::default()
+            },
+        )
+        .await;
+
+    let mut found = None;
+    loop {
+        let (type_id, payload) = client.recv().await;
+        match type_id {
+            7 => {
+                let state = tcp::ChannelState::decode(payload.as_slice())
+                    .expect("a well-formed ChannelState");
+                if state.channel_id == Some(id) {
+                    found = Some(state);
+                }
+            }
+            5 => return found.expect("the channel was announced before ServerSync"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_large_channel_description_is_flooded_as_a_hash_and_fetched_on_demand() {
+    // The regression this guards. A channel description rode inline in the login
+    // flood, and murmur stores an image inside a description as base64, so a
+    // themed server's flood could pass the gateway's per-connection control
+    // budget; the tail of the handshake -- ServerSync and the user list -- was
+    // then dropped with no log, and the client connected to a tree it could not
+    // see.
+    //
+    // `a_channel_tree_too_large_for_the_grpc_default_still_reaches_a_client`
+    // did not catch it and could not: it runs in-process, where the OS socket
+    // buffer swallows a multi-MiB flood so the byte budget (which bounds
+    // *un-drained* queue occupancy, not total bytes) is never reached, and it
+    // asserted only that every channel was announced, never that a description
+    // stays out of the flood.
+    //
+    // The fix, asserted directly: a description at or over the threshold travels
+    // as its SHA-1 (`ChannelState.description_hash`), the body is fetched with
+    // `RequestBlob.channel_description`, and the flood carries a few dozen bytes
+    // per channel however much artwork it holds.
+    let data_dir = TempDir::new("lazy-description");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let artwork = "A".repeat(LAZY_DESCRIPTION_BYTES);
+    let id = deployment
+        .create_described_channel("Gallery", artwork.clone())
+        .await;
+
+    let mut client = Client::connect(deployment.port).await;
+    let flooded = flood_channel_state(&mut client, "viewer", id).await;
+    assert!(
+        flooded
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty(),
+        "a large description must not ride inline in the flood"
+    );
+    assert_eq!(
+        flooded.description_hash.as_ref().map(Vec::len),
+        Some(20),
+        "it travels as its 20-byte SHA-1 instead"
+    );
+
+    // Redeem it the way a client renders a channel it has clicked into.
+    client
+        .send(
+            23,
+            &tcp::RequestBlob {
+                channel_description: vec![id],
+                ..tcp::RequestBlob::default()
+            },
+        )
+        .await;
+    let redeemed = loop {
+        let (type_id, payload) = client.recv().await;
+        if type_id == 7 {
+            let state =
+                tcp::ChannelState::decode(payload.as_slice()).expect("a well-formed ChannelState");
+            if state.channel_id == Some(id) {
+                break state;
+            }
+        }
+    };
+    assert_eq!(
+        redeemed.description.as_deref(),
+        Some(artwork.as_str()),
+        "RequestBlob.channel_description returns the full body"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_login_flood_over_the_control_budget_still_completes() {
+    // The outage itself, made deterministic. On the deployed server the flood
+    // passed the gateway's 4 MiB control budget and the handshake was truncated:
+    // the client authenticated, then received neither ServerSync nor the tree,
+    // with nothing in the log. In-process the OS buffer hides a 4 MiB flood, so
+    // the budget is set small here and one oversized description reaches it in a
+    // single frame -- inlined it overflows and the login never completes; hashed
+    // it stays tiny and the handshake runs to `SuggestConfig`, which is what
+    // [`handshake`] returning at all asserts.
+    let data_dir = TempDir::new("flood-over-budget");
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        config.gateway.control_bytes = 256 * 1024;
+    })
+    .await;
+
+    // Inlined, this one channel's `ChannelState` alone exceeds the budget.
+    let _ = deployment
+        .create_described_channel("Gallery", "A".repeat(512 * 1024))
+        .await;
+
+    let mut client = Client::connect(deployment.port).await;
+    let _session = handshake(&mut client, "viewer").await;
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn the_server_announces_its_release_version_not_a_service_crate_s() {
+    // The opening `Version.release` is the server's version, from the workspace,
+    // and must not be a component crate's own number. It was built from
+    // `session-lifecycle`'s `CARGO_PKG_VERSION` -- 0.2.0, that service's pinned
+    // version -- so every client read "Starling 0.2.0" whatever the release.
+    let data_dir = TempDir::new("release-version");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut client = Client::connect(deployment.port).await;
+    let (greeting_type, payload) = client.recv().await;
+    assert_eq!(greeting_type, 0, "the server speaks Version first");
+    let greeting = tcp::Version::decode(payload.as_slice()).expect("a well-formed Version");
+    assert_eq!(
+        greeting.release.as_deref(),
+        Some(format!("Starling {}", starling_runtime::VERSION).as_str()),
+        "the advertised release must be the server's version, not a service's"
+    );
+
+    deployment.stop();
+}
+
 #[tokio::test]
 async fn an_encrypted_message_reaches_the_other_member_of_its_channel() {
     // Persistent chat, end to end over the real wire: the server stores an
