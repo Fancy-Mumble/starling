@@ -1,0 +1,47 @@
+# Maintainer: Fancy Mumble <https://github.com/Fancy-Mumble/starling/issues>
+
+pkgname=starling-bin
+_pkgname=starling
+pkgver=0.2.2
+pkgrel=1
+pkgdesc='Pure-Rust Mumble server: a gateway in front, independent services behind it (binary release)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Fancy-Mumble/starling'
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+provides=("starling=$pkgver")
+conflicts=('starling')
+_base="$url/releases/download/v$pkgver"
+# The release archives carry the binary, the unit and the docs, but no licence
+# text, so that comes from the tag it was built from.
+source=("LICENSE-$pkgver::$url/raw/v$pkgver/LICENSE")
+source_x86_64=("$_base/starling-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$_base/starling-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums=('b536f595f6539b7cdd07e3803639c372dbba309b0ccdcee5a25921344b780b22')
+sha256sums_x86_64=('7e4a7c89114568a459b207d0b0290c87702014244b1beb55b908bf7764d091ab')
+sha256sums_aarch64=('b116468a8c983dc9f45add0b0f4c96eccfff3712c9e7710eaba692d2d1391e69')
+
+package() {
+	local _target
+	case "$CARCH" in
+		x86_64)  _target=x86_64-unknown-linux-gnu ;;
+		aarch64) _target=aarch64-unknown-linux-gnu ;;
+	esac
+	cd "starling-$pkgver-$_target"
+
+	install -Dm755 starling "$pkgdir/usr/bin/starling"
+
+	# Not enabled by installing; see the source package for why.
+	#   systemctl enable --now starling
+	#   journalctl -u starling      # the first start prints the SuperUser password
+	install -Dm644 starling.service \
+		"$pkgdir/usr/lib/systemd/system/starling.service"
+
+	install -Dm644 starling.example.toml \
+		"$pkgdir/usr/share/doc/$_pkgname/starling.example.toml"
+	install -Dm644 README-archive.txt \
+		"$pkgdir/usr/share/doc/$_pkgname/README.txt"
+
+	install -Dm644 "$srcdir/LICENSE-$pkgver" \
+		"$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

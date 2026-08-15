@@ -1,0 +1,61 @@
+# Maintainer: Fancy Mumble <https://github.com/Fancy-Mumble/starling/issues>
+
+pkgname=starling
+pkgver=0.2.2
+pkgrel=1
+pkgdesc='Pure-Rust Mumble server: a gateway in front, independent services behind it'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Fancy-Mumble/starling'
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+# protoc: starling-proto's build.rs shells one out rather than bundling it, and
+# every .proto here uses proto3 `optional`, so it has to be >= 3.15.
+makedepends=('cargo' 'protobuf')
+# The release profile already sets thin-LTO with codegen-units=1; makepkg's own
+# LTO flags would fight it.
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('aee276eaa1fa8f6c387eaeeeb317ce8b3ffb4e05590591c752d1f17a1efce70d')
+
+prepare() {
+	cd "$pkgname-$pkgver"
+	# rust-toolchain.toml pins 1.95.0. Left alone, a rustup-based builder would
+	# fetch that toolchain mid-build -- network access inside build(), which a
+	# clean chroot does not have. `stable` overrides the pin, and Arch's rust is
+	# past the 1.95 floor the workspace resolver holds dependencies to.
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release --bin starling
+}
+
+# No check(). The tests under crates/starling/tests are end-to-end: they bind
+# real TCP and UDP sockets and drive a gateway handshake across them, which a
+# build chroot with no network cannot do. Run them outside packaging.
+
+package() {
+	cd "$pkgname-$pkgver"
+
+	install -Dm755 target/release/starling "$pkgdir/usr/bin/starling"
+
+	# Installed but deliberately not enabled: a voice server that starts
+	# listening on 64738 because somebody ran `pacman -S` is a surprise.
+	#   systemctl enable --now starling
+	#   journalctl -u starling      # the first start prints the SuperUser password
+	install -Dm644 packaging/starling.service \
+		"$pkgdir/usr/lib/systemd/system/starling.service"
+
+	install -Dm644 starling.example.toml \
+		"$pkgdir/usr/share/doc/$pkgname/starling.example.toml"
+	install -Dm644 examples/reference.toml \
+		"$pkgdir/usr/share/doc/$pkgname/examples/reference.toml"
+	install -Dm644 packaging/README-archive.txt \
+		"$pkgdir/usr/share/doc/$pkgname/README.txt"
+
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

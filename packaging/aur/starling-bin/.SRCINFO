@@ -1,0 +1,20 @@
+pkgbase = starling-bin
+	pkgdesc = Pure-Rust Mumble server: a gateway in front, independent services behind it (binary release)
+	pkgver = 0.2.2
+	pkgrel = 1
+	url = https://github.com/Fancy-Mumble/starling
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = gcc-libs
+	depends = glibc
+	provides = starling=0.2.2
+	conflicts = starling
+	source = LICENSE-0.2.2::https://github.com/Fancy-Mumble/starling/raw/v0.2.2/LICENSE
+	sha256sums = b536f595f6539b7cdd07e3803639c372dbba309b0ccdcee5a25921344b780b22
+	source_x86_64 = https://github.com/Fancy-Mumble/starling/releases/download/v0.2.2/starling-0.2.2-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = 7e4a7c89114568a459b207d0b0290c87702014244b1beb55b908bf7764d091ab
+	source_aarch64 = https://github.com/Fancy-Mumble/starling/releases/download/v0.2.2/starling-0.2.2-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = b116468a8c983dc9f45add0b0f4c96eccfff3712c9e7710eaba692d2d1391e69
+
+pkgname = starling-bin
