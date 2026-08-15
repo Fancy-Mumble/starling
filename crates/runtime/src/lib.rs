@@ -68,3 +68,13 @@ pub use storage::{Store, StoreError};
 pub use tier::Tier;
 pub use trail::{Record, Trail};
 pub use transport::{MalformedEndpoint, Transport};
+
+/// The server's release version, `Cargo.toml`'s `[workspace.package] version`.
+///
+/// This crate inherits the workspace version (the binary and the internal
+/// libraries do; the services and proto crates pin their own), so it is the one
+/// place a service can read the *server's* version rather than its own crate's.
+/// `session-lifecycle`'s handshake used to build its `Version.release` from its
+/// own `CARGO_PKG_VERSION`, so every client was told "Starling 0.2.0" -- that
+/// service's pinned number -- regardless of the release actually running.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

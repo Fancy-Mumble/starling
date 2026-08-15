@@ -128,7 +128,11 @@ pub fn server_version() -> tcp::Version {
     tcp::Version {
         version_v2: Some(MUMBLE_VERSION_V2),
         fancy_protocol: Some(FANCY_PROTOCOL),
-        release: Some(format!("Starling {}", env!("CARGO_PKG_VERSION"))),
+        // The server's release version, not this crate's own: `CARGO_PKG_VERSION`
+        // here is `session-lifecycle`'s pinned number, so it announced "Starling
+        // 0.2.0" to every client whatever the release. `runtime` carries the
+        // workspace version, which is the one a client should see.
+        release: Some(format!("Starling {}", starling_runtime::VERSION)),
         os: Some(std::env::consts::OS.to_owned()),
         os_version: Some(std::env::consts::ARCH.to_owned()),
         ..tcp::Version::default()
