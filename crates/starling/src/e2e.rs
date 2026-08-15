@@ -4304,9 +4304,16 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
     let data_dir = TempDir::new("health-overview");
     let deployment = Deployment::start(data_dir.path()).await;
 
-    // The first sweep runs immediately, but "immediately" is still after the
-    // services it asks have bound. Retried rather than slept on: how long a
-    // whole deployment takes to come up is not what this asserts.
+    // The first sweep runs the moment the collector starts, which is while
+    // the other services are still opening their databases and binding. A
+    // callee that takes longer than the dial's retry window to bind (a cold
+    // Windows runner does) is honestly reported unreachable in that sweep,
+    // and honestly reported so for a whole `POLL_INTERVAL`, because that is
+    // the warming picture the collector exists to show. What this asserts is
+    // the settled one, so a sweep with anything unreachable is waited out
+    // rather than judged. The deadline is what turns "still unreachable"
+    // into the failure; how long a whole deployment takes to come up is not
+    // what this asserts.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let overview = loop {
         let attempt = async {
@@ -4316,7 +4323,12 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
                 .await
                 .ok()?
                 .into_inner();
-            (!overview.services.is_empty()).then_some(overview)
+            let settled = !overview.services.is_empty()
+                && overview
+                    .services
+                    .iter()
+                    .all(|service| service.state != i32::from(State::Unreachable));
+            settled.then_some(overview)
         }
         .await;
         if let Some(overview) = attempt {
@@ -4324,14 +4336,15 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the health collector never produced a sweep"
+            "the health collector never produced a sweep with every service reachable"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
 
     // Every enabled service is in the sweep, including the ones with no wire
     // type. A collector that only knew the client-facing services would miss
-    // session-view, which everything else reads through.
+    // session-view, which everything else reads through. Reachability was
+    // the loop's condition; presence is this one's.
     for expected in [
         "voice",
         "metadata",
@@ -4339,16 +4352,12 @@ async fn the_health_collector_reports_every_service_in_a_live_deployment() {
         "session-view",
         "permissions",
     ] {
-        let found = overview
-            .services
-            .iter()
-            .find(|service| service.service == expected)
-            .unwrap_or_else(|| panic!("{expected} is missing from the sweep"));
-        assert_ne!(
-            found.state,
-            i32::from(State::Unreachable),
-            "{expected} was unreachable: {}",
-            found.error
+        assert!(
+            overview
+                .services
+                .iter()
+                .any(|service| service.service == expected),
+            "{expected} is missing from the sweep"
         );
     }
 
