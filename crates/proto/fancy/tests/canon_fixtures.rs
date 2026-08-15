@@ -275,3 +275,60 @@ fn the_fetch_asks_for_the_page_size_it_meant() {
     assert_eq!(fetch.channel, 4);
     assert_eq!(fetch.page.map(|page| page.limit), Some(50));
 }
+
+#[test]
+fn the_key_announce_arrives_with_its_identity_proof_intact() {
+    // The client's half asserts it *produces* these bytes; this asserts we read
+    // the proof back. `record_peer_key` on the far end refuses an announce
+    // whose Ed25519 self-signature does not verify over exactly these fields,
+    // so a canon that lost any of them would hand every recipient a peer key it
+    // cannot attribute - a silent downgrade from authenticated to hearsay.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("key announce"))
+        .expect("the key-announce fixture");
+    let envelope = PchatEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(pchat_envelope::Body::KeyAnnounce(announce)) = envelope.body else {
+        panic!("expected a key announce, got {:?}", envelope.body);
+    };
+    assert_eq!(announce.channel, 4);
+    assert_eq!(announce.public_key, vec![0x11; 32]);
+    assert_eq!(announce.holder_cert, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+    assert_eq!(announce.signing_public, vec![0x22; 32]);
+    assert_eq!(announce.signature, vec![0x33; 64]);
+    assert_eq!(announce.tls_signature, vec![0x44; 8]);
+    assert_eq!(announce.algorithm_version, 1);
+    assert_eq!(announce.announced_at_ms, 1_700_000_000_000);
+}
+
+#[test]
+fn the_key_delivery_names_who_sealed_it() {
+    // `sender_cert` is why this arm could not carry `fancy_v1` before: the
+    // recipient resolves the sealer's key-agreement and signing keys from it,
+    // and without them the envelope cannot be opened however intact the
+    // ciphertext is. `recipient` is 0 on purpose - the sender addresses an
+    // identity and this server resolves it to a session.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("key delivery"))
+        .expect("the key-delivery fixture");
+    let envelope = PchatEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(pchat_envelope::Body::KeyDeliver(deliver)) = envelope.body else {
+        panic!("expected a key delivery, got {:?}", envelope.body);
+    };
+    assert_eq!(deliver.channel, 4);
+    assert_eq!(deliver.epoch, 3);
+    assert_eq!(
+        deliver.recipient, 0,
+        "addressed by certificate, not session"
+    );
+    assert_eq!(deliver.sealed_key, vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(deliver.recipient_cert, vec![0x11, 0x22, 0x33, 0x44]);
+    assert_eq!(deliver.sender_cert, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+    assert_eq!(deliver.signature, vec![0x55; 64]);
+    assert_eq!(deliver.request_id, "r-1");
+    assert_eq!(deliver.epoch_fingerprint, vec![0x77; 8]);
+    assert_eq!(deliver.parent_fingerprint, vec![0x66; 8]);
+    assert_eq!(deliver.countersigner_cert, vec![0x55, 0x66, 0x77, 0x88]);
+    assert_eq!(deliver.protocol, 2);
+}

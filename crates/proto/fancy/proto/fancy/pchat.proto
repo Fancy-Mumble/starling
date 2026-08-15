@@ -135,9 +135,38 @@ message Ack {
 message KeyAnnounce {
   uint32 channel = 1;
   uint32 epoch = 2;
+  // The X25519 key agreement key. Named `public_key` from when this message
+  // modelled a single key; `fancy_v1` has two and the signing half is below.
   bytes public_key = 3;
   // Whose key this is. Refused unless it is the sender's own certificate.
   bytes holder_cert = 4;
+
+  // -- fancy_v1 identity proof --------------------------------------------
+  //
+  // An announce is only worth anything if a recipient can tell it came from
+  // the identity it names, and these five fields are what makes that possible.
+  // They are not optional decoration: `record_peer_key` refuses an announce
+  // whose Ed25519 self-signature does not verify over
+  // (algorithm_version, holder_cert, announced_at_ms, public_key,
+  // signing_public), and refuses one whose timestamp does not advance. An
+  // announce arriving without them is not a degraded announce, it is an
+  // unverifiable one, and dropping them in translation would hand every
+  // recipient a peer key it cannot attribute.
+
+  // Ed25519 verification key. 32 bytes for algorithm_version 1.
+  bytes signing_public = 5;
+  // Ed25519 self-signature over the tuple above. 64 bytes.
+  bytes signature = 6;
+  // Signature by the TLS identity, binding this announce to the certificate
+  // the connection presented.
+  bytes tls_signature = 7;
+  // 1 = X25519 + Ed25519. A recipient refuses a version it does not implement
+  // rather than guessing at the key lengths.
+  uint32 algorithm_version = 8;
+  // Anti-rollback: a recipient discards an announce that does not advance on
+  // the newest it holds for this identity, so a replayed old key cannot
+  // displace a current one.
+  uint64 announced_at_ms = 9;
 }
 
 message KeyRequest {
@@ -147,13 +176,29 @@ message KeyRequest {
   // Who is asking, so a distributor knows which identity to seal to. Refused
   // unless it is the sender's own certificate.
   bytes requester_cert = 4;
+
+  // -- fancy_v1 --------------------------------------------------------------
+
+  // Correlates the answer with this request. `fancy_v1` evaluates consensus
+  // across several answers to one request before trusting a key, so an answer
+  // that cannot be tied back to what was asked cannot take part in it.
+  string request_id = 5;
+  // Which pchat protocol is being asked for; a key is only meaningful under
+  // the protocol it belongs to.
+  int32 protocol = 6;
+  // How many onward relays the requester will accept, so a request cannot be
+  // amplified indefinitely by intermediaries.
+  uint32 relay_cap = 7;
+  uint64 requested_at_ms = 8;
 }
 
 message KeyDeliver {
   uint32 channel = 1;
   uint32 epoch = 2;
   // Where to send it. A session, because this is the one arm the server
-  // unicasts and routing needs a live connection.
+  // unicasts and routing needs a live connection. May be left 0, in which case
+  // the server resolves it from `recipient_cert`: a sender addresses an
+  // identity, and only the server holds the identity-to-connection map.
   uint32 recipient = 3;
   bytes sealed_key = 4;
   bytes countersignature = 5;
@@ -164,12 +209,37 @@ message KeyDeliver {
   // against its own certificate and discards a delivery meant for somebody
   // else, which it cannot do from a session id alone.
   bytes recipient_cert = 6;
+
+  // -- fancy_v1 --------------------------------------------------------------
+
+  // Who sealed it. The recipient resolves the sender's key-agreement and
+  // signing keys from this to open the envelope at all, so a delivery without
+  // it is undecryptable no matter how intact the ciphertext is - the single
+  // field whose absence made this arm unusable for `fancy_v1`.
+  bytes sender_cert = 7;
+  // Ed25519 signature by the sender over the sealed key and its context.
+  bytes signature = 8;
+  // The `KeyRequest.request_id` this answers, for consensus evaluation.
+  string request_id = 9;
+  // Identifies the key epoch this delivers, and the one it descends from, so a
+  // recipient can place it in the ladder rather than trusting it flat.
+  bytes epoch_fingerprint = 10;
+  bytes parent_fingerprint = 11;
+  // Who countersigned, when `countersignature` is present.
+  bytes countersigner_cert = 12;
+  uint32 algorithm_version = 13;
+  int32 protocol = 14;
+  uint64 delivered_at_ms = 15;
 }
 
 message HolderReport {
   uint32 channel = 1;
   uint32 epoch = 2;
   repeated bytes holder_certs = 3;
+  // Whether this report claims the key by takeover rather than by holding it
+  // already, which is what lets recipients distinguish a new custodian from a
+  // peer restating what they knew.
+  int32 takeover_mode = 4;
 }
 
 message HolderQuery {

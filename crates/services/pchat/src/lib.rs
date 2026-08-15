@@ -1043,6 +1043,7 @@ mod tests {
             epoch: 1,
             public_key: vec![1],
             holder_cert: b"somebody-elses-cert".to_vec(),
+            ..KeyAnnounce::default()
         });
         assert!(
             service.frame(frame(forged)).await.is_empty(),
@@ -1057,6 +1058,7 @@ mod tests {
             epoch: 1,
             public_key: vec![1],
             holder_cert: SPEAKER_CERT.to_vec(),
+            ..KeyAnnounce::default()
         });
         let actions = service.frame(frame(honest)).await;
         assert_eq!(
@@ -1189,6 +1191,7 @@ mod tests {
                 epoch: 1,
                 public_key: vec![1],
                 holder_cert: SPEAKER_CERT.to_vec(),
+                ..KeyAnnounce::default()
             }),
             pchat_envelope::Body::Ack(Ack::default()),
         ] {
@@ -1253,6 +1256,7 @@ mod tests {
             sealed_key: vec![9],
             countersignature: Vec::new(),
             recipient_cert: Vec::new(),
+            ..KeyDeliver::default()
         }))
         .expect("KeyDeliver is relayable");
 
@@ -1287,6 +1291,7 @@ mod tests {
                     epoch: 1,
                     public_key: vec![1],
                     holder_cert: SPEAKER_CERT.to_vec(),
+                    ..KeyAnnounce::default()
                 }),
                 Some((6, Perm::ENTER)),
             ),
