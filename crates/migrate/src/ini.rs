@@ -187,6 +187,58 @@ impl Ini {
                 warn!(key, phase = "3", "plugin configuration ignored; ignoring");
             }
         }
+        self.warn_about_push();
+    }
+
+    /// Hand back the `[services.push]` block a migrated push setup needs.
+    ///
+    /// Told rather than written, and this is the one place the migration is
+    /// deliberately manual: a service block in the output would override the
+    /// built-in defaults *whole*, wire types and tier included, so a
+    /// `[services.push]` composed from two `.ini` lines would quietly
+    /// unregister push from the gateway. The operator gets the block to paste
+    /// and keeps the defaults underneath it.
+    fn warn_about_push(&self) {
+        let Some(block) = self.push_block() else {
+            return;
+        };
+        if self.get("pushmodulepath").is_some() {
+            // There is no module: Starling links FCM into the push service, so
+            // the path names a shared library nothing will ever load.
+            warn!(
+                key = "pushmodulepath",
+                "push is built in and loads no module; ignoring"
+            );
+        }
+        // murmur's master switch has no equivalent: a push service with no
+        // credentials configured delivers nothing, which is the same state.
+        let enabled = self
+            .get("pushenabled")
+            .is_some_and(|value| self.flag("pushenabled", value));
+        warn!(
+            %block,
+            enabled,
+            "push settings do not migrate on their own; add this block"
+        );
+    }
+
+    /// The `[services.push]` block this `.ini`'s push keys spell out, if it
+    /// states any.
+    #[must_use]
+    pub fn push_block(&self) -> Option<String> {
+        let stated = PUSH_OPTIONS
+            .iter()
+            .filter_map(|(key, option)| {
+                self.get(key).map(|value| format!("{option} = \"{value}\""))
+            })
+            .collect::<Vec<_>>();
+        if stated.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[services.push]\noptions = {{ {} }}",
+            stated.join(", ")
+        ))
     }
 
     /// The equivalent [`Config`].
@@ -333,6 +385,20 @@ const UNIMPLEMENTED: &[(&str, &str)] = &[
     ("webrtcsfupublicip", "6"),
     ("pchatenabled", "4"),
     ("pchatrequireregistration", "4"),
+];
+
+/// murmur's push keys, and the `options` key each becomes.
+///
+/// The provider is the same one (`starling-push`'s `fcm` module is murmur's
+/// `libmumble_push_fcm` ported), so the values carry across unchanged; only the
+/// spellings differ. See `starling.example.toml`.
+const PUSH_OPTIONS: &[(&str, &str)] = &[
+    ("pushcredentialspath", "fcm_credentials"),
+    ("pushprojectid", "fcm_project"),
+    ("pushtopicprefix", "fcm_topic_prefix"),
+    ("pushnotifytextmessage", "notify_text_message"),
+    ("pushnotifyreaction", "notify_reaction"),
+    ("pushnotifyuserjoin", "notify_user_join"),
 ];
 
 fn strip_comment(line: &str) -> &str {
@@ -559,6 +625,42 @@ registerName=Fancy Mumble e2e
         // says which one.
         let config = Ini::parse("port=not-a-number").to_config();
         assert_eq!(config.instances[0].port, Instance::default().port);
+    }
+
+    #[test]
+    fn push_settings_come_back_as_a_block_to_paste_and_not_as_silence() {
+        // The values carry across unchanged -- Starling's provider is murmur's
+        // FCM module ported -- so all an operator needs is the spellings.
+        let ini = Ini::parse(
+            "pushenabled=true\npushcredentialspath=/etc/mumble/fcm.json\n\
+             pushprojectid=frogpond\npushnotifyreaction=true\n",
+        );
+        let block = ini.push_block().expect("push keys produce a block");
+        assert!(block.starts_with("[services.push]"), "{block}");
+        assert!(
+            block.contains(r#"fcm_credentials = "/etc/mumble/fcm.json""#),
+            "{block}"
+        );
+        assert!(block.contains(r#"fcm_project = "frogpond""#), "{block}");
+        assert!(block.contains(r#"notify_reaction = "true""#), "{block}");
+    }
+
+    #[test]
+    fn an_ini_that_never_mentions_push_gets_no_block() {
+        // Most do not, and a migration that hands back configuration nobody
+        // asked for is one an operator stops reading.
+        assert_eq!(Ini::parse("port=64738").push_block(), None);
+    }
+
+    #[test]
+    fn a_migrated_file_never_writes_a_service_block_of_its_own() {
+        // It would override the built-in defaults whole -- tier and wire types
+        // included -- and a push service with `types = []` is one the gateway
+        // routes nothing to, silently.
+        let toml = Ini::parse("pushenabled=true\npushprojectid=frogpond\n")
+            .migrate()
+            .expect("it renders");
+        assert!(!toml.contains("[services.push]"), "{toml}");
     }
 
     #[test]
