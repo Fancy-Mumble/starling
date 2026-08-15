@@ -156,6 +156,10 @@ registry_location = ""
 # Control messages held per client. Full means disconnect that client: dropping
 # one desyncs it silently, and unbounded queueing is a memory DoS.
 control_queue = 4096
+# Control bytes held per client before that client is disconnected; bounds memory
+# where control_queue only bounds the count. The login channel flood pushes
+# against it -- raise it for a server with heavy channel artwork.
+control_bytes = 4194304
 # Tunnelled audio frames held per client. Full means drop the oldest and count
 # it, because a late audio frame is worthless.
 audio_queue = 128

@@ -19,6 +19,13 @@ pub struct GatewayConfig {
     /// message desyncs it silently, and unbounded queueing is a memory `DoS`.
     pub control_queue: usize,
 
+    /// Per client, the bytes the control lane may hold before that client is
+    /// disconnected. Bounds memory where `control_queue` only bounds the frame
+    /// count. The login channel flood is what pushes against it: a server whose
+    /// channel descriptions sum past this admits a client to a truncated tree.
+    /// Raise it for a server with heavy channel artwork.
+    pub control_bytes: usize,
+
     /// Per client, for tunnelled audio. Full means drop the oldest and count
     /// it, a late audio frame is worthless.
     pub audio_queue: usize,
@@ -49,6 +56,10 @@ impl Default for GatewayConfig {
         Self {
             listen_tcp: "0.0.0.0:64738".to_owned(),
             control_queue: 4096,
+            // 4 MiB: dozens of avatars plus far more ordinary control traffic
+            // than a healthy client is ever behind on. A thousand clients each
+            // at the ceiling is 4 GiB, a figure an operator can reason about.
+            control_bytes: 4 * 1024 * 1024,
             audio_queue: 128,
             default_deadline: HumanDuration::secs(5),
             breaker_failures: 5,

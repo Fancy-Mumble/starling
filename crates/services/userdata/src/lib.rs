@@ -30,6 +30,8 @@ use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::identity;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
+use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::userdata::user_data_server::{UserData, UserDataServer};
 use starling_proto_fancy::userdata::{
     Account, AccountPage, AuthRequest, AuthResult, Blob, BlobRef, BlobRequest, DeleteRequest,
@@ -424,7 +426,53 @@ impl UserdataService {
             let reply = starling_proto::proto::tcp::UserList { users: listed };
             actions.push(to_conn(inbound.conn, USER_LIST, reply.encode_to_vec()));
         }
+        // Channel descriptions travel as a hash in the flood, so the client
+        // redeems the body here just as it redeems avatars and comments above.
+        actions.extend(
+            self.channel_descriptions(inbound.scope, inbound.conn, &request.channel_description)
+                .await,
+        );
         actions
+    }
+
+    /// Answer `RequestBlob.channel_description`: the full body of a description
+    /// the client was handed only as a hash in the channel flood.
+    ///
+    /// The tree lives in `metadata`, so this reads it the way every other tree
+    /// reader does and returns each description as a `ChannelState`, which is
+    /// where a client merges a description in. Best-effort: an unreachable
+    /// metadata answers nothing, as murmur answers only what it can. The decode
+    /// limit is raised off the 4 MiB default for the same reason the handshake
+    /// raises it -- the tree is the one reply that outgrows it.
+    async fn channel_descriptions(&self, scope: u32, conn: u64, ids: &[u32]) -> Actions {
+        if ids.is_empty() {
+            return Actions::new();
+        }
+        let Ok(transport) = self.resolver.channel("metadata") else {
+            return Actions::new();
+        };
+        let Ok(tree) = MetadataClient::new(transport)
+            .max_decoding_message_size(self.resolver.max_tree_message())
+            .get_tree(TreeRequest {
+                scope: Some(Scope { instance: scope }),
+            })
+            .await
+        else {
+            return Actions::new();
+        };
+        let channels = tree.into_inner().channels;
+        ids.iter()
+            .filter_map(|id| channels.iter().find(|channel| channel.id == *id))
+            .map(|channel| {
+                let state = starling_proto::proto::tcp::ChannelState {
+                    channel_id: Some(channel.id),
+                    description: Some(channel.description.clone()),
+                    ..starling_proto::proto::tcp::ChannelState::default()
+                };
+                // 7 is ChannelState, as in the flood (`session-lifecycle`).
+                to_conn(conn, 7, state.encode_to_vec())
+            })
+            .collect()
     }
 
     /// Every live session on a server instance, from `session-view`.

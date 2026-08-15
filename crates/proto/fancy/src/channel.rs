@@ -45,6 +45,14 @@ pub const fn is_detached(channel: &Channel) -> bool {
 /// Seconds in a millisecond, for turning a creation time into a deadline.
 const MILLIS: u64 = 1_000;
 
+/// murmur's threshold: a description shorter than this rides inline, and one at
+/// or over it travels as a SHA-1 hash the client redeems with
+/// `RequestBlob.channel_description` (`Mumble.proto`, ChannelState fields 5 and
+/// 10). Inlining every description here regardless of size is what let a themed
+/// server's login flood outgrow the gateway's per-connection byte budget, so a
+/// client on a slow link was admitted to a truncated channel tree.
+const DESCRIPTION_INLINE_MAX: usize = 128;
+
 /// The upstream `ChannelState` for a channel.
 #[must_use]
 pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
@@ -59,11 +67,11 @@ pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
         parent: channel.parent,
         name: Some(channel.name.clone()),
         links: channel.links.clone(),
-        description: Some(channel.description.clone()),
         position: Some(channel.position),
         max_users: Some(channel.max_users),
         ..tcp::ChannelState::default()
     };
+    set_description(&mut state, &channel.description);
     set_legacy_temporary(&mut state, channel.flags & FLAG_TEMPORARY != 0);
     // The one Fancy field written here rather than left to the envelope, because
     // it is the only signal the client has that a channel is encrypted at all:
@@ -90,6 +98,33 @@ pub fn channel_state(channel: &Channel) -> tcp::ChannelState {
     }
     state.attributes = attributes(channel);
     state
+}
+
+/// Put the description on the wire the way murmur does: inline while it is short,
+/// and as a SHA-1 the client redeems with `RequestBlob.channel_description` once
+/// it reaches [`DESCRIPTION_INLINE_MAX`]. Exactly one of the two fields is set,
+/// so a client keys off whichever it finds, as it does for user comments.
+///
+/// The length is the UTF-8 byte length, which is what the client hashes and what
+/// the threshold is stated in; an empty description stays inline (an empty
+/// string), which is what every short description did before.
+fn set_description(state: &mut tcp::ChannelState, description: &str) {
+    if description.len() < DESCRIPTION_INLINE_MAX {
+        state.description = Some(description.to_owned());
+    } else {
+        state.description_hash = Some(description_hash(description));
+    }
+}
+
+/// The SHA-1 of a description's UTF-8 bytes, which is the digest a Mumble client
+/// compares against its blob cache and, on a miss, asks for by
+/// `RequestBlob.channel_description`.
+fn description_hash(description: &str) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(description.as_bytes());
+    hasher.finalize().to_vec()
 }
 
 /// The channel's own attributes, as `ChannelState.attributes` numbers them.
@@ -125,4 +160,62 @@ fn attributes(channel: &Channel) -> Vec<i32> {
 #[expect(deprecated, reason = "the only temporary signal a stock client reads")]
 fn set_legacy_temporary(state: &mut tcp::ChannelState, temporary: bool) {
     state.temporary = Some(temporary);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn described(description: &str) -> Channel {
+        Channel {
+            id: 1,
+            name: "Gallery".to_owned(),
+            description: description.to_owned(),
+            ..Channel::default()
+        }
+    }
+
+    #[test]
+    fn a_short_description_rides_inline() {
+        let state = channel_state(&described("a small note"));
+        assert_eq!(state.description.as_deref(), Some("a small note"));
+        assert!(
+            state.description_hash.is_none(),
+            "a short description needs no hash"
+        );
+    }
+
+    #[test]
+    fn an_empty_description_stays_inline_as_before() {
+        // The flood used to send `Some("")` for every channel without artwork;
+        // keeping that avoids a needless hash-then-fetch for the common case.
+        let state = channel_state(&described(""));
+        assert_eq!(state.description.as_deref(), Some(""));
+        assert!(state.description_hash.is_none());
+    }
+
+    #[test]
+    fn a_long_description_travels_as_a_hash_the_client_redeems() {
+        // At or over murmur's 128-byte threshold the body is replaced by its
+        // SHA-1; inlining it into every channel of the flood is what let a
+        // themed server's login outgrow the gateway's per-connection budget and
+        // truncate the tree. The client fetches the body with
+        // `RequestBlob.channel_description`.
+        let artwork = "A".repeat(DESCRIPTION_INLINE_MAX);
+        let state = channel_state(&described(&artwork));
+        assert!(
+            state.description.is_none(),
+            "the body must not ride inline once it is redeemable by hash"
+        );
+        assert_eq!(
+            state.description_hash.as_deref(),
+            Some(description_hash(&artwork).as_slice()),
+            "the hash must be the SHA-1 the client compares against its cache"
+        );
+        assert_eq!(
+            state.description_hash.as_ref().map(Vec::len),
+            Some(20),
+            "a SHA-1 is twenty bytes"
+        );
+    }
 }

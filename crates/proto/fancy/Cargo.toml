@@ -13,6 +13,9 @@ bitflags.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+# For the SHA-1 of a channel description, which murmur sends in place of the
+# body once it reaches 128 bytes (`Mumble.proto`, ChannelState field 10).
+sha1.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true

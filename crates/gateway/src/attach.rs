@@ -188,7 +188,15 @@ async fn run_attachment(
             continue;
         }
 
-        let mut client = ClientPlaneClient::new(channel);
+        // Raised off tonic's 4 MiB default, which is the same ceiling the
+        // per-connection control lane already enforces: a single `ServerAction`
+        // carrying one channel's artwork can exceed it, and the default caps the
+        // *decode* here rather than the send, so the whole attachment dies with
+        // "decoded message length too large" and every client on this gateway
+        // loses the service. `session-lifecycle` raises the same limit for its
+        // `get_tree` read (`handshake.rs`); this is the matching hop.
+        let mut client = ClientPlaneClient::new(channel)
+            .max_decoding_message_size(ctx.resolver.max_tree_message());
         let outbound = tokio_stream::wrappers::ReceiverStream::new(stream);
         let response = match client.attach(outbound).await {
             Ok(response) => response,
@@ -320,9 +328,17 @@ fn replay_to(replay: &starling_proto_fancy::control::Replay, ctx: &AttachContext
             },
         );
         if queued.is_err() {
+            // Same overflow, on the resume path: close and say so rather than
+            // silently unregister and leave the client hanging.
             ctx.metrics
                 .counter("starling_gateway_control_overflow_disconnects")
                 .inc();
+            tracing::warn!(
+                conn = handle.conn,
+                session = handle.session(),
+                "control lane overflowed during replay; disconnecting the client"
+            );
+            handle.close();
             ctx.registry.remove(handle.conn);
             return;
         }
@@ -379,12 +395,23 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
             payload: payload.clone(),
         };
         if handle.send(lane, frame).is_err() {
-            // Control overflow: bounded and honest. Reconnect re-syncs from
-            // scratch, and the client is told by the socket closing rather than
-            // by a silent hole in its world.
+            // Control overflow: bounded and honest. This used to remove the
+            // registry entry and stop, which never closed the socket — the
+            // client sat half-connected with a truncated handshake (an empty
+            // channel tree, no `ServerSync`, no users) until it gave up on its
+            // own tens of seconds later, and nothing was logged, only a counter.
+            // Close the socket so the client learns at once, and warn so an
+            // operator can see it: the send outgrew this client's byte budget.
             ctx.metrics
                 .counter("starling_gateway_control_overflow_disconnects")
                 .inc();
+            tracing::warn!(
+                conn = handle.conn,
+                session = handle.session(),
+                "control lane overflowed mid-send; disconnecting the client \
+                 (its outbound queue exceeded the byte budget)"
+            );
+            handle.close();
             ctx.registry.remove(handle.conn);
         }
     }

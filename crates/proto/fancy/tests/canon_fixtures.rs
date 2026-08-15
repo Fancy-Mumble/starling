@@ -41,6 +41,7 @@ const PCHAT: u16 = ServiceKind::Pchat.outer_type();
 // named. The workspace convention, rather than an `#[allow]` that would also hide
 // a genuinely unused dependency later.
 use bitflags as _;
+use sha1 as _;
 use starling_proto as _;
 use tonic as _;
 use tonic_prost as _;

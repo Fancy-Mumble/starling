@@ -2756,6 +2756,7 @@ version = "0.2.0"
 dependencies = [
  "bitflags",
  "prost",
+ "sha1 0.11.0",
  "starling-proto",
  "tonic",
  "tonic-prost",

@@ -114,7 +114,7 @@ impl Gateway {
             metrics,
             control_pressure: pressure.gauge(
                 connection::CONTROL_QUEUE_GAUGE,
-                connection::control_budget(),
+                config.gateway.control_bytes as u64,
             ),
             health,
             logger,
@@ -401,6 +401,7 @@ impl Gateway {
             token,
             self.config.gateway.control_queue,
             self.config.gateway.audio_queue,
+            self.config.gateway.control_bytes,
             self.control_pressure.clone(),
         );
         self.registry.insert(Arc::clone(&handle));

@@ -146,6 +146,7 @@ Every key has one, so a Kubernetes `ConfigMap` needs no templating and
 [gateway]
 listen_tcp       = "0.0.0.0:64738"   # control plane; TLS terminates here
 control_queue    = 4096              # per client. Full -> disconnect that client
+control_bytes    = 4194304           # per client, 4 MiB. Raise for heavy channel artwork
 default_deadline = "5s"              # per gRPC call unless a route overrides it
 
 [gateway.tls]

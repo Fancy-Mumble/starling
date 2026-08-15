@@ -341,6 +341,7 @@ pub(crate) fn channel(
     token: String,
     control_queue: usize,
     audio_queue: usize,
+    control_budget: usize,
     pressure: Gauge,
 ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
     let (tx, rx) = mpsc::channel(control_queue.max(1));
@@ -356,7 +357,7 @@ pub(crate) fn channel(
         audio_wake: Arc::new(Notify::new()),
         audio_capacity: audio_queue.max(1),
         queued_control: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        control_budget: CONTROL_BYTE_BUDGET,
+        control_budget: control_budget.max(1),
         pressure,
         dropped_audio: Arc::new(AtomicU32::new(0)),
         close: Arc::new(Notify::new()),
@@ -365,32 +366,14 @@ pub(crate) fn channel(
     (handle, rx)
 }
 
-/// Bytes one client may have waiting on the control lane.
-///
-/// The frame count alone does not bound memory: at the shipped 4096 frames and
-/// the default `image_message_length` of 128 KiB, one client that has stopped
-/// reading can hold **half a gigabyte**. A few of those take a gateway down,
-/// and heavy image sharing is precisely the workload that produces them.
-///
-/// 4 MiB is dozens of avatars plus far more ordinary control traffic than a
-/// healthy client is ever behind on, and a thousand clients simultaneously at
-/// the ceiling is 4 GiB, a number an operator can reason about, which the old
-/// bound never was.
-const CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
-
-/// What the control lane's occupancy gauge is called, and its declared bound.
+/// What the control lane's occupancy gauge is called.
 ///
 /// Named once because three places need to agree: the gateway that creates it,
-/// the dashboard that draws it, and the test that asserts it is reported. The
-/// capacity is [`CONTROL_BYTE_BUDGET`] and not the aggregate across clients,
-/// because the budget each client is disconnected for exceeding is its own.
+/// the dashboard that draws it, and the test that asserts it is reported. Its
+/// declared capacity is the configured `[gateway] control_bytes` — the same
+/// ceiling each client is disconnected for exceeding, not the aggregate across
+/// clients, because the budget is per client.
 pub(crate) const CONTROL_QUEUE_GAUGE: &str = "control queue (worst client)";
-
-/// The capacity to declare for [`CONTROL_QUEUE_GAUGE`].
-#[must_use]
-pub(crate) const fn control_budget() -> u64 {
-    CONTROL_BYTE_BUDGET as u64
-}
 
 /// Every connected client, by connection and by session.
 ///
@@ -496,6 +479,13 @@ mod tests {
     use super::*;
     use starling_runtime::pressure::Pressure;
 
+    // The default control-lane byte budget (`GatewayConfig::control_bytes`),
+    // used here as the fixture these queue tests were written against.
+    const CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+    fn control_budget() -> u64 {
+        CONTROL_BYTE_BUDGET as u64
+    }
+
     /// A handle whose gauge nothing reads.
     ///
     /// Most of these tests are about the queue, not about how it is reported,
@@ -512,6 +502,7 @@ mod tests {
             token,
             control_queue,
             audio_queue,
+            CONTROL_BYTE_BUDGET,
             Pressure::new().gauge(CONTROL_QUEUE_GAUGE, control_budget()),
         )
     }
@@ -631,7 +622,8 @@ mod tests {
         // still connected, about to not be.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
-        let (handle, _rx) = super::channel(1, "tok".to_owned(), 100_000, 4, gauge);
+        let (handle, _rx) =
+            super::channel(1, "tok".to_owned(), 100_000, 4, CONTROL_BYTE_BUDGET, gauge);
         let blob = Bytes::from(vec![0_u8; 128 * 1024]);
 
         while handle
@@ -664,7 +656,7 @@ mod tests {
         // a dashboard that never comes back down is one nobody believes.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
-        let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, gauge);
+        let (handle, mut rx) = super::channel(1, "tok".to_owned(), 16, 4, CONTROL_BYTE_BUDGET, gauge);
 
         handle
             .send(
