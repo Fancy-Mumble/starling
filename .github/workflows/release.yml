@@ -31,6 +31,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Pinned rather than "latest": a release that builds is not a place to find
+  # out that a new protoc changed its output. Any 3.15 or newer will do, which
+  # is what the proto3 `optional` fields need.
+  PROTOC_VERSION: "34.2"
+
 permissions:
   contents: read
 
@@ -66,14 +72,36 @@ jobs:
           key: release-${{ matrix.target }}
 
       # starling-proto's build.rs shells out to protoc rather than bundling one.
+      #
+      # Linux takes it from upstream rather than from apt. The Linux builds are
+      # pinned to Ubuntu 22.04 for the glibc 2.35 floor, and 22.04 ships protoc
+      # 3.12, which predates stable proto3 `optional` (3.15); every proto here
+      # uses it, so the distro package cannot build the tree at all. CI does not
+      # catch this because it runs on ubuntu-latest, where apt is current.
+      # Moving the runner would fix the build and raise the glibc floor with it,
+      # which is the tradeoff docs/RELEASING.md deliberately makes the other way.
       - name: Install protoc
         shell: bash
         run: |
           case "${{ runner.os }}" in
-            Linux)   sudo apt-get update && sudo apt-get install -y protobuf-compiler ;;
+            Linux)
+              case "$(uname -m)" in
+                x86_64)  arch=x86_64 ;;
+                aarch64) arch=aarch_64 ;;
+                *) echo "::error::unhandled Linux arch $(uname -m)" >&2; exit 1 ;;
+              esac
+              curl -fsSL -o /tmp/protoc.zip \
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${arch}.zip"
+              sudo unzip -oq /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
+              sudo chmod +x /usr/local/bin/protoc
+              # Named outright rather than left to PATH order, because the
+              # runner image may already carry apt's 3.12 at /usr/bin/protoc.
+              echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+              ;;
             Windows) choco install protoc -y ;;
             macOS)   brew install protobuf ;;
           esac
+          protoc --version
 
       # The version comes from the tag when there is one, and from the workspace
       # otherwise. They have to agree: cargo-deb and cargo-generate-rpm take the
