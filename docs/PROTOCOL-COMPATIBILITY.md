@@ -277,7 +277,13 @@ Two consequences worth stating, because both were live bugs before:
   because a pin is a property of the stored message. The name is not the owner.
 * **`WebRtcSignal` is one type for two features.** It is screenshare's by
   assignment; camera share shares the type rather than getting its own, exactly
-  as it did at 120.
+  as it did at 120. It rides at **inner tag 7** of `ScreenshareEnvelope`, beside
+  the share canon rather than instead of it: the canon models a share with an
+  identity, `WebRtcSignal` is one relayed blob per step, and the client speaks
+  the second. A canon with no home for it is not a neutral omission - it makes
+  `canon.rs` return `None`, which routes screen sharing down the
+  `PluginDataTransmission` relay, and that relay is client-to-client mesh with
+  the SFU cut out of the path entirely.
 
 ### What is dropped with epoch 0
 

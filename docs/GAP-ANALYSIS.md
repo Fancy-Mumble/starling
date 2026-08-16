@@ -460,7 +460,7 @@ learns the door is open by walking through it.
 | # | Missing | murmur reference |
 |---|---|---|
 | S1 | Zeroconf/Bonjour advertisement | `Zeroconf.cpp` |
-| S2 | The screen-share SFU, no `str0m` dependency exists; `screenshare` is signalling only | Fancy fork |
+| ~~S2~~ | ~~The screen-share SFU, no `str0m` dependency exists; `screenshare` is signalling only~~ **Done.** `starling-sfu` is the fork's `webrtc-sfu` crate, called directly rather than through a C FFI, and `screenshare` drives it in both dialects: the share canon, and murmur's `WebRtcSignal` at inner tag 7 of outer type 1008 - which is the one the shipped client speaks. A server with no `media_ip` still signals and the clients mesh, which is murmur's relay mode | Fancy fork |
 | ~~S3~~ | ~~`zstd` on the Fancy control stream~~ **Done.** The gateway batches queued frames and compresses the batch, under outer type 1900, only for a peer that announced `zstd` in its `Hello` | Fancy fork |
 | S4 | A session store that outlives a gateway pod. The resume ring is in-process, so RESUME cannot cross one | `ARCHITECTURE.md` §5 |
 | S5 | Sharding. Every shard key in `scaling.puml` is a design decision; nothing is sharded | |
