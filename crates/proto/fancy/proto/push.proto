@@ -11,6 +11,14 @@ service Push {
   rpc Unregister(UnregisterRequest) returns (starling.common.v1.Ack);
   rpc Notify(Notification) returns (NotifyResult);
   rpc Subscriptions(SubscriptionRequest) returns (SubscriptionList);
+  // Who else a message in these channels should reach: the connected sessions
+  // that asked for live delivery from a channel they are not in.
+  //
+  // Asked by `text` on the delivery path, which is why it answers with sessions
+  // and not with subscriptions: the caller is composing a recipient list, and
+  // the permission and mute decisions belong to the service that holds the
+  // subscriptions.
+  rpc LiveSubscribers(LiveQuery) returns (LiveList);
 }
 
 message Registration {
@@ -31,6 +39,14 @@ message UnregisterRequest {
 
 message Notification {
   starling.common.v1.Scope scope = 1;
+  // Who to consider notifying. Empty means everyone with a device registered
+  // on this server, which is what a caller that knows only who is *connected*
+  // has to be able to say: the offline set lives in this service's own table,
+  // and enumerating it is not the caller's job.
+  //
+  // Naming accounts here is not a way past the checks below it. A recipient
+  // still needs the SubscribePush permission in `channel`, and still has their
+  // mute preference honoured.
   repeated uint64 accounts = 2;
   string title = 3;
   string body = 4;
@@ -51,6 +67,21 @@ message NotifyResult {
   uint32 delivered = 1;
   uint32 skipped = 2;
   uint32 failed = 3;
+}
+
+message LiveQuery {
+  starling.common.v1.Scope scope = 1;
+  // The channels the message is addressed at, trees already expanded: a
+  // subscriber matches if any one of them is theirs.
+  repeated uint32 channels = 2;
+  // The sender, who is never added to their own message's recipients.
+  uint32 exclude_session = 3;
+}
+
+message LiveList {
+  // Sessions to add. The caller already has its own recipients and unions
+  // these in, so an overlap costs nothing.
+  repeated uint32 sessions = 1;
 }
 
 message SubscriptionRequest {
