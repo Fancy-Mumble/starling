@@ -81,8 +81,8 @@ impl Resolver {
     /// Read the deployment-wide sizes from `cell` rather than from the
     /// configuration this resolver was built with.
     ///
-    /// Only the sizes: see the note on [`Self::config`] for why endpoints stay
-    /// where they are.
+    /// Only the sizes: see the note on the private `config` field for why
+    /// endpoints stay where they are.
     #[must_use]
     pub fn following(mut self, cell: ConfigCell) -> Self {
         self.live = cell;

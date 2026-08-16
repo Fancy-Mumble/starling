@@ -316,7 +316,7 @@ pub struct AttachContext {
     /// How long one call may take before it counts as a failure.
     ///
     /// `gateway.default_deadline`. It bounds *opening* the attachment, not the
-    /// attachment: see [`run_attachment`].
+    /// attachment: see the private `run_attachment`.
     pub default_deadline: std::time::Duration,
 }
 

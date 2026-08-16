@@ -67,7 +67,7 @@ impl Backend {
     /// Connect to `url` with a pool of `max_connections`.
     ///
     /// The size is what the operator asked for, capped where the URL cannot
-    /// support it; see [`pool_size`].
+    /// support it; see the private `pool_size`.
     ///
     /// # Errors
     ///

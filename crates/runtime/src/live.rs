@@ -23,7 +23,7 @@
 //! # What the cell holds
 //!
 //! **The file as it now reads**, not "the subset that took effect". A key
-//! classified [`Reload::Restart`](crate::config::Reload::Restart) has no
+//! classified [`Reload::Restart`] has no
 //! follower by construction -- that is what the classification *means* -- so
 //! nothing acts on the new value, but a reader who went looking would see it.
 //! [`Outcome::deferred`] names exactly those keys, and it is logged and
