@@ -17,8 +17,8 @@ use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::feature::{PushAck, PushEnvelope, push_envelope};
 use starling_proto_fancy::push::push_server::{Push, PushServer};
 use starling_proto_fancy::push::{
-    Notification, NotifyResult, Registration, SubscriptionList, SubscriptionRequest,
-    UnregisterRequest,
+    LiveList, LiveQuery, Notification, NotifyResult, Registration, SubscriptionList,
+    SubscriptionRequest, UnregisterRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::metrics::Counter;
@@ -29,9 +29,11 @@ use starling_runtime::storage::{Migration, Store};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
+use crate::audience::{Audience, Permitted};
 use crate::fcm::{Category, Fcm, Message, Sender, Target};
 use crate::oauth::ServiceAccount;
 
+pub mod audience;
 pub mod fcm;
 pub mod oauth;
 
@@ -124,6 +126,20 @@ struct Plan {
     skipped: u32,
 }
 
+/// One connected client's request for live delivery.
+///
+/// The fork's `LivePushSubscription`, minus its `allowedChannels`: that set is
+/// computed once at subscribe time upstream and refreshed only while the user
+/// stays connected, so an ACL taken away in between still delivers. Here the
+/// permission is asked per message, about the one channel in question, which is
+/// both cheaper (one check, not one per channel on the server) and honest about
+/// a revocation.
+#[derive(Debug, Default, Clone)]
+struct LiveSubscription {
+    /// The channels this session wants left out.
+    muted: std::collections::BTreeSet<u32>,
+}
+
 /// The service.
 #[derive(Debug)]
 pub struct PushService {
@@ -148,6 +164,15 @@ pub struct PushService {
     permits: Arc<Semaphore>,
     /// Notifications dropped because that cap was reached.
     dropped: Counter,
+    /// Who may hear about a channel at all.
+    audience: Arc<dyn Audience>,
+    /// Live delivery, per `(scope, session)`.
+    ///
+    /// In memory and nowhere else, exactly as the fork's `QHash`: a
+    /// subscription is a property of a connection, and one that survived a
+    /// restart would be a subscription belonging to a session id that now
+    /// names somebody else.
+    live: std::sync::Mutex<std::collections::HashMap<(u32, u32), LiveSubscription>>,
 }
 
 impl PushService {
@@ -217,6 +242,92 @@ impl PushService {
         .collect()
     }
 
+    /// Record what a connected session wants delivered live.
+    ///
+    /// Replaces rather than merges, as every mute set here does: a client can
+    /// always say "I have stopped muting that one".
+    fn live_subscribe(&self, scope: u32, session: u32, muted: &[u32]) {
+        let Ok(mut live) = self.live.lock() else {
+            return;
+        };
+        // The session going away is what removes it (`Server.cpp:1838` does the
+        // same on disconnect), and [`Self::live_subscribers`] drops whatever the
+        // roster no longer knows, so a client that vanishes without a goodbye
+        // cannot leave one behind for the next holder of its id.
+        let _ = live.insert(
+            (scope, session),
+            LiveSubscription {
+                muted: muted.iter().copied().collect(),
+            },
+        );
+        tracing::debug!(session, muted = muted.len(), "live push subscription");
+    }
+
+    /// The sessions to add to a message addressed at `channels`.
+    ///
+    /// The fork's loop in `msgTextMessage` (`Messages.cpp:2497`), one condition
+    /// at a time: not the sender, subscribed, holds `SubscribePush` there, has
+    /// not muted it. "Already a recipient" is the caller's to apply, since the
+    /// caller is the one holding that list.
+    async fn live_subscribers(&self, scope: u32, channels: &[u32], exclude: u32) -> Vec<u32> {
+        let candidates: Vec<(u32, LiveSubscription)> = {
+            let Ok(mut live) = self.live.lock() else {
+                return Vec::new();
+            };
+            // A subscription outlives its session only until the next message.
+            // Only with a warm roster: a cold one knows nobody, and pruning
+            // against it would forget every live subscriber on the server.
+            if self.roster.is_warm() {
+                live.retain(|(_, session), _| self.roster.channel_of(*session).is_some());
+            }
+            live.iter()
+                .filter(|((subscribed_scope, session), _)| {
+                    *subscribed_scope == scope && *session != exclude
+                })
+                .map(|((_, session), subscription)| (*session, subscription.clone()))
+                .collect()
+        };
+
+        let mut sessions = Vec::new();
+        for (session, subscription) in candidates {
+            for channel in channels {
+                if subscription.muted.contains(channel) {
+                    continue;
+                }
+                // Asked now rather than cached at subscribe time, so a
+                // permission taken away while the user is connected stops
+                // delivery with the next message rather than with the next
+                // reconnect.
+                if self
+                    .audience
+                    .session_may_receive(scope, session, *channel)
+                    .await
+                {
+                    sessions.push(session);
+                    break;
+                }
+            }
+        }
+        sessions
+    }
+
+    /// Every account with a device registered on this server.
+    ///
+    /// The set a notification that names nobody is fanned out over. Distinct,
+    /// because a person with a phone and a tablet is one candidate with two
+    /// devices, and the per-device work happens further down.
+    async fn registered(&self, scope: u32) -> Vec<u64> {
+        use sqlx::Row as _;
+        sqlx::query("SELECT DISTINCT account_id FROM push_registration WHERE server_id = ?")
+            .bind(i64::from(scope))
+            .fetch_all(self.store.pool())
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|row| row.try_get::<i64, _>("account_id").unwrap_or_default() as u64)
+            .collect()
+    }
+
     /// Who this notification is really for, and who is deliberately left alone.
     async fn plan(&self, scope: u32, request: &Notification) -> Plan {
         let category = request
@@ -248,10 +359,33 @@ impl PushService {
             data: extra.clone(),
         };
 
-        for account in &request.accounts {
+        // A caller that names nobody means "whoever registered a device here",
+        // which is the only thing it can mean: `text` knows who is *connected*
+        // and this service is the one that knows who is not. murmur's dispatch
+        // walks its whole registration table for the same reason.
+        let candidates = if request.accounts.is_empty() {
+            self.registered(scope).await
+        } else {
+            request.accounts.clone()
+        };
+
+        for account in &candidates {
             // Connected recipients already have the real message; notifying
             // them again is how a phone buzzes for something on screen.
             if request.skip_accounts.contains(account) {
+                plan.skipped += 1;
+                continue;
+            }
+            // The gate the fork puts on registration: a notification carries a
+            // channel's name and a line of what was said in it, so being told
+            // about a channel is a permission and not a consequence of owning
+            // a phone. `SubscribePush` is not in the default grant, exactly as
+            // upstream, so an operator switching push on grants it too.
+            if !self
+                .audience
+                .may_receive(scope, *account, request.channel)
+                .await
+            {
                 plan.skipped += 1;
                 continue;
             }
@@ -382,6 +516,20 @@ impl Push for PushRpc {
             registrations: self.0.subscriptions(scope, req.account).await,
         }))
     }
+
+    async fn live_subscribers(
+        &self,
+        request: Request<LiveQuery>,
+    ) -> Result<Response<LiveList>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        Ok(Response::new(LiveList {
+            sessions: self
+                .0
+                .live_subscribers(scope, &req.channels, req.exclude_session)
+                .await,
+        }))
+    }
 }
 
 impl ClientService for PushService {
@@ -402,6 +550,23 @@ impl ClientService for PushService {
             );
             return Actions::new();
         };
+
+        // Live delivery is about a *session*, not a person, so it is answered
+        // before the account is looked up: the fork asks only that the sender
+        // is authenticated (`msgFancySubscribePush`), and a guest sitting in a
+        // channel they may subscribe to is exactly as entitled to see the room
+        // as a registered user is.
+        if let Some(push_envelope::Body::LiveSubscribe(subscribe)) = &envelope.body {
+            self.live_subscribe(inbound.scope, inbound.session, &subscribe.muted);
+            let reply = PushEnvelope {
+                body: Some(push_envelope::Body::Ack(PushAck {
+                    ok: true,
+                    detail: String::new(),
+                })),
+            };
+            return vec![to_conn(inbound.conn, outer, reply.encode_to_vec())];
+        }
+
         // A push token belongs to a person, so an unregistered guest has
         // nothing durable to file one under and is refused rather than stored
         // under a session id that will belong to somebody else tomorrow.
@@ -535,6 +700,8 @@ impl Serve for PushService {
             provider: provider(&options),
             permits: Arc::new(Semaphore::new(IN_FLIGHT)),
             dropped: ctx.metrics.counter("starling_push_dropped"),
+            audience: Arc::new(Permitted::new(ctx.resolver.clone())),
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -560,11 +727,17 @@ impl Serve for PushService {
 mod tests {
     use super::*;
 
+    use crate::audience::tests::Allowed;
+
     async fn service() -> Arc<PushService> {
         with_settings(Settings::murmur_defaults()).await
     }
 
     async fn with_settings(settings: Settings) -> Arc<PushService> {
+        with(settings, Arc::new(Allowed::everyone())).await
+    }
+
+    async fn with(settings: Settings, audience: Arc<dyn Audience>) -> Arc<PushService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
@@ -588,6 +761,8 @@ mod tests {
             provider: None,
             permits: Arc::new(Semaphore::new(IN_FLIGHT)),
             dropped: starling_runtime::Metrics::new().counter("starling_push_dropped"),
+            audience,
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -793,6 +968,166 @@ mod tests {
             Some(&Target::Topic("mumble_server2_channel7".to_owned())),
             "with no registrations at all, the topic is still addressed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_notification_that_names_nobody_reaches_everyone_registered() {
+        // What `text` sends: it knows who is connected, and this service is the
+        // one that knows who is not. Naming the offline recipients would mean
+        // the caller enumerating a table it does not own.
+        let service = service().await;
+        registered(&service, 1, 5, "phone", Vec::new()).await;
+        registered(&service, 1, 6, "tablet", Vec::new()).await;
+
+        let mut request = notification(7, Vec::new());
+        request.skip_accounts = vec![6];
+        let plan = service.plan(1, &request).await;
+
+        assert_eq!(plan.messages.len(), 1, "the connected one is left alone");
+        assert_eq!(
+            plan.messages.first().map(|message| &message.target),
+            Some(&Target::Token("phone".to_owned()))
+        );
+        assert_eq!(plan.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_channel_somebody_may_not_subscribe_to_never_reaches_their_phone() {
+        // The leak this closes: a notification carries the channel and a line
+        // of what was said in it, so without the check, registering a device
+        // would read out the parts of a server you cannot see.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::only([(5, 7)])),
+        )
+        .await;
+        registered(&service, 1, 5, "t", Vec::new()).await;
+
+        assert_eq!(
+            service
+                .plan(1, &notification(7, vec![5]))
+                .await
+                .messages
+                .len(),
+            1,
+            "the channel they may subscribe to still notifies"
+        );
+
+        let elsewhere = service.plan(1, &notification(9, vec![5])).await;
+        assert!(
+            elsewhere.messages.is_empty(),
+            "a channel they may not see must not be announced to them"
+        );
+        assert_eq!(elsewhere.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_live_subscriber_hears_a_channel_they_are_not_sitting_in() {
+        // The fork's `FancySubscribePush`: live delivery without joining and
+        // without a listener, for the channels the subscriber holds
+        // `SubscribePush` in.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::sessions([(9, 4)])),
+        )
+        .await;
+        service.live_subscribe(1, 9, &[]);
+
+        assert_eq!(
+            service.live_subscribers(1, &[4], 0).await,
+            vec![9],
+            "a subscriber with the permission is named"
+        );
+        assert!(
+            service.live_subscribers(1, &[5], 0).await.is_empty(),
+            "a channel they may not subscribe to is not delivered to them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_subscriber_is_never_added_to_their_own_message() {
+        // `subscriber == uSource` in the fork's loop. Without it the sender
+        // gets their own message back twice.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::sessions([(9, 4)])),
+        )
+        .await;
+        service.live_subscribe(1, 9, &[]);
+
+        assert!(service.live_subscribers(1, &[4], 9).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_muted_channel_is_left_out_of_live_delivery_too() {
+        // The same exclusion list the fork keeps on the subscription, and the
+        // reason the message carries one at all.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::sessions([(9, 4), (9, 5)])),
+        )
+        .await;
+        service.live_subscribe(1, 9, &[4]);
+
+        assert!(service.live_subscribers(1, &[4], 0).await.is_empty());
+        assert_eq!(
+            service.live_subscribers(1, &[4, 5], 0).await,
+            vec![9],
+            "one muted channel does not silence a message that also names another"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscription_dies_with_the_session_that_made_it() {
+        // The fork drops it in `connectionClosed` (`Server.cpp:1838`). Session
+        // ids are reused, so one left behind would deliver a private channel to
+        // whoever is handed the number next.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::sessions([(9, 4), (10, 4)])),
+        )
+        .await;
+        service.live_subscribe(1, 9, &[]);
+        service.live_subscribe(1, 10, &[]);
+
+        // Cold: nothing is known, so nothing is thrown away. Forgetting every
+        // subscriber because `session-view` has not answered yet would be the
+        // worse failure.
+        assert_eq!(service.live_subscribers(1, &[4], 0).await.len(), 2);
+
+        use starling_proto_fancy::sessionview::{Session, Sessions, ViewEvent, view_event};
+        let _ = service.roster.apply(ViewEvent {
+            event: Some(view_event::Event::Snapshot(Sessions {
+                sessions: vec![Session {
+                    session: 9,
+                    channel: 4,
+                    ..Session::default()
+                }],
+                ..Sessions::default()
+            })),
+        });
+
+        assert_eq!(
+            service.live_subscribers(1, &[4], 0).await,
+            vec![9],
+            "the session that has gone is dropped, the one still here is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscription_belongs_to_one_server_instance() {
+        // Session ids are per instance. A subscription that leaked across them
+        // would deliver another virtual server's messages to whoever holds the
+        // same number here.
+        let service = with(
+            Settings::murmur_defaults(),
+            Arc::new(Allowed::sessions([(9, 4)])),
+        )
+        .await;
+        service.live_subscribe(2, 9, &[]);
+
+        assert!(service.live_subscribers(1, &[4], 0).await.is_empty());
+        assert_eq!(service.live_subscribers(2, &[4], 0).await, vec![9]);
     }
 
     #[tokio::test]

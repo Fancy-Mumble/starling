@@ -122,6 +122,12 @@ url_ttl = "15m"
 # The key is the file the Firebase console downloads. It names its own project,
 # so `fcm_project` is only needed to override it.
 #
+# Being notified about a channel is a permission, not a consequence of owning a
+# phone: a notification carries the channel and a line of what was said in it.
+# The bit is `SubscribePush`, and like the fork it is NOT in the default grant,
+# so add an ACL entry granting it wherever push should reach people. Without
+# one, devices register and nothing is ever sent to them.
+#
 # `fcm_topic_prefix` is for the other deployment shape: clients subscribe to
 # FCM topics themselves and the server never learns a device token. Then a
 # notification goes to `<prefix>_server<N>_channel<C>` - and, since the server
