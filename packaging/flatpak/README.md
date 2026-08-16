@@ -1,6 +1,6 @@
 # Starling on Flathub
 
-> **Ready to submit.** The manifest pins `v0.2.3`, that tag contains this
+> **Ready to submit.** The manifest pins `v0.2.4`, that tag contains this
 > directory, and `cargo-sources.json` was regenerated from its `Cargo.lock`
 > (verified identical). The one thing left is outside this repository: serve
 > the token at `https://fancy-mumble.com/.well-known/org.flathub.VerifiedApps.txt`
@@ -93,7 +93,7 @@ flatpak run org.flatpak.Builder --user --install-deps-from=flathub \
       Flathub maps the app ID `com.fancy_mumble.Starling` back to the domain
       `fancy-mumble.com` (underscore for hyphen), which is what earns the
       verified badge.
-- [x] Tag to ship: **v0.2.3** (commit `e5d6977`), pinned in the manifest, with
+- [x] Tag to ship: **v0.2.4** (commit `ac64543`), pinned in the manifest, with
       `cargo-sources.json` regenerated from that tag's `Cargo.lock`.
 - [ ] `LICENSE` says MIT and GitHub does not detect it. Worth checking the file
       is where GitHub looks, since Flathub reviewers read the same metadata.
