@@ -115,7 +115,11 @@ pub struct ClientHandle {
     control: mpsc::Sender<Outbound>,
     audio: Arc<Mutex<VecDeque<Outbound>>>,
     audio_wake: Arc<Notify>,
-    audio_capacity: usize,
+    /// How many audio frames may sit buffered, as the operator has it now.
+    ///
+    /// Shared rather than copied per connection, so raising it reaches the
+    /// clients already connected. See `crate::limits`.
+    limits: Arc<crate::limits::Limits>,
     dropped_audio: Arc<AtomicU32>,
     close: Arc<Notify>,
     /// Bytes currently sitting in the control queue.
@@ -131,8 +135,7 @@ pub struct ClientHandle {
     /// operator actually has, "is anybody close to being disconnected for
     /// this", see `Gauge::observe`.
     pressure: Gauge,
-    /// The ceiling those bytes may reach before the client is disconnected.
-    control_budget: usize,
+
     /// Raised when the connection is ending and the writer should flush what
     /// is already queued before the socket goes.
     ///
@@ -224,7 +227,7 @@ impl ClientHandle {
                 // outcome that is both bounded and honest.
                 let len = frame.len();
                 let queued = self.queued_control.load(Ordering::Relaxed);
-                if queued.saturating_add(len) > self.control_budget {
+                if queued.saturating_add(len) > self.limits.control_bytes() {
                     self.pressure.reject();
                     return Err(QueueError::ControlOverflow);
                 }
@@ -247,7 +250,7 @@ impl ClientHandle {
             }
             Lane::Audio => {
                 if let Ok(mut queue) = self.audio.lock() {
-                    while queue.len() >= self.audio_capacity {
+                    while queue.len() >= self.limits.audio_queue() {
                         let _ = queue.pop_front();
                         let _ = self.dropped_audio.fetch_add(1, Ordering::Relaxed);
                     }
@@ -339,12 +342,14 @@ impl ClientHandle {
 pub(crate) fn channel(
     conn: u64,
     token: String,
-    control_queue: usize,
-    audio_queue: usize,
-    control_budget: usize,
+    limits: Arc<crate::limits::Limits>,
     pressure: Gauge,
 ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
-    let (tx, rx) = mpsc::channel(control_queue.max(1));
+    // Read once, here: an `mpsc`'s capacity is fixed when it is created, which
+    // is why `control_queue` takes effect on the next connection rather than
+    // this one. The other two bounds are read per enqueue and so follow the
+    // file under a live connection.
+    let (tx, rx) = mpsc::channel(limits.control_queue());
     let handle = Arc::new(ClientHandle {
         conn,
         session: AtomicU32::new(0),
@@ -355,9 +360,9 @@ pub(crate) fn channel(
         compresses: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         audio: Arc::new(Mutex::new(VecDeque::new())),
         audio_wake: Arc::new(Notify::new()),
-        audio_capacity: audio_queue.max(1),
+
         queued_control: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        control_budget: control_budget.max(1),
+        limits,
         pressure,
         dropped_audio: Arc::new(AtomicU32::new(0)),
         close: Arc::new(Notify::new()),
@@ -497,14 +502,125 @@ mod tests {
         control_queue: usize,
         audio_queue: usize,
     ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
+        with_limits(
+            conn,
+            token,
+            Arc::new(crate::limits::Limits::from_config(
+                &starling_runtime::config::GatewayConfig {
+                    control_queue,
+                    audio_queue,
+                    control_bytes: CONTROL_BYTE_BUDGET,
+                    ..starling_runtime::config::GatewayConfig::default()
+                },
+            )),
+        )
+    }
+
+    /// The same as [`channel`], but reporting into a gauge the caller can read.
+    fn with_limits_and_gauge(
+        conn: u64,
+        token: String,
+        control_queue: usize,
+        audio_queue: usize,
+        gauge: Gauge,
+    ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
         super::channel(
             conn,
             token,
-            control_queue,
-            audio_queue,
-            CONTROL_BYTE_BUDGET,
+            Arc::new(crate::limits::Limits::from_config(
+                &starling_runtime::config::GatewayConfig {
+                    control_queue,
+                    audio_queue,
+                    control_bytes: CONTROL_BYTE_BUDGET,
+                    ..starling_runtime::config::GatewayConfig::default()
+                },
+            )),
+            gauge,
+        )
+    }
+
+    /// The same, over bounds the caller can move while the connection is open.
+    fn with_limits(
+        conn: u64,
+        token: String,
+        limits: Arc<crate::limits::Limits>,
+    ) -> (Arc<ClientHandle>, mpsc::Receiver<Outbound>) {
+        super::channel(
+            conn,
+            token,
+            limits,
             Pressure::new().gauge(CONTROL_QUEUE_GAUGE, control_budget()),
         )
+    }
+
+    #[test]
+    fn raising_the_byte_budget_reaches_a_connection_already_open() {
+        // The incident this exists for: a client is being disconnected for
+        // control overflow, and the operator must be able to widen the lane
+        // without restarting the process holding every other client.
+        use starling_runtime::config::GatewayConfig;
+
+        let limits = Arc::new(crate::limits::Limits::from_config(&GatewayConfig {
+            control_bytes: 64,
+            control_queue: 16,
+            ..GatewayConfig::default()
+        }));
+        let (handle, _rx) = with_limits(1, "tok".to_owned(), Arc::clone(&limits));
+
+        let frame = || Outbound::whole(Bytes::from(vec![0_u8; 128]));
+        assert_eq!(
+            handle.send(Lane::Control, frame()),
+            Err(QueueError::ControlOverflow),
+            "128 bytes must not fit in a 64-byte budget"
+        );
+
+        let _ = limits.adopt(&GatewayConfig {
+            control_bytes: 4096,
+            control_queue: 16,
+            ..GatewayConfig::default()
+        });
+        assert!(
+            handle.send(Lane::Control, frame()).is_ok(),
+            "the same connection must follow the raised budget"
+        );
+    }
+
+    #[test]
+    fn lowering_the_audio_bound_reaches_a_connection_already_open() {
+        use starling_runtime::config::GatewayConfig;
+
+        let limits = Arc::new(crate::limits::Limits::from_config(&GatewayConfig {
+            audio_queue: 4,
+            ..GatewayConfig::default()
+        }));
+        let (handle, _rx) = with_limits(1, "tok".to_owned(), Arc::clone(&limits));
+        for byte in [1_u8, 2, 3, 4] {
+            let _ = handle.send(
+                Lane::Audio,
+                Outbound::whole(Bytes::copy_from_slice(&[byte])),
+            );
+        }
+        assert_eq!(
+            handle.dropped_audio(),
+            0,
+            "four frames fit in a bound of four"
+        );
+
+        let _ = limits.adopt(&GatewayConfig {
+            audio_queue: 2,
+            ..GatewayConfig::default()
+        });
+        let _ = handle.send(Lane::Audio, Outbound::whole(Bytes::copy_from_slice(&[5])));
+        assert_eq!(
+            handle.dropped_audio(),
+            3,
+            "the next push trims to the new bound, dropping the oldest"
+        );
+        assert_eq!(
+            handle.pop_audio().map(|frame| frame.payload),
+            Some(Bytes::copy_from_slice(&[4])),
+            "and keeps the newest, because a late audio frame is worthless"
+        );
     }
 
     #[test]
@@ -622,8 +738,7 @@ mod tests {
         // still connected, about to not be.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
-        let (handle, _rx) =
-            super::channel(1, "tok".to_owned(), 100_000, 4, CONTROL_BYTE_BUDGET, gauge);
+        let (handle, _rx) = with_limits_and_gauge(1, "tok".to_owned(), 100_000, 4, gauge);
         let blob = Bytes::from(vec![0_u8; 128 * 1024]);
 
         while handle
@@ -656,8 +771,7 @@ mod tests {
         // a dashboard that never comes back down is one nobody believes.
         let pressure = Pressure::new();
         let gauge = pressure.gauge(CONTROL_QUEUE_GAUGE, control_budget());
-        let (handle, mut rx) =
-            super::channel(1, "tok".to_owned(), 16, 4, CONTROL_BYTE_BUDGET, gauge);
+        let (handle, mut rx) = with_limits_and_gauge(1, "tok".to_owned(), 16, 4, gauge);
 
         handle
             .send(

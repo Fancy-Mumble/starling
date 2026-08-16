@@ -1,6 +1,7 @@
 //! A bounded in-memory ring buffer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::log::event::LogEvent;
@@ -26,7 +27,13 @@ struct Buffer {
 #[derive(Debug)]
 pub struct MemorySink {
     buffer: Arc<Mutex<Buffer>>,
-    capacity: usize,
+    /// How many records to keep, as the operator has it now.
+    ///
+    /// Shared with the read handle so `logging.memory.records` can be changed
+    /// on a running server, and so that turning the ring off is a capacity of
+    /// zero rather than a sink removed from the tree -- which would leave the
+    /// admin API holding a handle onto a ring nothing writes to any more.
+    capacity: Arc<AtomicUsize>,
 }
 
 /// A read handle onto a [`MemorySink`]'s contents.
@@ -36,6 +43,7 @@ pub struct MemorySink {
 #[derive(Debug, Clone)]
 pub struct MemoryHandle {
     buffer: Arc<Mutex<Buffer>>,
+    capacity: Arc<AtomicUsize>,
 }
 
 impl MemorySink {
@@ -44,7 +52,7 @@ impl MemorySink {
     pub fn new(capacity: usize) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(Buffer::default())),
-            capacity: capacity.max(1),
+            capacity: Arc::new(AtomicUsize::new(capacity)),
         }
     }
 
@@ -53,11 +61,23 @@ impl MemorySink {
     pub fn handle(&self) -> MemoryHandle {
         MemoryHandle {
             buffer: Arc::clone(&self.buffer),
+            capacity: Arc::clone(&self.capacity),
         }
     }
 }
 
 impl MemoryHandle {
+    /// Keep at most `records` from now on. Zero switches the ring off.
+    pub fn set_capacity(&self, records: usize) {
+        self.capacity.store(records, Ordering::Relaxed);
+    }
+
+    /// How many records the ring keeps.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Relaxed)
+    }
+
     /// The most recent records, newest last, at most `limit` of them.
     #[must_use]
     pub fn recent(&self, limit: usize) -> Vec<LogEvent> {
@@ -89,9 +109,19 @@ impl LogSink for MemorySink {
     }
 
     fn write(&mut self, event: &LogEvent) -> Result<(), SinkError> {
+        let capacity = self.capacity.load(Ordering::Relaxed);
         let mut buffer = self.buffer.lock().sink("memory")?;
 
-        if buffer.events.len() == self.capacity {
+        // Zero is "the operator turned the ring off", not "keep one": the ring
+        // is switched off by `logging.memory.enabled`, and a sink that kept a
+        // single record would still be holding one an operator asked it not to.
+        if capacity == 0 {
+            if !buffer.events.is_empty() {
+                buffer.events.clear();
+            }
+            return Ok(());
+        }
+        while buffer.events.len() >= capacity {
             let _ = buffer.events.pop_front();
             buffer.evicted += 1;
         }
@@ -167,13 +197,47 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_capacity_still_holds_one_record() {
-        // A sink that can hold nothing is a NullSink with extra steps; clamping
-        // means a mis-set config degrades rather than silently discarding.
+    fn a_zero_capacity_is_the_ring_switched_off() {
+        // This used to clamp to one, on the argument that a sink holding
+        // nothing is a `NullSink` with extra steps. It is now how
+        // `logging.memory.enabled = false` is expressed, because the admin API
+        // holds this sink's handle for the life of the process and removing the
+        // sink from the tree would leave it reading a ring nothing writes to.
+        // A ring an operator switched off must hold nothing, not one record.
         let mut sink = MemorySink::new(0);
         let handle = sink.handle();
         sink.write(&event(1)).expect("write");
-        assert_eq!(handle.recent(10).len(), 1);
+        assert!(handle.recent(10).is_empty());
+    }
+
+    #[test]
+    fn resizing_the_ring_takes_effect_on_the_next_record() {
+        let mut sink = MemorySink::new(4);
+        let handle = sink.handle();
+        for n in 1..=4 {
+            sink.write(&event(n)).expect("write");
+        }
+        assert_eq!(handle.recent(10).len(), 4);
+
+        handle.set_capacity(2);
+        sink.write(&event(5)).expect("write");
+        assert_eq!(
+            messages(&handle.recent(10)),
+            vec!["event 4", "event 5"],
+            "the ring trims to the new bound, keeping the newest"
+        );
+    }
+
+    #[test]
+    fn switching_the_ring_off_releases_what_it_was_holding() {
+        // Otherwise "off" would still be pinning however many records happened
+        // to be in memory when the operator turned it off.
+        let mut sink = MemorySink::new(4);
+        let handle = sink.handle();
+        sink.write(&event(1)).expect("write");
+        handle.set_capacity(0);
+        sink.write(&event(2)).expect("write");
+        assert!(handle.recent(10).is_empty());
     }
 
     #[test]

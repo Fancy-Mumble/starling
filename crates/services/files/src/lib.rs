@@ -15,7 +15,8 @@ pub mod sign;
 
 pub use sign::{Signature, sign, verify};
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
@@ -51,9 +52,19 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
 pub struct FilesService {
     store: Store,
     secret: Vec<u8>,
-    public_url: String,
-    ttl_ms: u64,
-    max_upload: u64,
+    /// What signed URLs point at, as the operator has it now.
+    ///
+    /// Live, and the most valuable of the three: a `public_url` that is wrong
+    /// -- the wrong scheme behind a new TLS terminator, a hostname that moved,
+    /// a port that a proxy no longer forwards -- hands every client a URL that
+    /// does not resolve, and every one of those is discovered *after* the
+    /// deployment, from users who cannot download anything. Minted per grant,
+    /// so correcting it fixes the next URL rather than the next restart.
+    public_url: RwLock<Arc<str>>,
+    /// How long a signed URL stays valid.
+    ttl_ms: AtomicU64,
+    /// The largest upload that will be signed for.
+    max_upload: AtomicU64,
     fanout: Fanout,
     logger: Logger,
 }
@@ -64,16 +75,60 @@ impl FilesService {
     /// Short-lived and signed rather than a capability that never expires: a
     /// URL that leaks into a log or a chat history should stop working.
     fn grant(&self, method: &str, key: &str) -> SignedUrl {
-        let expires = now_ms() + self.ttl_ms;
+        let expires = now_ms() + self.ttl_ms.load(Ordering::Relaxed);
         let signature = sign(&self.secret, method, key, expires);
         SignedUrl {
             url: format!(
                 "{}/{key}?expires={expires}&sig={signature}",
-                self.public_url.trim_end_matches('/')
+                self.public_url().trim_end_matches('/')
             ),
             expires_at_ms: expires,
             method: method.to_owned(),
         }
+    }
+
+    /// What signed URLs currently point at.
+    fn public_url(&self) -> Arc<str> {
+        match self.public_url.read() {
+            Ok(url) => Arc::clone(&url),
+            // Serving a URL is worth more than a panic here, and the poisoned
+            // value is still the last one an operator set.
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// The largest upload that will be signed for.
+    fn max_upload(&self) -> u64 {
+        self.max_upload.load(Ordering::Relaxed)
+    }
+
+    /// The three keys this service reads from `[services.files]`, resolved.
+    fn settings(service: &starling_runtime::config::ServiceConfig) -> (Arc<str>, u64, u64) {
+        (
+            service
+                .public_url
+                .clone()
+                .unwrap_or_else(|| "http://localhost:8080".to_owned())
+                .into(),
+            service
+                .url_ttl
+                .map_or(900_000, |ttl| ttl.get().as_millis() as u64),
+            service.max_upload.map_or(512 * 1024 * 1024, ByteSize::get),
+        )
+    }
+
+    /// Adopt `[services.files]` as the file now states it.
+    fn adopt(&self, service: &starling_runtime::config::ServiceConfig) {
+        let (public_url, ttl_ms, max_upload) = Self::settings(service);
+        if *self.public_url() != *public_url {
+            match self.public_url.write() {
+                Ok(mut held) => *held = Arc::clone(&public_url),
+                Err(poisoned) => *poisoned.into_inner() = Arc::clone(&public_url),
+            }
+            tracing::info!(public_url = %public_url, "signed URLs now point here");
+        }
+        self.ttl_ms.store(ttl_ms, Ordering::Relaxed);
+        self.max_upload.store(max_upload, Ordering::Relaxed);
     }
 }
 
@@ -86,18 +141,18 @@ impl Files for FilesRpc {
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignedUrl>, Status> {
         let req = request.into_inner();
         let op = sign_request::Op::try_from(req.op).unwrap_or(sign_request::Op::Get);
-        if matches!(op, sign_request::Op::Put) && req.max_bytes > self.0.max_upload {
+        if matches!(op, sign_request::Op::Put) && req.max_bytes > self.0.max_upload() {
             // The client is told, but the operator is the one who can raise the
             // limit, and cannot if the refusal never reaches them.
             self.0.logger.log(
                 LogEvent::notice(Category::Permission, "upload refused: over the size limit")
                     .with("key", req.key.clone())
                     .with("requested", req.max_bytes)
-                    .with("limit", self.0.max_upload),
+                    .with("limit", self.0.max_upload()),
             );
             return Err(Status::invalid_argument(format!(
                 "an upload may be at most {} bytes",
-                self.0.max_upload
+                self.0.max_upload()
             )));
         }
         let method = if matches!(op, sign_request::Op::Put) {
@@ -179,13 +234,13 @@ impl ClientService for FilesService {
 
         let reply = match envelope.body {
             Some(files_envelope::Body::Upload(upload)) => {
-                if upload.size > self.max_upload {
+                if upload.size > self.max_upload() {
                     FilesEnvelope {
                         body: Some(files_envelope::Body::Refused(Refused {
                             request_id: upload.request_id,
                             refusal: Some(Refusal {
                                 kind: refusal::Kind::Limit as i32,
-                                detail: format!("the limit is {} bytes", self.max_upload),
+                                detail: format!("the limit is {} bytes", self.max_upload()),
                                 retry_after_ms: 0,
                             }),
                         })),
@@ -229,20 +284,36 @@ impl Serve for FilesService {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
         let service = ctx.service();
+        let (public_url, ttl_ms, max_upload) = Self::settings(&service);
         Ok(Arc::new(Self {
             store,
             secret: sign::secret(&ctx.config.runtime.data_dir)?,
-            public_url: service
-                .public_url
-                .clone()
-                .unwrap_or_else(|| "http://localhost:8080".to_owned()),
-            ttl_ms: service
-                .url_ttl
-                .map_or(900_000, |ttl| ttl.get().as_millis() as u64),
-            max_upload: service.max_upload.map_or(512 * 1024 * 1024, ByteSize::get),
+            public_url: RwLock::new(public_url),
+            ttl_ms: AtomicU64::new(ttl_ms),
+            max_upload: AtomicU64::new(max_upload),
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
         }))
+    }
+
+    /// Follow `[services.files]`, so a corrected `public_url` reaches the next
+    /// URL minted rather than the next restart.
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let mut configs = ctx.live.subscribe();
+        loop {
+            tokio::select! {
+                () = ctx.shutdown.wait() => return Ok(()),
+                changed = configs.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    let config = Arc::clone(&configs.borrow_and_update());
+                    if let Some(service) = config.services.get(&ctx.name) {
+                        self.adopt(service);
+                    }
+                }
+            }
+        }
     }
 
     fn routes(self: Arc<Self>) -> tonic::service::Routes {
@@ -274,12 +345,75 @@ mod tests {
         Arc::new(FilesService {
             store,
             secret: b"test-secret".to_vec(),
-            public_url: "https://files.example.org".to_owned(),
-            ttl_ms: 900_000,
-            max_upload: 1024,
+            public_url: RwLock::new("https://files.example.org".into()),
+            ttl_ms: AtomicU64::new(900_000),
+            max_upload: AtomicU64::new(1024),
             fanout: Fanout::default(),
             logger: Logger::null(),
         })
+    }
+
+    /// A `[services.files]` block with the three reloadable keys set.
+    fn block(
+        public_url: &str,
+        ttl: &str,
+        max_upload: &str,
+    ) -> starling_runtime::config::ServiceConfig {
+        toml::from_str(&format!(
+            "public_url = {public_url:?}\nurl_ttl = {ttl:?}\nmax_upload = {max_upload:?}\n"
+        ))
+        .expect("a [services.files] block")
+    }
+
+    #[tokio::test]
+    async fn a_corrected_public_url_reaches_the_next_signed_url() {
+        // The failure this exists for: a `public_url` naming the wrong scheme
+        // or a host that moved hands every client a URL that does not resolve,
+        // and it is always discovered from users who cannot download anything.
+        let service = service().await;
+        assert!(
+            service.grant("GET", "k").url.starts_with("https://files.example.org/"),
+            "{}",
+            service.grant("GET", "k").url
+        );
+
+        service.adopt(&block("https://cdn.example.net", "15m", "512MiB"));
+
+        let granted = service.grant("GET", "k");
+        assert!(
+            granted.url.starts_with("https://cdn.example.net/k?"),
+            "the next URL must point at the corrected host, got {}",
+            granted.url
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_ttl_and_upload_ceiling_take_effect_at_once() {
+        let service = service().await;
+        assert_eq!(service.max_upload(), 1024);
+
+        service.adopt(&block("https://files.example.org", "1s", "2KiB"));
+
+        assert_eq!(service.max_upload(), 2048);
+        let granted = service.grant("GET", "k");
+        assert!(
+            granted.expires_at_ms <= now_ms() + 1_000,
+            "a shortened TTL must apply to the next grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_that_states_nothing_returns_the_documented_defaults() {
+        // Removing a line has to mean the layer below it, here the shipped
+        // default, or the file could never express "never mind".
+        let service = service().await;
+        service.adopt(&starling_runtime::config::ServiceConfig::default());
+        assert_eq!(service.max_upload(), 512 * 1024 * 1024);
+        assert!(
+            service.grant("GET", "k").url.starts_with("http://localhost:8080/"),
+            "{}",
+            service.grant("GET", "k").url
+        );
     }
 
     #[tokio::test]

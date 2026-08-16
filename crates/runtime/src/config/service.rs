@@ -162,7 +162,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
-            max_connections: 8,
+            max_connections: crate::storage::DEFAULT_MAX_CONNECTIONS,
         }
     }
 }

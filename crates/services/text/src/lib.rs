@@ -1326,10 +1326,6 @@ impl Serve for TextService {
         store.migrate(SCHEMA).await?;
         store.migrate(scheduled::SCHEMA).await?;
         let settings = Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
-        // Dropped on purpose: these live as long as the process, and a service
-        // whose settings stopped updating would be enforcing yesterday's limit
-        // with nothing to say so.
-        drop(settings.watch(&ctx.instances()));
         ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
             store,
@@ -1354,9 +1350,17 @@ impl Serve for TextService {
         // Started here rather than in `build`, so a service that is only
         // constructed (a test, a config check) never posts anything.
         let deliveries = tokio::spawn(Arc::clone(&self).deliver_loop(ctx.instances()));
+        // Here rather than in `build` for the same reason, and because a
+        // subscription started there had nowhere to be stopped: it is a stream
+        // on `server-config`, which cannot finish its own drain while this
+        // service holds one open.
+        let watchers = self.settings.watch(&ctx.instances());
         ctx.shutdown.wait().await;
         follower.abort();
         deliveries.abort();
+        for watcher in watchers {
+            watcher.abort();
+        }
         Ok(())
     }
 

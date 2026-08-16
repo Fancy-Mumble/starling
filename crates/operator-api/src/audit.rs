@@ -1,9 +1,12 @@
 //! Fail-closed audit for the admin plane.
 //!
 //! Every operator action is recorded, and **a request is refused if it cannot
-//! be recorded**. `audit` is an optional service and the highest-privilege
-//! plane must not depend on one, so `operator-api` writes this record itself
-//! (`docs/ARCHITECTURE.md` §3).
+//! be recorded** unless the operator sets `fail_closed = false`. `audit` is an
+//! optional service and the highest-privilege plane must not depend on one, so
+//! `operator-api` writes this record itself (`docs/ARCHITECTURE.md` §3).
+//!
+//! This type writes and reports; the policy is applied one layer up, in
+//! [`crate::OperatorApi::record`].
 
 use std::io::Write as _;
 use std::sync::Mutex;

@@ -10,7 +10,9 @@
 //! to shut the writer down. None of that is a composition concern.
 
 use crate::log::setup::LogSpec;
-use crate::log::sinks::{ConsoleSink, FanoutSink, FileSink, FilterSink, MemorySink};
+use crate::log::sinks::{
+    ConsoleSink, FanoutSink, FileSink, FilterHandle, FilterSink, MemorySink, SwapHandle, SwapSink,
+};
 use crate::log::{Category, LogEvent, LogSink, Logger, LoggerShutdown, MemoryHandle};
 
 /// The running log: emitter, shutdown handle, and the ring an admin view reads.
@@ -25,6 +27,24 @@ pub struct LogRuntime {
     logger: Logger,
     shutdown: LoggerShutdown,
     recent: Option<MemoryHandle>,
+    handles: LogHandles,
+}
+
+/// Everything about a running log that a reload can change.
+///
+/// Bundled rather than passed one at a time so that adding a reloadable part of
+/// `[logging]` does not change the signature at every composition root, and so
+/// that "what can a reload move" has one answer to read.
+#[derive(Debug, Clone)]
+pub struct LogHandles {
+    /// Severity threshold and category set.
+    pub filter: FilterHandle,
+    /// The log file, or the absence of one.
+    pub file: SwapHandle,
+    /// Console output, or the absence of it.
+    pub console: SwapHandle,
+    /// The in-memory ring the admin view reads.
+    pub memory: MemoryHandle,
 }
 
 impl LogRuntime {
@@ -43,25 +63,45 @@ impl LogRuntime {
         let mut fanout = FanoutSink::new();
         let mut recent = None;
 
-        if spec.console {
-            fanout = fanout.with(Box::new(ConsoleSink::stderr()));
-        }
+        // Behind a slot, and so is the file below: both can then be switched on
+        // by a reload, not merely reconfigured. A conditionally-built branch
+        // leaves nowhere to put one later.
+        let console_sink = SwapSink::new(
+            "console",
+            spec.console.then(|| Box::new(ConsoleSink::stderr()) as Box<dyn LogSink>),
+        );
+        let console = console_sink.handle();
+        fanout = fanout.with(Box::new(console_sink));
 
+        // Always present, even with no file in it, so that `[logging.file]`
+        // can be switched *on* by a reload rather than only reconfigured: a
+        // conditionally-built branch would leave nowhere to put one later.
+        let mut file_slot = None;
         if let Some(file) = &spec.file {
             match FileSink::open(&file.path, file.max_bytes, file.keep) {
-                Ok(sink) => fanout = fanout.with(Box::new(sink)),
+                Ok(sink) => file_slot = Some(Box::new(sink) as Box<dyn LogSink>),
                 Err(e) => warnings.push(format!("file logging disabled: {e}")),
             }
         }
+        let file_sink = SwapSink::new("file", file_slot);
+        let file = file_sink.handle();
+        fanout = fanout.with(Box::new(file_sink));
 
-        if let Some(records) = spec.memory {
-            let sink = MemorySink::new(records.max(1));
-            recent = Some(sink.handle());
-            fanout = fanout.with(Box::new(sink));
+        // Always built, with a capacity of zero when the ring is switched off,
+        // because the admin API holds this handle for the life of the process:
+        // a sink added later would leave it reading a ring nothing writes to.
+        let memory_sink = MemorySink::new(spec.memory.unwrap_or(0));
+        let memory = memory_sink.handle();
+        if spec.memory.is_some() {
+            recent = Some(memory.clone());
         }
+        fanout = fanout.with(Box::new(memory_sink));
 
         let filtered =
             FilterSink::new(Box::new(fanout), spec.level).with_categories(spec.categories.clone());
+        // Taken before the sink is boxed and handed to the writer thread: after
+        // that the filter is owned by another thread and unreachable.
+        let filter = filtered.handle();
         let sink: Box<dyn LogSink> = Box::new(filtered);
 
         let (logger, shutdown) = Logger::spawn(sink, spec.queue.max(1));
@@ -73,6 +113,12 @@ impl LogRuntime {
             logger,
             shutdown,
             recent,
+            handles: LogHandles {
+                filter,
+                file,
+                console,
+                memory,
+            },
         }
     }
 
@@ -101,6 +147,19 @@ impl LogRuntime {
     #[must_use]
     pub fn logger(&self) -> &Logger {
         &self.logger
+    }
+
+    /// Everything a reload can change about the running log.
+    ///
+    /// The whole of `[logging]` except `queue` is reloadable, and for one
+    /// reason: every part of it is something an operator discovers is wrong
+    /// *while the server is running* -- a level too coarse to diagnose with, a
+    /// full disk, a mistyped path, a rotation size far too small -- and none of
+    /// them is worth restarting the process that holds every client's
+    /// connection to fix.
+    #[must_use]
+    pub fn handles(&self) -> LogHandles {
+        self.handles.clone()
     }
 
     /// Reader for the in-memory ring, when one is configured.

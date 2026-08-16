@@ -30,7 +30,12 @@ pub struct GatewayConfig {
     /// it, a late audio frame is worthless.
     pub audio_queue: usize,
 
-    /// Per gRPC call, unless a route overrides it.
+    /// How long the gateway waits on one call to a service before counting it
+    /// as a failure.
+    ///
+    /// The call it bounds is `attach`, which is the only one the gateway makes:
+    /// the dial, the handshake and the response headers. Not the attachment
+    /// that follows, which is a stream and is meant to be long-lived.
     pub default_deadline: HumanDuration,
 
     /// How many consecutive failures trip a service's breaker, and for how

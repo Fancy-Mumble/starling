@@ -12,6 +12,27 @@ use tonic::service::Routes;
 
 use crate::listener::Gateway;
 
+/// Keep every attached service's circuit breaker following `[gateway]`.
+///
+/// A breaker tripping too eagerly sheds traffic nobody meant it to shed, and
+/// that is diagnosed with clients connected; a breaker that never trips leaves
+/// callers waiting out a full deadline on a service that is already down.
+/// Both are corrections an operator makes during the incident.
+fn follow_breakers(ctx: &ServiceContext, gateway: &Arc<Gateway>) {
+    let mut configs = ctx.live.subscribe();
+    let gateway = Arc::clone(gateway);
+    drop(tokio::spawn(async move {
+        while configs.changed().await.is_ok() {
+            let config = Arc::clone(&configs.borrow_and_update());
+            gateway.retune_breakers(&config.gateway);
+            // The routing table too: adding a service to `[services]` is the
+            // three lines the documentation promises, and now not also a
+            // gateway restart.
+            gateway.adopt_services(&config);
+        }
+    }));
+}
+
 /// The gateway, as a startable unit.
 #[derive(Debug)]
 pub struct GatewayService {
@@ -45,9 +66,15 @@ impl Serve for GatewayService {
             ctx.logger.clone(),
         )
         .map_err(|error| ServiceError::service(error.to_string()))?;
-        Ok(Arc::new(Self {
-            gateway: Arc::new(gateway),
-        }))
+        let gateway = Arc::new(gateway);
+        // The queue bounds follow the file from here on: `control_bytes` and
+        // `audio_queue` reach the connections already open, `control_queue` the
+        // next one accepted. See `crate::limits`.
+        crate::limits::follow(&ctx.live, gateway.limits());
+        crate::limiter::follow(&ctx.live, gateway.buckets());
+        follow_breakers(&ctx, &gateway);
+        crate::certs::follow(&ctx.live, gateway.certs(), ctx.logger.clone());
+        Ok(Arc::new(Self { gateway }))
     }
 
     /// No gRPC surface: nothing calls the gateway, the gateway calls everything.

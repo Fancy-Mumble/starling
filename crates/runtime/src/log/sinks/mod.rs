@@ -29,10 +29,12 @@ mod file;
 mod filter;
 mod memory;
 mod null;
+mod swap;
 
 pub use console::ConsoleSink;
 pub use fanout::FanoutSink;
 pub use file::FileSink;
-pub use filter::FilterSink;
+pub use filter::{FilterHandle, FilterSink};
 pub use memory::{MemoryHandle, MemorySink};
 pub use null::NullSink;
+pub use swap::{SwapHandle, SwapSink};

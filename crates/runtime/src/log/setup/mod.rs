@@ -18,7 +18,7 @@ mod runtime;
 mod spec;
 
 pub use config::{ConsoleConfig, FileConfig, LogConfig, MemoryConfig};
-pub use runtime::LogRuntime;
+pub use runtime::{LogHandles, LogRuntime};
 pub use spec::{
     DEFAULT_KEEP_FILES, DEFAULT_MAX_FILE_BYTES, DEFAULT_MEMORY_RECORDS, DEFAULT_QUEUE, FileSpec,
     LogSpec,

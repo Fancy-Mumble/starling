@@ -23,7 +23,8 @@
 //! refused if it cannot be recorded, written by this process rather than
 //! through the `audit` service, because audit is optional and the
 //! highest-privilege plane must not depend on a service the operator may not be
-//! running.
+//! running. `audit.fail_closed = false` trades that refusal for a logged error
+//! and is the operator's decision, not the default.
 
 pub mod audit;
 pub mod auth;
@@ -41,12 +42,24 @@ pub use routes::router;
 
 use std::sync::Arc;
 
+use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
 /// The service.
 #[derive(Debug)]
 pub struct OperatorApi {
-    auth: Arc<dyn Authenticator>,
+    /// How a caller proves who they are, as the operator has it now.
+    ///
+    /// Live, and the reason is the one credential that most needs rotating: a
+    /// static `token` has no expiry and no identity, so the only way to revoke
+    /// one is to replace it. Behind an `RwLock` rather than copied per request,
+    /// because a leaked admin token must stop working *now*, not at the next
+    /// restart of the highest-privilege surface in the system.
+    ///
+    /// The same applies to the scope maps: an identity-provider role that should no longer
+    /// map to `["*"]` is an authorisation withdrawn, and withdrawal that waits
+    /// for a restart is not withdrawal.
+    auth: std::sync::RwLock<Arc<dyn Authenticator>>,
     audit: AuditLog,
     listen: String,
     resolver: starling_runtime::channel::Resolver,
@@ -61,17 +74,97 @@ impl OperatorApi {
     /// [`Refusal`] when the credential is missing, malformed, expired or
     /// carries no scope this deployment maps.
     pub fn identify(&self, header: Option<&str>) -> Result<Identity, Refusal> {
-        self.auth.identify(header)
+        self.authenticator().identify(header)
     }
 
-    /// Record an action, refusing if it cannot be recorded.
+    /// The authentication strategy in force.
+    fn authenticator(&self) -> Arc<dyn Authenticator> {
+        match self.auth.read() {
+            Ok(held) => Arc::clone(&held),
+            // Refusing every request over a poisoned lock would take the admin
+            // plane down; the strategy behind it is still the last one set.
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Adopt `[services.operator-api.auth]` as the file now states it.
+    ///
+    /// A configuration the factory refuses -- a mode named without its block --
+    /// leaves the previous strategy in force and is reported. The alternative,
+    /// falling back to something permissive, would turn a typo into an open
+    /// admin plane.
+    fn adopt_auth(&self, service: &starling_runtime::config::ServiceConfig, logger: &Logger) {
+        match authenticator(service.auth.clone().unwrap_or_default()) {
+            Ok(next) => {
+                match self.auth.write() {
+                    Ok(mut held) => *held = next,
+                    Err(poisoned) => *poisoned.into_inner() = next,
+                }
+                logger.log(LogEvent::notice(
+                    Category::Admin,
+                    "operator authentication reloaded",
+                ));
+            }
+            Err(error) => logger.log(
+                LogEvent::warning(Category::Admin, "operator authentication unchanged")
+                    .with("error", error),
+            ),
+        }
+    }
+
+    /// Record an action, refusing it if it cannot be recorded.
+    ///
+    /// The one place `audit.fail_closed` is read, so every caller can treat an
+    /// error as "refuse this request" and none of them has to know the policy.
     ///
     /// # Errors
     ///
-    /// The I/O error. Fail-closed is the whole contract: an action that cannot
-    /// be recorded does not happen.
+    /// The I/O error, when `fail_closed` is set, which is the default and the
+    /// whole contract: an action that cannot be recorded does not happen. With
+    /// it unset the write still failed and is logged at error, but the request
+    /// is allowed to proceed, an operator's decision to take.
     pub fn record(&self, record: &AuditRecord) -> std::io::Result<()> {
-        self.audit.record(record)
+        match self.audit.record(record) {
+            Ok(()) => Ok(()),
+            Err(error) if self.audit.fail_closed() => Err(error),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    subject = record.subject,
+                    action = record.action,
+                    "an operator action was not recorded and proceeded anyway (audit.fail_closed = false)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether a failure to record refuses the request.
+    ///
+    /// For a caller that needs to describe the policy rather than apply it;
+    /// [`Self::record`] applies it.
+    #[must_use]
+    pub const fn audit_fail_closed(&self) -> bool {
+        self.audit.fail_closed()
+    }
+
+    /// Keep the authentication strategy following the file.
+    ///
+    /// Its own task because `run` is blocked in `axum::serve` for the life of
+    /// the process.
+    fn follow_auth(self: &Arc<Self>, ctx: &ServiceContext) {
+        let mut configs = ctx.live.subscribe();
+        let api = Arc::clone(self);
+        let logger = ctx.logger.clone();
+        let name = ctx.name.clone();
+        drop(tokio::spawn(async move {
+            while configs.changed().await.is_ok() {
+                let service = configs.borrow_and_update().services.get(&name).cloned();
+                if let Some(service) = service {
+                    api.adopt_auth(&service, &logger);
+                }
+            }
+        }));
     }
 
     /// How to reach the services this API calls.
@@ -144,7 +237,7 @@ impl Serve for OperatorApi {
             .map_err(ServiceError::service)?;
         let audit = AuditLog::new(service.audit.clone().unwrap_or_default());
         Ok(Arc::new(Self {
-            auth,
+            auth: std::sync::RwLock::new(auth),
             audit,
             // Localhost unless the operator meant otherwise: this surface wants
             // the opposite exposure to the gateway's.
@@ -174,11 +267,74 @@ impl Serve for OperatorApi {
         // that starts when it asks.
         self.events.spawn_bridges(self.resolver.clone());
         self.spawn_webtransport(&ctx);
+        self.follow_auth(&ctx);
 
         let shutdown = ctx.shutdown.clone();
         axum::serve(listener, router(Arc::clone(&self)))
             .with_graceful_shutdown(async move { shutdown.wait().await })
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use starling_runtime::config::{Config, OperatorAudit, OperatorAuth, TokenAuth};
+
+    /// An API whose audit log cannot be written: the path is a directory.
+    ///
+    /// Nothing here touches the network; only [`OperatorApi::record`] is under
+    /// test.
+    fn api_with_unwritable_audit(fail_closed: bool) -> OperatorApi {
+        let auth = authenticator(OperatorAuth {
+            token: Some(TokenAuth { tokens: vec![] }),
+            ..OperatorAuth::default()
+        })
+        .expect("an empty token set is a valid authenticator");
+
+        OperatorApi {
+            auth: std::sync::RwLock::new(auth),
+            audit: AuditLog::new(OperatorAudit {
+                path: std::path::PathBuf::from("/"),
+                fail_closed,
+            }),
+            listen: "127.0.0.1:0".to_owned(),
+            resolver: starling_runtime::channel::Resolver::new(
+                Arc::new(Config::default()),
+                starling_runtime::inproc::Broker::new(),
+            ),
+            events: EventHub::new(),
+        }
+    }
+
+    fn record() -> AuditRecord {
+        AuditRecord {
+            subject: "token:ADMIN".to_owned(),
+            action: "POST /accounts".to_owned(),
+            outcome: "accepted".to_owned(),
+        }
+    }
+
+    #[test]
+    fn fail_closed_refuses_an_action_that_could_not_be_recorded() {
+        let api = api_with_unwritable_audit(true);
+        assert!(api.audit_fail_closed());
+        assert!(
+            api.record(&record()).is_err(),
+            "the default must refuse: an action that cannot be recorded does not happen"
+        );
+    }
+
+    #[test]
+    fn fail_closed_unset_lets_the_action_proceed() {
+        // The bug this prevents: the key was read by nobody, so an operator who
+        // turned it off still got a 503 the moment the log filled up.
+        let api = api_with_unwritable_audit(false);
+        assert!(!api.audit_fail_closed());
+        assert!(
+            api.record(&record()).is_ok(),
+            "with fail_closed unset the write still failed, but the request proceeds"
+        );
     }
 }

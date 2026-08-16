@@ -617,7 +617,6 @@ impl Serve for AuditService {
         store.migrate(SCHEMA).await?;
         let settings =
             starling_runtime::Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone());
-        drop(settings.watch(&ctx.instances()));
         Ok(Arc::new(Self {
             store,
             fanout: Fanout::default(),
@@ -635,8 +634,15 @@ impl Serve for AuditService {
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let scopes = ctx.instances();
         let sweeper = tokio::spawn(Arc::clone(&self).sweep_forever(scopes));
+        // Here rather than in `build`, where there was nowhere to stop it: the
+        // subscription is a stream on `server-config`, and that service cannot
+        // finish its own drain while this one holds a stream open into it.
+        let watchers = self.settings.watch(&ctx.instances());
         ctx.shutdown.wait().await;
         sweeper.abort();
+        for watcher in watchers {
+            watcher.abort();
+        }
         Ok(())
     }
 

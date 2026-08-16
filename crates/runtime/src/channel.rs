@@ -17,12 +17,22 @@ use tonic::transport::Channel;
 
 use crate::config::Config;
 use crate::inproc::{Broker, BrokerError};
+use crate::live::ConfigCell;
 use crate::transport::{self, Transport};
 
 /// Resolves service names to channels, and remembers the result.
 #[derive(Debug, Clone)]
 pub struct Resolver {
+    /// The configuration this resolver was built with.
+    ///
+    /// Endpoints are read from here and **not** from [`Self::live`], on
+    /// purpose: the channel cache below is never invalidated, so a re-pointed
+    /// endpoint would be read but not dialled. Reading it live would make a
+    /// restart-only key look as though it had taken effect, which is exactly
+    /// the failure the classification table exists to prevent.
     config: Arc<Config>,
+    /// The configuration as it now reads, for the deployment-wide sizes.
+    live: ConfigCell,
     broker: Broker,
     all_in_one: bool,
     cache: Arc<Mutex<HashMap<String, Channel>>>,
@@ -60,11 +70,23 @@ impl Resolver {
     pub fn new(config: Arc<Config>, broker: Broker) -> Self {
         let all_in_one = config.runtime.all_in_one;
         Self {
+            live: ConfigCell::fixed(Arc::clone(&config)),
             config,
             broker,
             all_in_one,
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Read the deployment-wide sizes from `cell` rather than from the
+    /// configuration this resolver was built with.
+    ///
+    /// Only the sizes: see the note on [`Self::config`] for why endpoints stay
+    /// where they are.
+    #[must_use]
+    pub fn following(mut self, cell: ConfigCell) -> Self {
+        self.live = cell;
+        self
     }
 
     /// How `service` is **dialled**, after the all-in-one short-circuit.
@@ -148,7 +170,7 @@ impl Resolver {
         // asks for 8 GiB gets the largest message it can address, which is
         // already more than it can allocate. Nothing is served by failing the
         // dial over the arithmetic.
-        usize::try_from(self.config.runtime.max_tree_message.get()).unwrap_or(usize::MAX)
+        usize::try_from(self.live.current().runtime.max_tree_message.get()).unwrap_or(usize::MAX)
     }
 
     /// The gateway's per-client control budget, for services that answer a
@@ -161,7 +183,7 @@ impl Resolver {
     /// disagree with the gateway about when a client dies.
     #[must_use]
     pub fn control_bytes(&self) -> usize {
-        self.config.gateway.control_bytes
+        self.live.current().gateway.control_bytes
     }
 
     fn cached(&self, service: &str) -> Result<Option<Channel>, ChannelError> {

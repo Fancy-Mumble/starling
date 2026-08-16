@@ -43,6 +43,29 @@ impl Severity {
         }
     }
 
+    /// Its position in [`Self::ALL`], for packing into an atomic.
+    ///
+    /// The log's threshold is shared with the writer thread and changed while
+    /// it runs (`logging.level` is reloadable), and an enum cannot live in an
+    /// `AtomicU8` on its own.
+    #[must_use]
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Debug => 0,
+            Self::Info => 1,
+            Self::Notice => 2,
+            Self::Warning => 3,
+            Self::Error => 4,
+            Self::Critical => 5,
+        }
+    }
+
+    /// The severity [`Self::index`] produced, or `None` for anything else.
+    #[must_use]
+    pub fn from_index(index: u8) -> Option<Self> {
+        Self::ALL.get(index as usize).copied()
+    }
+
     /// Parse a severity name, case-insensitively.
     ///
     /// Kept as an inherent method because [`FromStr`](std::str::FromStr) is the
@@ -86,6 +109,17 @@ impl std::str::FromStr for Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_index_round_trips_and_matches_the_ordering() {
+        // The atomic the live threshold lives in stores this number, so an
+        // index that disagreed with `ALL` would silently change the level.
+        for (position, severity) in Severity::ALL.iter().enumerate() {
+            assert_eq!(severity.index() as usize, position);
+            assert_eq!(Severity::from_index(severity.index()), Some(*severity));
+        }
+        assert_eq!(Severity::from_index(u8::MAX), None);
+    }
 
     #[test]
     fn severities_order_from_least_to_most_urgent() {

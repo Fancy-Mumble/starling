@@ -102,7 +102,7 @@ Starling splits them, because they have different lifetimes:
 | Examples | endpoints, listen ports, TLS paths, storage URLs, tiers, routes | `max_users`, `welcome_text`, `password`, `max_bandwidth`, `message_limit`, `allow_html`, `cert_required`, `allow_ping`, `registry_*` |
 | Written in | the file, at any level | `[instances.settings]`, or the admin UI |
 | Changed by | editing the file | an operator, at runtime, like murmur |
-| Takes effect | on restart | immediately, republished to subscribers |
+| Takes effect | on `SIGHUP`, or on restart -- see [Reloading](#reloading) | immediately, republished to subscribers |
 | Scope | the process | per server instance |
 
 Anything that needs a restart anyway is read once at startup and injected at
@@ -131,6 +131,114 @@ snapshot, so a setting nobody has touched keeps following the file. Change
 A row written before this was recorded keeps all of its settings, so an upgrade
 changes nothing.
 
+## Reloading
+
+Send a running process **`SIGHUP`** and it re-reads its configuration file, the
+`include` tree and the environment, exactly as a boot does:
+
+```sh
+systemctl reload starling            # or: kill -HUP $(pidof starling)
+kubectl exec deploy/starling -- kill -HUP 1
+```
+
+**A reload either takes effect completely or changes nothing.** The file is
+parsed and validated first -- an unknown key, an `include` that cannot be
+followed, a routing table two services would both answer for -- and only then is
+anything applied. A file that does not load leaves the running server exactly as
+it was, and says so. There is no half-applied state, which is what makes
+`SIGHUP` safe to send to a server full of clients.
+
+What changed is recorded, by name and by class:
+
+```json
+{"message":"configuration reloaded","revision":"3f2a91c0b8d14e77",
+ "applied":"gateway.limits.signalling.burst, logging.level",
+ "next_connection":"gateway.control_queue",
+ "pending_restart":"gateway.listen_tcp"}
+```
+
+`revision` is a digest of the whole merged configuration. Two processes
+reporting the same revision are running the same configuration, so a fleet
+mid-reload is visible rather than inferred.
+
+A process started with no file -- `--all-in-one` on the built-in defaults --
+reports that there is nothing to re-read rather than silently doing nothing.
+`SIGHUP` does not exist on Windows.
+
+### What a reload reaches
+
+**Everything in `[logging]` except `queue`.** The level, the categories, the
+console, the in-memory ring, and the log file with its rotation size and
+generations -- including switching file logging on or off, which needs no file
+to have been configured at boot. Raising the level to `debug` is what an
+operator does *because* something is going wrong now, and the restart it used to
+need destroyed the state being investigated. `queue` is the writer thread's
+channel depth, fixed when that thread started.
+
+**The gateway's tuning, on connections already open.** `control_bytes` and
+`audio_queue` are read on every enqueue, so widening the control lane rescues
+clients being disconnected for overflow *now*, rather than after a restart that
+would disconnect all of them. Every `[gateway.limits]` bucket re-tunes the same
+way -- the bucket that ate a screen share's SDP offer is diagnosed on a live
+server. The circuit-breaker numbers likewise, keeping the failures already
+counted.
+
+Two caveats worth stating plainly. `control_queue` sizes a channel created when
+a client is accepted, so it applies to **connections from then on**, and is
+reported separately for that reason. And re-tuning a rate limit never hands back
+tokens already spent, so a reload cannot be used to refill anybody's bucket.
+
+**The certificate, at the next handshake.** `[gateway.tls]` is re-read on every
+reload rather than only when the paths change, because cert-manager and Let's
+Encrypt renew *in place*: the filenames stay and the bytes change. A pair that
+cannot be read leaves the working certificate in force. Renewing with the same
+key keeps the fingerprint clients pin; rotating to a new key is a client-visible
+event whatever the server does.
+
+**The routing table.** Adding a service to `[services]` is the three lines in
+[Adding a service](#adding-a-service), and no longer a gateway restart either:
+the gateway swaps its table, attaches to what is new, detaches from what is
+gone, and re-tiers the rest. A service whose breaker has tripped is left alone
+-- this reconciles the table against the file, and a breaker doing its job is
+not a reason to lose the failure count that says so.
+
+**`[instances.settings]`.** The operational layer follows the file for every
+setting no operator has changed at run time, republished to every subscriber in
+the fleet. The precedence in [Which wins](#which-wins) is unchanged: what an
+operator set through the admin UI still outranks the file, and adopting the file
+claims nothing, so the next edit lands too.
+
+**`[services.operator-api.auth]`.** The admin plane rebuilds its strategy, which
+is the only way to revoke a static `token`: it has no expiry and no identity, so
+replacing it *is* revocation, and revocation that waits for a restart is not
+revocation. A configuration the factory refuses leaves the previous strategy in
+force rather than falling back to something permissive.
+
+**`runtime.max_tree_message`**, and **`[services.files]`**'s `public_url`,
+`url_ttl` and `max_upload`. A `public_url` naming a scheme or host that moved
+hands every client a URL that does not resolve, and that is always discovered
+afterwards, from users who cannot download anything.
+
+### What a reload does not reach
+
+Reported by name as `pending_restart`, never silently ignored:
+
+| | Why |
+|---|---|
+| `gateway.listen_tcp`, `services.*.{bind,listen,udp_listen}`, `services.*.webtransport.*` | a bound socket |
+| `services.*.endpoint` | technically reloadable, and deliberately not: the channel cache is never evicted, so a re-pointed endpoint would be read and not dialled -- and a fleet half-way through re-pointing a service is the disagreement the Helm `checksum/config` annotation exists to prevent |
+| `services.*.storage.*` | a pool's size is fixed when the pool is built, and moving a database under a live service is a different operation from reloading a file |
+| `runtime.{all_in_one,data_dir}` | the process topology, and every file already opened from it |
+| `[telemetry]` | the tracing subscriber and the metrics socket are installed once per process |
+| `logging.queue` | the writer thread's channel depth |
+| `instances.*.{id,name,port}` | `id` shards every stored row, `port` is a socket, and the root channel's name is stored in the database after first boot and changed by renaming the channel |
+| `services.*.options.*` | one row covering fourteen keys with different answers -- `directory`'s `trust_store` and `push`'s notification switches would follow a reload, `screenshare`'s `media_port` is a bound socket, `session-lifecycle`'s `max_users` sizes a pre-allocated id pool. Held together and refused conservatively until they are separated per service |
+| `gateway.resume.*` | the replay ring is sized when the store is built |
+
+`SIGHUP` is not a way to reach a state startup would refuse: the same validation
+runs, so a reload cannot leave a gateway with an empty routing table or two
+services claiming one wire type.
+
 ## Environment variables
 
 Every key has one, so a Kubernetes `ConfigMap` needs no templating and
@@ -147,7 +255,7 @@ Every key has one, so a Kubernetes `ConfigMap` needs no templating and
 listen_tcp       = "0.0.0.0:64738"   # control plane; TLS terminates here
 control_queue    = 4096              # per client. Full -> disconnect that client
 control_bytes    = 4194304           # per client, 4 MiB. Raise for heavy channel artwork
-default_deadline = "5s"              # per gRPC call unless a route overrides it
+default_deadline = "5s"              # a service that has not answered by here has failed
 
 [gateway.tls]
 cert = "/etc/starling/tls/cert.pem"
@@ -268,6 +376,9 @@ fail_closed = true                 # cannot record it -> it does not happen
 `operator-api` writes this record itself rather than calling the `audit` service,
 because audit is optional and the highest-privilege plane must not depend on a
 service the operator may not be running.
+
+With `fail_closed = false` a request whose record could not be written proceeds
+anyway, and the failed write is logged at error. Restart to change it.
 
 ## A service
 
@@ -403,7 +514,8 @@ max_connections = 16
 url = "sqlite:///var/lib/starling/userdata.db"
 ```
 
-In-memory SQLite is capped to one connection automatically: five connections to
+`max_connections` defaults to 8 and is the pool the service actually gets.
+In-memory SQLite is capped to one connection regardless: five connections to
 `:memory:` are five different databases.
 
 ## Observability

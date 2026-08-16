@@ -11,8 +11,8 @@
 //! seen is worse than the silence they were built against.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use starling_runtime::config::LimitConfig;
 use starling_runtime::ratelimit::{Rate, TokenBucket};
@@ -20,6 +20,82 @@ use starling_runtime::ratelimit::{Rate, TokenBucket};
 /// The bucket every route falls back to, and the one murmur's `messagelimit`
 /// is about.
 pub const CONTROL: &str = "control";
+
+/// The `[gateway.limits]` table an operator can change while the server runs.
+///
+/// Every bucket, not just `control`: the one that ate a screen share's SDP
+/// offer was `signalling`, and the operator diagnosing that has a server full
+/// of clients whose sessions a restart would end.
+///
+/// Read on the frame path by every connection, so the check is a relaxed load
+/// of a generation counter and the map behind it is touched only when that
+/// number moves. A mutex per frame would put every client's traffic behind one
+/// another for a table that changes about as often as the file does.
+#[derive(Debug, Default)]
+pub struct LiveBuckets {
+    generation: AtomicU64,
+    table: Mutex<BTreeMap<String, LimitConfig>>,
+}
+
+impl LiveBuckets {
+    /// The table `config` states, at generation zero.
+    #[must_use]
+    pub fn new(config: &BTreeMap<String, LimitConfig>) -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            table: Mutex::new(config.clone()),
+        }
+    }
+
+    /// Publish `config`, and say whether it differed from what was there.
+    pub fn set(&self, config: &BTreeMap<String, LimitConfig>) -> bool {
+        let mut table = match self.table.lock() {
+            Ok(table) => table,
+            // Rate limiting must not take the process down over a poisoned
+            // lock; the same rule the pressure registry follows.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *table == *config {
+            return false;
+        }
+        table.clone_from(config);
+        // Released after the write, so a reader that sees the new generation
+        // sees the new table.
+        let _ = self.generation.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// Which revision of the table is published.
+    #[must_use]
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// A copy of the published table.
+    #[must_use]
+    fn snapshot(&self) -> BTreeMap<String, LimitConfig> {
+        match self.table.lock() {
+            Ok(table) => table.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// Keep `buckets` following `[gateway.limits]` in `cell`.
+pub fn follow(cell: &starling_runtime::live::ConfigCell, buckets: Arc<LiveBuckets>) {
+    let mut configs = cell.subscribe();
+    drop(tokio::spawn(async move {
+        while configs.changed().await.is_ok() {
+            let changed = {
+                let config = configs.borrow_and_update();
+                buckets.set(&config.gateway.limits)
+            };
+            if changed {
+                tracing::info!("gateway rate-limit buckets changed");
+            }
+        }
+    }));
+}
 
 /// What to do with a frame that has just arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,22 +162,27 @@ pub struct Limiter {
     /// What was last applied from `live`, so an unchanged setting is not
     /// re-applied on every frame.
     applied: Option<LimitConfig>,
+    /// The `[gateway.limits]` table as the file now states it, shared.
+    table: Arc<LiveBuckets>,
+    /// Which revision of that table this connection has adopted.
+    generation: u64,
 }
 
 impl Limiter {
     /// A limiter with the configured buckets, all full.
     #[must_use]
     pub fn new(config: &BTreeMap<String, LimitConfig>, now_ms: u64) -> Self {
-        Self::live(config, now_ms, Arc::new(MessageLimit::default()))
+        Self::live(
+            &Arc::new(LiveBuckets::new(config)),
+            now_ms,
+            Arc::new(MessageLimit::default()),
+        )
     }
 
     /// The same, following `live` for the control bucket.
     #[must_use]
-    pub fn live(
-        config: &BTreeMap<String, LimitConfig>,
-        now_ms: u64,
-        live: Arc<MessageLimit>,
-    ) -> Self {
+    pub fn live(table: &Arc<LiveBuckets>, now_ms: u64, live: Arc<MessageLimit>) -> Self {
+        let config = table.snapshot();
         let buckets = config
             .iter()
             .map(|(name, limit)| {
@@ -113,10 +194,45 @@ impl Limiter {
             .collect();
         Self {
             buckets,
-            config: config.clone(),
+            config,
             live,
             applied: None,
+            table: Arc::clone(table),
+            generation: table.generation(),
         }
+    }
+
+    /// Adopt a changed `[gateway.limits]` table.
+    ///
+    /// Costs one relaxed load per frame in the common case, where the operator
+    /// has changed nothing and the generation has not moved.
+    fn follow_buckets(&mut self, now_ms: u64) {
+        let generation = self.table.generation();
+        if generation == self.generation {
+            return;
+        }
+        self.generation = generation;
+        self.config = self.table.snapshot();
+        // Retune what exists and create what is new, rather than rebuilding the
+        // map: a client mid-burst keeps the tokens it has already spent, so a
+        // reload cannot be used -- accidentally or otherwise -- to refill every
+        // bucket on the server.
+        for (name, limit) in &self.config {
+            match self.buckets.get_mut(name) {
+                Some(bucket) => bucket.retune(limit.rate, limit.burst),
+                None => {
+                    let _ = self.buckets.insert(
+                        name.clone(),
+                        TokenBucket::new(limit.rate, limit.burst, now_ms),
+                    );
+                }
+            }
+        }
+        self.buckets
+            .retain(|name, _| self.config.contains_key(name));
+        // The operator's run-time `message_limit` outranks the file, so it is
+        // re-asserted on the next charge to the control bucket.
+        self.applied = None;
     }
 
     /// Charge one frame to `bucket`.
@@ -126,6 +242,7 @@ impl Limiter {
     /// silently rate-limiting everything to zero would be a far worse failure
     /// than not limiting it at all. It is logged once by the caller.
     pub fn check(&mut self, bucket: &str, now_ms: u64) -> Verdict {
+        self.follow_buckets(now_ms);
         if bucket == CONTROL {
             self.follow_live();
         }
@@ -238,7 +355,8 @@ mod tests {
         // murmur's `setLiveConf` does and what a per-connection bucket built at
         // connect time cannot.
         let live = Arc::new(MessageLimit::default());
-        let mut limiter = Limiter::live(&config(), 0, Arc::clone(&live));
+        let mut limiter =
+            Limiter::live(&Arc::new(LiveBuckets::new(&config())), 0, Arc::clone(&live));
 
         // The TOML's burst of 5, and then throttled.
         for _ in 0..5 {
@@ -272,7 +390,8 @@ mod tests {
         // flooding, and the limit has to bite now rather than at its next
         // reconnect.
         let live = Arc::new(MessageLimit::default());
-        let mut limiter = Limiter::live(&config(), 0, Arc::clone(&live));
+        let mut limiter =
+            Limiter::live(&Arc::new(LiveBuckets::new(&config())), 0, Arc::clone(&live));
         live.set(1.0, 1);
         assert_eq!(limiter.check(CONTROL, 0), Verdict::Allow);
         assert!(
@@ -282,11 +401,130 @@ mod tests {
     }
 
     #[test]
+    fn a_reloaded_bucket_reaches_a_connection_already_open() {
+        // The bucket that ate a screen share's SDP offer was `signalling`, and
+        // the operator widening it has a server full of connected clients.
+        let table = Arc::new(LiveBuckets::new(&config()));
+        let mut limiter = Limiter::live(&table, 0, Arc::new(MessageLimit::default()));
+
+        // Drain `control`: the TOML fixture allows a burst of 5.
+        for _ in 0..5 {
+            assert_eq!(limiter.check(CONTROL, 0), Verdict::Allow);
+        }
+        assert!(matches!(
+            limiter.check(CONTROL, 0),
+            Verdict::Throttle { .. }
+        ));
+
+        let mut widened = config();
+        let _ = widened.insert(
+            CONTROL.to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(100.0),
+                burst: 100,
+            },
+        );
+        assert!(table.set(&widened), "the table changed");
+
+        // 10 ms later. At the widened 100/s that is a whole token; at the
+        // fixture's 1/s it would be a hundredth of one, so this assertion is
+        // the rate change reaching a connection that never reconnected.
+        //
+        // Note what it is *not*: the tokens already spent stay spent. `retune`
+        // raises the ceiling and the refill rate, it does not hand anything
+        // back -- otherwise a SIGHUP loop would be a way to bypass rate
+        // limiting entirely.
+        assert_eq!(
+            limiter.check(CONTROL, 10),
+            Verdict::Allow,
+            "the same connection must follow the widened bucket"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_table_does_not_refill_anybodys_bucket() {
+        // Otherwise a reload -- or a SIGHUP loop -- would be a way to bypass
+        // rate limiting entirely, by handing every client a full bucket.
+        let table = Arc::new(LiveBuckets::new(&config()));
+        let mut limiter = Limiter::live(&table, 0, Arc::new(MessageLimit::default()));
+        for _ in 0..5 {
+            assert_eq!(limiter.check(CONTROL, 0), Verdict::Allow);
+        }
+
+        assert!(!table.set(&config()), "nothing changed");
+        assert!(
+            matches!(limiter.check(CONTROL, 0), Verdict::Throttle { .. }),
+            "an unchanged table must not refill the bucket"
+        );
+    }
+
+    #[test]
+    fn a_reload_does_not_refill_a_bucket_it_merely_retuned() {
+        // The tokens already spent stay spent: `retune` changes the rate and
+        // the ceiling, it does not hand back what was taken.
+        let table = Arc::new(LiveBuckets::new(&config()));
+        let mut limiter = Limiter::live(&table, 0, Arc::new(MessageLimit::default()));
+        for _ in 0..5 {
+            assert_eq!(limiter.check(CONTROL, 0), Verdict::Allow);
+        }
+
+        let mut same_burst_slower = config();
+        let _ = same_burst_slower.insert(
+            CONTROL.to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(0.5),
+                burst: 5,
+            },
+        );
+        assert!(table.set(&same_burst_slower));
+        assert!(
+            matches!(limiter.check(CONTROL, 0), Verdict::Throttle { .. }),
+            "a retune must not refill"
+        );
+    }
+
+    #[test]
+    fn the_operators_message_limit_still_outranks_a_reloaded_file() {
+        // Precedence is unchanged by the file becoming live: what an operator
+        // set through the admin plane wins over `[gateway.limits.control]`.
+        // Asserted through the wait a throttled client is told to observe,
+        // which is the one number that names the rate actually in force.
+        let table = Arc::new(LiveBuckets::new(&config()));
+        let live = Arc::new(MessageLimit::default());
+        let mut limiter = Limiter::live(&table, 0, Arc::clone(&live));
+        live.set(50.0, 50);
+
+        let mut narrowed = config();
+        let _ = narrowed.insert(
+            CONTROL.to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(1.0),
+                burst: 1,
+            },
+        );
+        assert!(table.set(&narrowed));
+
+        // Drain whatever is there, then read the wait off the refusal.
+        let mut verdict = limiter.check(CONTROL, 0);
+        for _ in 0..64 {
+            if matches!(verdict, Verdict::Throttle { .. }) {
+                break;
+            }
+            verdict = limiter.check(CONTROL, 0);
+        }
+        assert_eq!(
+            verdict,
+            Verdict::Throttle { retry_after_ms: 20 },
+            "20 ms is one token at the operator's 50/s; the file's 1/s would say 1000"
+        );
+    }
+
+    #[test]
     fn an_unset_message_limit_leaves_the_deployments_own_numbers_alone() {
         // A `server-config` that comes up with its defaults must not silently
         // reset a `control` bucket the deployment deliberately tuned.
         let live = Arc::new(MessageLimit::default());
-        let mut limiter = Limiter::live(&config(), 0, live);
+        let mut limiter = Limiter::live(&Arc::new(LiveBuckets::new(&config())), 0, live);
         for _ in 0..5 {
             assert_eq!(limiter.check(CONTROL, 0), Verdict::Allow);
         }
@@ -301,7 +539,8 @@ mod tests {
         // `messagelimit` is murmur's control-message limit. Applying it to the
         // audio bucket would throttle a call off the air.
         let live = Arc::new(MessageLimit::default());
-        let mut limiter = Limiter::live(&config(), 0, Arc::clone(&live));
+        let mut limiter =
+            Limiter::live(&Arc::new(LiveBuckets::new(&config())), 0, Arc::clone(&live));
         live.set(1.0, 1);
         let _ = limiter.check(CONTROL, 0);
         for _ in 0..20 {

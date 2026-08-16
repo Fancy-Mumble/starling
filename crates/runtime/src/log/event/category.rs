@@ -37,7 +37,33 @@ impl Category {
         Self::Admin,
     ];
 
-    /// Lower-case name, as it appears in output and config.
+    /// Its position in [`Self::ALL`], for packing a set into a bitmask.
+    ///
+    /// The log's category filter is shared with the writer thread and changed
+    /// while it runs (`logging.categories` is reloadable). A `HashSet` behind a
+    /// mutex would be a lock acquisition on the path every record takes; eight
+    /// categories fit in a `u16` with room to spare.
+    #[must_use]
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Server => 0,
+            Self::Session => 1,
+            Self::Channel => 2,
+            Self::Message => 3,
+            Self::Permission => 4,
+            Self::Security => 5,
+            Self::Plugin => 6,
+            Self::Admin => 7,
+        }
+    }
+
+    /// The bit this category occupies in a category mask.
+    #[must_use]
+    pub fn bit(self) -> u16 {
+        1 << self.index()
+    }
+
+    /// Lower-case name, as it appears in config and output.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -112,6 +138,23 @@ mod tests {
     fn an_unknown_name_reports_none_rather_than_guessing() {
         assert_eq!(Category::from_name("biscuits"), None);
         assert_eq!(Category::from_name(""), None);
+    }
+
+    #[test]
+    fn an_index_round_trips_and_every_category_gets_its_own_bit() {
+        // The mask the live category filter lives in is a `u16`; two categories
+        // sharing a bit would silently filter one of them with the other.
+        let mut seen = 0_u16;
+        for (position, category) in Category::ALL.iter().enumerate() {
+            assert_eq!(category.index() as usize, position);
+            assert_eq!(seen & category.bit(), 0, "{category:?} reuses a bit");
+            seen |= category.bit();
+        }
+        assert!(
+            Category::ALL.len() <= 16,
+            "a u16 mask cannot hold {} categories",
+            Category::ALL.len()
+        );
     }
 
     #[test]

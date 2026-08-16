@@ -44,6 +44,7 @@ use starling_proto_fancy::serverconfig::server_config_server::{
 };
 use starling_proto_fancy::serverconfig::{GetRequest, SetRequest, Snapshot};
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::config::Config;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
@@ -134,6 +135,63 @@ impl ServerConfigService {
             tracing::error!(%error, "could not persist a configuration change");
         }
         let _ = self.updates.send(snapshot);
+    }
+
+    /// Re-apply `[instances.settings]` after the deployment file was reloaded.
+    ///
+    /// The same three layers as [`starting_point`], recomputed: murmur's
+    /// defaults, then the file as it now reads, then back on top whatever the
+    /// operator has set at run time. The middle layer is the only one that
+    /// moved, and the third still wins, so editing the file changes exactly
+    /// what nobody has touched -- which is what the boot path already promises
+    /// and what an operator plainly means by editing it.
+    ///
+    /// Published with **no** claimed fields: a value arriving from the file is
+    /// not an operator's decision, and recording it as one would freeze it
+    /// against every later edit of that file.
+    async fn adopt_file(&self, config: &Config, scopes: &[u32]) {
+        for scope in scopes {
+            let Some(instance) = config.instances.iter().find(|i| i.id == *scope) else {
+                // The file no longer mentions this instance. Its settings are
+                // left exactly as they are: `[[instances]]` needs a restart to
+                // add or remove one, so acting here would apply half of a
+                // change whose other half cannot happen yet.
+                continue;
+            };
+            let current = self.snapshot(*scope).await;
+            let owned: Vec<String> = self
+                .owned
+                .read()
+                .await
+                .get(scope)
+                .map(|owned| owned.iter().cloned().collect())
+                .unwrap_or_default();
+
+            // A row written before the `owned` column existed carries no record
+            // of which fields an operator chose, so all of them are treated as
+            // theirs and the file may not reach any of them.
+            if owned.iter().any(|field| field == ALL_FIELDS) {
+                continue;
+            }
+
+            let mut rebuilt = defaults(*scope);
+            let named = instance.settings.overlay(&mut rebuilt);
+            // Not an operator write, so the counter the gateway reads to tell
+            // "nobody has set this" from "somebody set it to zero" must not
+            // move (`crates/gateway/src/listener.rs`).
+            rebuilt.version = current.version;
+            apply_fields(&mut rebuilt, &current, &owned);
+
+            if rebuilt == current {
+                continue;
+            }
+            tracing::info!(
+                scope,
+                settings = named.join(", "),
+                "adopting settings from the reloaded file"
+            );
+            self.publish(rebuilt, &[]).await;
+        }
     }
 }
 
@@ -336,6 +394,32 @@ impl Serve for ServerConfigService {
             .add_service(ServerConfigServer::new(ConfigRpc(Arc::clone(&self))))
             .add_service(plane)
     }
+
+    /// Follow the deployment file, so `[instances.settings]` is live.
+    ///
+    /// This service is where the two configuration layers meet, which makes it
+    /// the only place a file edit can reach the operational half without a
+    /// restart: the snapshot it republishes is the one every subscriber in the
+    /// fleet already caches, so one SIGHUP here changes `max_users` everywhere
+    /// that reads it.
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let scopes = ctx.instances();
+        let mut configs = ctx.live.subscribe();
+        loop {
+            tokio::select! {
+                () = ctx.shutdown.wait() => return Ok(()),
+                changed = configs.changed() => {
+                    if changed.is_err() {
+                        // The cell outlives every service in practice; if it
+                        // did not, there is nothing further to follow.
+                        return Ok(());
+                    }
+                    let config = Arc::clone(&configs.borrow_and_update());
+                    self.adopt_file(&config, &scopes).await;
+                }
+            }
+        }
+    }
 }
 
 /// The settings `scope` starts with, and which of them the operator owns.
@@ -400,6 +484,224 @@ mod tests {
             store: None,
             fanout: Fanout::default(),
         })
+    }
+
+    /// A config whose `[instances.settings]` for server 1 is `settings`.
+    fn config_with(settings: starling_runtime::config::ServerSettings) -> Config {
+        use starling_runtime::config::Instance;
+
+        let mut config = Config::with_defaults(std::path::Path::new("/run/starling"));
+        config.instances = vec![Instance {
+            settings,
+            ..Instance::default()
+        }];
+        config
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_file_reaches_a_setting_nobody_has_touched() {
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        service.publish(defaults(1), &[]).await;
+        assert_ne!(service.snapshot(1).await.max_users, 20);
+
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    max_users: Some(20),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+
+        assert_eq!(service.snapshot(1).await.max_users, 20);
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_file_never_reverts_what_an_operator_set() {
+        // The rule the whole owned-field column exists for, now that the file
+        // can move underneath a running server: an operator who set
+        // `welcome_text` in the admin UI keeps it, and an unrelated edit to the
+        // file still applies.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        let mut operator = defaults(1);
+        operator.welcome_text = "set by an operator".to_owned();
+        service
+            .publish(operator, &["welcome_text".to_owned()])
+            .await;
+
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    welcome_text: Some("set in the file".to_owned()),
+                    max_users: Some(20),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+
+        let snapshot = service.snapshot(1).await;
+        assert_eq!(
+            snapshot.welcome_text, "set by an operator",
+            "the run-time layer outranks the file"
+        );
+        assert_eq!(
+            snapshot.max_users, 20,
+            "a setting nobody claimed still follows the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_setting_from_the_file_returns_it_to_the_default() {
+        // Removing a line has to mean something, and the only coherent meaning
+        // is the layer below it: murmur's default. Leaving the last value in
+        // place would make the file unable to express "never mind".
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        service.publish(defaults(1), &[]).await;
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    max_users: Some(20),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+        assert_eq!(service.snapshot(1).await.max_users, 20);
+
+        service
+            .adopt_file(&config_with(ServerSettings::default()), &[1])
+            .await;
+        assert_eq!(service.snapshot(1).await.max_users, defaults(1).max_users);
+    }
+
+    #[tokio::test]
+    async fn adopting_the_file_does_not_claim_the_settings_it_applied() {
+        // If it did, the *next* edit of the same key would be ignored: the
+        // field would be recorded as an operator's decision and outrank the
+        // file it came from.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        service.publish(defaults(1), &[]).await;
+        let config = config_with(ServerSettings {
+            max_users: Some(20),
+            ..ServerSettings::default()
+        });
+        service.adopt_file(&config, &[1]).await;
+
+        assert!(
+            service.owned.read().await.get(&1).is_none_or(BTreeSet::is_empty),
+            "the file must claim nothing"
+        );
+
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    max_users: Some(30),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+        assert_eq!(service.snapshot(1).await.max_users, 30, "a second edit lands");
+    }
+
+    #[tokio::test]
+    async fn adopting_the_file_does_not_move_the_version_counter() {
+        // The gateway reads `version == 0` as "no operator has ever set
+        // anything here" and skips applying `message_limit` while it holds.
+        // Bumping it from a file reload would make the gateway adopt a limit
+        // nobody set through the admin plane.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        service.publish(defaults(1), &[]).await;
+        let before = service.snapshot(1).await.version;
+
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    max_users: Some(20),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+
+        assert_eq!(service.snapshot(1).await.version, before);
+    }
+
+    #[tokio::test]
+    async fn a_pre_migration_row_is_left_alone_by_the_file() {
+        // It owns everything by definition, so there is no field the file may
+        // reach without overwriting a decision whose record was never kept.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        let mut stored = defaults(1);
+        stored.max_users = 5;
+        service.publish(stored, &[ALL_FIELDS.to_owned()]).await;
+
+        service
+            .adopt_file(
+                &config_with(ServerSettings {
+                    max_users: Some(20),
+                    ..ServerSettings::default()
+                }),
+                &[1],
+            )
+            .await;
+
+        assert_eq!(service.snapshot(1).await.max_users, 5);
+    }
+
+    #[tokio::test]
+    async fn an_instance_the_file_no_longer_names_keeps_its_settings() {
+        // Adding or removing an instance needs a restart, so acting on half of
+        // that change here would leave a server whose settings moved and whose
+        // actors did not.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        let mut stored = defaults(2);
+        stored.max_users = 7;
+        service.publish(stored, &[]).await;
+
+        service
+            .adopt_file(&config_with(ServerSettings::default()), &[2])
+            .await;
+
+        assert_eq!(service.snapshot(2).await.max_users, 7);
+    }
+
+    #[tokio::test]
+    async fn adopting_an_unchanged_file_publishes_nothing() {
+        // Every publish wakes every subscriber in the fleet; a SIGHUP that
+        // changed nothing must not cost a fanout.
+        use starling_runtime::config::ServerSettings;
+
+        let service = service();
+        service.publish(defaults(1), &[]).await;
+        let config = config_with(ServerSettings {
+            max_users: Some(20),
+            ..ServerSettings::default()
+        });
+        service.adopt_file(&config, &[1]).await;
+
+        let mut updates = service.updates.subscribe();
+        service.adopt_file(&config, &[1]).await;
+        assert!(
+            updates.try_recv().is_err(),
+            "an unchanged file must not republish"
+        );
     }
 
     /// A context whose deployment file configures `settings` for server 1.

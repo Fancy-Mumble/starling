@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 starling-crypto.workspace = true
+sha1.workspace = true
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true

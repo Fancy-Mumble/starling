@@ -127,7 +127,9 @@ impl Murmur {
         }
 
         let read_only = read_only_url(url);
-        let backend = Backend::connect(&read_only)
+        // One reader: a migration reads the source database in sequence, and a
+        // pool would only add connections to somebody else's live server.
+        let backend = Backend::connect(&read_only, 1)
             .await
             .map_err(|error| ReadError::Open(error.to_string()))?;
 

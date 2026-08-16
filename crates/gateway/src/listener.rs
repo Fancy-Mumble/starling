@@ -24,17 +24,20 @@ use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::metrics::Metrics;
 use starling_runtime::pressure::{Gauge, Pressure};
 use starling_runtime::shutdown::Shutdown;
+use starling_runtime::tier::Tier;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::attach::{AttachContext, Attachments};
+use crate::certs::{self, CertResolver};
 use crate::compress;
 use crate::connection::Outbound;
 use crate::connection::{self, ClientHandle, Lane, Registry};
-use crate::limiter::{Limiter, MessageLimit, Verdict};
+use crate::limiter::{Limiter, LiveBuckets, MessageLimit, Verdict};
+use crate::limits::Limits;
 use crate::resume::ResumeStore;
-use crate::router::Router;
+use crate::router::{LiveRouter, Router};
 
 /// Why the gateway could not run.
 #[derive(Debug, thiserror::Error)]
@@ -54,16 +57,35 @@ pub enum GatewayError {
     /// rustls refused the identity.
     #[error("tls configuration: {0}")]
     TlsConfig(#[from] rustls::Error),
+    /// The certificate pair could not be turned into something to present.
+    #[error("server certificate: {0}")]
+    Certificate(String),
     /// Nothing is routed, so no client could be served.
     #[error("the routing table is empty; check [services] in the configuration")]
     NoRoutes,
+}
+
+/// Every service the routing table names, with its tier.
+fn wanted_services(config: &Config) -> std::collections::BTreeMap<String, Tier> {
+    Router::from_config(config)
+        .services()
+        .into_iter()
+        .map(|name| {
+            let tier = config
+                .services
+                .get(&name)
+                .map(|service| service.tier)
+                .unwrap_or_default();
+            (name, tier)
+        })
+        .collect()
 }
 
 /// The control-plane front door.
 #[derive(Debug)]
 pub struct Gateway {
     config: Arc<Config>,
-    router: Router,
+    router: Arc<LiveRouter>,
     registry: Registry,
     attachments: Attachments,
     resume: ResumeStore,
@@ -78,6 +100,29 @@ pub struct Gateway {
     logger: Logger,
     next_conn: AtomicU64,
     gateway_id: String,
+    /// What `reconcile` needs to attach a service the file has just added.
+    ///
+    /// Filled in when the accept loop starts, because it holds the resolver
+    /// `run` is given. A reload arriving before then finds it empty and does
+    /// nothing, which is correct: the first attach has not happened yet, and it
+    /// will read the current table when it does.
+    attach_ctx: std::sync::OnceLock<AttachContext>,
+    /// The certificate presented at each handshake, replaceable while
+    /// listening.
+    certs: Arc<CertResolver>,
+    /// The `[gateway.limits]` table, as the operator has it now.
+    ///
+    /// Shared with every connection's [`Limiter`] for the same reason
+    /// `message_limit` is: the bucket that ate a screen share's SDP offer is
+    /// diagnosed on a running server, and widening it must not cost every
+    /// other client their session.
+    buckets: Arc<LiveBuckets>,
+    /// The per-client queue bounds, as the operator has them now.
+    ///
+    /// Shared with every connection for the same reason `message_limit` is:
+    /// raising `control_bytes` during an incident has to reach the clients
+    /// already connected, which is the only time anybody raises it.
+    limits: Arc<Limits>,
     /// murmur's `messagelimit`/`messageburst`, as the operator has them now.
     ///
     /// Shared with every connection's [`Limiter`]. Held here rather than
@@ -105,7 +150,17 @@ impl Gateway {
         if router.is_empty() {
             return Err(GatewayError::NoRoutes);
         }
+        let router = Arc::new(LiveRouter::new(router));
         let resume = ResumeStore::new(config.gateway.resume.ring);
+        let limits = Arc::new(Limits::from_config(&config.gateway));
+        let buckets = Arc::new(LiveBuckets::new(&config.gateway.limits));
+        // Loaded here so a broken pair fails the build rather than the first
+        // client's handshake, which is where `with_single_cert` used to catch
+        // it. Replaced in `acceptor` with the same pair, re-read at listen time.
+        let (cert, key) = certs::paths(&config);
+        let certs = Arc::new(CertResolver::new(
+            certs::load(&cert, &key).map_err(GatewayError::Certificate)?,
+        ));
         Ok(Self {
             router,
             registry: Registry::new(),
@@ -121,8 +176,73 @@ impl Gateway {
             next_conn: AtomicU64::new(1),
             gateway_id: format!("gw-{}", std::process::id()),
             message_limit: Arc::new(MessageLimit::default()),
+            limits,
+            buckets,
+            certs,
+            attach_ctx: std::sync::OnceLock::new(),
             config,
         })
+    }
+
+    /// The queue bounds every connection reads, for whatever follows the file.
+    #[must_use]
+    pub fn limits(&self) -> Arc<Limits> {
+        Arc::clone(&self.limits)
+    }
+
+    /// The rate-limit buckets every connection reads, for the same.
+    #[must_use]
+    pub fn buckets(&self) -> Arc<LiveBuckets> {
+        Arc::clone(&self.buckets)
+    }
+
+    /// The certificate resolver, for whatever follows the file.
+    #[must_use]
+    pub fn certs(&self) -> Arc<CertResolver> {
+        Arc::clone(&self.certs)
+    }
+
+    /// Adopt a changed `[services]` table: routes, tiers and buckets.
+    ///
+    /// Attaching to a service the file has just added, detaching from one it
+    /// has removed, and re-tiering the rest. `endpoint` is deliberately not
+    /// among the keys that reach here -- see the classification table.
+    pub fn adopt_services(&self, config: &Config) {
+        let next = Router::from_config(config);
+        if !self.router.replace(next) {
+            return;
+        }
+        let Some(ctx) = self.attach_ctx.get() else {
+            return;
+        };
+        let changed = self.attachments.reconcile(&wanted_services(config), ctx);
+        if changed.is_empty() {
+            return;
+        }
+        let mut event = LogEvent::notice(Category::Server, "routing table changed")
+            .with("routes", self.router.current().len());
+        for (field, names) in [
+            ("attached", &changed.attached),
+            ("detached", &changed.detached),
+            ("retiered", &changed.retiered),
+        ] {
+            if !names.is_empty() {
+                event = event.with(field, names.join(", "));
+            }
+        }
+        self.logger.log(event);
+    }
+
+    /// Adopt changed `[gateway]` breaker numbers.
+    pub fn retune_breakers(&self, gateway: &starling_runtime::config::GatewayConfig) {
+        self.attachments.retune_breakers(
+            gateway.breaker_failures,
+            gateway
+                .breaker_cooldown
+                .get()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
     }
 
     /// Attach to every routed service and serve until `shutdown` drains.
@@ -149,16 +269,15 @@ impl Gateway {
             metrics: self.metrics.clone(),
             breaker_failures: self.config.gateway.breaker_failures,
             breaker_cooldown_ms: self.config.gateway.breaker_cooldown.get().as_millis() as u64,
+            default_deadline: self.config.gateway.default_deadline.get(),
         };
-        for name in self.router.services() {
-            let tier = self
-                .config
-                .services
-                .get(&name)
-                .map(|service| service.tier)
-                .unwrap_or_default();
-            self.attachments.spawn(&name, tier, &ctx);
-        }
+        // The first attach: everything the table names is new here.
+        let _ = self
+            .attachments
+            .reconcile(&wanted_services(&self.config), &ctx);
+        // Kept for the life of the gateway: reconciling after a reload needs
+        // the same context the first attach used, and nothing in it changes.
+        let _ = self.attach_ctx.set(ctx.clone());
 
         // The session store is reported as a warning, never as unready: its
         // absence is a lost optimisation, and rejecting logins over one would
@@ -170,68 +289,91 @@ impl Gateway {
             );
         }
 
-        let acceptor = self.acceptor()?;
-        let address = self.config.gateway.listen_tcp.clone();
-        let listener = TcpListener::bind(&address)
-            .await
-            .map_err(|source| GatewayError::Bind {
-                address: address.clone(),
-                source,
-            })?;
-        self.logger.log(
-            LogEvent::info(Category::Server, "gateway listening")
-                .with("address", address.clone())
-                .with("routes", self.router.len())
-                .with("gateway", self.gateway_id.clone()),
-        );
-        self.health.ready("listener");
+        // From here to the teardown in an inner block, so that the two `?`
+        // below leave through it as well: a gateway that cannot bind its port
+        // has already attached to every service, and returning straight out
+        // would leave those streams open on a set of services that are about to
+        // be asked to stop. That start-up failure is the ordinary way a second
+        // instance is refused, so it is not a rare path.
+        let served = async {
+            let acceptor = self.acceptor()?;
+            let address = self.config.gateway.listen_tcp.clone();
+            let listener =
+                TcpListener::bind(&address)
+                    .await
+                    .map_err(|source| GatewayError::Bind {
+                        address: address.clone(),
+                        source,
+                    })?;
+            self.logger.log(
+                LogEvent::info(Category::Server, "gateway listening")
+                    .with("address", address.clone())
+                    .with("routes", self.router.current().len())
+                    .with("gateway", self.gateway_id.clone()),
+            );
+            self.health.ready("listener");
 
-        loop {
-            tokio::select! {
-                _ = shutdown.wait() => break,
-                accepted = listener.accept() => {
-                    let (stream, peer) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(error) => {
-                            // Running out of descriptors arrives here, and it
-                            // looks exactly like an idle server otherwise.
-                            self.logger.log(
-                                LogEvent::warning(Category::Server, "accept failed")
-                                    .with("error", error.to_string()),
-                            );
-                            continue;
+            loop {
+                tokio::select! {
+                    _ = shutdown.wait() => break,
+                    accepted = listener.accept() => {
+                        let (stream, peer) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                // Running out of descriptors arrives here, and it
+                                // looks exactly like an idle server otherwise.
+                                self.logger.log(
+                                    LogEvent::warning(Category::Server, "accept failed")
+                                        .with("error", error.to_string()),
+                                );
+                                continue;
+                            }
+                        };
+                        // TCP_NODELAY, as murmur sets on every accepted socket
+                        // (`Connection.cpp:40`). The control stream is small
+                        // request/reply frames, exactly what Nagle punishes: with
+                        // it on, a frame written after one still unacknowledged
+                        // waits for the peer's ACK, and Linux delays that ACK by
+                        // up to 40 ms. Measured against a WAN peer, a `Ping` reply
+                        // took two round trips instead of one, and 40 ms more
+                        // whenever the peer's ACK was delayed.
+                        if let Err(error) = stream.set_nodelay(true) {
+                            // Not fatal: the connection works without it, only
+                            // slower, and murmur ignores the same failure.
+                            tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
                         }
-                    };
-                    // TCP_NODELAY, as murmur sets on every accepted socket
-                    // (`Connection.cpp:40`). The control stream is small
-                    // request/reply frames, exactly what Nagle punishes: with
-                    // it on, a frame written after one still unacknowledged
-                    // waits for the peer's ACK, and Linux delays that ACK by
-                    // up to 40 ms. Measured against a WAN peer, a `Ping` reply
-                    // took two round trips instead of one, and 40 ms more
-                    // whenever the peer's ACK was delayed.
-                    if let Err(error) = stream.set_nodelay(true) {
-                        // Not fatal: the connection works without it, only
-                        // slower, and murmur ignores the same failure.
-                        tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
+                        let gateway = Arc::clone(&self);
+                        let acceptor = acceptor.clone();
+                        drop(tokio::spawn(async move {
+                            if let Err(error) = gateway.serve_client(stream, acceptor, peer).await {
+                                tracing::debug!(%peer, %error, "client ended");
+                            }
+                        }));
                     }
-                    let gateway = Arc::clone(&self);
-                    let acceptor = acceptor.clone();
-                    drop(tokio::spawn(async move {
-                        if let Err(error) = gateway.serve_client(stream, acceptor, peer).await {
-                            tracing::debug!(%peer, %error, "client ended");
-                        }
-                    }));
                 }
             }
+            Ok(())
         }
+        .await;
 
-        limits.abort();
+        // Everything this gateway holds open on a service is let go here, and
+        // not left to the process ending. Each of these is a live gRPC stream
+        // into a service that is draining at the same moment, and a service
+        // finishes draining only once the streams into it have ended: the
+        // attachments into every routed service, and `server-config`'s `watch`
+        // behind the message limit. Left running, they hold every service open
+        // against its own drain, and the process that was asked to stop stops
+        // on `SIGKILL` instead.
+        for task in limits {
+            task.abort();
+        }
+        let detached = self.attachments.detach_all();
         self.logger.log(
             LogEvent::info(Category::Server, "gateway draining")
-                .with("connections", self.registry.len()),
+                .with("connections", self.registry.len())
+                .with("detached", detached),
         );
-        Ok(())
+        served
     }
 
     /// Follow `server-config`'s `message_limit`/`message_burst` forever.
@@ -242,18 +384,23 @@ impl Gateway {
     /// [`Settings`](starling_runtime::Settings) the services do, so there is
     /// still one definition of what these numbers are and one fallback when
     /// `server-config` is down.
+    ///
+    /// Returns every task it started, subscription included, because the drain
+    /// has to be able to stop them: the subscription is a `watch` stream on
+    /// `server-config`, and a service cannot finish draining while a stream
+    /// into it is still open.
     fn follow_message_limit(
         &self,
         resolver: &starling_runtime::channel::Resolver,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let settings =
             starling_runtime::Settings::new(resolver.clone()).logging_to(self.logger.clone());
         let scope = self.instance();
         let live = Arc::clone(&self.message_limit);
         let logger = self.logger.clone();
-        drop(settings.watch(&[scope]));
+        let mut tasks = settings.watch(&[scope]);
 
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             /// How often the published numbers are re-read. The subscription
             /// keeps the snapshot current; this only moves it into the atomics,
             /// so it is a poll of local memory rather than of the network.
@@ -293,7 +440,8 @@ impl Gateway {
                         .with("burst", current.1),
                 );
             }
-        })
+        }));
+        tasks
     }
 
     fn instance(&self) -> u32 {
@@ -301,22 +449,7 @@ impl Gateway {
     }
 
     fn acceptor(&self) -> Result<TlsAcceptor, GatewayError> {
-        let data_dir = &self.config.runtime.data_dir;
-        let cert = self
-            .config
-            .gateway
-            .tls
-            .cert
-            .clone()
-            .unwrap_or_else(|| data_dir.join("cert.pem"));
-        let key = self
-            .config
-            .gateway
-            .tls
-            .key
-            .clone()
-            .unwrap_or_else(|| data_dir.join("key.pem"));
-        let identity = starling_crypto::identity::load_or_generate(&cert, &key)?;
+        let (cert, key) = certs::paths(&self.config);
 
         // rustls 0.23 no longer picks a default crypto backend on its own; it
         // must be installed once per process before the first `ServerConfig`
@@ -341,9 +474,18 @@ impl Gateway {
             || Arc::new(rustls::crypto::ring::default_provider()),
             Arc::clone,
         );
+        // A resolver rather than `with_single_cert`: the certificate is asked
+        // for at each handshake, so a renewal reaches the next client instead
+        // of the next restart. Renewals are not rare -- cert-manager and Let's
+        // Encrypt rotate on a schedule nobody plans around -- and this process
+        // holds every client's connection. See `crate::certs`.
+        let certified = certs::load(&cert, &key).map_err(GatewayError::Certificate)?;
+        self.certs.replace(certified);
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(AcceptAnyClientCertificate::new(provider))
-            .with_single_cert(identity.certs, identity.key)?;
+            .with_cert_resolver(
+                Arc::clone(&self.certs) as Arc<dyn rustls::server::ResolvesServerCert>
+            );
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
@@ -412,9 +554,7 @@ impl Gateway {
         let (handle, outbound) = connection::channel(
             conn,
             token,
-            self.config.gateway.control_queue,
-            self.config.gateway.audio_queue,
-            self.config.gateway.control_bytes,
+            Arc::clone(&self.limits),
             self.control_pressure.clone(),
         );
         self.registry.insert(Arc::clone(&handle));
@@ -442,11 +582,7 @@ impl Gateway {
         let (mut reader, writer) = tokio::io::split(tls);
         let writer_task = tokio::spawn(pump_writer(writer, outbound, Arc::clone(&handle)));
 
-        let mut limiter = Limiter::live(
-            &self.config.gateway.limits,
-            now_ms(),
-            Arc::clone(&self.message_limit),
-        );
+        let mut limiter = Limiter::live(&self.buckets, now_ms(), Arc::clone(&self.message_limit));
         let mut buffer = BytesMut::with_capacity(8 * 1024);
         let mut scratch = vec![0_u8; 8 * 1024];
 
@@ -531,7 +667,8 @@ impl Gateway {
             len = frame.payload.len(),
             "frame in"
         );
-        let Some(route) = self.router.route(frame.type_id) else {
+        let router = self.router.current();
+        let Some(route) = router.route(frame.type_id) else {
             // An unroutable type is dropped rather than fatal: a stale client
             // sending a burned type must not lose its session over it.
             tracing::debug!(
@@ -937,8 +1074,8 @@ mod tests {
             Logger::null(),
         )
         .expect("the defaults must be servable");
-        assert!(gateway.router.route(11).is_some());
-        assert_eq!(gateway.router.services().len(), 18);
+        assert!(gateway.router.current().route(11).is_some());
+        assert_eq!(gateway.router.current().services().len(), 18);
     }
 
     /// A writer that records each write call as one entry, vectored or not.

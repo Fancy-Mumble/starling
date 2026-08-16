@@ -20,7 +20,7 @@ pub mod dialect;
 mod kv;
 mod migrations;
 
-pub use backend::Backend;
+pub use backend::{Backend, DEFAULT_MAX_CONNECTIONS};
 pub use dialect::{Dialect, SqlDialect};
 pub use kv::{KvOp, KvStore};
 pub use migrations::Migration;
@@ -53,7 +53,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open `url` and apply nothing yet.
+    /// Open `url` with a pool of `max_connections`, and apply nothing yet.
     ///
     /// Migrations are applied by the owning service, because the schema belongs
     /// to it, this type deliberately does not know what tables exist.
@@ -62,9 +62,8 @@ impl Store {
     ///
     /// [`StoreError::Backend`] if the database cannot be opened.
     pub async fn open(url: &str, max_connections: u32) -> Result<Self, StoreError> {
-        let _ = max_connections;
         Ok(Self {
-            backend: Backend::connect(url).await?,
+            backend: Backend::connect(url, max_connections).await?,
         })
     }
 

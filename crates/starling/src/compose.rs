@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use starling_runtime::config::Config;
 use starling_runtime::inproc::Broker;
-use starling_runtime::log::{Category, LogEvent, LogRuntime, Logger};
+use starling_runtime::live::ConfigCell;
+use starling_runtime::log::{Category, LogEvent, LogHandles, LogRuntime, Logger};
 use starling_runtime::serve::{ServiceError, context};
 use starling_runtime::shutdown::Shutdown;
 use starling_runtime::telemetry;
@@ -28,12 +29,16 @@ pub(crate) fn one(name: &str, arguments: &[String]) -> Result<(), ServiceError> 
             .with("version", env!("CARGO_PKG_VERSION")),
     );
     let logger = log.logger().clone();
+    let handles = log.handles();
+    let source = source_path(arguments);
     let runtime = tokio::runtime::Runtime::new()?;
 
     let result = runtime.block_on(async move {
         let shutdown = Shutdown::new();
         shutdown.install_signal_handler();
-        let ctx = context(name, Arc::new(config), Broker::new(), shutdown, logger);
+        let config = Arc::new(config);
+        let cell = cell_for(&config, source, &logger, handles);
+        let ctx = context(name, config, Broker::new(), shutdown, logger).following(cell);
         let Some(handle) = units::spawn(name, ctx) else {
             return Err(ServiceError::service(format!("no service named {name:?}")));
         };
@@ -75,6 +80,10 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
             .with("data_dir", config.runtime.data_dir.display().to_string()),
     );
     let logger = log.logger().clone();
+    let handles = log.handles();
+    // After the first-start write above, so a fresh deployment reloads the file
+    // it just created rather than reporting that it has none.
+    let source = source_path(arguments);
     let config = Arc::new(config);
     let runtime = tokio::runtime::Runtime::new()?;
 
@@ -82,6 +91,10 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
         let shutdown = Shutdown::new();
         shutdown.install_signal_handler();
         let broker = Broker::new();
+        // One cell for the whole process, so a single SIGHUP is one read of the
+        // file and one consistent view of it across all twenty-two units. A
+        // cell each would mean twenty-two reads racing an operator's editor.
+        let cell = cell_for(&config, source, &logger, handles);
 
         // Before the services rather than during them. `userdata` creates the
         // administrator on its way up and announces the password there, which
@@ -109,7 +122,8 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
                 broker.clone(),
                 shutdown.clone(),
                 logger.clone(),
-            );
+            )
+            .following(cell.clone());
             if let Some(handle) = units::spawn(name, ctx) {
                 handles.push((*name, handle));
             }
@@ -131,7 +145,8 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
             broker.clone(),
             shutdown.clone(),
             logger.clone(),
-        );
+        )
+        .following(cell.clone());
         let Some(gateway) = units::spawn("gateway", gateway_ctx) else {
             return Err(ServiceError::service("the gateway could not be started"));
         };
@@ -298,6 +313,49 @@ fn resolve(
 /// start is [`all_in_one`]'s decision, so that `set-superuser-password` and a
 /// single-service run resolve the same paths without bringing a server into
 /// existence as a side effect of asking where one is.
+/// The process's configuration cell, with SIGHUP and the log-level applier
+/// already wired to it.
+///
+/// One function because the two entry points must agree: a reload that worked
+/// under `--all-in-one` and did nothing for a single service would be the
+/// worst kind of difference between the two deployment modes, and exactly the
+/// kind the routing table drifted into once already.
+fn cell_for(
+    config: &Arc<Config>,
+    source: Option<PathBuf>,
+    logger: &Logger,
+    handles: LogHandles,
+) -> ConfigCell {
+    let cell = match source {
+        Some(path) => ConfigCell::watching(Arc::clone(config), path),
+        None => ConfigCell::fixed(Arc::clone(config)),
+    };
+    // Re-decided on every reload, because it is a decision this entry point
+    // made rather than something the file said: `all_in_one` forces the flag
+    // after loading, and a reload that re-read the file without it reported the
+    // flag as a change needing a restart, every single time.
+    let all_in_one = config.runtime.all_in_one;
+    let cell = cell.adjusting(move |config| config.runtime.all_in_one = all_in_one);
+    cell.install_signal_handler(logger.clone());
+    starling_runtime::live::follow_logging(&cell, handles, logger.clone());
+    cell
+}
+
+/// The file this run reads, when there is one.
+///
+/// `None` for a run on the built-in defaults, which has no file to re-read and
+/// so cannot be reloaded. Resolved from the same [`source`] as [`load`], so the
+/// two can never disagree about which file is in play -- and called *after* a
+/// first start has written its configuration, which is what turns a `Fresh`
+/// resolution into the `Found` one below.
+pub(crate) fn source_path(arguments: &[String]) -> Option<PathBuf> {
+    match source(arguments) {
+        Source::Given(path) if path.as_os_str().is_empty() => None,
+        Source::Given(path) | Source::Found(path) => Some(path),
+        Source::Fresh { .. } | Source::Builtin => None,
+    }
+}
+
 pub(crate) fn load(arguments: &[String]) -> Result<Config, ServiceError> {
     match source(arguments) {
         Source::Given(path) if path.as_os_str().is_empty() => {

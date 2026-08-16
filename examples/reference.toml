@@ -165,7 +165,9 @@ control_bytes = 4194304
 # Tunnelled audio frames held per client. Full means drop the oldest and count
 # it, because a late audio frame is worthless.
 audio_queue = 128
-# How long the gateway waits on a service before giving up on one call.
+# How long the gateway waits on a service before giving up on one call and
+# counting a breaker failure. It bounds opening the attachment, not the
+# attachment, which is a stream and stays open.
 default_deadline = "5s"
 # Consecutive failures that trip a service's breaker, and how long it sheds
 # before probing again. Deadlines alone fail slowly.
@@ -433,7 +435,8 @@ tokens = [{ value_env = "STARLING_ADMIN_TOKEN", scopes = ["*"] }]
 # calling the audit service, which is optional and must not be a dependency of
 # the highest-privilege plane.
 path = "/var/log/starling/operator-audit.log"
-# A request that cannot be recorded is refused.
+# A request that cannot be recorded is refused. Set false and it proceeds, with
+# the failed write logged at error.
 fail_closed = true
 
 # The live channel is a WebSocket at GET /v1/events and needs no configuration.

@@ -11,13 +11,14 @@
 //! service, which would read it as something else entirely.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use starling_proto_fancy::types::OuterType;
 use starling_runtime::config::Config;
 use starling_runtime::tier::Tier;
 
 /// Where one wire type goes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// The service's configuration key, which is also its log name.
     pub service: String,
@@ -27,8 +28,69 @@ pub struct Route {
     pub bucket: String,
 }
 
+/// The routing table, replaceable while the gateway is serving.
+///
+/// The table used to be a plain field, so `[services]` -- which service answers
+/// which wire type, its tier, its rate-limit bucket -- could only change by
+/// restarting the process holding every client's connection. The documentation
+/// has always promised that adding a service is "three lines, no gateway
+/// release" (`docs/CONFIGURATION.md`); this is what makes that true without a
+/// restart as well.
+///
+/// A `RwLock` rather than a mutex or a per-frame rebuild: readers are the
+/// control frame path and never contend with each other, and the table changes
+/// about as often as the file does. `Arc` inside it so a reader holds the lock
+/// only long enough to clone a pointer.
+#[derive(Debug, Default)]
+pub struct LiveRouter {
+    current: std::sync::RwLock<Arc<Router>>,
+}
+
+impl LiveRouter {
+    /// A live table holding `router`.
+    #[must_use]
+    pub fn new(router: Router) -> Self {
+        Self {
+            current: std::sync::RwLock::new(Arc::new(router)),
+        }
+    }
+
+    /// The table in force.
+    #[must_use]
+    pub fn current(&self) -> Arc<Router> {
+        match self.current.read() {
+            Ok(held) => Arc::clone(&held),
+            // Routing must not stop over a poisoned lock: the table behind it is
+            // still the last one an operator published.
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Publish `next`, and say whether it differed from what was there.
+    ///
+    /// An empty table is refused: a gateway that routes nothing accepts clients
+    /// and answers none of them, which reads as a hung server rather than as a
+    /// misconfiguration. That is a startup error, and it must not become a
+    /// reachable state at run time either.
+    pub fn replace(&self, next: Router) -> bool {
+        if next.is_empty() {
+            tracing::warn!("refusing an empty routing table; keeping the previous one");
+            return false;
+        }
+        let mut held = match self.current.write() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if **held == next {
+            return false;
+        }
+        *held = Arc::new(next);
+        true
+    }
+}
+
 /// Every route, resolved once.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Router {
     routes: HashMap<u16, Route>,
 }

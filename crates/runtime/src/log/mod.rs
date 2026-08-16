@@ -49,10 +49,11 @@ pub use event::{
     UnknownSeverity,
 };
 pub use logger::{Logger, LoggerShutdown};
-pub use setup::{FileSpec, LogConfig, LogRuntime, LogSpec};
+pub use setup::{FileSpec, LogConfig, LogHandles, LogRuntime, LogSpec};
 pub use sink::{LogSink, SinkContext, SinkError};
 pub use sinks::{
-    ConsoleSink, FanoutSink, FileSink, FilterSink, MemoryHandle, MemorySink, NullSink,
+    ConsoleSink, FanoutSink, FileSink, FilterHandle, FilterSink, MemoryHandle, MemorySink,
+    NullSink, SwapHandle, SwapSink,
 };
 
 /// Render an [`Actor`](starling_proto_fancy::common::Actor) for a record.

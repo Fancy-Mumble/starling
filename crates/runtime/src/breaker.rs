@@ -31,8 +31,14 @@ pub enum BreakerState {
 pub struct Breaker {
     failures: Arc<AtomicU64>,
     opened_at_ms: Arc<AtomicU64>,
-    threshold: u64,
-    cooldown_ms: u64,
+    /// Consecutive failures before it trips, as the operator has it now.
+    ///
+    /// Shared and atomic rather than copied, because a breaker tripping too
+    /// eagerly is diagnosed on a running server: the gateway sheds essential
+    /// traffic nobody meant it to shed, and the operator needs the threshold
+    /// moved without restarting the process holding every client.
+    threshold: Arc<AtomicU64>,
+    cooldown_ms: Arc<AtomicU64>,
 }
 
 impl Breaker {
@@ -42,9 +48,32 @@ impl Breaker {
         Self {
             failures: Arc::new(AtomicU64::new(0)),
             opened_at_ms: Arc::new(AtomicU64::new(0)),
-            threshold: u64::from(threshold.max(1)),
-            cooldown_ms,
+            threshold: Arc::new(AtomicU64::new(u64::from(threshold.max(1)))),
+            cooldown_ms: Arc::new(AtomicU64::new(cooldown_ms)),
         }
+    }
+
+    /// Adopt new numbers, without disturbing the failures already counted.
+    ///
+    /// A breaker mid-cooldown keeps its clock: lowering the cooldown lets it
+    /// try again sooner, which is what an operator shortening it means, and
+    /// resetting the count instead would hide a service that is still failing.
+    pub fn retune(&self, threshold: u32, cooldown_ms: u64) {
+        self.threshold
+            .store(u64::from(threshold.max(1)), Ordering::Relaxed);
+        self.cooldown_ms.store(cooldown_ms, Ordering::Relaxed);
+    }
+
+    /// Consecutive failures before it trips.
+    #[must_use]
+    pub fn threshold(&self) -> u64 {
+        self.threshold.load(Ordering::Relaxed)
+    }
+
+    /// How long a tripped breaker sheds for.
+    #[must_use]
+    pub fn cooldown_ms(&self) -> u64 {
+        self.cooldown_ms.load(Ordering::Relaxed)
     }
 
     /// What the breaker would do to a call made now.
@@ -54,7 +83,7 @@ impl Breaker {
         if opened_at == 0 {
             return BreakerState::Closed;
         }
-        if now_ms.saturating_sub(opened_at) >= self.cooldown_ms {
+        if now_ms.saturating_sub(opened_at) >= self.cooldown_ms() {
             BreakerState::HalfOpen
         } else {
             BreakerState::Open
@@ -76,7 +105,7 @@ impl Breaker {
     /// Record a failure, tripping the breaker at the threshold.
     pub fn failed(&self, now_ms: u64) {
         let count = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if count >= self.threshold {
+        if count >= self.threshold() {
             // `now_ms + 1` because zero is the "never opened" sentinel and a
             // breaker tripping at time zero must still read as open.
             self.opened_at_ms.store(now_ms.max(1), Ordering::Release);
