@@ -101,7 +101,7 @@ modules:
       - type: git
         url: https://github.com/Fancy-Mumble/starling.git
         tag: v0.2.4
-        commit: ac6454320e5c09db54a4ed2b678c487c8ccb4f1c
+        commit: 9b7b3bddaa6c6e7da1ed7a61b593755d3e978b17
         x-checker-data:
           type: git
           tag-pattern: ^v([\d.]+)$

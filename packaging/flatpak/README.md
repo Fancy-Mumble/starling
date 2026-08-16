@@ -93,7 +93,7 @@ flatpak run org.flatpak.Builder --user --install-deps-from=flathub \
       Flathub maps the app ID `com.fancy_mumble.Starling` back to the domain
       `fancy-mumble.com` (underscore for hyphen), which is what earns the
       verified badge.
-- [x] Tag to ship: **v0.2.4** (commit `ac64543`), pinned in the manifest, with
+- [x] Tag to ship: **v0.2.4** (commit `9b7b3bd`), pinned in the manifest, with
       `cargo-sources.json` regenerated from that tag's `Cargo.lock`.
 - [ ] `LICENSE` says MIT and GitHub does not detect it. Worth checking the file
       is where GitHub looks, since Flathub reviewers read the same metadata.
