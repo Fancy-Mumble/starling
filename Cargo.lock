@@ -2434,7 +2434,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starling"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "starling-audit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "sha2 0.11.0",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "starling-crypto"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aes 0.9.2",
  "chacha20",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "starling-files"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hmac",
  "prost",
@@ -2570,11 +2570,11 @@ dependencies = [
 
 [[package]]
 name = "starling-gate"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "starling-gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "prost",
@@ -2640,7 +2640,7 @@ dependencies = [
 
 [[package]]
 name = "starling-migrate"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "sqlx",
  "starling-runtime",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "starling-operator-api"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "axum",
  "bytes",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "starling-runtime"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "hyper-util",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "starling-server-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "sqlx",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "starling-sfu"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "socket2",
  "str0m",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "starling-text"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "sqlx",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "starling-userdata"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hmac",
  "prost",
