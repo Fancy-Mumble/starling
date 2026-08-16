@@ -253,6 +253,28 @@ impl Roster {
         self.accounts.lock().ok()?.get(&session).copied().flatten()
     }
 
+    /// Every account with a session on this server right now.
+    ///
+    /// Guests are not in it: they have no account, so there is nothing to
+    /// compare a stored registration against.
+    ///
+    /// The question this answers is "who does **not** need telling", asked by
+    /// push before it notifies somebody's phone about a message already on
+    /// their screen. That direction matters when the roster is cold: it comes
+    /// back empty, which means nobody is skipped rather than nobody is
+    /// notified, so the failure is a duplicate notification and never a silent
+    /// one.
+    #[must_use]
+    pub fn connected_accounts(&self) -> Vec<u64> {
+        let Ok(held) = self.accounts.lock() else {
+            return Vec::new();
+        };
+        let mut accounts: Vec<u64> = held.values().copied().flatten().collect();
+        accounts.sort_unstable();
+        accounts.dedup();
+        accounts
+    }
+
     /// Everyone in `channel`, except `except`.
     ///
     /// Empty when the roster is cold, which the caller must treat as "send to
@@ -396,6 +418,37 @@ mod tests {
         members.sort_unstable();
         assert_eq!(members, vec![2]);
         assert!(roster.is_warm());
+    }
+
+    #[test]
+    fn the_connected_accounts_are_the_people_and_not_the_connections() {
+        // Read by push to decide who does *not* need telling. Two windows are
+        // one person who has already seen the message, and a guest is nobody
+        // there is anything to compare against.
+        let registered = |session: u32, account: u64| Session {
+            session,
+            channel: 4,
+            account,
+            registered: true,
+            ..Session::default()
+        };
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![
+            registered(1, 42),
+            registered(2, 42),
+            session(3, 4),
+        ]));
+
+        assert_eq!(roster.connected_accounts(), vec![42]);
+    }
+
+    #[test]
+    fn a_cold_roster_skips_nobody_so_a_notification_is_never_lost_to_it() {
+        // The opposite direction from `in_channel`, deliberately: an empty
+        // answer here means "skip nobody", so the cost of not knowing is a
+        // phone buzzing about something already on screen rather than a
+        // message nobody is told about.
+        assert!(Roster::new().connected_accounts().is_empty());
     }
 
     #[test]
