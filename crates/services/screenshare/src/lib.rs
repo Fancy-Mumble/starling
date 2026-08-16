@@ -45,13 +45,37 @@
 //! A server with no SFU configured still signals. The answer then carries the
 //! endpoint and an empty `sdp`, which is what it always did, and a client can
 //! tell it has been given an endpoint and no session.
+//!
+//! # Two dialects, one mechanism
+//!
+//! The above describes the share canon. The shipped client does not speak it:
+//! its whole screen-share stack is built on `WebRtcSignal`, epoch-0 type 120,
+//! which is one relayed blob per step rather than a share with an identity.
+//! That signalling is carried here too, at inner tag 7 of the same envelope,
+//! and is a port of murmur's `Server::msgWebRtcSignal` (`Messages.cpp:3885`).
+//!
+//! It is a *dialect*, not a second feature: both announce a share, both feed
+//! the same [`SfuHandle`], both are cleaned up by the same `closed`. Only the
+//! bytes differ, so [`Dialect`] is the only thing the paths branch on, and the
+//! branch is at the two points where bytes are produced.
+//!
+//! Two things murmur's path did that this one keeps:
+//!
+//! * **the relay fallback.** With no SFU the server addresses the signalling
+//!   and forwards it, and the clients negotiate a mesh between themselves. It
+//!   is the deployment that has no public media address, and it is why a
+//!   `target_session` of 0 means "my channel" rather than "the SFU";
+//! * **`sender_session` is stamped.** On this path a sender field a client
+//!   fills is a client signalling as somebody else, which is hijacking their
+//!   broadcast rather than merely mislabelling a message.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::screenshare::{
-    Answer, Offer, ScreenshareEnvelope, Start, Stop, Viewers, screenshare_envelope,
+    Answer, Offer, ScreenshareEnvelope, Start, Stop, Viewers, WebRtcSignal, screenshare_envelope,
+    web_rtc_signal::SignalType,
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
@@ -76,6 +100,85 @@ struct Share {
     conn: u64,
     channel: u32,
     viewers: Vec<u32>,
+    /// Which signalling announced it, and therefore which the server must
+    /// answer it in.
+    dialect: Dialect,
+}
+
+/// Which signalling a share is being conducted in.
+///
+/// Recorded per share rather than per connection because it is a property of
+/// the broadcast, and because the SFU's events name a broadcaster and nothing
+/// else: without this, an answer produced for a `WebRtcSignal` offer would go
+/// back as a canon `Answer` the client has no handler for, and the symptom is
+/// an offer that is accepted and never answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// `Start`/`Offer`/`Answer`/`Stop`, keyed by `share_id`.
+    Canon,
+    /// `WebRtcSignal`, keyed by the presenter's session.
+    Signal,
+}
+
+/// The prefix a `WebRtcSignal` broadcast is filed under.
+///
+/// That dialect has no share id: a broadcast is identified by its presenter's
+/// session and nothing else. One is synthesised so both dialects live in the
+/// same table, which is what keeps `closed`, `end` and the SFU pump single-path
+/// instead of duplicated per dialect.
+///
+/// Reserved, and refused to the canon path below: two shares under one id would
+/// otherwise resolve arbitrarily, and the loser is somebody's live broadcast.
+const SIGNAL_SHARE_PREFIX: &str = "webrtc:";
+
+/// Where `presenter`'s `WebRtcSignal` broadcast is filed.
+fn signal_share_id(presenter: u32) -> String {
+    format!("{SIGNAL_SHARE_PREFIX}{presenter}")
+}
+
+/// A `WebRtcSignal` envelope, encoded.
+///
+/// `sender` is always the server's own idea of who sent it; there is no path
+/// here that can put a client's claim in that field.
+fn signal_bytes(sender: u32, target: u32, kind: SignalType, payload: String) -> Vec<u8> {
+    ScreenshareEnvelope {
+        body: Some(screenshare_envelope::Body::Signal(WebRtcSignal {
+            target_session: target,
+            sender_session: sender,
+            signal_type: kind.into(),
+            payload,
+        })),
+    }
+    .encode_to_vec()
+}
+
+/// What an offer in the signal dialect is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalOffer {
+    /// The stream coming in, from the session that announced it.
+    Inbound,
+    /// One of the streams going out, of `broadcaster`'s share.
+    Outbound { broadcaster: u32 },
+}
+
+/// Which of the two an offer naming `target` is.
+///
+/// `target == 0` is the whole test, which is murmur's, and the sender is not
+/// consulted at all - deliberately. The case that forces it is the **loopback
+/// viewer**: a presenter watching their own share offers with the broadcaster's
+/// session in `target`, and that session is their own. Any rule of the form
+/// "the target resolves to the sender, so this is their inbound stream" reads
+/// that offer as a second broadcaster offer, which replaces the real inbound
+/// peer - the SFU accepts two broadcaster offers, the preview never decodes,
+/// and the share dies a few seconds later.
+const fn signal_offer_of(target: u32) -> SignalOffer {
+    if target == 0 {
+        SignalOffer::Inbound
+    } else {
+        SignalOffer::Outbound {
+            broadcaster: target,
+        }
+    }
 }
 
 /// What an offer means, which depends entirely on who sent it.
@@ -189,19 +292,32 @@ impl ScreenshareService {
                     // client negotiate against a session that is gone.
                     return Actions::new();
                 };
-                let answer = ScreenshareEnvelope {
-                    body: Some(screenshare_envelope::Body::Answer(Answer {
-                        share_id,
+                // In the dialect the offer came in, because that is the only
+                // thing the client on the other end has a handler for.
+                let answer = match share.dialect {
+                    Dialect::Canon => ScreenshareEnvelope {
+                        body: Some(screenshare_envelope::Body::Answer(Answer {
+                            share_id,
+                            sdp,
+                            sfu_host: self.endpoint.0.clone(),
+                            sfu_port: self.endpoint.1,
+                        })),
+                    }
+                    .encode_to_vec(),
+                    // Sender is the broadcaster, not the server: the client
+                    // routes an answer by whose stream it is for, and one
+                    // stamped with anything else is an answer it drops.
+                    Dialect::Signal => signal_bytes(
+                        broadcaster_session,
+                        target_session,
+                        SignalType::SdpAnswer,
                         sdp,
-                        sfu_host: self.endpoint.0.clone(),
-                        sfu_port: self.endpoint.1,
-                    })),
+                    ),
                 };
-                let _ = share;
                 vec![to_sessions(
                     vec![target_session],
                     ServiceKind::Screenshare.outer_type(),
-                    answer.encode_to_vec(),
+                    answer,
                 )]
             }
             SfuEvent::SessionEnded {
@@ -259,6 +375,17 @@ impl ScreenshareService {
 
     /// A client announcing a share.
     async fn on_start(&self, inbound: &Inbound, start: Start) -> Actions {
+        // The ids the other dialect's shares are filed under are not a client's
+        // to claim. Two shares under one id resolve arbitrarily, and the one
+        // that loses is somebody's live broadcast.
+        if start.share_id.starts_with(SIGNAL_SHARE_PREFIX) {
+            tracing::warn!(
+                session = inbound.session,
+                share = %start.share_id,
+                "screen share refused: that id is reserved for signal-dialect shares"
+            );
+            return Actions::new();
+        }
         // Sharing into a channel is broadcasting into it. Unchecked, a client
         // could announce a share in a channel it may not even enter, and every
         // member of that channel would be told.
@@ -282,6 +409,7 @@ impl ScreenshareService {
                     conn: inbound.conn,
                     channel: start.channel,
                     viewers: Vec::new(),
+                    dialect: Dialect::Canon,
                 },
             );
         }
@@ -345,6 +473,212 @@ impl ScreenshareService {
             }
         }
         Actions::new()
+    }
+
+    /// One `WebRtcSignal`, the dialect the shipped client speaks.
+    ///
+    /// A port of murmur's `Server::msgWebRtcSignal`, keeping its order: reject
+    /// what has no channel, charge the permission, stamp the sender, then
+    /// either drive the SFU or relay. What it adds is the share record, which
+    /// murmur had no equivalent of at all - and without which a presenter who
+    /// closes their laptop leaves every viewer watching a stream that stopped,
+    /// exactly the bug `closed` was written for on the canon path.
+    async fn on_signal(&self, inbound: &Inbound, signal: &WebRtcSignal) -> Actions {
+        // murmur: `Channel *c = uSource->cChannel; if (!c) return;`. A session
+        // the roster cannot place has no channel to signal into.
+        let Some(channel) = self.roster.channel_of(inbound.session) else {
+            tracing::debug!(
+                session = inbound.session,
+                "screen-share signal from a session the roster cannot place"
+            );
+            return Actions::new();
+        };
+        let target = signal.target_session;
+        let kind = signal.signal_type();
+
+        // Broadcasting into a channel takes what broadcasting takes.
+        //
+        // murmur charged `TextMessage` to *every* signal, viewers' offers
+        // included. Charging it only to the broadcasts is the one deliberate
+        // difference: a directed signal is one half of a negotiation between
+        // two members of a channel they are both already in, and requiring
+        // Speak of it would lock a listener out of watching a share.
+        if target == 0 && !self.allows(inbound, channel, Perm::SPEAK).await {
+            tracing::warn!(
+                session = inbound.session,
+                channel,
+                ?kind,
+                "screen-share signal refused: no Speak in that channel"
+            );
+            return vec![starling_runtime::permit::permission_denied(
+                inbound,
+                Perm::SPEAK,
+                channel,
+            )];
+        }
+
+        match kind {
+            SignalType::Start => self.signal_start(inbound, signal, channel),
+            SignalType::Stop => {
+                let share_id = signal_share_id(inbound.session);
+                match self.share(&share_id) {
+                    Some(share) => self.end(&share_id, &share, inbound.session),
+                    // A STOP for a broadcast this server has no record of: the
+                    // presenter reconnected, or `closed` already ended it.
+                    // Relayed rather than dropped, because a viewer that missed
+                    // the first one is still showing a dead stream and this is
+                    // idempotent for one that did not.
+                    None => self.audience(
+                        channel,
+                        inbound.session,
+                        signal_bytes(inbound.session, 0, SignalType::Stop, String::new()),
+                    ),
+                }
+            }
+            SignalType::SdpOffer => self.signal_offer(inbound, signal, channel),
+            SignalType::SdpAnswer => {
+                if self.sfu.is_some() {
+                    // Only the server answers when there is an SFU. murmur
+                    // ignores these silently and so does this.
+                    return Actions::new();
+                }
+                self.relay(inbound, channel, signal)
+            }
+            SignalType::IceCandidate => {
+                if let Some(sfu) = self.sfu.as_ref() {
+                    // Accepted and dropped: this SFU is ICE-lite. Handed over
+                    // rather than discarded here so that the one place that
+                    // decides what a candidate is worth stays the SFU's.
+                    let broadcaster = if target == 0 { inbound.session } else { target };
+                    sfu.add_ice_candidate(broadcaster, inbound.session, signal.payload.clone());
+                    return Actions::new();
+                }
+                self.relay(inbound, channel, signal)
+            }
+        }
+    }
+
+    /// A `WebRtcSignal` START: the share announcement of this dialect.
+    ///
+    /// Re-sent by the client whenever somebody joins the channel, carrying the
+    /// same track metadata as the first one, so everything here is written to
+    /// be idempotent: the record is replaced, `create_session` is idempotent by
+    /// contract, and the announcement goes out again for the late joiner.
+    fn signal_start(&self, inbound: &Inbound, signal: &WebRtcSignal, channel: u32) -> Actions {
+        if let Ok(mut shares) = self.shares.lock() {
+            let _ = shares.insert(
+                signal_share_id(inbound.session),
+                Share {
+                    presenter: inbound.session,
+                    conn: inbound.conn,
+                    channel,
+                    viewers: Vec::new(),
+                    dialect: Dialect::Signal,
+                },
+            );
+        }
+        if let Some(sfu) = self.sfu.as_ref() {
+            // Opened before anything is announced, for the reason `on_start`
+            // gives: a viewer that sees the announcement offers immediately,
+            // and an offer for a session the SFU has not been told about is an
+            // offer it drops.
+            sfu.create_session(inbound.session);
+        }
+        self.audience(
+            channel,
+            inbound.session,
+            // The payload is the track metadata every viewer re-parses, so it
+            // is relayed verbatim; a re-announce that lost it downgrades every
+            // viewer's idea of the share to a single screen track.
+            signal_bytes(
+                inbound.session,
+                0,
+                SignalType::Start,
+                signal.payload.clone(),
+            ),
+        )
+    }
+
+    /// A `WebRtcSignal` SDP offer: the stream coming in, or one going out.
+    ///
+    /// **`target_session == 0` is the whole discriminator**, which is murmur's,
+    /// and the reason it cannot be "does the target resolve to the sender" is
+    /// the *loopback viewer*: a presenter watching their own share offers with
+    /// the broadcaster's session in `target`, and that session is their own.
+    /// Read as "this is my inbound stream", that offer replaces the real one -
+    /// the SFU logs two accepted broadcaster offers, the preview never decodes,
+    /// and the share dies. This is not a hypothetical; it is what the e2e run
+    /// showed before this was written the way murmur writes it.
+    ///
+    /// Naming yourself the broadcaster is safe here without a `role_of`-style
+    /// check, because the session handed to the SFU is the **stamped sender**
+    /// and never the claim: a client can only ever open its own broadcast,
+    /// which is what its START already did. The claim in `target` is only ever
+    /// used to *look up somebody else's* share, below.
+    fn signal_offer(&self, inbound: &Inbound, signal: &WebRtcSignal, channel: u32) -> Actions {
+        let Some(sfu) = self.sfu.as_ref() else {
+            return self.relay(inbound, channel, signal);
+        };
+        // An offer about a broadcast nobody announced is dropped, either way
+        // round. murmur forwarded it to the SFU regardless, which let any
+        // client allocate media resources for a session id it made up.
+        match signal_offer_of(signal.target_session) {
+            SignalOffer::Inbound => {
+                if self.share(&signal_share_id(inbound.session)).is_none() {
+                    tracing::debug!(
+                        session = inbound.session,
+                        "screen-share offer from a session that announced no broadcast"
+                    );
+                    return Actions::new();
+                }
+                sfu.broadcaster_offer(inbound.session, signal.payload.clone());
+            }
+            SignalOffer::Outbound { broadcaster } => {
+                let Some(share) = self.share(&signal_share_id(broadcaster)) else {
+                    tracing::debug!(
+                        session = inbound.session,
+                        broadcaster,
+                        "screen-share offer for a broadcast that was never announced"
+                    );
+                    return Actions::new();
+                };
+                sfu.viewer_offer(share.presenter, inbound.session, signal.payload.clone());
+            }
+        }
+        Actions::new()
+    }
+
+    /// murmur's relay: the server addresses the signal and forwards it.
+    ///
+    /// What a server with no SFU has always done, and it is a real deployment
+    /// rather than a degraded one - the clients negotiate a mesh between
+    /// themselves and no media touches this process.
+    fn relay(&self, inbound: &Inbound, channel: u32, signal: &WebRtcSignal) -> Actions {
+        let payload = signal_bytes(
+            inbound.session,
+            signal.target_session,
+            signal.signal_type(),
+            signal.payload.clone(),
+        );
+        if signal.target_session == 0 {
+            return self.audience(channel, inbound.session, payload);
+        }
+        // Directed, and only within the channel: murmur checks
+        // `pDst->cChannel == c` before relaying, which is what stops a signal
+        // being addressed at a session on the other side of the server.
+        if self.roster.channel_of(signal.target_session) != Some(channel) {
+            tracing::debug!(
+                session = inbound.session,
+                target = signal.target_session,
+                "screen-share signal dropped: the target is not in this channel"
+            );
+            return Actions::new();
+        }
+        vec![to_sessions(
+            vec![signal.target_session],
+            ServiceKind::Screenshare.outer_type(),
+            payload,
+        )]
     }
 
     /// Somebody ending a share.
@@ -430,16 +764,34 @@ impl ScreenshareService {
             // outbound peer holding sockets for the life of the process.
             sfu.destroy_session(share.presenter);
         }
-        let stopped = ScreenshareEnvelope {
-            body: Some(screenshare_envelope::Body::Stop(Stop {
-                share_id: share_id.to_owned(),
+        let (stopped, except) = match share.dialect {
+            Dialect::Canon => (
+                ScreenshareEnvelope {
+                    body: Some(screenshare_envelope::Body::Stop(Stop {
+                        share_id: share_id.to_owned(),
+                        actor,
+                    })),
+                }
+                .encode_to_vec(),
+                // Nobody is excepted, the presenter included: a presenter whose
+                // share was stopped by a moderator has to be told, and a
+                // presenter who stopped it themselves is not harmed by the
+                // confirmation.
+                0,
+            ),
+            Dialect::Signal => (
+                // Stamped with the presenter however it ended: viewers tear
+                // down the stream the *sender* was broadcasting, so a STOP
+                // carrying a moderator's session would tear down nothing.
+                signal_bytes(share.presenter, 0, SignalType::Stop, String::new()),
+                // This dialect has no `actor` field, so a client cannot tell
+                // its own STOP from anybody else's and tears its local view
+                // down on either. Excepting whoever ended it keeps that from
+                // happening to them, and is what murmur's relay did anyway.
                 actor,
-            })),
+            ),
         };
-        // Nobody is excepted, the presenter included: a presenter whose share
-        // was stopped by a moderator has to be told, and a presenter who
-        // stopped it themselves is not harmed by the confirmation.
-        self.audience(share.channel, 0, stopped.encode_to_vec())
+        self.audience(share.channel, except, stopped)
     }
 }
 
@@ -467,6 +819,9 @@ impl ClientService for ScreenshareService {
             Some(screenshare_envelope::Body::Stop(stop)) => self.on_stop(&inbound, &stop).await,
             Some(screenshare_envelope::Body::Viewers(request)) => {
                 self.on_viewers(&inbound, &request)
+            }
+            Some(screenshare_envelope::Body::Signal(signal)) => {
+                self.on_signal(&inbound, &signal).await
             }
             Some(screenshare_envelope::Body::Health(health)) => {
                 // Recorded rather than dropped. It was falling into a catch-all
@@ -698,6 +1053,40 @@ mod tests {
         }
     }
 
+    /// The envelope an action carries.
+    fn carried(action: &starling_proto_fancy::control::ServerAction) -> ScreenshareEnvelope {
+        let Some(starling_proto_fancy::control::server_action::Action::Send(send)) =
+            action.action.as_ref()
+        else {
+            panic!("expected a send");
+        };
+        ScreenshareEnvelope::decode(send.payload.as_slice()).expect("a screenshare envelope")
+    }
+
+    /// The `WebRtcSignal` an action carries, insisting it is one.
+    ///
+    /// Which dialect the bytes are in is the assertion in half the tests below:
+    /// an answer in the wrong one reaches a client with no handler for it, and
+    /// on the wire that is indistinguishable from an offer that was ignored.
+    fn carried_signal(action: &starling_proto_fancy::control::ServerAction) -> WebRtcSignal {
+        match carried(action).body {
+            Some(screenshare_envelope::Body::Signal(signal)) => signal,
+            other => panic!("expected a WebRtcSignal, got {other:?}"),
+        }
+    }
+
+    fn signal_of(target: u32, kind: SignalType, payload: &str) -> ScreenshareEnvelope {
+        ScreenshareEnvelope {
+            body: Some(screenshare_envelope::Body::Signal(WebRtcSignal {
+                target_session: target,
+                // What a client claims; every test below asserts it is ignored.
+                sender_session: 999,
+                signal_type: kind.into(),
+                payload: payload.to_owned(),
+            })),
+        }
+    }
+
     #[tokio::test]
     async fn an_offer_is_answered_with_the_sfu_endpoint_rather_than_trickled_to() {
         // The SFU is ICE-lite: its candidates ride in the answer, and waiting
@@ -899,6 +1288,245 @@ mod tests {
         });
         assert!(service.share("s11").is_none());
         assert!(addressed(&actions[0]).contains(&1));
+    }
+
+    // -- The signal dialect -------------------------------------------------
+    //
+    // murmur's `WebRtcSignal` path, which is the one the shipped client speaks.
+    // These build with `sfu: None`, so they exercise the relay fallback: the
+    // deployment with no public media address, and the mode every one of these
+    // assertions was true in on murmur.
+
+    #[tokio::test]
+    async fn a_start_signal_announces_the_broadcast_to_the_channel() {
+        let service = permissive();
+        seat(&service, &[(1, 3), (2, 3), (9, 7), (4, 3)]);
+
+        let actions = service
+            .frame(frame(4, &signal_of(0, SignalType::Start, "tracks")))
+            .await;
+        assert_eq!(actions.len(), 1);
+        let mut told = addressed(&actions[0]);
+        told.sort_unstable();
+        assert_eq!(told, vec![1, 2], "the channel, without the presenter");
+
+        let announced = carried_signal(&actions[0]);
+        assert_eq!(announced.sender_session, 4, "stamped over the client's 999");
+        assert_eq!(
+            announced.payload, "tracks",
+            "the track metadata is relayed verbatim; a re-announce that lost it \
+             downgrades every viewer to a single screen track"
+        );
+        assert!(
+            service.share(&signal_share_id(4)).is_some(),
+            "and the broadcast is recorded, which murmur never did"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_signal_in_a_channel_the_client_may_not_speak_in_is_refused() {
+        let service = strict();
+        seat(&service, &[(1, 3), (4, 3)]);
+
+        let actions = service
+            .frame(frame(4, &signal_of(0, SignalType::Start, "")))
+            .await;
+        assert_eq!(actions.len(), 1, "the client is told, not ignored");
+        assert!(
+            service.share(&signal_share_id(4)).is_none(),
+            "a refused broadcast must not be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn watching_a_share_does_not_take_speak() {
+        // The one deliberate difference from murmur, which charged its
+        // permission to every signal. A viewer's offer is one half of a
+        // negotiation inside a channel it is already in; requiring Speak of it
+        // locks a listener out of watching.
+        let service = strict();
+        seat(&service, &[(4, 3), (5, 3)]);
+
+        let actions = service
+            .frame(frame(5, &signal_of(4, SignalType::SdpOffer, "v=0")))
+            .await;
+        assert_eq!(
+            addressed(&actions[0]),
+            vec![4],
+            "relayed to the broadcaster"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directed_signal_reaches_only_its_target() {
+        let service = permissive();
+        seat(&service, &[(1, 3), (4, 3), (5, 3)]);
+
+        let actions = service
+            .frame(frame(5, &signal_of(4, SignalType::SdpAnswer, "v=0 answer")))
+            .await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(addressed(&actions[0]), vec![4]);
+        let relayed = carried_signal(&actions[0]);
+        assert_eq!(relayed.sender_session, 5);
+        assert_eq!(relayed.target_session, 4);
+        assert_eq!(relayed.payload, "v=0 answer");
+    }
+
+    #[tokio::test]
+    async fn a_signal_addressed_across_channels_is_dropped() {
+        // murmur checks `pDst->cChannel == c` before relaying. Without it the
+        // signalling is a directed message channel to any session on the
+        // server, from any session, carrying an arbitrary string.
+        let service = permissive();
+        seat(&service, &[(4, 3), (9, 7)]);
+
+        assert!(
+            service
+                .frame(frame(4, &signal_of(9, SignalType::SdpOffer, "v=0")))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signal_from_a_session_the_roster_cannot_place_is_dropped() {
+        // murmur: `if (!c) return;`. Nobody has a channel before the roster is
+        // warm, and a broadcast announced to nobody is worse than none.
+        let service = permissive();
+        assert!(
+            service
+                .frame(frame(4, &signal_of(0, SignalType::Start, "")))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broadcasters_offer_is_relayed_to_the_channel_when_there_is_no_sfu() {
+        // The mesh deployment: the server addresses the signalling and the
+        // clients negotiate between themselves.
+        let service = permissive();
+        seat(&service, &[(1, 3), (2, 3), (4, 3)]);
+        let _ = service
+            .frame(frame(4, &signal_of(0, SignalType::Start, "")))
+            .await;
+
+        let actions = service
+            .frame(frame(4, &signal_of(0, SignalType::SdpOffer, "v=0 offer")))
+            .await;
+        let mut told = addressed(&actions[0]);
+        told.sort_unstable();
+        assert_eq!(told, vec![1, 2]);
+        assert_eq!(carried_signal(&actions[0]).payload, "v=0 offer");
+    }
+
+    #[tokio::test]
+    async fn a_stop_signal_ends_the_broadcast_and_is_not_echoed_to_the_sender() {
+        // This dialect has no `actor` field, so a client cannot tell its own
+        // STOP from anybody else's and tears its local view down on either.
+        let service = permissive();
+        seat(&service, &[(1, 3), (4, 3)]);
+        let _ = service
+            .frame(frame(4, &signal_of(0, SignalType::Start, "")))
+            .await;
+
+        let actions = service
+            .frame(frame(4, &signal_of(0, SignalType::Stop, "")))
+            .await;
+        assert!(service.share(&signal_share_id(4)).is_none(), "it is over");
+        let told = addressed(&actions[0]);
+        assert_eq!(told, vec![1], "the channel, not the presenter");
+        let stopped = carried_signal(&actions[0]);
+        assert_eq!(stopped.signal_type(), SignalType::Stop);
+        assert_eq!(stopped.sender_session, 4, "whose broadcast ended");
+    }
+
+    #[tokio::test]
+    async fn a_presenter_who_disconnects_ends_a_signal_broadcast_too() {
+        // The cleanup murmur had no equivalent of: it tracked no shares, so a
+        // presenter closing their laptop left every viewer watching a stream
+        // that had stopped, with no event to tell them.
+        let service = permissive();
+        seat(&service, &[(1, 3), (4, 3)]);
+        let _ = service
+            .frame(frame_on(4, 77, &signal_of(0, SignalType::Start, "")))
+            .await;
+
+        let actions = service.closed(77, "gone").await;
+        assert!(service.share(&signal_share_id(4)).is_none());
+        assert_eq!(actions.len(), 1, "and the channel is told");
+        assert!(addressed(&actions[0]).contains(&1));
+        assert_eq!(
+            carried_signal(&actions[0]).signal_type(),
+            SignalType::Stop,
+            "in the dialect the broadcast was announced in"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_a_signal_broadcast_comes_back_as_a_signal() {
+        // The whole reason the dialect is recorded. A canon `Answer` here
+        // reaches a client that has no handler for it, which on the wire is
+        // indistinguishable from an offer that was silently dropped.
+        let service = permissive();
+        seat(&service, &[(4, 3), (5, 3)]);
+        let _ = service
+            .frame(frame(4, &signal_of(0, SignalType::Start, "")))
+            .await;
+
+        let actions = service.on_sfu_event(SfuEvent::SdpAnswer {
+            target_session: 5,
+            broadcaster_session: 4,
+            sdp: "v=0 answer".to_owned(),
+        });
+        assert_eq!(addressed(&actions[0]), vec![5], "the viewer");
+        let answer = carried_signal(&actions[0]);
+        assert_eq!(answer.signal_type(), SignalType::SdpAnswer);
+        assert_eq!(
+            answer.sender_session, 4,
+            "the client routes an answer by whose stream it is for"
+        );
+        assert_eq!(answer.target_session, 5);
+        assert_eq!(answer.payload, "v=0 answer");
+    }
+
+    #[test]
+    fn a_presenter_watching_their_own_share_is_a_viewer_of_it() {
+        // The loopback viewer, and the bug that made the e2e run fail with the
+        // SFU accepting two broadcaster offers: the presenter's own viewer
+        // offer names the broadcaster in `target`, and that is themselves.
+        // Read as "the target is me, so this is my inbound stream", it replaces
+        // the real inbound peer and the share dies with no frame ever decoded.
+        //
+        // `target == 0` is therefore the whole test, exactly as in murmur, and
+        // the sender is not part of it at all.
+        assert_eq!(signal_offer_of(0), SignalOffer::Inbound, "the stream in");
+        assert_eq!(
+            signal_offer_of(1),
+            SignalOffer::Outbound { broadcaster: 1 },
+            "session 1 naming session 1 is the loopback viewer, not a second \
+             broadcaster offer"
+        );
+        assert_eq!(
+            signal_offer_of(4),
+            SignalOffer::Outbound { broadcaster: 4 },
+            "and anybody else naming 4 is a viewer of 4"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_canon_share_cannot_claim_a_signal_dialect_id() {
+        // Two shares under one id resolve arbitrarily, and the one that loses
+        // is somebody's live broadcast.
+        let service = permissive();
+        seat(&service, &[(1, 3), (5, 3)]);
+
+        let squat = service
+            .frame(frame(5, &start_of(&signal_share_id(4), 3)))
+            .await;
+        assert!(squat.is_empty(), "refused, and announced to nobody");
+        assert!(service.share(&signal_share_id(4)).is_none());
     }
 
     #[tokio::test]

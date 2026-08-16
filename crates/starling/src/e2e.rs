@@ -4652,6 +4652,194 @@ async fn a_typing_indicator_names_the_typist_and_is_not_echoed_to_them() {
     deployment.stop();
 }
 
+/// The screenshare service's outer type.
+const SCREENSHARE: u16 = 1008;
+
+/// The next screenshare body a client is given.
+async fn next_screenshare(client: &mut Client) -> fancy::screenshare::screenshare_envelope::Body {
+    let (_, payload) = client.recv_until(SCREENSHARE).await;
+    fancy::screenshare::ScreenshareEnvelope::decode(payload.as_slice())
+        .expect("a well-formed ScreenshareEnvelope")
+        .body
+        .expect("an envelope with a body in it")
+}
+
+/// One `WebRtcSignal`, as a client sends it.
+fn webrtc(
+    target: u32,
+    kind: fancy::screenshare::web_rtc_signal::SignalType,
+    payload: &str,
+) -> fancy::screenshare::ScreenshareEnvelope {
+    fancy::screenshare::ScreenshareEnvelope {
+        body: Some(fancy::screenshare::screenshare_envelope::Body::Signal(
+            fancy::screenshare::WebRtcSignal {
+                target_session: target,
+                // What a client claims. The assertion below is that it does
+                // not survive: on this path a sender field a client fills is a
+                // client signalling as somebody else, which means hijacking
+                // their broadcast.
+                sender_session: 4_242,
+                signal_type: kind.into(),
+                payload: payload.to_owned(),
+            },
+        )),
+    }
+}
+
+#[tokio::test]
+async fn a_screen_share_announcement_reaches_the_channel_and_names_the_real_presenter() {
+    // The signalling the shipped client speaks, over a real socket: it proves
+    // the routing as much as the handler. Outer type 1008 has to reach the
+    // screenshare service, and it has to arrive on the `signalling` bucket -
+    // on murmur's single 1/s control bucket this silently ate the SDP offer
+    // that follows, and a dropped offer looks exactly like a client bug.
+    let data_dir = TempDir::new("webrtc-start");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SCREENSHARE,
+            &webrtc(
+                0,
+                fancy::screenshare::web_rtc_signal::SignalType::Start,
+                "tracks",
+            ),
+        )
+        .await;
+
+    let fancy::screenshare::screenshare_envelope::Body::Signal(signal) =
+        next_screenshare(&mut bob).await
+    else {
+        panic!("bob was sent something other than the announcement");
+    };
+    assert_eq!(
+        signal.signal_type(),
+        fancy::screenshare::web_rtc_signal::SignalType::Start
+    );
+    assert_eq!(
+        signal.sender_session, alice_session,
+        "stamped by the server, over the 4242 alice claimed"
+    );
+    assert_eq!(
+        signal.payload, "tracks",
+        "the track metadata every viewer re-parses, relayed verbatim"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_screen_share_offer_is_relayed_to_the_one_session_it_names() {
+    // The mesh half, which is what a deployment with no public media address
+    // runs: the server addresses the signalling and the clients negotiate
+    // between themselves. murmur's directed relay, including that it is
+    // directed - a broadcast here would show one viewer's SDP to the channel.
+    let data_dir = TempDir::new("webrtc-offer");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+    let mut carol = Client::connect(deployment.port).await;
+    let _ = handshake(&mut carol, "carol").await;
+
+    alice
+        .send(
+            SCREENSHARE,
+            &webrtc(
+                0,
+                fancy::screenshare::web_rtc_signal::SignalType::Start,
+                "tracks",
+            ),
+        )
+        .await;
+    // Both viewers are told, which is what makes the next assertion about the
+    // offer being *directed* rather than about nothing arriving at all.
+    let _ = next_screenshare(&mut bob).await;
+    let _ = next_screenshare(&mut carol).await;
+
+    bob.send(
+        SCREENSHARE,
+        &webrtc(
+            alice_session,
+            fancy::screenshare::web_rtc_signal::SignalType::SdpOffer,
+            "v=0 bob",
+        ),
+    )
+    .await;
+
+    let fancy::screenshare::screenshare_envelope::Body::Signal(offer) =
+        next_screenshare(&mut alice).await
+    else {
+        panic!("alice was sent something other than the offer");
+    };
+    assert_eq!(offer.sender_session, bob_session);
+    assert_eq!(offer.payload, "v=0 bob");
+
+    // And carol is not shown bob's SDP. Scanning for a *screenshare* frame
+    // rather than any frame: unrelated handshake traffic would read as one.
+    let leaked = timeout(Duration::from_millis(750), async {
+        loop {
+            let (type_id, _) = carol.recv().await;
+            if type_id == SCREENSHARE {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(leaked.is_err(), "a directed offer went to the channel");
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_presenter_who_drops_ends_their_screen_share_for_everyone_else() {
+    // murmur tracked no shares at all, so a presenter closing their laptop
+    // left every viewer watching a stream that had stopped, with no event to
+    // tell them: it could only be cleared by the presenter reconnecting and
+    // stopping it by hand.
+    let data_dir = TempDir::new("webrtc-drop");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SCREENSHARE,
+            &webrtc(
+                0,
+                fancy::screenshare::web_rtc_signal::SignalType::Start,
+                "tracks",
+            ),
+        )
+        .await;
+    let _ = next_screenshare(&mut bob).await;
+
+    drop(alice);
+
+    let fancy::screenshare::screenshare_envelope::Body::Signal(stopped) =
+        next_screenshare(&mut bob).await
+    else {
+        panic!("bob was sent something other than the stop");
+    };
+    assert_eq!(
+        stopped.signal_type(),
+        fancy::screenshare::web_rtc_signal::SignalType::Stop,
+        "in the dialect the broadcast was announced in"
+    );
+
+    deployment.stop();
+}
+
 #[tokio::test]
 async fn a_poll_and_its_vote_carry_the_identity_and_the_channel_the_server_resolved() {
     // The vote is the half that was invisible: the canon vote carries no
