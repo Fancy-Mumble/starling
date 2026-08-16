@@ -1511,6 +1511,116 @@ async fn a_login_flood_over_the_control_budget_still_completes() {
 }
 
 #[tokio::test]
+async fn a_request_for_every_description_is_answered_within_the_control_budget() {
+    // The outage's second half. Hashing the descriptions moved the megabytes
+    // out of the flood, but a Fancy client redeems them by asking for the whole
+    // tree in one `RequestBlob` at `ServerSync` -- and the answer to that went
+    // out as one burst, past the same budget, killing the client a few hundred
+    // milliseconds after it had connected. Against the deployed server: 36
+    // channels, 5.75 MiB of descriptions, 4 MiB budget, reset every time.
+    //
+    // So the reply is capped, and the contract is what this asserts: one
+    // request is answered with what fits and no more, the rest keep their
+    // hashes, and asking again redeems them -- the whole tree arrives, over
+    // several rounds, without the connection ever being at risk.
+    let data_dir = TempDir::new("blob-within-budget");
+    const BUDGET: usize = 256 * 1024;
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        config.gateway.control_bytes = BUDGET;
+    })
+    .await;
+    // Half the budget is the cap; each of these is comfortably under it, so
+    // nothing here is unanswerable -- only more than one reply can carry.
+    let ceiling = BUDGET / 2;
+    let each = 48 * 1024;
+    let mut ids = Vec::new();
+    for n in 0..8 {
+        ids.push(
+            deployment
+                .create_described_channel(&format!("Gallery {n}"), "A".repeat(each))
+                .await,
+        );
+    }
+
+    let mut client = Client::connect(deployment.port).await;
+    let _session = handshake(&mut client, "viewer").await;
+
+    /// Long enough to be sure a reply has stopped, short enough to spend eight
+    /// of them: this is the gap between rounds, not a frame timeout.
+    const QUIET: Duration = Duration::from_millis(500);
+    let mut redeemed: Vec<u32> = Vec::new();
+    let mut rounds = 0;
+    while redeemed.len() < ids.len() {
+        rounds += 1;
+        assert!(
+            rounds <= ids.len(),
+            "each round must redeem at least one description; \
+             {} of {} after {rounds} rounds",
+            redeemed.len(),
+            ids.len()
+        );
+        let missing: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| !redeemed.contains(id))
+            .collect();
+        client
+            .send(
+                23,
+                &tcp::RequestBlob {
+                    channel_description: missing,
+                    ..tcp::RequestBlob::default()
+                },
+            )
+            .await;
+
+        let mut answered = 0usize;
+        while let Some((type_id, payload)) = client.next_frame(QUIET).await {
+            if type_id != 7 {
+                continue;
+            }
+            let state =
+                tcp::ChannelState::decode(payload.as_slice()).expect("a well-formed ChannelState");
+            let (Some(id), Some(description)) = (state.channel_id, state.description) else {
+                continue;
+            };
+            if description.is_empty() || !ids.contains(&id) {
+                continue;
+            }
+            assert_eq!(description.len(), each, "a redeemed description is whole");
+            answered += description.len();
+            redeemed.push(id);
+        }
+        assert!(
+            answered <= ceiling,
+            "one request must not be answered with more than the cap: \
+             {answered} bytes against a {ceiling}-byte ceiling"
+        );
+        assert!(answered > 0, "a request must make progress");
+    }
+    assert!(
+        rounds > 1,
+        "the point is a reply too large for one round; it took {rounds}"
+    );
+
+    // Still connected, and still being served: the reply that used to be a
+    // disconnect is now just a reply.
+    client
+        .send(
+            3,
+            &tcp::Ping {
+                timestamp: Some(1),
+                ..tcp::Ping::default()
+            },
+        )
+        .await;
+    let (kind, _) = client.recv().await;
+    assert_eq!(kind, 3, "the server answers a ping on a live connection");
+
+    deployment.stop();
+}
+
+#[tokio::test]
 async fn the_server_announces_its_release_version_not_a_service_crate_s() {
     // The opening `Version.release` is the server's version, from the workspace,
     // and must not be a component crate's own number. It was built from

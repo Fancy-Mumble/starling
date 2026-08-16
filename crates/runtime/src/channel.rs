@@ -151,6 +151,19 @@ impl Resolver {
         usize::try_from(self.config.runtime.max_tree_message.get()).unwrap_or(usize::MAX)
     }
 
+    /// The gateway's per-client control budget, for services that answer a
+    /// request with many frames at once.
+    ///
+    /// A service cannot see a client's queue, so a reply it builds in one go is
+    /// the one thing it *can* keep from overflowing that queue by itself. Here
+    /// for the same reason [`Self::max_tree_message`] is: it is the
+    /// deployment's number, and a service that guessed a different one would
+    /// disagree with the gateway about when a client dies.
+    #[must_use]
+    pub fn control_bytes(&self) -> usize {
+        self.config.gateway.control_bytes
+    }
+
     fn cached(&self, service: &str) -> Result<Option<Channel>, ChannelError> {
         let cache = self.cache.lock().map_err(|_| ChannelError::Poisoned)?;
         Ok(cache.get(service).cloned())

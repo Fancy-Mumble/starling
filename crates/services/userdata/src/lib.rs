@@ -56,6 +56,66 @@ const REQUEST_BLOB: u16 = 23;
 /// The root channel, where the server-wide permissions live.
 const ROOT_CHANNEL: u32 = 0;
 
+/// One `RequestBlob` answer, bounded by what the client can hold.
+///
+/// Every blob a client redeems -- avatars, comments, channel descriptions --
+/// is queued on that client's control lane at once, and a lane over `[gateway]
+/// control_bytes` is a disconnect. A client that asks for a lot in one request
+/// would otherwise be killed by the answer it asked for: a Fancy client redeems
+/// its whole channel tree at `ServerSync`, and against a real server that was
+/// 36 descriptions of inline artwork, 5.75 MiB, into a 4 MiB budget.
+///
+/// So an answer carries what fits and no more. What is left keeps its hash and
+/// is redeemed by the next request: a blob withheld renders as an empty
+/// description or a missing avatar until it is asked for again, while a blob
+/// that overflows the lane costs the client its connection.
+struct BlobReply {
+    conn: u64,
+    /// The most this answer may queue, in bytes.
+    ceiling: usize,
+    spent: usize,
+    withheld: usize,
+    actions: Actions,
+}
+
+impl BlobReply {
+    fn new(conn: u64, ceiling: usize) -> Self {
+        Self {
+            conn,
+            ceiling,
+            spent: 0,
+            withheld: 0,
+            actions: Actions::new(),
+        }
+    }
+
+    /// Queue one frame if the budget has room for it, and count it as withheld
+    /// if it does not. Later frames are still offered: a small comment can fit
+    /// where a large avatar did not, and answering it is strictly better than
+    /// refusing it for the company it kept.
+    fn push(&mut self, type_id: u16, payload: Vec<u8>) {
+        if self.spent + payload.len() > self.ceiling {
+            self.withheld += 1;
+            return;
+        }
+        self.spent += payload.len();
+        self.actions.push(to_conn(self.conn, type_id, payload));
+    }
+
+    fn finish(self) -> Actions {
+        if self.withheld > 0 {
+            tracing::debug!(
+                conn = self.conn,
+                answered = self.actions.len(),
+                withheld = self.withheld,
+                ceiling = self.ceiling,
+                "control budget spent; the rest keep their hashes"
+            );
+        }
+        self.actions
+    }
+}
+
 /// The service.
 #[derive(Debug)]
 pub struct UserdataService {
@@ -356,6 +416,12 @@ impl UserdataService {
                 .and_then(|other| identity::account(other.registered, other.account))
         };
 
+        // Half the budget, not all of it: this reply shares the lane with
+        // whatever else is in flight for that client -- the tail of a
+        // handshake, other users' states -- and a cap that assumed an empty
+        // queue would be the overflow it is here to avoid.
+        let mut reply = BlobReply::new(inbound.conn, self.resolver.control_bytes() / 2);
+
         let mut states = Vec::new();
         for session in &request.session_texture {
             let Some(id) = account_of(*session) else {
@@ -418,21 +484,18 @@ impl UserdataService {
             }
         }
 
-        let mut actions: Actions = states
-            .into_iter()
-            .map(|state| to_conn(inbound.conn, 9, state.encode_to_vec()))
-            .collect();
+        for state in states {
+            reply.push(9, state.encode_to_vec());
+        }
         if !listed.is_empty() {
-            let reply = starling_proto::proto::tcp::UserList { users: listed };
-            actions.push(to_conn(inbound.conn, USER_LIST, reply.encode_to_vec()));
+            let users = starling_proto::proto::tcp::UserList { users: listed };
+            reply.push(USER_LIST, users.encode_to_vec());
         }
         // Channel descriptions travel as a hash in the flood, so the client
         // redeems the body here just as it redeems avatars and comments above.
-        actions.extend(
-            self.channel_descriptions(inbound.scope, inbound.conn, &request.channel_description)
-                .await,
-        );
-        actions
+        self.channel_descriptions(inbound.scope, &request.channel_description, &mut reply)
+            .await;
+        reply.finish()
     }
 
     /// Answer `RequestBlob.channel_description`: the full body of a description
@@ -444,12 +507,15 @@ impl UserdataService {
     /// metadata answers nothing, as murmur answers only what it can. The decode
     /// limit is raised off the 4 MiB default for the same reason the handshake
     /// raises it -- the tree is the one reply that outgrows it.
-    async fn channel_descriptions(&self, scope: u32, conn: u64, ids: &[u32]) -> Actions {
+    ///
+    /// Answered into `reply`, so the descriptions share one budget with the
+    /// avatars and comments of the same request.
+    async fn channel_descriptions(&self, scope: u32, ids: &[u32], reply: &mut BlobReply) {
         if ids.is_empty() {
-            return Actions::new();
+            return;
         }
         let Ok(transport) = self.resolver.channel("metadata") else {
-            return Actions::new();
+            return;
         };
         let Ok(tree) = MetadataClient::new(transport)
             .max_decoding_message_size(self.resolver.max_tree_message())
@@ -458,21 +524,36 @@ impl UserdataService {
             })
             .await
         else {
-            return Actions::new();
+            return;
         };
         let channels = tree.into_inner().channels;
-        ids.iter()
-            .filter_map(|id| channels.iter().find(|channel| channel.id == *id))
-            .map(|channel| {
-                let state = starling_proto::proto::tcp::ChannelState {
-                    channel_id: Some(channel.id),
-                    description: Some(channel.description.clone()),
-                    ..starling_proto::proto::tcp::ChannelState::default()
-                };
-                // 7 is ChannelState, as in the flood (`session-lifecycle`).
-                to_conn(conn, 7, state.encode_to_vec())
-            })
-            .collect()
+        for id in ids {
+            let Some(channel) = channels.iter().find(|channel| channel.id == *id) else {
+                continue;
+            };
+            let state = starling_proto::proto::tcp::ChannelState {
+                channel_id: Some(channel.id),
+                description: Some(channel.description.clone()),
+                ..starling_proto::proto::tcp::ChannelState::default()
+            };
+            let payload = state.encode_to_vec();
+            if payload.len() > reply.ceiling {
+                // Not "later": never. No request can carry this one, so say so,
+                // naming the channel and both numbers -- the operator's choice
+                // is to shrink the artwork or raise the budget, and neither is
+                // visible from a blank description.
+                tracing::warn!(
+                    channel = channel.id,
+                    bytes = payload.len(),
+                    ceiling = reply.ceiling,
+                    "channel description is larger than a client's control \
+                     budget allows to be sent; leaving it unanswered"
+                );
+                continue;
+            }
+            // 7 is ChannelState, as in the flood (`session-lifecycle`).
+            reply.push(7, payload);
+        }
     }
 
     /// Every live session on a server instance, from `session-view`.

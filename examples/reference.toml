@@ -158,7 +158,9 @@ registry_location = ""
 control_queue = 4096
 # Control bytes held per client before that client is disconnected; bounds memory
 # where control_queue only bounds the count. The login channel flood pushes
-# against it -- raise it for a server with heavy channel artwork.
+# against it -- raise it for a server with heavy channel artwork. A blob reply is
+# capped at half of it, so a client that asks for many channel descriptions at
+# once is answered over several requests rather than disconnected.
 control_bytes = 4194304
 # Tunnelled audio frames held per client. Full means drop the oldest and count
 # it, because a late audio frame is worthless.
