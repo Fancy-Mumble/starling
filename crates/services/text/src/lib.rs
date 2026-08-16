@@ -25,6 +25,8 @@ use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::perm::Perm;
+use starling_proto_fancy::push::push_client::PushClient;
+use starling_proto_fancy::push::{LiveQuery, Notification};
 use starling_proto_fancy::sessionview::SubscribeRequest;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::text::text_server::{Text, TextServer};
@@ -72,6 +74,20 @@ const COLD_ROSTER_RETRY_MS: u64 = 1_000;
 /// exactly like a server where nobody is talking. Gating readiness keeps
 /// traffic away until it can actually address a channel.
 const VIEW_GATE: &str = "session-view";
+
+/// How long a message may wait for `push` to name its live subscribers.
+///
+/// This one is on the delivery path rather than behind a spawn, so it is the
+/// only place an optional service can slow chat down. Short enough that a
+/// `push` in trouble costs a few extra recipients and not a visible delay.
+const LIVE_SUBSCRIBER_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How much of a message a push notification carries.
+///
+/// murmur's `.left(200)`. A preview and not the message: the point is to say
+/// enough that somebody decides whether to open the app, and a notification
+/// that reproduces a whole paste on a lock screen is the wrong side of that.
+const PREVIEW_CHARS: usize = 200;
 
 /// How many delivered messages a `Watch` subscriber may fall behind by.
 ///
@@ -129,6 +145,11 @@ pub struct TextService {
     /// without limit and never the delivery of the message itself. A chat
     /// observer falling behind is not a reason to stop serving chat.
     events: broadcast::Sender<MessageEvent>,
+    /// Whether `push` is a service this deployment runs.
+    ///
+    /// Read once at start-up so that an operator who switched push off does not
+    /// pay a dial, and a log line, on every message anybody sends.
+    live_push: bool,
     /// Wakes the delivery timer when what is due next has changed.
     ///
     /// Without it a message scheduled for two minutes from now would wait
@@ -629,6 +650,10 @@ impl TextService {
 
         let recipients = self.recipients_of(inbound, &message).await;
 
+        // Before the empty-recipients return below, because a message into a
+        // channel nobody is sitting in is exactly the one push exists for.
+        self.notify_absent(inbound, &message).await;
+
         let echo = starling_proto::proto::tcp::TextMessage {
             actor: Some(inbound.session),
             ..message
@@ -644,6 +669,96 @@ impl TextService {
             return Actions::new();
         }
         vec![to_sessions(recipients, TEXT_MESSAGE, echo.encode_to_vec())]
+    }
+
+    /// Tell `push` about a message, for the people who are not here to read it.
+    ///
+    /// murmur's `Server::dispatchPushNotifications`, and the two halves have
+    /// swapped places: upstream walks its own registration table from inside
+    /// the chat path, here the chat service says what happened and the push
+    /// service decides whose phone that reaches. It is the only division that
+    /// works, since who is *connected* is knowledge this service has and who
+    /// registered a device is knowledge it does not.
+    ///
+    /// The push calls are spawned and never awaited. A notification is
+    /// best-effort by definition, and a chat message must not wait on an OAuth
+    /// exchange with Google to reach the people who are already looking at the
+    /// channel.
+    async fn notify_absent(
+        &self,
+        inbound: &Inbound,
+        message: &starling_proto::proto::tcp::TextMessage,
+    ) {
+        // Only channels. A message addressed at sessions is addressed at people
+        // who are connected by definition, and there is nobody absent to tell.
+        let mut channels = message.channel_id.clone();
+        if !message.tree_id.is_empty() {
+            for channel in self
+                .expand_channels(inbound.scope, &message.tree_id, true)
+                .await
+            {
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                }
+            }
+        }
+        if channels.is_empty() {
+            return;
+        }
+        let Ok(transport) = self.resolver.channel("push") else {
+            tracing::debug!("push is unreachable; nobody offline hears about this message");
+            return;
+        };
+
+        let scope = inbound.scope;
+        let title = self.roster.name_of(inbound.session).unwrap_or_default();
+        let body = preview(&message.message);
+        // Everyone with a session, which includes the sender: they are all
+        // looking at the message already. A cold roster skips nobody, so the
+        // failure is a phone that buzzes about something on screen rather than
+        // one that stays silent about something it should have shown.
+        let skip_accounts = self.roster.connected_accounts();
+
+        drop(tokio::spawn(async move {
+            let mut client = PushClient::new(transport);
+            // One per channel: a mute preference and a `SubscribePush` grant
+            // are both per channel, so a message to three of them is three
+            // different questions about the same words.
+            for channel in channels {
+                let answer = client
+                    .notify(Notification {
+                        scope: Some(Scope { instance: scope }),
+                        // Deliberately nobody: this service knows who is
+                        // connected, `push` knows who registered a device.
+                        accounts: Vec::new(),
+                        title: title.clone(),
+                        body: body.clone(),
+                        data: std::collections::HashMap::new(),
+                        skip_accounts: skip_accounts.clone(),
+                        channel,
+                    })
+                    .await;
+                match answer {
+                    Ok(result) => {
+                        let result = result.into_inner();
+                        tracing::debug!(
+                            channel,
+                            delivered = result.delivered,
+                            skipped = result.skipped,
+                            failed = result.failed,
+                            "notified the absent about a message"
+                        );
+                    }
+                    // Debug, not warn: push is optional and a server without it
+                    // is a supported deployment, not a broken one.
+                    Err(status) => tracing::debug!(
+                        channel,
+                        %status,
+                        "could not tell push about a message"
+                    ),
+                }
+            }
+        }));
     }
 
     /// Who a client's message is actually for.
@@ -673,17 +788,70 @@ impl TextService {
             }
         }
         // Only pay for the tree walk when a tree was actually addressed.
+        let mut channels = message.channel_id.clone();
         if !message.tree_id.is_empty() {
             for channel in self
                 .expand_channels(inbound.scope, &message.tree_id, true)
                 .await
             {
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                }
                 for session in self.roster.in_channel(channel, inbound.session) {
                     add(session);
                 }
             }
         }
+
+        // Everyone who asked to hear this room without sitting in it.
+        for session in self.live_subscribers(inbound, &channels).await {
+            add(session);
+        }
         targets
+    }
+
+    /// The connected sessions that asked `push` for live delivery here.
+    ///
+    /// The fork keeps these in the server object and walks them inline
+    /// (`Messages.cpp:2497`); across a service boundary it is one question
+    /// asked of the service that holds the subscriptions, which also holds the
+    /// permission and mute decisions that go with them.
+    ///
+    /// Bounded hard, and answered with nobody on any failure. Live delivery is
+    /// an extra: a `push` that is down, slow or absent must cost the people it
+    /// would have reached, never the message itself.
+    async fn live_subscribers(&self, inbound: &Inbound, channels: &[u32]) -> Vec<u32> {
+        if channels.is_empty() || !self.live_push {
+            return Vec::new();
+        }
+        let Ok(transport) = self.resolver.channel("push") else {
+            return Vec::new();
+        };
+        let mut client = PushClient::new(transport);
+        let query = client.live_subscribers(LiveQuery {
+            scope: Some(Scope {
+                instance: inbound.scope,
+            }),
+            channels: channels.to_vec(),
+            exclude_session: inbound.session,
+        });
+        match tokio::time::timeout(LIVE_SUBSCRIBER_BUDGET, query).await {
+            Ok(Ok(list)) => list.into_inner().sessions,
+            Ok(Err(status)) => {
+                tracing::debug!(%status, "push could not name its live subscribers");
+                Vec::new()
+            }
+            Err(_) => {
+                // Warned about, unlike the error above: a `push` that answers
+                // too slowly delays every message on the server by this budget,
+                // and that is worth an operator seeing.
+                tracing::warn!(
+                    budget_ms = LIVE_SUBSCRIBER_BUDGET.as_millis(),
+                    "push did not name its live subscribers in time"
+                );
+                Vec::new()
+            }
+        }
     }
 
     async fn on_envelope(&self, inbound: &Inbound) -> Actions {
@@ -1136,6 +1304,20 @@ impl TextService {
     }
 }
 
+/// The line a notification shows under the sender's name.
+///
+/// Markup comes off first: the body is delivered to clients as it was sent,
+/// tags and all, and a phone shows a notification as plain text, so a message
+/// typed in a formatting client would arrive on a lock screen as `<b>hi</b>`.
+/// Then 200 characters of what is left, counted in characters and not bytes,
+/// so the cut never lands inside one.
+fn preview(body: &str) -> String {
+    filter::strip_html(body)
+        .chars()
+        .take(PREVIEW_CHARS)
+        .collect()
+}
+
 impl Serve for TextService {
     const NAME: &'static str = "text";
 
@@ -1159,6 +1341,11 @@ impl Serve for TextService {
             roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
+            live_push: ctx
+                .config
+                .services
+                .get("push")
+                .is_none_or(|push| push.enabled),
         }))
     }
 
@@ -1233,6 +1420,10 @@ mod tests {
             roster: Arc::new(Roster::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
+            // On, so the path a message takes in production is the path these
+            // tests take; `push` is unreachable here, which is the case the
+            // budget and the empty answer exist for.
+            live_push: true,
         })
     }
 
@@ -1731,6 +1922,46 @@ mod tests {
             .expect("stored");
         let _ = service.deliver_due(1).await;
         assert_eq!(actor_of(&delivered.try_recv().expect("a delivery")), None);
+    }
+
+    #[test]
+    fn a_notification_preview_is_the_words_and_not_the_markup() {
+        // The body reaches clients as it was sent, tags included; a lock screen
+        // renders none of them, so `<b>hi</b>` would arrive verbatim.
+        assert_eq!(preview("<b>hi</b> there"), "hi there");
+    }
+
+    #[test]
+    fn a_long_message_is_cut_by_characters_and_never_inside_one() {
+        // murmur's 200, and counted the way a `String` can actually be cut: a
+        // byte-wise truncation lands mid-character on the first non-ASCII
+        // message and panics.
+        let long = "é".repeat(PREVIEW_CHARS + 50);
+        let preview = preview(&long);
+        assert_eq!(preview.chars().count(), PREVIEW_CHARS);
+        assert!(preview.starts_with('é'));
+    }
+
+    #[tokio::test]
+    async fn a_message_nobody_is_there_for_still_goes_to_push() {
+        // The case push exists for. `push` is unreachable in these tests, so
+        // what is asserted is that the attempt is made and that failing to
+        // reach an optional service never touches delivery.
+        let service = service().await;
+        let message = starling_proto::proto::tcp::TextMessage {
+            channel_id: vec![7],
+            message: "anybody there?".to_owned(),
+            ..starling_proto::proto::tcp::TextMessage::default()
+        };
+        let inbound = Inbound {
+            scope: 1,
+            conn: 1,
+            session: 7,
+            type_id: TEXT_MESSAGE,
+            gateway: String::new(),
+            payload: message.encode_to_vec(),
+        };
+        service.notify_absent(&inbound, &message).await;
     }
 
     /// The actor on the `TextMessage` a delivery pushed.
