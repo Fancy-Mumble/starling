@@ -193,7 +193,7 @@ pub enum SendError {
         /// What went wrong.
         reason: String,
     },
-    /// It took longer than [`TIMEOUT`].
+    /// It took longer than this crate's request timeout.
     #[error("{host} did not answer within {}s", TIMEOUT.as_secs())]
     TimedOut {
         /// Which host went quiet.

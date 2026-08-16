@@ -151,7 +151,7 @@ impl ServiceAccount {
     }
 
     /// A signed assertion, good from `issued_at` (seconds since the epoch, on
-    /// *Google's* clock) for [`ASSERTION_LIFETIME`].
+    /// *Google's* clock) for the assertion lifetime.
     ///
     /// The caller passes the time rather than this reading the clock, because
     /// the clock this has to agree with is not necessarily the local one; see

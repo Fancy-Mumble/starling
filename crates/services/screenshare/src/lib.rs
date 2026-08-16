@@ -56,7 +56,7 @@
 //!
 //! It is a *dialect*, not a second feature: both announce a share, both feed
 //! the same [`SfuHandle`], both are cleaned up by the same `closed`. Only the
-//! bytes differ, so [`Dialect`] is the only thing the paths branch on, and the
+//! bytes differ, so `Dialect` is the only thing the paths branch on, and the
 //! branch is at the two points where bytes are produced.
 //!
 //! Two things murmur's path did that this one keeps:
