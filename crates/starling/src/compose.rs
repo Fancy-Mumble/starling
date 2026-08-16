@@ -336,7 +336,7 @@ fn cell_for(
     // flag as a change needing a restart, every single time.
     let all_in_one = config.runtime.all_in_one;
     let cell = cell.adjusting(move |config| config.runtime.all_in_one = all_in_one);
-    cell.install_signal_handler(logger.clone());
+    cell.install_signal_handler(logger);
     starling_runtime::live::follow_logging(&cell, handles, logger.clone());
     cell
 }

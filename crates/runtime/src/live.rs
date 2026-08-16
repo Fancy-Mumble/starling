@@ -299,10 +299,11 @@ impl ConfigCell {
     /// On platforms with no `SIGHUP` this does nothing: Windows has no such
     /// signal, and inventing a substitute here would be a second mechanism to
     /// document and keep working. The admin plane is the portable trigger.
-    pub fn install_signal_handler(&self, logger: Logger) {
+    pub fn install_signal_handler(&self, logger: &Logger) {
         #[cfg(unix)]
         {
             let cell = self.clone();
+            let logger = logger.clone();
             drop(tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
                 let mut hangup = match signal(SignalKind::hangup()) {
@@ -320,7 +321,7 @@ impl ConfigCell {
         }
         #[cfg(not(unix))]
         {
-            let _ = logger;
+            let _: &Logger = logger;
         }
     }
 }

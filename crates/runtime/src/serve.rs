@@ -381,7 +381,7 @@ pub fn serve<S: Serve>() -> Result<(), ServiceError> {
             // service written against it needs no second code path.
             None => ConfigCell::fixed(Arc::clone(&config)),
         };
-        cell.install_signal_handler(logger.clone());
+        cell.install_signal_handler(&logger);
         crate::live::follow_logging(&cell, handles, logger.clone());
 
         let ctx = context(S::NAME, config, Broker::new(), shutdown, logger).following(cell);
