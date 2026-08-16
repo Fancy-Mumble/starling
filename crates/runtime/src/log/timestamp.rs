@@ -7,7 +7,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Format a [`SystemTime`] as RFC 3339 UTC with milliseconds.
+/// Format a [`SystemTime`] as RFC 3339 UTC with microseconds.
+///
+/// Microseconds rather than milliseconds because that is what `tracing`'s
+/// default timer prints, and the two share a stderr: two widths of timestamp
+/// in one column read as two logs.
 ///
 /// Times before the Unix epoch format as the epoch: a log record cannot
 /// meaningfully predate the process, and returning an error here would make
@@ -16,14 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn rfc3339(at: SystemTime) -> String {
     let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = since_epoch.as_secs();
-    let millis = since_epoch.subsec_millis();
+    let micros = since_epoch.subsec_micros();
 
     let days = (secs / 86_400) as i64;
     let time_of_day = secs % 86_400;
     let (year, month, day) = civil_from_days(days);
 
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{micros:06}Z",
         time_of_day / 3600,
         (time_of_day % 3600) / 60,
         time_of_day % 60,
@@ -52,49 +56,49 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn at(secs: u64, millis: u32) -> SystemTime {
-        UNIX_EPOCH + Duration::new(secs, millis * 1_000_000)
+    fn at(secs: u64, micros: u32) -> SystemTime {
+        UNIX_EPOCH + Duration::new(secs, micros * 1_000)
     }
 
     #[test]
     fn the_epoch_formats_as_the_epoch() {
-        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]
     fn known_timestamps_match_their_rfc3339_form() {
         // Cross-checked against `date -u -d @<secs>`.
-        assert_eq!(rfc3339(at(1_000_000_000, 0)), "2001-09-09T01:46:40.000Z");
-        assert_eq!(rfc3339(at(1_700_000_000, 0)), "2023-11-14T22:13:20.000Z");
-        assert_eq!(rfc3339(at(2_000_000_000, 0)), "2033-05-18T03:33:20.000Z");
+        assert_eq!(rfc3339(at(1_000_000_000, 0)), "2001-09-09T01:46:40.000000Z");
+        assert_eq!(rfc3339(at(1_700_000_000, 0)), "2023-11-14T22:13:20.000000Z");
+        assert_eq!(rfc3339(at(2_000_000_000, 0)), "2033-05-18T03:33:20.000000Z");
     }
 
     #[test]
-    fn milliseconds_are_zero_padded() {
-        assert_eq!(rfc3339(at(0, 7)), "1970-01-01T00:00:00.007Z");
-        assert_eq!(rfc3339(at(0, 70)), "1970-01-01T00:00:00.070Z");
-        assert_eq!(rfc3339(at(0, 700)), "1970-01-01T00:00:00.700Z");
+    fn microseconds_are_zero_padded() {
+        assert_eq!(rfc3339(at(0, 7)), "1970-01-01T00:00:00.000007Z");
+        assert_eq!(rfc3339(at(0, 7_000)), "1970-01-01T00:00:00.007000Z");
+        assert_eq!(rfc3339(at(0, 700_000)), "1970-01-01T00:00:00.700000Z");
     }
 
     #[test]
     fn leap_days_are_handled() {
         // 2000 is a leap year (divisible by 400), 1900 was not.
-        assert_eq!(rfc3339(at(951_782_400, 0)), "2000-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339(at(951_782_400, 0)), "2000-02-29T00:00:00.000000Z");
         // 2024-02-29.
-        assert_eq!(rfc3339(at(1_709_164_800, 0)), "2024-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339(at(1_709_164_800, 0)), "2024-02-29T00:00:00.000000Z");
     }
 
     #[test]
     fn year_and_century_boundaries_are_exact() {
-        assert_eq!(rfc3339(at(946_684_799, 0)), "1999-12-31T23:59:59.000Z");
-        assert_eq!(rfc3339(at(946_684_800, 0)), "2000-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(at(946_684_799, 0)), "1999-12-31T23:59:59.000000Z");
+        assert_eq!(rfc3339(at(946_684_800, 0)), "2000-01-01T00:00:00.000000Z");
     }
 
     #[test]
     fn a_time_before_the_epoch_clamps_rather_than_failing() {
         // A sink must never have to handle a formatting error.
         let before = UNIX_EPOCH - Duration::from_secs(60);
-        assert_eq!(rfc3339(before), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(before), "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]

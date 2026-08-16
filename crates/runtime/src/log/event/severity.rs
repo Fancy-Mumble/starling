@@ -30,16 +30,17 @@ impl Severity {
         Self::Critical,
     ];
 
-    /// Fixed-width label, so console output aligns.
+    /// Fixed-width label, right-aligned so console output lines up with
+    /// `tracing`'s (` INFO`, ` WARN`, `ERROR`), which shares the same stderr.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Debug => "DEBUG",
-            Self::Info => "INFO ",
-            Self::Notice => "NOTE ",
-            Self::Warning => "WARN ",
+            Self::Info => " INFO",
+            Self::Notice => " NOTE",
+            Self::Warning => " WARN",
             Self::Error => "ERROR",
-            Self::Critical => "CRIT ",
+            Self::Critical => " CRIT",
         }
     }
 

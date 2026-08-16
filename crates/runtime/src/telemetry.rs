@@ -27,11 +27,15 @@ pub fn install(config: &TelemetryConfig) {
     // `warn`, not `info`, when `RUST_LOG` says nothing.
     //
     // Both this and `crate::log` write to stderr, and at `info` they narrated
-    // the same events twice in two different shapes, the operator log's
-    // `INFO session client connected ...` next to tracing's
+    // the same events twice, the operator log's
+    // `INFO session: client connected ...` next to tracing's
     // `INFO starling_gateway::listener: client connected ...`. The operator log
     // is the one meant to be *read*: it is curated, categorised, and covers
     // startup, connections and refusals. This one is a developer's dial.
+    //
+    // The two are laid out alike on purpose (`ConsoleSink` follows this
+    // formatter's shape and colours), so when both do speak they read as one
+    // log rather than two interleaved ones.
     //
     // So the default is the level at which a developer's dial is worth
     // interrupting an operator: something went wrong. `RUST_LOG=debug` brings
