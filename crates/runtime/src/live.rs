@@ -268,10 +268,7 @@ impl ConfigCell {
             .with("revision", outcome.revision.clone())
             .with("applied", Outcome::names(&outcome.applied));
         if !outcome.next_connection.is_empty() {
-            event = event.with(
-                "next_connection",
-                Outcome::names(&outcome.next_connection),
-            );
+            event = event.with("next_connection", Outcome::names(&outcome.next_connection));
         }
         if !outcome.deferred.is_empty() {
             event = event.with("pending_restart", Outcome::names(&outcome.deferred));
@@ -380,7 +377,9 @@ fn apply_logging(wanted: &LogConfig, applied: &LogConfig, handles: &LogHandles, 
     }
 
     if wanted.categories != applied.categories {
-        handles.filter.set_categories(spec.categories.iter().copied());
+        handles
+            .filter
+            .set_categories(spec.categories.iter().copied());
         let named = if spec.categories.is_empty() {
             "(all)".to_owned()
         } else {
@@ -414,9 +413,7 @@ fn apply_logging(wanted: &LogConfig, applied: &LogConfig, handles: &LogHandles, 
     if wanted.memory != applied.memory {
         let records = spec.memory.unwrap_or(0);
         handles.memory.set_capacity(records);
-        logger.log(
-            LogEvent::notice(Category::Server, "log ring resized").with("records", records),
-        );
+        logger.log(LogEvent::notice(Category::Server, "log ring resized").with("records", records));
     }
 
     if wanted.file != applied.file {
@@ -467,10 +464,8 @@ mod tests {
     /// Named after the test using it, so two running concurrently do not
     /// rewrite each other's file mid-reload.
     fn written(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "starling-reload-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("starling-reload-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("starling.toml");
@@ -488,7 +483,10 @@ mod tests {
 
     #[test]
     fn a_reload_publishes_what_the_file_now_says() {
-        let path = written("reload-publishes", "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n");
+        let path = written(
+            "reload-publishes",
+            "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n",
+        );
         let cell = ConfigCell::watching(
             Arc::new(Config::load(&path).expect("the file must load")),
             &path,
@@ -522,8 +520,7 @@ mod tests {
             &path,
         );
 
-        std::fs::write(&path, "[gateway]\nlisten_tcp = \"0.0.0.0:64750\"\n")
-            .expect("rewritable");
+        std::fs::write(&path, "[gateway]\nlisten_tcp = \"0.0.0.0:64750\"\n").expect("rewritable");
         let outcome = cell.reload().expect("the new file must load");
 
         assert!(outcome.applied.is_empty(), "{:#?}", outcome.applied);
@@ -558,7 +555,10 @@ mod tests {
         // The property that makes SIGHUP safe on a live server: validation runs
         // before anything is published, so a fat-fingered edit is a warning in
         // the log rather than a server that has half-adopted it.
-        let path = written("broken-file", "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n");
+        let path = written(
+            "broken-file",
+            "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n",
+        );
         let cell = ConfigCell::watching(
             Arc::new(Config::load(&path).expect("the file must load")),
             &path,
@@ -587,14 +587,20 @@ mod tests {
         std::fs::write(&path, "[services.text]\ntypes = [1006]\n").expect("rewritable");
         let error = cell.reload().expect_err("1006 is pchat's");
         assert!(
-            matches!(error, ReloadError::Config(ConfigError::DuplicateType { .. })),
+            matches!(
+                error,
+                ReloadError::Config(ConfigError::DuplicateType { .. })
+            ),
             "{error:?}"
         );
     }
 
     #[tokio::test]
     async fn a_follower_is_woken_by_a_reload() {
-        let path = written("follower-woken", "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n");
+        let path = written(
+            "follower-woken",
+            "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n",
+        );
         let cell = ConfigCell::watching(
             Arc::new(Config::load(&path).expect("the file must load")),
             &path,
@@ -620,7 +626,10 @@ mod tests {
         // A follower re-applying its slice on every SIGHUP would turn an
         // operator's "did I save that?" into a republished snapshot for every
         // subscriber in the fleet.
-        let path = written("no-change", "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n");
+        let path = written(
+            "no-change",
+            "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n",
+        );
         let cell = ConfigCell::watching(
             Arc::new(Config::load(&path).expect("the file must load")),
             &path,
@@ -630,11 +639,8 @@ mod tests {
         let outcome = cell.reload().expect("the same file must still load");
         assert!(outcome.is_empty());
 
-        let woken = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            follower.changed(),
-        )
-        .await;
+        let woken =
+            tokio::time::timeout(std::time::Duration::from_millis(100), follower.changed()).await;
         assert!(woken.is_err(), "nothing changed, so nothing may be woken");
     }
 
@@ -746,10 +752,8 @@ mod tests {
     fn a_log_file_can_be_switched_on_without_a_restart() {
         // The half a conditionally-built sink tree could never do: with no
         // `[logging.file]` at boot there was nowhere to put one later.
-        let dir = std::env::temp_dir().join(format!(
-            "starling-reload-logfile-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("starling-reload-logfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("starling.log");
@@ -779,7 +783,11 @@ mod tests {
         // A reload that could not open the new file must not also stop writing
         // to the old: the log is the thing being relied on to explain this.
         let (_log, handles) = log();
-        let unopenable = if cfg!(windows) { "\\\\?\\" } else { "/proc/self/mem/nope" };
+        let unopenable = if cfg!(windows) {
+            "\\\\?\\"
+        } else {
+            "/proc/self/mem/nope"
+        };
         apply_logging(
             &logging(&format!("[file]\npath = {unopenable:?}")),
             &logging(""),
@@ -793,7 +801,10 @@ mod tests {
 
     #[test]
     fn the_revision_is_the_one_the_outcome_reports() {
-        let path = written("revision", "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n");
+        let path = written(
+            "revision",
+            "[[instances]]\nid = 1\n[instances.settings]\nmax_users = 10\n",
+        );
         let cell = ConfigCell::watching(
             Arc::new(Config::load(&path).expect("the file must load")),
             &path,

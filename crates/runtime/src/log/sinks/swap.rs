@@ -207,7 +207,11 @@ mod tests {
         handle.put(second);
         sink.write(&event("after")).expect("write");
 
-        assert_eq!(first_handle.recent(10).len(), 1, "the old sink keeps its own");
+        assert_eq!(
+            first_handle.recent(10).len(),
+            1,
+            "the old sink keeps its own"
+        );
         assert_eq!(second_handle.recent(10).len(), 1);
         assert_eq!(second_handle.recent(10)[0].message, "after");
     }

@@ -173,7 +173,11 @@ mod tests {
         assert_eq!(level.level(), Severity::Debug);
         sink.write(&event(Severity::Info, Category::Server))
             .expect("write");
-        assert_eq!(handle.recent(10).len(), 1, "the next record follows the new level");
+        assert_eq!(
+            handle.recent(10).len(),
+            1,
+            "the next record follows the new level"
+        );
     }
 
     #[test]

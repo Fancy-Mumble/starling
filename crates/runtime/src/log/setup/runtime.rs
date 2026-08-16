@@ -68,7 +68,8 @@ impl LogRuntime {
         // leaves nowhere to put one later.
         let console_sink = SwapSink::new(
             "console",
-            spec.console.then(|| Box::new(ConsoleSink::stderr()) as Box<dyn LogSink>),
+            spec.console
+                .then(|| Box::new(ConsoleSink::stderr()) as Box<dyn LogSink>),
         );
         let console = console_sink.handle();
         fanout = fanout.with(Box::new(console_sink));

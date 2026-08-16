@@ -388,7 +388,11 @@ fn walk(value: &toml::Value, path: &mut String, flat: &mut BTreeMap<String, Stri
 pub fn changes(old: &Config, new: &Config) -> Vec<Change> {
     let (old, new) = (flatten(old), flatten(new));
     let mut changes = Vec::new();
-    for path in old.keys().chain(new.keys()).collect::<std::collections::BTreeSet<_>>() {
+    for path in old
+        .keys()
+        .chain(new.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let (before, after) = (old.get(path), new.get(path));
         if before == after {
             continue;
@@ -469,8 +473,8 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/reference.toml");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let config: Config = toml::from_str(&text)
-            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let config: Config =
+            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 
         let missing: Vec<_> = flatten(&config)
             .into_keys()
@@ -571,7 +575,9 @@ mod tests {
             .expect("the key is still present");
         assert_eq!(shown, REDACTED);
         assert!(
-            !flatten(&old).values().any(|value| value.contains("hunter2")),
+            !flatten(&old)
+                .values()
+                .any(|value| value.contains("hunter2")),
             "the password reached the flattened form"
         );
     }

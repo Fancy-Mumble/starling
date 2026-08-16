@@ -384,8 +384,7 @@ pub fn serve<S: Serve>() -> Result<(), ServiceError> {
         cell.install_signal_handler(logger.clone());
         crate::live::follow_logging(&cell, handles, logger.clone());
 
-        let ctx =
-            context(S::NAME, config, Broker::new(), shutdown, logger).following(cell);
+        let ctx = context(S::NAME, config, Broker::new(), shutdown, logger).following(cell);
         run::<S>(ctx).await
     });
 

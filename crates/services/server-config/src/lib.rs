@@ -598,7 +598,12 @@ mod tests {
         service.adopt_file(&config, &[1]).await;
 
         assert!(
-            service.owned.read().await.get(&1).is_none_or(BTreeSet::is_empty),
+            service
+                .owned
+                .read()
+                .await
+                .get(&1)
+                .is_none_or(BTreeSet::is_empty),
             "the file must claim nothing"
         );
 
@@ -611,7 +616,11 @@ mod tests {
                 &[1],
             )
             .await;
-        assert_eq!(service.snapshot(1).await.max_users, 30, "a second edit lands");
+        assert_eq!(
+            service.snapshot(1).await.max_users,
+            30,
+            "a second edit lands"
+        );
     }
 
     #[tokio::test]

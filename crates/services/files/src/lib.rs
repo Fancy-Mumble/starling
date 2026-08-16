@@ -372,7 +372,10 @@ mod tests {
         // and it is always discovered from users who cannot download anything.
         let service = service().await;
         assert!(
-            service.grant("GET", "k").url.starts_with("https://files.example.org/"),
+            service
+                .grant("GET", "k")
+                .url
+                .starts_with("https://files.example.org/"),
             "{}",
             service.grant("GET", "k").url
         );
@@ -410,7 +413,10 @@ mod tests {
         service.adopt(&starling_runtime::config::ServiceConfig::default());
         assert_eq!(service.max_upload(), 512 * 1024 * 1024);
         assert!(
-            service.grant("GET", "k").url.starts_with("http://localhost:8080/"),
+            service
+                .grant("GET", "k")
+                .url
+                .starts_with("http://localhost:8080/"),
             "{}",
             service.grant("GET", "k").url
         );
