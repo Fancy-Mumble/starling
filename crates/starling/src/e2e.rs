@@ -1545,8 +1545,10 @@ async fn a_request_for_every_description_is_answered_within_the_control_budget()
     let mut client = Client::connect(deployment.port).await;
     let _session = handshake(&mut client, "viewer").await;
 
-    /// Long enough to be sure a reply has stopped, short enough to spend eight
-    /// of them: this is the gap between rounds, not a frame timeout.
+    /// The gap between frames once a round's burst is already flowing, not
+    /// the wait for its first one: short enough to spend eight of these in
+    /// one test, long enough that back-to-back frames from the same reply
+    /// never trip it.
     const QUIET: Duration = Duration::from_millis(500);
     let mut redeemed: Vec<u32> = Vec::new();
     let mut rounds = 0;
@@ -1575,10 +1577,26 @@ async fn a_request_for_every_description_is_answered_within_the_control_budget()
             .await;
 
         let mut answered = 0usize;
-        while let Some((type_id, payload)) = client.next_frame(QUIET).await {
+        // The wait for this round's *first* `ChannelState` is [`FRAME_TIMEOUT`],
+        // same as every other "did the server answer at all" in this file: a
+        // busy runner can starve the gateway's task for a while without it
+        // making any less progress than an idle one, and that starving is
+        // exactly what [`QUIET`] was mistaken for before, one round in five
+        // failing under load with a 500ms deadline that measured scheduler
+        // noise instead of the reply.
+        //
+        // The connection carries more than this round's answer -- a
+        // `PermissionQuery` the server sends on its own schedule showed up
+        // here too, in the same slot a real reply would have -- so only a
+        // frame that *is* one, type 7, is allowed to tighten the deadline to
+        // QUIET. Anything else is read and ignored without changing `wait`,
+        // exactly as a client waiting on this round would treat it.
+        let mut wait = FRAME_TIMEOUT;
+        while let Some((type_id, payload)) = client.next_frame(wait).await {
             if type_id != 7 {
                 continue;
             }
+            wait = QUIET;
             let state =
                 tcp::ChannelState::decode(payload.as_slice()).expect("a well-formed ChannelState");
             let (Some(id), Some(description)) = (state.channel_id, state.description) else {
@@ -1596,7 +1614,10 @@ async fn a_request_for_every_description_is_answered_within_the_control_budget()
             "one request must not be answered with more than the cap: \
              {answered} bytes against a {ceiling}-byte ceiling"
         );
-        assert!(answered > 0, "a request must make progress");
+        assert!(
+            answered > 0,
+            "a request must make progress: no reply within {FRAME_TIMEOUT:?} of asking"
+        );
     }
     assert!(
         rounds > 1,
