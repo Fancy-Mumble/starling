@@ -202,6 +202,19 @@ impl Gateway {
                             continue;
                         }
                     };
+                    // TCP_NODELAY, as murmur sets on every accepted socket
+                    // (`Connection.cpp:40`). The control stream is small
+                    // request/reply frames, exactly what Nagle punishes: with
+                    // it on, a frame written after one still unacknowledged
+                    // waits for the peer's ACK, and Linux delays that ACK by
+                    // up to 40 ms. Measured against a WAN peer, a `Ping` reply
+                    // took two round trips instead of one, and 40 ms more
+                    // whenever the peer's ACK was delayed.
+                    if let Err(error) = stream.set_nodelay(true) {
+                        // Not fatal: the connection works without it, only
+                        // slower, and murmur ignores the same failure.
+                        tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
+                    }
                     let gateway = Arc::clone(&self);
                     let acceptor = acceptor.clone();
                     drop(tokio::spawn(async move {
@@ -748,12 +761,7 @@ async fn pump_writer(
 
                 let mut failed = false;
                 for frame in to_write {
-                    // Header then payload, never joined. Joining them would copy
-                    // the payload once per recipient to carry a per-connection
-                    // sequence number (`PROTOCOL-REDESIGN.md` §4, Z4).
-                    if writer.write_all(&frame.prefix).await.is_err()
-                        || writer.write_all(&frame.payload).await.is_err()
-                    {
+                    if write_frame(&mut writer, frame).await.is_err() {
                         failed = true;
                         break;
                     }
@@ -764,9 +772,7 @@ async fn pump_writer(
             }
             () = handle.audio_ready() => {
                 while let Some(frame) = handle.pop_audio() {
-                    if writer.write_all(&frame.prefix).await.is_err()
-                        || writer.write_all(&frame.payload).await.is_err()
-                    {
+                    if write_frame(&mut writer, &frame).await.is_err() {
                         return;
                     }
                 }
@@ -784,9 +790,7 @@ async fn pump_writer(
             () = handle.draining() => {
                 while let Ok(frame) = outbound.try_recv() {
                     handle.control_sent(frame.len());
-                    if writer.write_all(&frame.prefix).await.is_err()
-                        || writer.write_all(&frame.payload).await.is_err()
-                    {
+                    if write_frame(&mut writer, &frame).await.is_err() {
                         break;
                     }
                 }
@@ -795,6 +799,30 @@ async fn pump_writer(
         }
     }
     let _ = writer.shutdown().await;
+}
+
+/// Write one frame, header and payload together.
+///
+/// One vectored write, so rustls seals both into a single TLS record and the
+/// kernel sends one segment. They are still never joined in memory: the payload
+/// is shared across every recipient of a broadcast and the header is not
+/// (`PROTOCOL-REDESIGN.md` §4, Z4), and a vectored write carries the two halves
+/// to the socket without copying either.
+///
+/// Two plain writes here cost two TLS records and two segments per frame, and
+/// with Nagle on the second waited for the first to be acknowledged: an extra
+/// round trip per frame on a WAN, plus the peer's delayed-ACK timer whenever
+/// that fired.
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Outbound,
+) -> std::io::Result<()> {
+    use bytes::Buf as _;
+    if frame.prefix.is_empty() {
+        return writer.write_all(&frame.payload).await;
+    }
+    let mut joined = frame.prefix.clone().chain(frame.payload.clone());
+    writer.write_all_buf(&mut joined).await
 }
 
 /// Whether an inbound type is charged to its route's rate-limit bucket.
@@ -911,5 +939,79 @@ mod tests {
         .expect("the defaults must be servable");
         assert!(gateway.router.route(11).is_some());
         assert_eq!(gateway.router.services().len(), 18);
+    }
+
+    /// A writer that records each write call as one entry, vectored or not.
+    ///
+    /// Stands in for the TLS stream, which seals every write into its own
+    /// record: two calls here would be two records on the wire.
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let joined: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+            let len = joined.len();
+            self.writes.push(joined);
+            std::task::Poll::Ready(Ok(len))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_goes_to_the_socket_in_one_write() {
+        // Header and payload were once two writes, so two TLS records and two
+        // segments, and with Nagle on the second waited for the first to be
+        // acknowledged: a `Ping` reply cost two round trips on a WAN, and the
+        // peer's delayed-ACK timer on top. One write is one record.
+        let frame = Outbound {
+            prefix: bytes::Bytes::from_static(&[0, 3, 0, 0, 0, 2]),
+            payload: bytes::Bytes::from_static(&[8, 1]),
+        };
+        let mut writer = RecordingWriter::default();
+        write_frame(&mut writer, &frame).await.expect("a write");
+        assert_eq!(writer.writes, vec![vec![0, 3, 0, 0, 0, 2, 8, 1]]);
+
+        // Audio arrives already joined, and must not be split to fit the rule.
+        let mut writer = RecordingWriter::default();
+        write_frame(
+            &mut writer,
+            &Outbound::whole(bytes::Bytes::from_static(&[1, 2, 3])),
+        )
+        .await
+        .expect("a write");
+        assert_eq!(writer.writes, vec![vec![1, 2, 3]]);
     }
 }
