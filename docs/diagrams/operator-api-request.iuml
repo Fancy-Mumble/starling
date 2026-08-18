@@ -1,0 +1,91 @@
+' The body of operator-api-request.puml / operator-api-request-dark.puml. Not a
+' diagram on its own: it carries no start marker, so PlantUML will not render
+' this file directly.
+'
+' Careful: the start and end markers must not appear in this file *at all*, not
+' even inside a comment like this one. PlantUML scans for them lexically, so a
+' comment that merely names one opens a second diagram here and the include
+' fails with a line number pointing at neither.
+'
+' Split out because OPERATOR-API.md embeds a light and a dark render and they
+' must not drift. Everything the same in both lives here; each wrapper adds only
+' the colours that differ. See README.md for why a global flag cannot do this.
+
+' A post-render step widens this single font name into a fallback stack, so a
+' viewer without Inter gets a sans-serif rather than the monospace a missing
+' font can otherwise fall back to.
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam defaultTextAlignment center
+
+title One operator request: identify, authorise, record, then act
+
+header
+Every handler does the same four steps in the same order.
+The <b>record precedes the action</b>: one written afterwards can be missing for something that happened.
+Rationale: <b>ARCHITECTURE.md</b> S3.   Endpoints and payloads: <b>OPERATOR-API.md</b>.
+endheader
+
+actor "admin client\ncurl · panel · bot" as client $c_client
+participant "**operator-api**\naxum, one process" as api $c_api
+participant "**Authenticator**  «Strategy»\ntoken · mtls · oidc · jwt\nlive: rebuilt when the TOML changes" as auth $c_auth
+database "**audit file**\nappend-only JSONL\nflushed per record" as file $c_file
+participant "**the service**\nuserdata · metadata · permissions\nmoderation · text · audit · health\nserver-config · session-*" as svc $c_svc
+
+client -> api : HTTP + Authorization
+
+api -> auth : identify(header)
+alt no credential, or not this mode's shape
+  auth --> api : Missing | Malformed
+  api --> client : **401** {"error": ...}
+else genuine but not accepted here, or no mapped scope
+  auth --> api : Rejected | Unscoped
+  api --> client : **403**
+else identified
+  auth --> api : Identity {subject, scopes}
+  note right of auth $c_auth
+    The subject is the <b>variable name</b>, never the token value:
+    token:STARLING_ADMIN_TOKEN. An audit record must not contain
+    the credential whose use it records.
+  end note
+
+  api -> api : identity.allows(scope)?
+  alt lacks the scope this route needs
+    api --> client : **403** this identity does not hold X
+  else
+    api -> file : {id, at_ms, subject, action, outcome:"accepted"}
+    alt the write failed and audit.fail_closed
+      file --> api : io error
+      api --> client : **503** not recorded, so it did not happen
+    else recorded, or fail_closed = false
+      api -> svc : gRPC, carrying Actor{Operator{subject, scope}}
+      note right of api $c_svc
+        <b>Not a second policy implementation.</b> The same methods the
+        gateway calls, with an operator identity instead of a session.
+        The Actor is not authorisation, the services trust this plane,
+        it is so the change has a name against it in the service's log.
+      end note
+      alt unreachable, or a transport error
+        svc --> api : tonic::Status
+        api --> client : **502** <service> is unreachable
+      else applied = false
+        svc --> api : {applied: false, refused: "..."}
+        api --> client : **409**, or **404** when the target is gone
+      else applied
+        svc --> api : the result
+        api --> client : **200** body, or **204**
+      end
+    end
+  end
+end
+
+legend bottom
+  <b>Why 401 and 403 stay apart.</b>  401 is "who are you", 403 is "not you",
+  and they send an operator to different files. Collapsing them was a bug.
+  --
+  <b>Why the record is fail-closed.</b>  audit is an optional service, and the
+  highest-privilege plane must not depend on one an operator may not run, so
+  this file is written by this process. fail_closed = false trades the refusal
+  for a logged error: the operator's decision, and not the default.
+endlegend

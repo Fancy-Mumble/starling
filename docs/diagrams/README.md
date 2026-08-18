@@ -8,17 +8,29 @@
 | `scaling.puml` | The shard key per service, what scales out, what cannot, and why |
 | `gateway-internals.puml` | The gateway's parts, and what it deliberately does not know |
 | `deployment.puml` | Container topology, and the four exposure problems |
+| `operator-api-request.puml` | The admin plane's request path: identify, authorise, record, act, and which status each failure produces |
+| `operator-api-events.puml` | The live channel: four bridges, one hub, two transports, and when `started` may fire |
+| `operator-api-*-dark.puml` | The same two on a dark canvas. Each pair wraps its own `.iuml`, as `shape` does |
 
 Each answers one question, and none repeats another's rationale, shard keys live
-only in `scaling.puml`, gateway mechanics only in `gateway-internals.puml`.
+only in `scaling.puml`, gateway mechanics only in `gateway-internals.puml`,
+admin-plane endpoints only in `../OPERATOR-API.md`.
 
 Rendered PNGs are build output and are not committed, `*.png` here is ignored.
 
-**One exception: `shape.svg` and `shape-dark.svg` are committed.** The root
-README embeds them, and GitHub renders no `.puml`, so a source-only rule there
-would mean no picture at all on the page most people read first. They are the
-only renders in the tree, and both must be regenerated whenever `shape.iuml`
-changes. See *The committed SVGs* below. Nothing regenerates them for you.
+**The exception is the SVGs a document embeds**, because GitHub renders no
+`.puml`, so a source-only rule would mean no picture at all on the pages people
+actually read. Six are committed, in light and dark pairs:
+
+| Committed render | Embedded by |
+|---|---|
+| `shape.svg`, `shape-dark.svg` | the root `README.md` |
+| `operator-api-request.svg`, `operator-api-request-dark.svg` | `../OPERATOR-API.md` §3 |
+| `operator-api-events.svg`, `operator-api-events-dark.svg` | `../OPERATOR-API.md` §6 |
+
+Each pair shares one `.iuml` body, so **both halves of a pair must be
+regenerated whenever that body changes**, and neither is regenerated for you.
+See *The committed SVGs* below. Every other diagram here stays source-only.
 
 Prose lives in `../ARCHITECTURE.md`, `../PROTOCOL-COMPATIBILITY.md` and
 `../CONFIGURATION.md`. Diagrams carry structure; rationale goes in the docs, so
@@ -56,17 +68,21 @@ what a reader can rely on today.
 
 ## The committed SVGs
 
-`shape.svg` and `shape-dark.svg` are the only renders in the tree, because the
-root README embeds them in a `<picture>` and GitHub picks by the reader's theme.
-Regenerate **both** whenever `shape.iuml` changes:
+The six above are the only renders in the tree, because a `<picture>` embeds
+each pair and GitHub picks by the reader's theme. Regenerate **both halves**
+whenever the shared `.iuml` changes, and re-run both passes afterwards, the
+render overwrites the file each time:
 
 ```sh
-java -jar plantuml.jar -Playout=smetana -tsvg shape.puml shape-dark.puml
+java -jar plantuml.jar -Playout=smetana -tsvg \
+  shape.puml shape-dark.puml \
+  operator-api-request.puml operator-api-request-dark.puml \
+  operator-api-events.puml operator-api-events-dark.puml
 python - <<'EOF'
-import re
+import glob, re
 FONT = ("Inter, system-ui, -apple-system, 'Segoe UI', "
         "Roboto, Helvetica, Arial, sans-serif")
-for f in ('shape.svg', 'shape-dark.svg'):
+for f in sorted(glob.glob('shape*.svg') + glob.glob('operator-api-*.svg')):
     s = open(f, encoding='utf-8').read()
     m = re.search(r'style="[^"]*background:(#[0-9A-Fa-f]{6})', s)
     assert m, f'no background colour in {f}'
@@ -86,7 +102,7 @@ attribute on the root `<svg>` and emits no background element, so a viewer that
 drops that attribute gets the text on whatever is behind it, an unreadable
 diagram in one theme or the other. The injected `<rect>` is a painted element
 and survives. The colour is read back out of the file rather than hard-coded, so
-the one snippet serves both variants.
+the one snippet serves every variant.
 
 The **font** one: `skinparam defaultFontName Inter` emits a bare
 `font-family="Inter"`, and almost no viewer, GitHub's included, has Inter. Left

@@ -1,0 +1,18 @@
+@startuml operator-api-events
+' Light render. The body is operator-api-events.iuml, shared with
+' operator-api-events-dark.puml, which supplies the same variables in dark
+' values.
+!theme plain
+
+!$c_up   = "#FAFAFA"
+!$c_api  = "#FFE9D6"
+!$c_card = "#FFFFFF"
+!$c_seed = "#FFF9C4"
+!$c_hub  = "#FFE0B2"
+!$c_wire = "#F3E5F5"
+!$c_sub  = "#E3F2FD"
+!$c_out  = "#6A1B9A"
+!$c_in   = "#1565C0"
+
+!include operator-api-events.iuml
+@enduml

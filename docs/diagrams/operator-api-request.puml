@@ -1,0 +1,14 @@
+@startuml operator-api-request
+' Light render. The body is operator-api-request.iuml, shared with
+' operator-api-request-dark.puml, which supplies the same variables in dark
+' values.
+!theme plain
+
+!$c_client = "#F3E5F5"
+!$c_api    = "#FFE9D6"
+!$c_auth   = "#FFF9C4"
+!$c_file   = "#FFE0B2"
+!$c_svc    = "#E8F5E9"
+
+!include operator-api-request.iuml
+@enduml

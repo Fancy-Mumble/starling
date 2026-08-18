@@ -1,0 +1,108 @@
+' The body of operator-api-events.puml / operator-api-events-dark.puml. Not a
+' diagram on its own: it carries no start marker, so PlantUML will not render
+' this file directly.
+'
+' Careful: the start and end markers must not appear in this file *at all*, not
+' even inside a comment like this one. PlantUML scans for them lexically, so a
+' comment that merely names one opens a second diagram here and the include
+' fails with a line number pointing at neither.
+'
+' Split out because OPERATOR-API.md embeds a light and a dark render and they
+' must not drift. Everything the same in both lives here; each wrapper adds only
+' the colours that differ. See README.md for why a global flag cannot do this.
+
+' A post-render step widens this single font name into a fallback stack, so a
+' viewer without Inter gets a sans-serif rather than the monospace a missing
+' font can otherwise fall back to.
+skinparam defaultFontName Inter
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 16
+skinparam ranksep 44
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title The live channel: four bridges, one hub, two transports
+
+header
+<b>An upsert is a create and an update collapsed into one.</b>  Right for a subscriber rebuilding a view,
+wrong for one reacting to arrivals, so the bridges track seen ids and split it back apart here,
+rather than reshaping a wire format several services depend on around one consumer.
+Event names and payloads: <b>OPERATOR-API.md</b> S6.   Request path: <b>operator-api-request.puml</b>.
+endheader
+
+package "**upstream services**, gRPC streams" as UP $c_up {
+  component "**session-view**\nSubscribe: snapshot · upsert · gone" as sview $c_seed
+  component "**metadata**\nGetTree to seed, then Watch\n**decode limit raised**: an imported\ntree outgrows gRPC's 4 MiB default" as meta $c_seed
+  component "**text**\nWatch: delivered messages" as text $c_card
+  component "**context-actions**\nWatch: entries owner=operator-api" as ctx $c_card
+}
+
+package "**starling-operator-api**" as API $c_api {
+  component "**bridge_sessions**\nseen ids -> userConnected\nlast state -> userStateChanged\n«suppressed when the projection is equal»\nremoved -> userDisconnected, last state" as bsess $c_card
+  component "**bridge_channels**\nseeded from the tree first, so an existing\nchannel's first edit is not a creation\n-> channelCreated · channelStateChanged\n· channelRemoved" as bchan $c_card
+  component "**bridge_text**\n-> userTextMessage" as btext $c_card
+  component "**bridge_context**\n-> contextAction" as bctx $c_card
+
+  component "**EventHub**\ntokio broadcast, **1024 deep**\nattached counter, 4 of 4 = live\n--\n**not a replay.** Read /v1/sessions and\n/v1/channels first, then follow this" as hub $c_hub
+
+  component "**WebSocket**  GET /v1/events\nauthorised **before** the upgrade" as ws $c_wire
+  component "**WebTransport**  HTTP/3, same path\nnewline-delimited, off unless configured\nevents out · commands in, two uni streams" as wt $c_wire
+}
+
+actor "subscriber\nviewer · user manager · bot" as sub $c_sub
+
+sview --> bsess : upsert · gone
+meta  --> bchan : upsert · removed
+text  --> btext : message
+ctx   --> bctx  : trigger
+
+bsess --> hub
+bchan --> hub
+btext --> hub
+bctx  --> hub
+
+hub --> ws : Event
+hub --> wt : Event
+ws -[$c_out]-> sub : JSON per message
+wt -[$c_out]-> sub : JSON per line
+sub -[$c_in]-> ws : addContext · removeContext · ping
+sub -[$c_in]-> wt : same commands
+
+note right of hub $c_hub
+  <b>started fires at 4 of 4, not at the first.</b>  It was set by the
+  session bridge alone, so it went out while the channel bridge
+  was still attaching: a channel created in that window produced
+  no event, and a subscriber that had done what started invites
+  waited for something nobody was listening for.
+  --
+  <b>stopped fires when any one drops.</b>  A subscriber cannot tell
+  which half of the server it has stopped hearing about.
+  --
+  A subscriber arriving while the channel is already live is sent
+  its own <b>started</b>, since this is published once and never replayed.
+  --
+  Falling behind 1024 sends <b>lagged</b> with the count, rather than
+  hiding it: a consumer that knows can re-read the state routes,
+  one that does not acts on a picture it believes is current.
+end note
+
+note right of wt $c_wire
+  <b>The channel is bidirectional for this one reason.</b>  A context-menu
+  entry has to live exactly as long as the connection servicing it,
+  so a disconnect withdraws what it registered. Entries are owned by
+  <b>operator-api</b>, not by the operator: operators come and go and the
+  menu entry outlives the request.
+end note
+
+legend bottom
+  <b>Reconnect is silent.</b>  A bridge re-seeds from the snapshot, so everyone already
+  connected is not reported as an arrival and a restart is not a join flood. Retry is
+  a flat 2 s, and an attach that hangs is abandoned at 5 s, without which a dial that
+  never refuses means the retry is never reached and the channel silently never starts.
+  --
+  <b>WebSocket is the one that works everywhere.</b>  WebTransport is Extended CONNECT over
+  HTTP/3, which reverse proxies do not generally forward, so a proxied deployment uses
+  the WebSocket and binds no UDP port. A QUIC port that will not bind is logged, never
+  fatal: it must not take down the surface carrying the same channel.
+endlegend

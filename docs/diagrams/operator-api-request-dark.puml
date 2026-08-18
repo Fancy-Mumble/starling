@@ -1,0 +1,51 @@
+@startuml operator-api-request-dark
+' Dark render. The body is operator-api-request.iuml, shared with
+' operator-api-request.puml.
+'
+' Dark throughout, not a dark border around a white picture: the participants,
+' the alt frames, the notes and the canvas are all dark and every glyph is
+' light. Overriding only the canvas leaves the boxes white, which on a dark page
+' is worse than no dark render at all.
+'
+' These sit after !theme, which would otherwise reset them.
+!theme plain
+
+!$c_client = "#2E1F33"
+!$c_api    = "#3D2A17"
+!$c_auth   = "#3A3517"
+!$c_file   = "#3D2E17"
+!$c_svc    = "#16301C"
+
+skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
+skinparam titleFontColor #E6EDF3
+skinparam headerFontColor #9198A1
+skinparam ArrowColor #8B949E
+skinparam ArrowFontColor #E6EDF3
+skinparam actorFontColor #E6EDF3
+skinparam actorBorderColor #8B949E
+skinparam participantFontColor #E6EDF3
+skinparam participantBorderColor #30363D
+skinparam databaseFontColor #E6EDF3
+skinparam databaseBorderColor #30363D
+skinparam noteBackgroundColor #161B22
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
+skinparam legendBackgroundColor #161B22
+skinparam legendBorderColor #30363D
+skinparam legendFontColor #E6EDF3
+
+' The alt frames. Without these the group label keeps the theme's light fill and
+' the branch conditions print dark-on-dark, which is the one part of a sequence
+' diagram a reader follows the picture by.
+skinparam sequenceLifeLineBorderColor #30363D
+skinparam sequenceGroupBackgroundColor #21262D
+skinparam sequenceGroupBodyBackgroundColor #0D1117
+skinparam sequenceGroupBorderColor #30363D
+skinparam sequenceGroupFontColor #E6EDF3
+skinparam sequenceGroupHeaderFontColor #E6EDF3
+skinparam sequenceDividerBackgroundColor #21262D
+skinparam sequenceDividerFontColor #E6EDF3
+
+!include operator-api-request.iuml
+@enduml

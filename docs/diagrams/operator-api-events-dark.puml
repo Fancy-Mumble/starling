@@ -1,0 +1,45 @@
+@startuml operator-api-events-dark
+' Dark render. The body is operator-api-events.iuml, shared with
+' operator-api-events.puml.
+'
+' Dark throughout, not a dark border around a white picture: the cards, the
+' packages, the notes and the canvas are all dark and every glyph is light.
+' Overriding only the canvas leaves the cards white, which on a dark page is
+' worse than no dark render at all.
+'
+' These sit after !theme, which would otherwise reset them.
+!theme plain
+
+!$c_up   = "#161B22"
+' The package, not a card: a large area of the warm fill the light render uses
+' reads as a highlight rather than as a container, so this is the same hue held
+' back to roughly the neighbouring package's weight.
+!$c_api  = "#241A11"
+!$c_card = "#1C2128"
+!$c_seed = "#3A3517"
+!$c_hub  = "#3D2E17"
+!$c_wire = "#2E1F33"
+!$c_sub  = "#17293D"
+!$c_out  = "#C792EA"
+!$c_in   = "#79B8FF"
+
+skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
+skinparam titleFontColor #E6EDF3
+skinparam headerFontColor #9198A1
+skinparam ArrowColor #8B949E
+skinparam ArrowFontColor #E6EDF3
+skinparam actorFontColor #E6EDF3
+skinparam actorBorderColor #8B949E
+skinparam componentFontColor #E6EDF3
+skinparam componentBorderColor #30363D
+skinparam packageFontColor #E6EDF3
+skinparam packageBorderColor #30363D
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
+skinparam legendBackgroundColor #161B22
+skinparam legendBorderColor #30363D
+skinparam legendFontColor #E6EDF3
+
+!include operator-api-events.iuml
+@enduml
