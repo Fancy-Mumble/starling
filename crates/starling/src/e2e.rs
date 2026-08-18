@@ -4247,6 +4247,7 @@ async fn an_operator_clears_another_users_comment_but_cannot_write_one() {
     // should have to read and cannot replace it with one of their own choosing.
     // Enforcing only the permission would let an administrator put words into
     // somebody else's profile, under that person's name, on every client.
+    use sha1::Digest as _;
     use starling_proto_fancy::perm::Perm;
     use starling_proto_fancy::permissions::AclSet;
 
@@ -4286,9 +4287,15 @@ async fn an_operator_clears_another_users_comment_but_cannot_write_one() {
     )
     .await
     .expect("everyone is told bob set a comment");
-    assert!(
-        posted.comment_hash.is_some_and(|hash| !hash.is_empty()),
-        "the hash is what a client fetches the body with"
+    // SHA-1 of the body, not merely "some hash": a Mumble client recomputes this
+    // digest from the comment it is handed (`UserModel.cpp:1188`) and keys its
+    // "comment already seen" table by the result, so a hash produced any other
+    // way makes every reconnect look like a brand-new comment and paints the
+    // yellow flag on a user whose comment has not changed in months.
+    assert_eq!(
+        posted.comment_hash.as_deref(),
+        Some(sha1::Sha1::digest(b"something regrettable").as_slice()),
+        "the announced hash is the one the client computes for itself"
     );
 
     // Bob may not be *given* a comment by somebody else, however privileged.

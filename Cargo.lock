@@ -2441,6 +2441,7 @@ dependencies = [
  "prost",
  "rustls",
  "serde_json",
+ "sha1 0.11.0",
  "starling-audit",
  "starling-context-actions",
  "starling-crypto",
