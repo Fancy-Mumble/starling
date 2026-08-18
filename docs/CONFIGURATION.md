@@ -276,6 +276,9 @@ plugin    = { rate = "4/s",  burst = 15 }   # murmur's own plugin bucket
 trivial in any language and authentication is whatever you already run. Off unless
 configured, and localhost-bound when it is.
 
+The endpoints, scopes, payloads and event names are
+[`OPERATOR-API.md`](OPERATOR-API.md); only the TOML is here.
+
 ```toml
 [services.operator-api]
 enabled = false                    # off by default, on purpose

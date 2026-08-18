@@ -15,7 +15,8 @@ bypass the gateway entirely.** Architecture:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Wire compatibility:
 [`docs/PROTOCOL-COMPATIBILITY.md`](docs/PROTOCOL-COMPATIBILITY.md). Config:
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Storage:
-[`docs/STORAGE.md`](docs/STORAGE.md). Diagrams:
+[`docs/STORAGE.md`](docs/STORAGE.md). Admin plane:
+[`docs/OPERATOR-API.md`](docs/OPERATOR-API.md). Diagrams:
 [`docs/diagrams/`](docs/diagrams/).
 
 How far the port has got, measured against two different targets:

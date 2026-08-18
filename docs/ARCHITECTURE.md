@@ -138,6 +138,8 @@ exposure, a private ingress, or none at all.
 
 The operator surface (the replacement for Ice) can create users, rewrite ACLs,
 ban, and read the database. It is the highest-privilege surface in the system.
+Its endpoints and event names are [`OPERATOR-API.md`](OPERATOR-API.md); the
+reasoning is here.
 
 **It is plain HTTP with an OpenAPI description**, for two reasons. An admin client
 becomes trivial to write in any language, including a browser panel and `curl`.
