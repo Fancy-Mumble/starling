@@ -150,6 +150,7 @@ impl Accounts {
     /// [`StoreError`] if the schema cannot be applied.
     pub async fn open(store: Store) -> Result<Self, StoreError> {
         store.migrate(SCHEMA).await?;
+        rekey_legacy_blobs(&store).await;
         let accounts = Self {
             store,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -988,9 +989,31 @@ impl Accounts {
     }
 
     /// Store a blob, deduplicated by content hash.
+    ///
+    /// **SHA-1, and it has to be.** This hash is not a private storage key: it
+    /// is a comment's or an avatar's identity *on the wire*, and a Mumble
+    /// client recomputes it the moment it holds the body rather than trusting
+    /// the one it was sent -- `qbaCommentHash = sha1(comment)`
+    /// (`vendor/server/src/mumble/UserModel.cpp:1188`), the same digest murmur
+    /// assigns on the way in (`Server::hashAssign`).
+    ///
+    /// The client then keys two local tables by it: its blob cache, and the
+    /// `comments` table recording which comment it has already shown its user
+    /// (`Database::seenComment`). Under any other digest the announced hash and
+    /// the recomputed one never agree, so the "seen" row written after the user
+    /// reads a comment is never found again: every reconnect redraws an
+    /// unchanged comment as new, with the yellow flag, forever -- and every
+    /// avatar misses the cache and is downloaded again.
+    ///
+    /// Content addressing under a digest with known collisions is a real
+    /// weakness and this is not blind to it; it is upstream's, inherited
+    /// deliberately, because the alternative is a hash no client agrees with.
+    /// What it buys an attacker is bounded: the store holds only comments and
+    /// avatars, and substituting one takes a chosen-prefix collision against
+    /// content the victim can be made to store.
     pub async fn put_blob(&self, _scope: u32, bytes: &[u8]) -> BlobRef {
-        use sha2::{Digest as _, Sha256};
-        let hash = Sha256::digest(bytes).to_vec();
+        use sha1::{Digest as _, Sha1};
+        let hash = Sha1::digest(bytes).to_vec();
         let _ = sqlx::query(
             "INSERT INTO blob (hash, bytes, size, refs) VALUES (?, ?, ?, 1) \
              ON CONFLICT (hash) DO UPDATE SET refs = blob.refs + 1",
@@ -1035,6 +1058,95 @@ impl Accounts {
             tracing::error!(%error, "could not persist an account");
         }
     }
+}
+
+/// Move blobs written under the old SHA-256 digest onto their SHA-1 address.
+///
+/// Every hash [`Accounts::put_blob`] hands out is announced to clients, and a
+/// Mumble client keys its blob cache and its "comment already seen" table by
+/// the SHA-1 it computes from the body itself. Blobs stored before that was
+/// true are still *readable* -- the account points at the row it was given --
+/// but the hash on the wire is one no client will ever agree with, so those
+/// accounts would keep announcing a new comment on every join. This walks them
+/// over once.
+///
+/// A pass, not a `Migration`: the new key is a digest of the bytes, which no
+/// backend's SQL can compute. It costs one indexed scan of the blob keys on a
+/// server that has already been walked over, because the rows it selects are
+/// exactly the rows it removes.
+async fn rekey_legacy_blobs(store: &Store) {
+    use sha1::{Digest as _, Sha1};
+    use sqlx::Row as _;
+
+    // Keys only. The bytes are avatars, and reading a few hundred of those to
+    // decide there is nothing to do would be a slow start on every boot.
+    let Ok(rows) = sqlx::query("SELECT hash FROM blob WHERE length(hash) <> 20")
+        .fetch_all(store.pool())
+        .await
+    else {
+        return;
+    };
+    let legacy: Vec<Vec<u8>> = rows
+        .into_iter()
+        .filter_map(|row| row.try_get("hash").ok())
+        .collect();
+    if legacy.is_empty() {
+        return;
+    }
+
+    let mut moved = 0_usize;
+    for old in legacy {
+        let Ok(Some(row)) = sqlx::query("SELECT bytes FROM blob WHERE hash = ?")
+            .bind(old.as_slice())
+            .fetch_optional(store.pool())
+            .await
+        else {
+            continue;
+        };
+        let Ok(bytes) = row.try_get::<Vec<u8>, _>("bytes") else {
+            continue;
+        };
+        let new = Sha1::digest(&bytes).to_vec();
+
+        // The content may already be stored under its SHA-1 by someone who set
+        // the same comment after the upgrade; then this is a merge, and the
+        // reference count has to carry over rather than the row being written
+        // twice.
+        let write = sqlx::query(
+            "INSERT INTO blob (hash, bytes, size, refs) VALUES (?, ?, ?, 1)              ON CONFLICT (hash) DO UPDATE SET refs = blob.refs + 1",
+        )
+        .bind(new.as_slice())
+        .bind(bytes.as_slice())
+        .bind(bytes.len() as i64)
+        .execute(store.pool())
+        .await;
+        if let Err(error) = write {
+            tracing::warn!(%error, "could not re-address a stored blob; leaving it where it is");
+            continue;
+        }
+
+        // The account moves before the old row goes, so an interruption leaves
+        // a spare copy rather than an account pointing at nothing.
+        for statement in [
+            "UPDATE account SET comment_hash = ? WHERE comment_hash = ?",
+            "UPDATE account SET texture_hash = ? WHERE texture_hash = ?",
+        ] {
+            let _ = sqlx::query(statement)
+                .bind(new.as_slice())
+                .bind(old.as_slice())
+                .execute(store.pool())
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM blob WHERE hash = ?")
+            .bind(old.as_slice())
+            .execute(store.pool())
+            .await;
+        moved += 1;
+    }
+    tracing::info!(
+        blobs = moved,
+        "re-addressed stored comments and avatars by SHA-1, the digest clients compute themselves"
+    );
 }
 
 fn outcome(outcome: auth_result::Outcome, account: Option<Account>) -> AuthResult {
@@ -1774,6 +1886,85 @@ mod tests {
             .await
             .expect("registered");
         assert!(accounts.rename(2, elsewhere.id, "ivan").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_blob_is_addressed_by_the_sha1_a_client_computes_for_itself() {
+        // The bug this pins: a Mumble client recomputes the hash from the body
+        // (`UserModel.cpp:1188`) and keys its "comment already seen" table by
+        // the result, so a comment announced under any other digest is a new
+        // comment on every single join.
+        use sha1::{Digest as _, Sha1};
+
+        let accounts = accounts().await;
+        let stored = accounts.put_blob(1, b"a profile").await;
+        assert_eq!(
+            stored.hash,
+            Sha1::digest(b"a profile").to_vec(),
+            "the announced hash is the one the client will compute"
+        );
+        assert_eq!(
+            stored.hash.len(),
+            20,
+            "and it is 20 bytes wide, as murmur's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_comment_stored_under_the_old_digest_is_re_addressed_on_open() {
+        // Without this an account registered before the fix keeps announcing a
+        // hash no client agrees with, and keeps flagging an unchanged comment.
+        use sha1::{Digest as _, Sha1};
+        use sha2::Sha256;
+
+        let accounts = accounts().await;
+        let legacy = Sha256::digest(b"an old comment").to_vec();
+        let _ = sqlx::query("INSERT INTO blob (hash, bytes, size, refs) VALUES (?, ?, ?, 1)")
+            .bind(legacy.as_slice())
+            .bind(b"an old comment".as_slice())
+            .bind(14_i64)
+            .execute(accounts.store.pool())
+            .await
+            .expect("a blob as an older build wrote it");
+        let _ = accounts
+            .register(
+                1,
+                Account {
+                    name: "dana".to_owned(),
+                    comment_hash: legacy.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("registered");
+
+        rekey_legacy_blobs(&accounts.store).await;
+
+        let reopened = Accounts::open(accounts.store.clone())
+            .await
+            .expect("schema");
+        let dana = reopened
+            .list(1, "dana", 50, 0)
+            .accounts
+            .into_iter()
+            .next()
+            .expect("dana");
+        assert_eq!(
+            dana.comment_hash,
+            Sha1::digest(b"an old comment").to_vec(),
+            "the account now names the comment the way a client will"
+        );
+        assert_eq!(
+            reopened.blob(1, &dana.comment_hash).await,
+            Some(b"an old comment".to_vec()),
+            "and the body is still there under the new address"
+        );
+        assert_eq!(
+            reopened.blob(1, &legacy).await,
+            None,
+            "the row under the old address is gone rather than duplicated"
+        );
     }
 
     #[tokio::test]

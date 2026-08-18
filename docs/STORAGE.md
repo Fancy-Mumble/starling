@@ -88,6 +88,13 @@ keeps the bytes per user.
 **Greenfield:** a `blob` table keyed by hash, with a refcount. Identical avatars
 are stored once, and `RequestBlob` becomes a primary-key lookup.
 
+The hash is **SHA-1**, and that is not a free choice. It is the same key the
+protocol uses, and a Mumble client recomputes it from any body it is handed
+(`UserModel.cpp:1188`) rather than trusting the announced one, then keys its
+blob cache and its "comment already seen" table by the result. A storage digest
+that is not the wire digest makes the two disagree forever: every reconnect
+redraws an unchanged comment as new. Shipping SHA-256 here did exactly that.
+
 ### L5, The plugin ecosystem already solved this, better
 
 `3rdparty/mumble-plugin-host/audit/src/store.rs` opens its own SQLite database
