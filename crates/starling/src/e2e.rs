@@ -379,6 +379,52 @@ impl Deployment {
         .into_inner()
     }
 
+    /// Block until `permissions` grants `session` the `permission` in `channel`.
+    ///
+    /// For a test whose grant reaches `channel` only by **inheritance**.
+    /// `permissions` learns the tree by subscribing to `metadata`
+    /// (`follow_tree`), and that subscription is dialled the instant
+    /// `permissions` is up, which on a cold deployment is seconds before
+    /// `metadata` is. Until it connects, every channel evaluates as a root, a
+    /// grant on the parent reaches nothing, and the test is refused for a
+    /// reason that has nothing to do with what it asserts. `wait_until_serving`
+    /// cannot cover it: it watches sockets, and this is a stream between two
+    /// services that are both already serving.
+    ///
+    /// Asked over the same gRPC every service asks, so what it waits for is the
+    /// answer the service under test is about to get.
+    async fn wait_until_permitted(&self, session: u32, channel: u32, permission: u32) {
+        use starling_proto_fancy::permissions::SessionCheckRequest;
+        use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
+
+        let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
+        loop {
+            let allowed = async {
+                let transport = self.resolver.channel("permissions").ok()?;
+                let decision = PermissionsClient::new(transport)
+                    .check_session(SessionCheckRequest {
+                        scope: None,
+                        session,
+                        channel,
+                        permission,
+                        temporary_tokens: Vec::new(),
+                    })
+                    .await
+                    .ok()?;
+                Some(decision.into_inner().allowed)
+            }
+            .await;
+            if allowed == Some(true) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permissions never granted {permission:#x} in channel {channel} to session {session}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The records this deployment has written so far.
     fn records(&self) -> Vec<starling_runtime::log::LogEvent> {
         self.log
@@ -4235,6 +4281,77 @@ async fn a_moderator_moves_another_user_by_either_half_of_murmurs_rule() {
         Some(lobby),
         "the moved user's own Enter has to be enough, with no Move on the mover"
     );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn an_administrator_holding_only_write_on_the_root_can_move_people() {
+    // The way every Mumble server's administrators are made: `Write` for the
+    // `admin` group on the root, handed down, and nothing else spelled out.
+    // murmur makes that enough because `Write` implies `Move` and the rest
+    // of the channel after the walk (`vendor/server/src/ACL.cpp:240`).
+    // Starling transcribed the walk and not the line after it, so such an
+    // administrator could rewrite every ACL on the server and was refused
+    // every move, with a `PermissionDenied` naming a permission they were
+    // certain they held.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("move-by-write");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let vault = deployment.create_channel("Vault").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("admin", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    // A room nobody may walk into, so the move below is carried by the
+    // administrator's implied `Move` on both ends and not by bob's `Enter`.
+    deployment
+        .set_acl(AclSet {
+            channel: vault,
+            inherit: true,
+            acls: vec![entry("all", Perm::empty(), Perm::ENTER)],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(0, "admin", alice_session)
+        .await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake(&mut bob, "bob").await;
+
+    // The destination half of the move is alice's *inherited* `Move` in the
+    // Vault, which `permissions` can only see once it has learned from
+    // `metadata` that the Vault hangs off the root. Wait for that rather than
+    // for luck: what is under test is the implication, not the boot order.
+    deployment
+        .wait_until_permitted(alice_session, vault, Perm::MOVE.bits())
+        .await;
+
+    alice
+        .send(
+            9,
+            &tcp::UserState {
+                session: Some(bob_session),
+                channel_id: Some(vault),
+                ..tcp::UserState::default()
+            },
+        )
+        .await;
+    let dragged = timeout(FRAME_TIMEOUT, bob.next_move_of(bob_session))
+        .await
+        .expect("Write on the root has to be enough to move somebody");
+    assert_eq!(dragged.channel_id, Some(vault));
+    assert_eq!(dragged.actor, Some(alice_session));
 
     deployment.stop();
 }
