@@ -4357,6 +4357,90 @@ async fn an_administrator_holding_only_write_on_the_root_can_move_people() {
 }
 
 #[tokio::test]
+async fn moving_a_channel_takes_make_channel_on_where_it_is_going() {
+    // murmur's rule for a re-parent is two questions (`Messages.cpp:2025`,
+    // `:2032`): `Write` on the channel being moved, then `MakeChannel` on the
+    // new parent, because putting a channel somewhere is the same power as
+    // creating one there. Starling asked the first and not the second, so
+    // anybody who owned a room could hang it under any channel on the server,
+    // including ones they could not create in.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("move-channel");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let attic = deployment.create_channel("Attic").await;
+    let wing = deployment.create_channel("Locked Wing").await;
+
+    // Alice owns the Attic and nothing else.
+    deployment
+        .set_acl(AclSet {
+            channel: attic,
+            inherit: true,
+            acls: vec![entry("ops", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(attic, "ops", alice_session)
+        .await;
+
+    // The move she may not make: her own room, into a wing she cannot create
+    // in. The refusal names the permission and the channel it was missing on,
+    // so the client can say which of the two rooms is the problem.
+    alice
+        .send(
+            7,
+            &tcp::ChannelState {
+                channel_id: Some(attic),
+                parent: Some(wing),
+                ..tcp::ChannelState::default()
+            },
+        )
+        .await;
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(12))
+        .await
+        .expect("the move is refused out loud, not dropped");
+    let refusal = tcp::PermissionDenied::decode(payload.as_slice()).expect("well-formed");
+    assert_eq!(refusal.permission, Some(Perm::MAKE_CHANNEL.bits()));
+    assert_eq!(refusal.channel_id, Some(wing));
+
+    // Given `MakeChannel` in the wing, the same move goes through.
+    deployment
+        .set_acl(AclSet {
+            channel: wing,
+            inherit: true,
+            acls: vec![entry("ops", Perm::MAKE_CHANNEL, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    deployment
+        .add_temporary_group(wing, "ops", alice_session)
+        .await;
+    alice
+        .send(
+            7,
+            &tcp::ChannelState {
+                channel_id: Some(attic),
+                parent: Some(wing),
+                ..tcp::ChannelState::default()
+            },
+        )
+        .await;
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(7))
+        .await
+        .expect("the move is announced");
+    let moved = tcp::ChannelState::decode(payload.as_slice()).expect("well-formed");
+    assert_eq!(moved.channel_id, Some(attic));
+    assert_eq!(moved.parent, Some(wing));
+
+    deployment.stop();
+}
+
+#[tokio::test]
 async fn an_operator_clears_another_users_comment_but_cannot_write_one() {
     // `docs/GAP-ANALYSIS.md` U6. Both halves are the feature: murmur's rule is
     // `ResetUserContent` on the root **and** an empty value
