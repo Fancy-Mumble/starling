@@ -196,10 +196,13 @@ them as unproven until you have. No Starling binary yet contains the signal_v1 b
 - The archive does not dedup on the sender's id the way murmur does, so a client that
   retries a send writes two rows. Wants a unique index plus an ack reporting "already
   stored" rather than a failed insert.
-- `FetchResponse` hardcodes `supersedes: String::new()`, so an edit's `replaces_id`
+- ~~`FetchResponse` hardcodes `supersedes: String::new()`, so an edit's `replaces_id`
   never survives the archive, and `store_message` parses the client's `replaces_id`
   as a uuid7 (client ids are v4) before storing it. Edits do not round-trip through
-  history. No suite covers this.
+  history. No suite covers this.~~ **Fixed 2026-08-19** (`486a2c5`): migration
+  `0005_pchat_client_supersedes` stores it verbatim as TEXT beside `client_id`,
+  and the read falls back to the old uuid7 column. Two unit tests; still no e2e
+  suite over an edit.
 - The signal_v1 storage ban reads the protocol the *frame* declared. A client that
   mislabels its own message still gets it archived — a client lying about its own
   history rather than reading someone else's. The airtight form asks `metadata` for
@@ -323,9 +326,10 @@ engine deliberately: the pattern comes from a config file and is matched against
 a stranger picked. **`Cargo.toml`/`Cargo.lock` are touched** — relevant to anyone
 diffing lockfiles for the rename cutover.
 
-**Not done:** `docs/GAP-ANALYSIS.md` still lists C5 (no name validation) and A4 (no
-last-channel memory) as open — both now closed, tables need updating. No e2e coverage
-of the landing cascade. `LastChannel` has no operator-api surface. Migration `0003`'s
+**Not done:** ~~`docs/GAP-ANALYSIS.md` still lists C5 (no name validation) and A4
+(no last-channel memory) as open — both now closed, tables need updating.~~ **Done
+2026-08-19** (`9a20732`); two comments in `userdata` had gone stale with them.
+No e2e coverage of the landing cascade. `LastChannel` has no operator-api surface. Migration `0003`'s
 upgrade path is untested — the suite only ever migrates from zero, because
 `StarlingServer.start()` mkdtemps a fresh data dir per run.
 
@@ -539,5 +543,8 @@ client windows share one display.
   the rename landed (`daf58f7`) and the probe with it (`55898c0`).
 - A stub screencast portal on a private D-Bus (§5) — the only route to covering the
   real PipeWire/DMA-BUF path.
-- `docs/GAP-ANALYSIS.md` C5 and A4 are closed but still listed as open.
-- Archive edits do not round-trip through history (§4, gaps).
+- ~~`docs/GAP-ANALYSIS.md` C5 and A4 are closed but still listed as open.~~
+  **Done** (`9a20732`). What is left of A4 is the directory row, which needs a
+  bulk `LastChannel` read rather than one RPC per account.
+- ~~Archive edits do not round-trip through history (§4, gaps).~~ **Done**
+  (`486a2c5`), unit-covered; an e2e suite over an edit would still be new.
