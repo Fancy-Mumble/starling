@@ -125,6 +125,46 @@ const SCHEMA: &[Migration<'static>] = &[
         "0005_pchat_client_supersedes",
         &["ALTER TABLE pchat_message ADD COLUMN client_supersedes TEXT NULL"],
     ),
+    // A send that is retried must not become two messages. murmur dedups on the
+    // id the sender minted (`PchatProtocolHandlers.cpp:58`); here `client_id`
+    // was indexed for lookups but not constrained, so a client that never saw
+    // its ack and sent again wrote a second row, and the channel's history grew
+    // a copy of the message every time the network hiccuped.
+    //
+    // The index is the arbiter rather than a check before the insert, because a
+    // retry is *concurrent with* the attempt it is retrying by definition, and
+    // two lookups that both find nothing would both then write.
+    //
+    // NULL `client_id`s stay distinct on all three backends, which is the right
+    // reading: a sender that minted no id has not said which message this is,
+    // so nothing about a second one identifies it as the same message.
+    //
+    // The delete is spelled through a derived table because MySQL refuses a
+    // DELETE whose subquery names the target table, and materialising it is the
+    // documented way round; SQLite accepts the same statement. Rows are matched
+    // on `id` alone, which is safe because it is a uuid7 this server minted.
+    // The oldest row of each group is the one kept, so the archive keeps the
+    // copy its readers already have.
+    //
+    // `ix_pchat_client_id` is left in place, redundant against the new unique
+    // index: `DROP INDEX` is spelled differently on every backend, and a spare
+    // index costs a write rather than a wrong answer.
+    Migration::new(
+        "0006_pchat_one_row_per_sender_id",
+        &[
+            "DELETE FROM pchat_message WHERE id IN (\
+                 SELECT extra FROM (\
+                     SELECT dup.id AS extra FROM pchat_message dup \
+                     JOIN pchat_message keep \
+                       ON keep.server_id = dup.server_id \
+                      AND keep.channel_id = dup.channel_id \
+                      AND keep.client_id = dup.client_id \
+                      AND keep.id < dup.id \
+                     WHERE dup.client_id IS NOT NULL) AS extras)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_pchat_client_id \
+             ON pchat_message(server_id, channel_id, client_id)",
+        ],
+    ),
 ];
 
 /// Whether a message of this protocol belongs in the archive at all.
@@ -143,6 +183,18 @@ const SCHEMA: &[Migration<'static>] = &[
 /// path does not otherwise need.
 const fn archivable(protocol: i32) -> bool {
     protocol != Protocol::SignalV1 as i32
+}
+
+/// What became of a message the archive was asked to keep.
+#[derive(Debug)]
+enum Kept {
+    /// A new row, filed under this id.
+    New(Uuid7),
+    /// This sender had already stored this message, under this id. A retry is a
+    /// delivery event rather than an error.
+    Duplicate(Uuid7),
+    /// Nothing was written, and nothing is on record.
+    Failed,
 }
 
 /// The service.
@@ -166,8 +218,8 @@ pub struct PchatService {
 }
 
 impl PchatService {
-    /// Store one ciphertext, returning the id it was filed under.
-    async fn store_message(&self, scope: u32, message: &Message) -> Option<Uuid7> {
+    /// Store one ciphertext, and say which of the three things happened.
+    async fn store_message(&self, scope: u32, message: &Message) -> Kept {
         let id = Uuid7::now();
         let result = sqlx::query(
             "INSERT INTO pchat_message \
@@ -205,26 +257,45 @@ impl PchatService {
         .execute(self.store.pool())
         .await;
         match result {
-            Ok(_) => Some(id),
-            Err(error) => {
-                tracing::error!(%error, "could not store a persistent-chat message");
-                None
-            }
+            Ok(_) => Kept::New(id),
+            // The insert is what asks the question, because the unique index on
+            // the sender's id is the only thing that can answer it without a
+            // race: a retry arrives while the attempt it is retrying may still
+            // be in flight, so two lookups would both find nothing and both
+            // write. Which failure this was is then read off the table rather
+            // than off an error code, since the three backends spell a
+            // constraint violation three ways, and a disk that is full spells
+            // it a fourth.
+            Err(error) => match self
+                .stored_id(scope, message.channel, &message.message_id)
+                .await
+            {
+                Some(existing) => {
+                    tracing::debug!(
+                        channel = message.channel,
+                        "the sender had already stored this message"
+                    );
+                    Kept::Duplicate(existing)
+                }
+                None => {
+                    tracing::error!(%error, "could not store a persistent-chat message");
+                    Kept::Failed
+                }
+            },
         }
     }
 
-    /// Where a wire id sits in this channel's storage order.
+    /// The row this channel already holds under a sender's own id, if any.
     ///
-    /// A cursor arrives as an id a client holds, and what a client holds is the
-    /// *sender's* id - so it is looked up rather than parsed. Falling back to
-    /// parsing covers rows written before `client_id` existed, whose only
-    /// identity is this server's own uuid7.
-    async fn cursor_of(&self, scope: u32, channel: u32, wire_id: &str) -> Option<Vec<u8>> {
+    /// Strictly what is on the table: unlike [`Self::cursor_of`] this does not
+    /// fall back to reading the wire id as a uuid7, because the question here
+    /// is "has this been stored", and a well-formed id naming no row is a no.
+    async fn stored_id(&self, scope: u32, channel: u32, wire_id: &str) -> Option<Uuid7> {
         use sqlx::Row as _;
         if wire_id.is_empty() {
             return None;
         }
-        let found = sqlx::query(
+        sqlx::query(
             "SELECT id FROM pchat_message \
              WHERE server_id = ? AND channel_id = ? AND client_id = ?",
         )
@@ -235,9 +306,22 @@ impl PchatService {
         .await
         .ok()
         .flatten()
-        .and_then(|row| row.try_get::<Vec<u8>, _>("id").ok());
+        .and_then(|row| row.try_get::<Vec<u8>, _>("id").ok())
+        .as_deref()
+        .and_then(Uuid7::from_slice)
+    }
 
-        found.or_else(|| Uuid7::parse(wire_id).map(Uuid7::to_vec))
+    /// Where a wire id sits in this channel's storage order.
+    ///
+    /// A cursor arrives as an id a client holds, and what a client holds is the
+    /// *sender's* id - so it is looked up rather than parsed. Falling back to
+    /// parsing covers rows written before `client_id` existed, whose only
+    /// identity is this server's own uuid7.
+    async fn cursor_of(&self, scope: u32, channel: u32, wire_id: &str) -> Option<Vec<u8>> {
+        match self.stored_id(scope, channel, wire_id).await {
+            Some(found) => Some(found.to_vec()),
+            None => Uuid7::parse(wire_id).map(Uuid7::to_vec),
+        }
     }
 
     /// A page of ciphertexts, newest first.
@@ -598,19 +682,26 @@ impl PchatService {
         message.sender_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
         // Relayed either way; this decides whether a row outlives the relay.
         let archived = if archivable(message.protocol) {
-            let Some(id) = self.store_message(inbound.scope, &message).await else {
-                return vec![self.ack(
-                    inbound,
-                    &message.message_id,
-                    ack::Status::Refused,
-                    "the message could not be stored",
-                )];
-            };
-            Some(id)
+            match self.store_message(inbound.scope, &message).await {
+                Kept::New(id) => Some((id, ack::Status::Stored)),
+                Kept::Duplicate(id) => Some((id, ack::Status::Duplicate)),
+                Kept::Failed => {
+                    return vec![self.ack(
+                        inbound,
+                        &message.message_id,
+                        ack::Status::Refused,
+                        "the message could not be stored",
+                    )];
+                }
+            }
         } else {
             None
         };
-        let id = archived.unwrap_or_else(Uuid7::now);
+        let on_record = archived.is_some();
+        // A message that is not archived is still acknowledged as stored: the
+        // status answers "did this land", and for signal_v1 landing *is* the
+        // relay, which is the whole of what that mode promises.
+        let (id, status) = archived.unwrap_or_else(|| (Uuid7::now(), ack::Status::Stored));
 
         // The sender's id is left alone. It used to be replaced with `id`, the
         // key this server files the row under, and that made every archive
@@ -640,10 +731,20 @@ impl PchatService {
             channel,
             bytes = message.ciphertext.len(),
             protocol = message.protocol,
-            archived = archived.is_some(),
+            archived = on_record,
             "stored an encrypted message"
         );
-        let acknowledgement = self.ack(inbound, &message.message_id, ack::Status::Stored, "");
+        // Relayed even when the row was already there. The duplicate rule is
+        // about the archive holding one copy, not about delivery: the client
+        // retried because *it* saw no acknowledgement, and the relay it is
+        // retrying may have been what went missing. Recipients dedup on the
+        // sender's id, so a second delivery costs nothing and a dropped one
+        // cannot be recovered.
+        let detail = match status {
+            ack::Status::Duplicate => "the sender had already stored this message",
+            _ => "",
+        };
+        let acknowledgement = self.ack(inbound, &message.message_id, status, detail);
         let relay = PchatEnvelope {
             body: Some(pchat_envelope::Body::Message(message)),
         };
@@ -801,19 +902,25 @@ mod tests {
     use starling_proto_fancy::fancy::pchat::{Delete, KeyAnnounce, KeyDeliver, Pin, PinList};
     use starling_proto_fancy::fancy::wire::Cursor;
 
-    async fn service() -> Arc<PchatService> {
-        // A name unique per call: `cache=shared` makes same-named in-memory
-        // databases visible to every connection that names them, so two tests
-        // sharing one name would race on the same `starling_migration` row.
+    /// An empty in-memory database, with no schema on it yet.
+    ///
+    /// A name unique per call: `cache=shared` makes same-named in-memory
+    /// databases visible to every connection that names them, so two tests
+    /// sharing one name would race on the same `starling_migration` row.
+    async fn memory_store() -> Store {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(
+        Store::open(
             &format!("sqlite:file:pchat-test-{id}?mode=memory&cache=shared"),
             1,
         )
         .await
-        .expect("in-memory database");
+        .expect("in-memory database")
+    }
+
+    async fn service() -> Arc<PchatService> {
+        let store = memory_store().await;
         store.migrate(SCHEMA).await.expect("schema");
         // Points at a `permissions` nothing is serving, so every check denies.
         // The storage tests below call `store_message`/`fetch` directly and are
@@ -1014,6 +1121,116 @@ mod tests {
         assert!(
             stored.supersedes.is_empty(),
             "a message that replaced nothing must come back naming nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_send_is_one_row_and_says_which() {
+        // A client retries because it saw no acknowledgement, which says
+        // nothing about whether the message arrived - so the second attempt is
+        // an ordinary event, not an error, and the archive has to recognise it.
+        // Without the unique index on the sender's id it did not: the retry
+        // wrote a second row, and the channel's history grew a copy of the
+        // message every time the network hiccuped.
+        let service = service().await;
+        let sent = Message {
+            message_id: "8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a".to_owned(),
+            ..message(4, b"did that get through")
+        };
+
+        let first = service.store_message(1, &sent).await;
+        let again = service.store_message(1, &sent).await;
+
+        let (Kept::New(stored), Kept::Duplicate(found)) = (&first, &again) else {
+            panic!("a retry must be recognised, not stored again: {first:?} then {again:?}");
+        };
+        assert_eq!(
+            stored, found,
+            "and it must name the row the sender already has, not a new one"
+        );
+        assert_eq!(
+            service.count(1, 4).await,
+            1,
+            "one send is one message however many times it was attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sends_that_name_no_id_are_two_messages() {
+        // The other side of the rule. A sender that minted no id has not said
+        // which message this is, so a second one that looks identical is not
+        // identifiable as the same message - somebody typing "ok" twice is the
+        // ordinary case, and collapsing that would lose a real message. NULLs
+        // stay distinct under the unique index, which is what makes this work
+        // rather than an accident of it.
+        let service = service().await;
+        let _ = service.store_message(1, &message(4, b"ok")).await;
+        let _ = service.store_message(1, &message(4, b"ok")).await;
+
+        assert_eq!(
+            service.count(1, 4).await,
+            2,
+            "two anonymous sends are two messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_clears_duplicates_an_older_archive_already_holds() {
+        // The one migration in this service that deletes rows, so the one worth
+        // running against a database that has something in it. A deployment
+        // that ran the versions between `0004` and `0006` can hold retry
+        // duplicates, and `CREATE UNIQUE INDEX` over them does not warn, it
+        // fails - which is a server that will not boot, reported as a schema
+        // error naming an index rather than the rows behind it.
+        let store = memory_store().await;
+        let before = &SCHEMA[..SCHEMA.len() - 1];
+        assert_eq!(
+            before.last().map(|m| m.name),
+            Some("0005_pchat_client_supersedes"),
+            "this test is about upgrading from the version just before the index"
+        );
+        store.migrate(before).await.expect("the older schema");
+
+        // Two rows, one sender id: what a retry used to leave behind. The uuid7
+        // keys differ because the server minted one per attempt, and the older
+        // one is the copy the channel's readers already have.
+        for key in [1u8, 2] {
+            let _ = sqlx::query(
+                "INSERT INTO pchat_message \
+                     (server_id, channel_id, id, sent_at_ms, sender, epoch, \
+                      ciphertext, client_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(1i64)
+            .bind(4i64)
+            .bind(vec![key; 16])
+            .bind(1_700_000_000_000i64)
+            .bind(1i64)
+            .bind(1i64)
+            .bind(b"x".as_slice())
+            .bind("8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a")
+            .execute(store.pool())
+            .await
+            .expect("a duplicate an older build would have written");
+        }
+
+        store
+            .migrate(SCHEMA)
+            .await
+            .expect("the upgrade must not fail");
+
+        use sqlx::Row as _;
+        let surviving: Vec<Vec<u8>> = sqlx::query("SELECT id FROM pchat_message")
+            .fetch_all(store.pool())
+            .await
+            .expect("the surviving rows")
+            .into_iter()
+            .filter_map(|row| row.try_get::<Vec<u8>, _>("id").ok())
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![vec![1u8; 16]],
+            "the oldest copy is the one kept, because it is the one already read"
         );
     }
 
