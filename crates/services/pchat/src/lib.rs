@@ -111,6 +111,20 @@ const SCHEMA: &[Migration<'static>] = &[
              ON pchat_message(server_id, channel_id, client_id)",
         ],
     ),
+    // The same mistake as `0004`, one field over. An edit names the message it
+    // replaces by the id its *sender* minted, and `supersedes` was declared a
+    // BLOB holding a uuid7 - so the write parsed a client's uuid4, got nothing
+    // and stored NULL. Every edit reached the channel live and then vanished
+    // from history, which reads as an archive quietly keeping the version its
+    // author retracted.
+    //
+    // TEXT, beside `client_id` and in the same vocabulary, because the two name
+    // the same kind of thing: one message as a client knows it. The old column
+    // stays and is still read, because a uuid7-minting sender's edits are in it.
+    Migration::new(
+        "0005_pchat_client_supersedes",
+        &["ALTER TABLE pchat_message ADD COLUMN client_supersedes TEXT NULL"],
+    ),
 ];
 
 /// Whether a message of this protocol belongs in the archive at all.
@@ -159,8 +173,8 @@ impl PchatService {
             "INSERT INTO pchat_message \
                  (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, \
                   supersedes, sender_cert, epoch_fingerprint, chain_index, protocol, \
-                  client_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  client_id, client_supersedes) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(message.channel))
@@ -178,12 +192,16 @@ impl PchatService {
         .bind(i64::from(message.sender))
         .bind(i64::from(message.epoch))
         .bind(message.ciphertext.as_slice())
+        // Kept for a sender that mints uuid7s, so the column goes on meaning
+        // what it always meant; `client_supersedes` below is where a real edit
+        // lands, verbatim and unparsed.
         .bind(Uuid7::parse(&message.supersedes).map(Uuid7::to_vec))
         .bind((!message.sender_cert.is_empty()).then(|| message.sender_cert.clone()))
         .bind((!message.epoch_fingerprint.is_empty()).then(|| message.epoch_fingerprint.clone()))
         .bind(i64::from(message.chain_index))
         .bind(i64::from(message.protocol))
         .bind((!message.message_id.is_empty()).then(|| message.message_id.clone()))
+        .bind((!message.supersedes.is_empty()).then(|| message.supersedes.clone()))
         .execute(self.store.pool())
         .await;
         match result {
@@ -236,11 +254,11 @@ impl PchatService {
         // signal_v1 rows on disk. This is what keeps them unreadable without a
         // data migration.
         let sql = if before.is_some() {
-            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
+            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, supersedes, client_supersedes, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
              WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
              AND id < ? ORDER BY id DESC LIMIT ?"
         } else {
-            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
+            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, supersedes, client_supersedes, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
              WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
              ORDER BY id DESC LIMIT ?"
         };
@@ -274,7 +292,7 @@ impl PchatService {
                 sender: row.try_get::<i64, _>("sender").unwrap_or_default() as u32,
                 ciphertext: row.try_get("ciphertext").unwrap_or_default(),
                 sent_at_ms: row.try_get::<i64, _>("sent_at_ms").unwrap_or_default() as u64,
-                supersedes: String::new(),
+                supersedes: wire_supersedes(&row),
                 epoch: row.try_get::<i64, _>("epoch").unwrap_or_default() as u32,
                 // NULL for a row written before the column existed, which is
                 // read back as "unattributable" rather than guessed at.
@@ -341,6 +359,28 @@ fn wire_id(row: &sqlx::any::AnyRow) -> String {
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| {
             Uuid7::from_slice(&row.try_get::<Vec<u8>, _>("id").unwrap_or_default())
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        })
+}
+
+/// The id an archived edit names, in the vocabulary its sender used.
+///
+/// The same shape as [`wire_id`] and for the same reason: `client_supersedes`
+/// holds what the sender actually wrote, while the uuid7 `supersedes` blob is
+/// the older column, which only ever held anything for a sender that minted
+/// uuid7s. A row that is not an edit has neither and comes back empty.
+fn wire_supersedes(row: &sqlx::any::AnyRow) -> String {
+    use sqlx::Row as _;
+    row.try_get::<Option<String>, _>("client_supersedes")
+        .ok()
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            row.try_get::<Option<Vec<u8>>, _>("supersedes")
+                .ok()
+                .flatten()
+                .and_then(|raw| Uuid7::from_slice(&raw))
                 .map(|id| id.to_string())
                 .unwrap_or_default()
         })
@@ -927,6 +967,53 @@ mod tests {
         assert_eq!(
             stored.sent_at_ms, sealed.sent_at_ms,
             "and the time it sealed under, not this server's clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_still_names_what_it_replaced_after_a_round_trip() {
+        // The same failure as the id above, one field over and one step later.
+        // An edit reached the channel correctly and then lost its link in
+        // history: `supersedes` was a BLOB parsed as a uuid7, clients mint
+        // uuid4s, so the parse gave `None` and the row stored NULL. On the way
+        // back out the field was hardcoded empty, so even a uuid7 sender's edit
+        // could not have survived. A reader paging back therefore saw both
+        // versions as separate messages, with the retracted one below the
+        // correction - an archive disagreeing with the live channel about what
+        // was said.
+        let service = service().await;
+        let original = "8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a";
+        let edit = Message {
+            message_id: "1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d".to_owned(),
+            supersedes: original.to_owned(),
+            ..message(4, b"what I meant to say")
+        };
+        let _ = service.store_message(1, &edit).await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let stored = page.messages.first().expect("the edit is on record");
+        assert_eq!(
+            stored.supersedes, original,
+            "an archived edit must still name the message it replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_message_supersedes_nothing() {
+        // The other half of the rule, and the one a fallback chain gets wrong:
+        // reading two columns to answer one field must not invent an answer for
+        // a row that is not an edit at all. An empty `supersedes` is what tells
+        // a client to render the message rather than fold it into another.
+        let service = service().await;
+        let _ = service
+            .store_message(1, &message(4, b"just a message"))
+            .await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let stored = page.messages.first().expect("the message is on record");
+        assert!(
+            stored.supersedes.is_empty(),
+            "a message that replaced nothing must come back naming nothing"
         );
     }
 
