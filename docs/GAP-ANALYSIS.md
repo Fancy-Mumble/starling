@@ -243,7 +243,35 @@ client rendering a channel that has gone has no other way to find out.
 
 | # | Missing | Notes |
 |---|---|---|
-| C5 | No name validation. murmur holds channel *and* user names to configurable regexes (`qrChannelName`, `qrUserName`, `Server.cpp:483`); Starling accepts any string |, |
+| ~~C5~~ | ~~No name validation. murmur holds channel *and* user names to configurable regexes (`qrChannelName`, `qrUserName`, `Server.cpp:483`); Starling accepts any string~~ **Done**, see below | `runtime/src/names.rs` |
+
+**Nothing in this table is open.** C5 is done: `channel_name_regex` and
+`user_name_regex` are settings carrying murmur's own defaults, enforced in
+`metadata` on channel create and rename and in `userdata` at login, at
+registration and on both renames. The entry's one word of estimate, "regexes",
+hid the two decisions that actually mattered.
+
+* **Anchored.** murmur wraps the operator's pattern before matching it
+  (`Server.cpp:618`, `QRegularExpression::anchoredPattern`). Unanchored, every
+  pattern here is worthless: `[\w]+` accepts `hello; DROP` because it matches
+  the `hello` inside it, so a restriction admits exactly what it was written to
+  keep out. `names.rs` wraps in `\A(?:...)\z` rather than `^(?:...)$`, so a
+  trailing newline cannot end the match early either.
+* **A broken pattern fails open**, loudly, and this is the one place worth
+  disagreeing with upstream. An unparseable `QRegularExpression` matches
+  nothing, so a typo in `username` refuses every login on the server including
+  the administrator's, and the only way back in is to edit the file that broke
+  it. The cost of being wrong in this direction is a name somebody would rather
+  not have; in the other it is an outage. An empty pattern is not an error, it
+  is how an operator turns the rule off.
+
+The rule lives in `runtime` rather than in either service for the reason
+`settings` gives: `metadata` checks one kind of name and `userdata` the other,
+and a check written out twice is eventually two different checks. Length is
+held separately at 512 characters, murmur's, and checked before the pattern is
+(`Server.cpp:2610`), because an operator's `.+` is not an invitation to store a
+megabyte of channel name. The SuperUser is exempt from `user_name_regex`, the
+same carve-out `cert_required` has and for the same reason.
 
 **C1 (channel links) is built.** `links_add`/`links_remove` are read off the
 wire, `LinkChannel` is enforced on the channel being edited *and* on each
@@ -293,7 +321,7 @@ stored as content-addressed blobs.
 
 | # | Missing | Notes |
 |---|---|---|
-| A4 | **No last-channel memory.** murmur records a registered user's channel on leaving and puts them back there on their next login (`DBWrapper::setLastChannel`, `:1463`); Starling stores nothing and every login lands in the root |, |
+| ~~A4~~ | ~~**No last-channel memory.** murmur records a registered user's channel on leaving and puts them back there on their next login (`DBWrapper::setLastChannel`, `:1463`); Starling stores nothing and every login lands in the root~~ **Done**, see below | `metadata`, migration `0003` |
 | A5 | `SuggestConfig`(25) is sent **empty**, `tcp::SuggestConfig::default()`. murmur fills in the version, positional-audio and push-to-talk it wants clients to adopt; the settings do not exist here, so the message is a formality | `handshake.rs:322` |
 
 **A1 is done.** `UserList`(18) is answered in both modes, and the read is two
@@ -315,8 +343,27 @@ refuses anything past 8 MiB, and a directory of avatars is the one message here
 that can reach it, an unsendable frame would be this exact bug wearing a
 different face, the operator opening the dialog and finding it empty.
 
-A4 is what stops `last_channel` being filled in on a directory row: a zero there
-is not "unknown" to a client, it is the root channel.
+**A4 is done.** `metadata` records the channel a registered account left and
+when it left (migration `0003_last_channel`) and answers a `LastChannel` RPC;
+`session-lifecycle` asks at login and walks a cascade, the remembered channel
+when `remember_channel` is on and the row is younger than
+`remember_channel_duration`, then `default_channel`, then the root, skipping
+any candidate the account may not enter or that is already full.
+
+Two things the entry did not predict. The cascade had to run **after**
+`announce_up` rather than inside `welcome`, because asking `permissions`
+whether the user may enter a candidate resolves through `session-view`, which
+answers "session could not be identified" to anything asked earlier and
+therefore denies every candidate. And the row is only honest if something
+records the leaving: `Leave` on disconnect had never been called at all, so
+memberships accumulated for every session that had ever connected and occupancy
+counted the dead, invisible until an occupancy *limit* reads it and then it is a
+room that says it is full and looks empty.
+
+What is still absent is the *directory* row. `UserList.User.last_channel` is
+sent empty because reading it is one RPC per account against an answer that runs
+to ten thousand rows, and a zero there is not "unknown" to a client, it is the
+root channel. It wants a bulk read on `metadata`, not a loop.
 
 A client registration stores no password, so the account is claimed by its
 certificate from then on. That is murmur's model and it is why `on_register`
@@ -529,4 +576,6 @@ log and `operator-api`. Public-list registration and the server-browser ping.
    which is one arm in voice's `recipients`; see §3.
 
 A3 (`cert_required`) and U6 (`ResetUserContent`) are **done**, both as riders as
-predicted. A4, A5 and C5 are cosmetic against the rest of this list.
+predicted. A4 and C5 are done too, as riders on the six murmur settings that had no
+Starling equivalent at all. A5 is what is left of that group, and is
+cosmetic against the rest of this list.

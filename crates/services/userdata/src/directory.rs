@@ -203,9 +203,13 @@ impl UserdataService {
                         + std::time::Duration::from_millis(account.last_active_ms),
                 )
             }),
-            // Absent because nothing records it: Starling has no last-channel
-            // memory at all (`docs/GAP-ANALYSIS.md` A4), and a zero here is not
-            // "unknown" to a client; it is the root channel.
+            // `metadata` does remember where an account was last seen
+            // (`0003_last_channel`), but only one account at a time, and this
+            // answer runs to `MAX_ENTRIES` rows: filling the field would be ten
+            // thousand round trips to decorate a dialog. It wants a bulk read
+            // (`docs/GAP-ANALYSIS.md` A4). Absent rather than zero until then,
+            // because a zero here is not "unknown" to a client; it is the root
+            // channel.
             last_channel: None,
             texture,
             comment_hash,
@@ -286,10 +290,12 @@ impl UserdataService {
     async fn rename(&self, inbound: &Inbound, id: u32, name: &str) -> Actions {
         let name = name.trim();
         if name.is_empty() {
-            // murmur runs the name past `validateUserName` and answers a bad one
-            // with `DenyType::UserName` (`Messages.cpp:3245`). Starling has no
-            // name regex at all (`docs/GAP-ANALYSIS.md` C5), so the one rule it
-            // can honestly enforce is that a name has to be something.
+            // murmur runs the name past `validateUserName` and answers a bad
+            // one with `DenyType::UserName` (`Messages.cpp:3245`). So does
+            // `Accounts::rename` below, against `user_name_regex`, and its
+            // refusal comes back through the same answer. Emptiness is checked
+            // here only because it is the one rule that holds whatever the
+            // operator's pattern says.
             return vec![invalid_name(inbound, name)];
         }
         let id = u64::from(id);
