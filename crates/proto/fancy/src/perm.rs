@@ -115,6 +115,41 @@ impl Perm {
         .union(Self::TEXT_MESSAGE)
         .union(Self::LISTEN);
 
+    /// What holding [`Self::WRITE`] in a channel brings with it.
+    ///
+    /// murmur adds these after the walk whenever `Write` survived it
+    /// (`vendor/server/src/ACL.cpp:240`): an operator who may rewrite a
+    /// channel's ACL could grant themselves any of these anyway, so refusing
+    /// them is a round trip through the ACL editor and nothing else. It is also
+    /// what every client and operator expects: `Write` on the root is how a
+    /// Mumble server's administrators are made, and an administrator who cannot
+    /// move anybody is one whose server looks broken.
+    pub const IMPLIED_BY_WRITE: Self = Self::TRAVERSE
+        .union(Self::ENTER)
+        .union(Self::MUTE_DEAFEN)
+        .union(Self::MOVE)
+        .union(Self::MAKE_CHANNEL)
+        .union(Self::LINK_CHANNEL)
+        .union(Self::TEXT_MESSAGE)
+        .union(Self::MAKE_TEMP_CHANNEL)
+        .union(Self::LISTEN)
+        .union(Self::SHARE_FILES)
+        .union(Self::SHARE_FILES_PUBLIC)
+        .union(Self::SEE_CHANNEL);
+
+    /// What [`Self::WRITE`] on the **root** channel brings with it, on top of
+    /// [`Self::IMPLIED_BY_WRITE`].
+    ///
+    /// The server-wide permissions (`vendor/server/src/ACL.cpp:244`). Only at
+    /// the root because they are only ever *asked* at the root: a kick is from
+    /// the server, not from a channel.
+    pub const IMPLIED_BY_WRITE_AT_ROOT: Self = Self::KICK
+        .union(Self::BAN)
+        .union(Self::RESET_USER_CONTENT)
+        .union(Self::REGISTER)
+        .union(Self::SELF_REGISTER)
+        .union(Self::MANAGE_EMOTES);
+
     /// What the SuperUser is granted, before any ACL is consulted.
     ///
     /// Everything **except speaking and whispering**

@@ -426,7 +426,7 @@ avatars, and now also bounds a message body when HTML is allowed.
 Found by the 2026-07-27 sweep; this file had not covered any of it, and §0 listing
 `ACL`(13) as "handled" was true only for reads.
 
-**All four are now done.** Kept in full rather than deleted, because each says
+**All five are now done.** Kept in full rather than deleted, because each says
 what the symptom looked like from outside, and the three of them that are one
 mistake are worth being able to point at.
 
@@ -436,6 +436,7 @@ mistake are worth being able to point at.
 | G2 | **Access tokens do nothing.** `Subject.tokens` is in the proto, is written as `Vec::new()` at every call site, and `permissions` never reads it. So `#token` groups cannot match, **channel passwords do not work** | Done. `Authenticate.tokens` is recorded on the connection, carried on `Session` and read back into `Subject`; a second `Authenticate` replaces them mid-session; `UserState.temporary_access_tokens` rides on the one `Enter` check it was sent for, through `SessionCheckRequest.temporary_tokens` |
 | G3 | **Most of murmur's group grammar is absent.** `groups_of` recognises `all`, `auth` and named groups. Upstream (`src/Group.cpp:120-185`) also has `none`, `strong` (a verified certificate), `in`, `out` and `sub[,offset,min,max]`, plus four prefixes: `!` negate, `~` evaluate against the ACL's own channel, `#` access token, `$` certificate hash. `matches` compares the group name with `==`, so every one of these is read as an ordinary group name that nobody is in | Done, whole grammar, in `permissions/src/group.rs`. Named groups are now *resolved* through the chain, `inherit` and `inheritable` were ignored before, so a group a parent declared as not inheritable was held in every child |
 | G4 | **An ACL entry naming account 0 also matches every guest.** `matches` compares `entry.account == subject.account` without consulting `registered`, and an unregistered guest is written as `account = 0, registered = false`, the same pair the SuperUser has. `identity::account` exists for exactly this and is used two lines away at `:182` | Done, as a rider on G3: `matches` was being rewritten for the grammar, and it is the function the bug is in. Now `identity::account(...) == entry.account`, and an entry may name an account *and* a group as upstream allows |
+| G5 | **`Write` implies nothing.** `evaluate` transcribes murmur's walk and stops before the line after it (`ACL.cpp:240`): whoever holds `Write` in a channel is also granted Traverse, Enter, MuteDeafen, **Move**, MakeChannel, LinkChannel, TextMessage, MakeTempChannel, Listen, ShareFiles, ShareFilesPublic and SeeChannel, and at the root Kick, Ban, Register, SelfRegister, ResetUserContent and ManageEmotes. So the usual table that makes administrators, `Write` for `admin` on the root, produced people who could rewrite every ACL and were refused every move, with a `PermissionDenied` naming `Move` | Done. `Perm::IMPLIED_BY_WRITE` and `Perm::IMPLIED_BY_WRITE_AT_ROOT` in `proto/fancy/src/perm.rs`, applied after the walk in `evaluate`, so a deny of `Move` beside a grant of `Write` does not stick, as upstream. Found 2026-08-19 from a live server |
 
 G4 was the third appearance of one mistake: the file's own comments record
 fixing it in `is_superuser` (the constant was 1, granting everything to the first

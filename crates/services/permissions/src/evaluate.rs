@@ -451,6 +451,19 @@ pub fn evaluate(acls: &Acls, scope: u32, subject: &Subject, channel: u32) -> u32
         }
     }
 
+    // `Write` carries the rest of the channel with it, after the walk and so
+    // past any deny on the way (`vendor/server/src/ACL.cpp:240`). Without this
+    // the usual way of making an administrator, `Write` on the root for the
+    // `admin` group, produced somebody who could edit every ACL and move
+    // nobody: `on_move` asks for `Move`, the table only said `Write`, and the
+    // refusal named a permission the operator was sure they had granted.
+    if granted.contains(Perm::WRITE) {
+        granted |= Perm::IMPLIED_BY_WRITE;
+        if channel == ROOT_CHANNEL {
+            granted |= Perm::IMPLIED_BY_WRITE_AT_ROOT;
+        }
+    }
+
     granted.bits()
 }
 
@@ -746,6 +759,108 @@ mod tests {
         assert!(!granted.contains(Perm::WRITE));
         assert!(!granted.contains(Perm::MAKE_CHANNEL));
         assert!(!granted.contains(Perm::KICK));
+    }
+
+    /// `Write` on the root for everybody, handed down: the table an operator
+    /// writes to make administrators, with the group widened for the test.
+    fn write_on_the_root() -> Acls {
+        let acls = Acls::new();
+        acls.set_parent(1, 5, 0);
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![allow("all", Perm::WRITE, true)],
+                groups: Vec::new(),
+            },
+        );
+        acls
+    }
+
+    #[test]
+    fn write_carries_move_and_the_rest_of_the_channel_with_it() {
+        // The rule murmur applies after the walk (`ACL.cpp:240`), and the
+        // regression this exists for: an administrator made the usual way,
+        // `Write` on the root, was refused every move because the table never
+        // spelled out `Move`.
+        let granted =
+            Perm::from_bits_truncate(evaluate(&write_on_the_root(), 1, &Subject::default(), 5));
+        assert!(granted.contains(Perm::WRITE));
+        assert!(
+            granted.contains(Perm::IMPLIED_BY_WRITE),
+            "Write must imply the channel permissions, got {granted:?}"
+        );
+        // But not the server-wide ones, away from the root.
+        assert!(!granted.contains(Perm::KICK));
+        assert!(!granted.contains(Perm::BAN));
+    }
+
+    #[test]
+    fn write_on_the_root_carries_the_server_wide_permissions_too() {
+        // `ACL.cpp:244`: at the root, `Write` also brings Kick, Ban, Register
+        // and the rest, which is what lets a root administrator administer.
+        let granted =
+            Perm::from_bits_truncate(evaluate(&write_on_the_root(), 1, &Subject::default(), 0));
+        assert!(granted.contains(Perm::IMPLIED_BY_WRITE));
+        assert!(
+            granted.contains(Perm::IMPLIED_BY_WRITE_AT_ROOT),
+            "Write on the root must imply Kick, Ban and the rest, got {granted:?}"
+        );
+    }
+
+    #[test]
+    fn write_implies_past_a_deny_at_the_same_level() {
+        // Applied after the walk, so a deny of `Move` next to a grant of `Write`
+        // does not stick, as upstream. An operator who wants to take `Move`
+        // away from somebody has to take `Write` away too, which is the honest
+        // shape of that rule: somebody holding `Write` could give it back.
+        let acls = Acls::new();
+        acls.set(
+            1,
+            AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("all".to_owned()),
+                    grant: Perm::WRITE.bits(),
+                    deny: Perm::MOVE.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+        let granted = Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 0));
+        assert!(granted.contains(Perm::MOVE));
+    }
+
+    #[test]
+    fn write_taken_away_by_a_child_takes_what_it_implied_with_it() {
+        // The implication is evaluated on the final result, not accumulated:
+        // a child that denies `Write` is a channel the root administrator may
+        // not move people in either, unless the table grants `Move` itself.
+        let acls = write_on_the_root();
+        acls.set(
+            1,
+            AclSet {
+                channel: 5,
+                inherit: true,
+                acls: vec![AclEntry {
+                    apply_here: true,
+                    apply_subs: true,
+                    group: Some("all".to_owned()),
+                    deny: Perm::WRITE.bits(),
+                    ..AclEntry::default()
+                }],
+                groups: Vec::new(),
+            },
+        );
+        let granted = Perm::from_bits_truncate(evaluate(&acls, 1, &Subject::default(), 5));
+        assert!(!granted.contains(Perm::WRITE));
+        assert!(!granted.contains(Perm::MOVE));
+        assert!(!granted.contains(Perm::MAKE_CHANNEL));
     }
 
     #[test]
