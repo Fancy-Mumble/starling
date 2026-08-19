@@ -34,9 +34,9 @@ use starling_proto_fancy::metadata::Channel as ChannelRecord;
 use starling_proto_fancy::metadata::metadata_server::{Metadata, MetadataServer};
 use starling_proto_fancy::metadata::{
     AccessRequest, AccessResult, ChannelResult, CreateRequest, EnterRequest, EnterResult,
-    LastChannelRequest, LastChannelResult, LeaveRequest, LinkRequest, ListenRequest, ListenResult,
-    RemoveRequest, RestoreListenersRequest, Tree, TreeEvent, TreeRequest, UpdateRequest,
-    listen_refusal,
+    LastChannelRequest, LastChannelResult, LastChannelsRequest, LastChannelsResult, LeaveRequest,
+    LinkRequest, ListenRequest, ListenResult, RemoveRequest, RestoreListenersRequest, Tree,
+    TreeEvent, TreeRequest, UpdateRequest, last_channels_result, listen_refusal,
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::permissions::AclSet;
@@ -603,6 +603,20 @@ impl Metadata for MetadataRpc {
         ))
     }
 
+    async fn last_channels(
+        &self,
+        request: Request<LastChannelsRequest>,
+    ) -> Result<Response<LastChannelsResult>, Status> {
+        let req = request.into_inner();
+        let scope = scope_of(req.scope);
+        Ok(Response::new(LastChannelsResult {
+            entries: self
+                .0
+                .last_channels(scope, &req.accounts, req.max_age_s)
+                .await,
+        }))
+    }
+
     async fn listen(
         &self,
         request: Request<ListenRequest>,
@@ -950,21 +964,90 @@ impl MetadataService {
         let channel = row.try_get::<i64, _>("channel_id").unwrap_or_default() as u32;
         let left_at_ms = row.try_get::<i64, _>("left_at_ms").unwrap_or_default() as u64;
 
-        // Zero is forever, which is murmur's default and the reading that makes
-        // `remember_channel` mean what its name says.
-        if max_age_s != 0 {
-            let age_ms = now_ms().saturating_sub(left_at_ms);
-            if age_ms > u64::from(max_age_s) * 1_000 {
-                return unknown;
-            }
-        }
-        if !self.trees.exists(scope, channel) {
+        if !self.remembered(scope, channel, left_at_ms, max_age_s) {
             return unknown;
         }
         LastChannelResult {
             known: true,
             channel,
         }
+    }
+
+    /// The same question about many accounts, for the registered-user dialog.
+    ///
+    /// One query for the whole answer, which is the point: asking
+    /// [`Self::last_channel`] per row would be ten thousand round trips to
+    /// decorate a dialog, and that is why the column was left empty rather than
+    /// filled slowly.
+    ///
+    /// The scope's rows are read and then filtered in memory instead of being
+    /// asked for by `IN (...)`: a list of placeholders has to be built for the
+    /// backend it will run on (`?` on SQLite and MySQL, `$n` on PostgreSQL) and
+    /// nothing here has needed a dynamic one before. The read is one row per
+    /// registered account, which is the same shape as the answer the caller is
+    /// building, so it does not trade a round trip for a scan of something
+    /// larger.
+    async fn last_channels(
+        &self,
+        scope: u32,
+        accounts: &[u64],
+        max_age_s: u32,
+    ) -> Vec<last_channels_result::Entry> {
+        use sqlx::Row as _;
+
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        if accounts.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<u64> = accounts.iter().copied().collect();
+        let rows = sqlx::query(
+            "SELECT account_id, channel_id, left_at_ms FROM last_channel \
+             WHERE server_id = ?",
+        )
+        .bind(i64::from(scope))
+        .fetch_all(store.pool())
+        .await;
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "could not read the remembered channels");
+                return Vec::new();
+            }
+        };
+
+        rows.into_iter()
+            .filter_map(|row| {
+                let account = row.try_get::<i64, _>("account_id").ok()? as u64;
+                if !wanted.contains(&account) {
+                    return None;
+                }
+                let channel = row.try_get::<i64, _>("channel_id").ok()? as u32;
+                let left_at_ms = row.try_get::<i64, _>("left_at_ms").ok()? as u64;
+                // The same three ways of answering "no" as the single-account
+                // form, so the dialog and the login cannot disagree about what
+                // is remembered.
+                self.remembered(scope, channel, left_at_ms, max_age_s)
+                    .then_some(last_channels_result::Entry { account, channel })
+            })
+            .collect()
+    }
+
+    /// Whether a stored memory is still worth acting on.
+    ///
+    /// Zero is forever, which is murmur's default and the reading that makes
+    /// `remember_channel` mean what its name says. A channel that has since
+    /// been deleted is forgotten whatever its age, which is why this question
+    /// lives with the tree.
+    fn remembered(&self, scope: u32, channel: u32, left_at_ms: u64, max_age_s: u32) -> bool {
+        if max_age_s != 0 {
+            let age_ms = now_ms().saturating_sub(left_at_ms);
+            if age_ms > u64::from(max_age_s) * 1_000 {
+                return false;
+            }
+        }
+        self.trees.exists(scope, channel)
     }
 
     /// Whether the client on `inbound` holds `needed` in `channel`.
@@ -1916,4 +1999,148 @@ pub fn scope_of(scope: Option<starling_proto_fancy::common::Scope>) -> u32 {
 #[must_use]
 pub const fn outer_type() -> u16 {
     ServiceKind::Metadata.outer_type()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service with a real store and a one-channel tree, and nothing else
+    /// reachable: every test here is about what the `last_channel` table says,
+    /// and a resolver pointing at services nobody is serving is enough for
+    /// that.
+    async fn service() -> MetadataService {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let store = Store::open(
+            &format!("sqlite:file:metadata-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        store.migrate(SCHEMA).await.expect("schema");
+
+        let nowhere = Resolver::new(
+            Arc::new(starling_runtime::config::Config::default()),
+            starling_runtime::inproc::Broker::default(),
+        );
+        let (events, _) = broadcast::channel(EVENT_BUFFER);
+        MetadataService {
+            trees: Trees::new(&[1], "Starling"),
+            events,
+            fanout: Fanout::default(),
+            logger: Logger::null(),
+            trail: Trail::new(nowhere.clone()),
+            permit: Permit::new(nowhere.clone()),
+            settings: Settings::new(nowhere.clone()),
+            resolver: nowhere,
+            store: Some(store),
+            channel_names: NameRule::new(),
+        }
+    }
+
+    /// The channels the dialog would show for these accounts.
+    async fn asked(service: &MetadataService, accounts: &[u64], max_age_s: u32) -> Vec<(u64, u32)> {
+        let mut seen: Vec<(u64, u32)> = service
+            .last_channels(1, accounts, max_age_s)
+            .await
+            .into_iter()
+            .map(|entry| (entry.account, entry.channel))
+            .collect();
+        seen.sort_unstable();
+        seen
+    }
+
+    #[tokio::test]
+    async fn the_dialog_reads_every_remembered_channel_in_one_call() {
+        // The directory row was sent empty because filling it meant one round
+        // trip per account against an answer of up to ten thousand rows. This
+        // is the read that replaced them, so the thing worth asserting is that
+        // it answers about a list rather than about one account.
+        let service = service().await;
+        let room = service
+            .trees
+            .create(1, Some(named("Room")), Creation::default());
+        let room = room.channel.expect("the channel").id;
+        service.remember_channel(1, 7, room).await;
+        service.remember_channel(1, 8, 0).await;
+
+        assert_eq!(
+            asked(&service, &[7, 8], 0).await,
+            vec![(7, room), (8, 0)],
+            "every account asked about that has an answer is in the answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_nobody_asked_about_is_not_in_the_answer() {
+        // The filter is what keeps this an answer to the question and not a
+        // dump of the table: a directory that shows the accounts it did not
+        // list would be disclosing presence about them.
+        let service = service().await;
+        service.remember_channel(1, 7, 0).await;
+        service.remember_channel(1, 8, 0).await;
+
+        assert_eq!(asked(&service, &[8], 0).await, vec![(8, 0)]);
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_has_since_gone_is_not_remembered() {
+        // Why this answer belongs to `metadata` and not to `userdata`: the row
+        // survives the channel. Handing the id back would name a channel the
+        // client does not have, which renders as nothing at all.
+        let service = service().await;
+        let room = service
+            .trees
+            .create(1, Some(named("Room")), Creation::default());
+        let room = room.channel.expect("the channel").id;
+        service.remember_channel(1, 7, room).await;
+        let _ = service.trees.remove(1, room);
+
+        assert_eq!(
+            asked(&service, &[7], 0).await,
+            Vec::new(),
+            "a deleted channel is forgotten, not handed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_older_than_the_operator_allows_is_no_memory() {
+        // The same rule the login cascade applies, asserted here because both
+        // now run through one helper: if they could disagree, the dialog would
+        // promise a landing the next login would not honour.
+        let service = service().await;
+        service.remember_channel(1, 7, 0).await;
+        let store = service.store.as_ref().expect("the store");
+        let _ = sqlx::query(
+            "UPDATE last_channel SET left_at_ms = ? WHERE server_id = ? AND account_id = ?",
+        )
+        .bind(now_ms() as i64 - 90_000)
+        .bind(1i64)
+        .bind(7i64)
+        .execute(store.pool())
+        .await
+        .expect("ageing the row");
+
+        assert_eq!(
+            asked(&service, &[7], 60).await,
+            Vec::new(),
+            "ninety seconds ago is outside a sixty-second memory"
+        );
+        assert_eq!(
+            asked(&service, &[7], 0).await,
+            vec![(7, 0)],
+            "and zero still means forever, as it does for murmur"
+        );
+    }
+
+    /// A channel record under the root, for [`Trees::create`].
+    fn named(name: &str) -> starling_proto_fancy::metadata::Channel {
+        starling_proto_fancy::metadata::Channel {
+            name: name.to_owned(),
+            parent: Some(0),
+            ..starling_proto_fancy::metadata::Channel::default()
+        }
+    }
 }

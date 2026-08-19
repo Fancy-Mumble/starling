@@ -11,9 +11,14 @@
 //! nothing to do with accounts: how much it is about to send, and how much of it
 //! the asker is entitled to see.
 
+use std::collections::HashMap;
+
 use prost::Message as _;
 use starling_proto::proto::tcp;
+use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::identity;
+use starling_proto_fancy::metadata::LastChannelsRequest;
+use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::userdata::Account;
 use starling_runtime::log::timestamp::rfc3339;
@@ -113,11 +118,13 @@ impl UserdataService {
 
         let accounts = self.every_account(inbound.scope);
         let listed = accounts.len();
+        let last_channels = self.last_channels(inbound.scope, &accounts, manage).await;
         let mut budget = TEXTURE_BUDGET;
         let mut users = Vec::with_capacity(listed);
         for account in accounts {
+            let last_channel = last_channels.get(&account.id).copied();
             users.push(
-                self.entry(inbound.scope, account, manage, &mut budget)
+                self.entry(inbound.scope, account, manage, last_channel, &mut budget)
                     .await,
             );
         }
@@ -172,6 +179,55 @@ impl UserdataService {
         all
     }
 
+    /// Where each listed account was last seen, in one call.
+    ///
+    /// `metadata` owns the answer, because a remembered channel may have been
+    /// deleted since and only the tree can say so. Read in bulk for the whole
+    /// dialog: per row it would be one round trip per account, which is why
+    /// this column used to be sent empty.
+    ///
+    /// Best-effort and `manage`-only. An unreachable `metadata` costs the
+    /// column and not the dialog, the same bargain the rest of this answer
+    /// makes with textures; and where somebody was last is presence, which
+    /// `ReadRegister` does not carry (see [`Self::entry`]).
+    async fn last_channels(
+        &self,
+        scope: u32,
+        accounts: &[Account],
+        manage: bool,
+    ) -> HashMap<u64, u32> {
+        if !manage || accounts.is_empty() {
+            return HashMap::new();
+        }
+        let Ok(transport) = self.resolver.channel("metadata") else {
+            return HashMap::new();
+        };
+        let asked = MetadataClient::new(transport)
+            .last_channels(LastChannelsRequest {
+                scope: Some(Scope { instance: scope }),
+                accounts: accounts.iter().map(|account| account.id).collect(),
+                // Zero, not `remember_channel_duration`: the dialog reports
+                // where somebody was, which is a fact about the past, while the
+                // duration decides where to put them, which is a decision about
+                // now. An operator who turned the memory off still gets to see
+                // what is on record.
+                max_age_s: 0,
+            })
+            .await;
+        match asked {
+            Ok(answer) => answer
+                .into_inner()
+                .entries
+                .into_iter()
+                .map(|entry| (entry.account, entry.channel))
+                .collect(),
+            Err(error) => {
+                tracing::debug!(%error, "could not read the remembered channels");
+                HashMap::new()
+            }
+        }
+    }
+
     /// One directory row.
     ///
     /// `budget` is decremented by whatever texture this row takes and is what
@@ -182,6 +238,7 @@ impl UserdataService {
         scope: u32,
         account: Account,
         manage: bool,
+        last_channel: Option<u32>,
         budget: &mut usize,
     ) -> tcp::user_list::User {
         let texture = self.affordable_texture(scope, &account, budget).await;
@@ -203,14 +260,9 @@ impl UserdataService {
                         + std::time::Duration::from_millis(account.last_active_ms),
                 )
             }),
-            // `metadata` does remember where an account was last seen
-            // (`0003_last_channel`), but only one account at a time, and this
-            // answer runs to `MAX_ENTRIES` rows: filling the field would be ten
-            // thousand round trips to decorate a dialog. It wants a bulk read
-            // (`docs/GAP-ANALYSIS.md` A4). Absent rather than zero until then,
-            // because a zero here is not "unknown" to a client; it is the root
-            // channel.
-            last_channel: None,
+            // Absent rather than zero when nothing is remembered, because a
+            // zero here is not "unknown" to a client; it is the root channel.
+            last_channel,
             texture,
             comment_hash,
             comment,

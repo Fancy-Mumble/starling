@@ -35,6 +35,12 @@ service Metadata {
   // than in `userdata` because it is a fact about the tree: the channel may
   // have been deleted since, and only this service can say so.
   rpc LastChannel(LastChannelRequest) returns (LastChannelResult);
+  // The same question about a list of accounts, for the registered-user
+  // dialog. Separate from `LastChannel` rather than a repeated field on it
+  // because the two have different callers and different failure appetites: a
+  // login needs one answer and blocks on it, a directory needs ten thousand and
+  // would rather send the dialog without the column than not send it.
+  rpc LastChannels(LastChannelsRequest) returns (LastChannelsResult);
 }
 
 message TreeRequest {
@@ -261,6 +267,27 @@ message LastChannelRequest {
   // How stale the memory may be, in seconds since the account last left a
   // channel. Zero is murmur's default and means it never expires.
   uint32 max_age_s = 3;
+}
+
+message LastChannelsRequest {
+  starling.common.v1.Scope scope = 1;
+  repeated uint64 accounts = 2;
+  // As `LastChannelRequest.max_age_s`. A directory asks with zero: the dialog
+  // reports where somebody was, which is a fact about the past, while
+  // `remember_channel_duration` decides where to *put* them, which is a
+  // decision about now.
+  uint32 max_age_s = 3;
+}
+
+message LastChannelsResult {
+  message Entry {
+    uint64 account = 1;
+    uint32 channel = 2;
+  }
+  // Only the accounts with an answer. Absence is the "not known" of
+  // `LastChannelResult.known`, for the same reason: a zero here would read as
+  // the root channel.
+  repeated Entry entries = 1;
 }
 
 message LastChannelResult {
