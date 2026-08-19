@@ -234,9 +234,18 @@ impl PermissionsService {
                     continue;
                 }
             };
-            let Ok(stream) = stream else {
-                tokio::time::sleep(RETRY).await;
-                continue;
+            let stream = match stream {
+                Ok(stream) => stream,
+                // Debug, not warn: on a cold start this fires once a second
+                // until metadata is up, which is expected and not an incident.
+                // But said at all, because until the tree arrives every channel
+                // evaluates as a root, and a refusal in that window looks like
+                // a wrong ACL rather than the boot order it is.
+                Err(status) => {
+                    tracing::debug!(%status, "metadata is not taking the tree subscription yet; retrying");
+                    tokio::time::sleep(RETRY).await;
+                    continue;
+                }
             };
 
             let mut events = stream.into_inner();
