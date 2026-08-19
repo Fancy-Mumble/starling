@@ -2009,16 +2009,24 @@ mod tests {
     /// reachable: every test here is about what the `last_channel` table says,
     /// and a resolver pointing at services nobody is serving is enough for
     /// that.
-    async fn service() -> MetadataService {
+    /// An empty in-memory database, with no schema on it yet. Named uniquely
+    /// per call: `cache=shared` makes same-named in-memory databases visible to
+    /// every connection that names them, so two tests sharing one name would
+    /// race on the same `starling_migration` row.
+    async fn memory_store() -> Store {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(
+        Store::open(
             &format!("sqlite:file:metadata-test-{id}?mode=memory&cache=shared"),
             1,
         )
         .await
-        .expect("in-memory database");
+        .expect("in-memory database")
+    }
+
+    async fn service() -> MetadataService {
+        let store = memory_store().await;
         store.migrate(SCHEMA).await.expect("schema");
 
         let nowhere = Resolver::new(
@@ -2132,6 +2140,58 @@ mod tests {
             asked(&service, &[7], 0).await,
             vec![(7, 0)],
             "and zero still means forever, as it does for murmur"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_written_before_an_upgrade_is_still_there_after_it() {
+        // No test had ever run one of these migrations against a database with
+        // anything in it: the e2e suite makes a fresh data dir per run, so it
+        // only ever migrates from zero, which is the one case production never
+        // is. Written as a walk over the whole list rather than against the
+        // migration that prompted it, so a later one that rewrites the channel
+        // table has to answer this too.
+        let store = memory_store().await;
+        store
+            .migrate(&SCHEMA[..1])
+            .await
+            .expect("the first schema this service ever had");
+        let _ = sqlx::query(
+            "INSERT INTO channel \
+                 (server_id, id, parent_id, name, description, position, max_users, \
+                  flags, expiry_mode, expiry_duration_s, created_at_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(1i64)
+        .bind(7i64)
+        .bind(0i64)
+        .bind("Room")
+        .bind("")
+        .bind(0i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1_700_000_000_000i64)
+        .execute(store.pool())
+        .await
+        .expect("a channel an older build had already created");
+
+        for step in 2..=SCHEMA.len() {
+            store
+                .migrate(&SCHEMA[..step])
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", SCHEMA[step - 1].name));
+        }
+
+        // Through `load`, not through a `SELECT`: what an operator notices
+        // about a bad upgrade is a server that comes up with an empty tree, so
+        // the assertion is the one the boot path makes.
+        let trees = Trees::new(&[1], "Starling");
+        trees.load(&store).await;
+        assert!(
+            trees.exists(1, 7),
+            "a channel from before the upgrade must still be in the tree after it"
         );
     }
 

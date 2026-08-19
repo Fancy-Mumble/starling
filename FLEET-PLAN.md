@@ -333,9 +333,12 @@ diffing lockfiles for the rename cutover.
 **Not done:** ~~`docs/GAP-ANALYSIS.md` still lists C5 (no name validation) and A4
 (no last-channel memory) as open — both now closed, tables need updating.~~ **Done
 2026-08-19** (`9a20732`); two comments in `userdata` had gone stale with them.
-No e2e coverage of the landing cascade. `LastChannel` has no operator-api surface. Migration `0003`'s
+No e2e coverage of the landing cascade. `LastChannel` has no operator-api surface. ~~Migration `0003`'s
 upgrade path is untested — the suite only ever migrates from zero, because
-`StarlingServer.start()` mkdtemps a fresh data dir per run.
+`StarlingServer.start()` mkdtemps a fresh data dir per run.~~ **Covered
+2026-08-19** by a unit test that lays a channel down under the oldest schema
+and walks every migration over it, so the next one that touches that table has
+to answer the same question. The e2e suite still only migrates from zero.
 
 ## 6.2 virtual_server → instance rename — LANDED
 
