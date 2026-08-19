@@ -1596,6 +1596,27 @@ impl MetadataService {
             return vec![permission_denied(inbound, needed, channel_asked_about)];
         }
 
+        // Re-parenting is a second question, asked of the *new parent*: murmur
+        // takes `Write` on the channel being moved and then `MakeChannel` (or
+        // `MakeTempChannel`, for a temporary one) where it is going
+        // (`Messages.cpp:2025`, `:2032`), because putting a channel somewhere
+        // is the same power as creating one there. Only asked when the parent
+        // actually changes: a client re-sends the current parent with an
+        // unrelated edit, and murmur compares before it asks.
+        if let (Some(id), Some(new_parent)) = (state.channel_id, state.parent)
+            && let Some(current) = self.trees.parent_of(inbound.scope, id)
+            && current != new_parent
+        {
+            let make = if self.trees.transient(inbound.scope, &[id]).contains(&id) {
+                Perm::MAKE_TEMP_CHANNEL
+            } else {
+                Perm::MAKE_CHANNEL
+            };
+            if !self.allows(inbound, new_parent, make).await {
+                return vec![permission_denied(inbound, make, new_parent)];
+            }
+        }
+
         if let Some(refusal) = self.name_refusal(inbound, &state, channel_asked_about) {
             return refusal;
         }

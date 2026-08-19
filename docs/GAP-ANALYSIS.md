@@ -306,6 +306,15 @@ through the admin surface is the person who set the limit, which is where
 murmur draws the same line, `canNest` and the count check living in
 `msgChannelState`.
 
+**C6, moving a channel, asked half of murmur's question.** A re-parent takes
+`Write` on the channel being moved **and** `MakeChannel` (`MakeTempChannel` for
+a temporary one) on the new parent (`Messages.cpp:2025`, `:2032`): putting a
+channel somewhere is the same power as creating one there. `on_channel_state`
+asked only the first, so whoever owned a room could hang it under any channel
+on the server, including ones they could not create in. Closed 2026-08-19,
+asked only when the parent actually changes, because a client re-sends the
+current parent with an unrelated edit.
+
 **C4 was half true and is now closed.** Entry *did* enforce `max_users`; what
 the entry described was real all the same, the rule was written out twice, once
 in the entity where it was tested and once in the tree that clients actually

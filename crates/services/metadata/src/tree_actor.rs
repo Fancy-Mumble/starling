@@ -321,6 +321,20 @@ impl Trees {
             .unwrap_or(false)
     }
 
+    /// Where `channel` hangs now, for a write that would move it.
+    ///
+    /// `None` for the root, a detached channel, or an id the tree does not
+    /// have: none of the three has a parent to be moved away from, and
+    /// [`Self::update`] refuses to move any of them itself, so a caller that
+    /// reads `None` as "not a move" is not letting anything past.
+    #[must_use]
+    pub fn parent_of(&self, scope: u32, channel: u32) -> Option<u32> {
+        self.with(scope, |state| {
+            state.channels.get(&channel).and_then(|c| c.parent)
+        })
+        .flatten()
+    }
+
     /// Put a returning user's stored listeners back on `session`.
     ///
     /// Applied without the ceilings: they bound what a user may *ask for*, and
