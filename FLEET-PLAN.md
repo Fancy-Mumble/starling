@@ -193,9 +193,13 @@ them as unproven until you have. No Starling binary yet contains the signal_v1 b
 
 ## Gaps deliberately left
 
-- The archive does not dedup on the sender's id the way murmur does, so a client that
+- ~~The archive does not dedup on the sender's id the way murmur does, so a client that
   retries a send writes two rows. Wants a unique index plus an ack reporting "already
-  stored" rather than a failed insert.
+  stored" rather than a failed insert.~~ **Fixed 2026-08-19** (`cb0c07d`): migration
+  `0006_pchat_one_row_per_sender_id`, and the `DUPLICATE` ack the proto already had a
+  slot for. The relay still goes out — the archive holding one copy is a different
+  question from delivery. The upgrade deletes the duplicates an older build wrote,
+  because `CREATE UNIQUE INDEX` over them refuses rather than warns.
 - ~~`FetchResponse` hardcodes `supersedes: String::new()`, so an edit's `replaces_id`
   never survives the archive, and `store_message` parses the client's `replaces_id`
   as a uuid7 (client ids are v4) before storing it. Edits do not round-trip through
@@ -544,7 +548,8 @@ client windows share one display.
 - A stub screencast portal on a private D-Bus (§5) — the only route to covering the
   real PipeWire/DMA-BUF path.
 - ~~`docs/GAP-ANALYSIS.md` C5 and A4 are closed but still listed as open.~~
-  **Done** (`9a20732`). What is left of A4 is the directory row, which needs a
-  bulk `LastChannel` read rather than one RPC per account.
+  **Done** (`9a20732`), and the directory row that was left of A4 with it
+  (`1181ed9`): `LastChannels` reads the whole dialog in one call. `LastChannel`
+  still has no operator-api surface (§6.1).
 - ~~Archive edits do not round-trip through history (§4, gaps).~~ **Done**
   (`486a2c5`), unit-covered; an e2e suite over an edit would still be new.

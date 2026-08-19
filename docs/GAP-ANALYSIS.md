@@ -360,10 +360,14 @@ memberships accumulated for every session that had ever connected and occupancy
 counted the dead, invisible until an occupancy *limit* reads it and then it is a
 room that says it is full and looks empty.
 
-What is still absent is the *directory* row. `UserList.User.last_channel` is
-sent empty because reading it is one RPC per account against an answer that runs
-to ten thousand rows, and a zero there is not "unknown" to a client, it is the
-root channel. It wants a bulk read on `metadata`, not a loop.
+The *directory* row carries it too, through a second RPC rather than a loop:
+`LastChannels` answers about the whole dialog at once, because per account it
+would be ten thousand round trips to decorate a list. Absence still means
+absence there - a zero in that field is not "unknown" to a client, it is the
+root channel - so an account with nothing remembered leaves it unset. The
+column is `Register`-only and best-effort, like `last_seen` beside it: where
+somebody was last is presence, and an unreachable `metadata` costs the column
+rather than the dialog.
 
 A client registration stores no password, so the account is claimed by its
 certificate from then on. That is murmur's model and it is why `on_register`
