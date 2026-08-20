@@ -64,7 +64,7 @@ members = [
 # The release version. The `starling` binary and the internal libraries
 # (runtime, crypto, gate, sfu, migrate, operator-api) inherit it; the services,
 # the gateway and the proto crates carry their own.
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 # Matches rust-toolchain.toml: the version the resolver holds dependencies to.
 # Drifting below the pin would admit crates the pinned compiler cannot build.
