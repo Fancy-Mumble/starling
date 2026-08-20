@@ -23,8 +23,12 @@ use serde_json as _;
 use sha2 as _;
 use thiserror as _;
 use tracing as _;
-// Feature-gated, because they are: with `wasm-plugins` off these crates are not
-// in the graph at all, and naming them unconditionally would fail to compile.
+// Platform- and feature-gated, because these dependencies are. Naming them
+// unconditionally fails to compile where they are not in the graph -- and not
+// naming them fails `unused_crate_dependencies` where they are, which is how
+// this arrived: `goblin` is Linux-only, so a Windows clippy run never sees it.
+#[cfg(target_os = "linux")]
+use goblin as _;
 #[cfg(feature = "wasm-plugins")]
 use wasmtime as _;
 #[cfg(feature = "wasm-wasi")]

@@ -19,6 +19,17 @@ ignore = [
     # rustls-pemfile is used only at startup to read a cert/key from disk, never
     # on peer input. Clears by migrating to the rustls-pki-types PEM API.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile (unmaintained): startup-only cert/key parsing, no peer input" },
+
+    # Both arrive through `abi_stable`, which is the foundation of the plugin
+    # ABI: every plugin binary links it, and the host has to link the same one
+    # or nothing loads. Neither advisory is a vulnerability -- both are
+    # "unmaintained" notices with no patched version to move to -- and
+    # abi_stable 0.11.3 is itself the latest release, so there is nothing to
+    # upgrade into. The C++ server's plugin-host workspace carries the same two
+    # for the same reason. Revisit if abi_stable publishes a release that drops
+    # them, or if either is upgraded to an actual vulnerability.
+    { id = "RUSTSEC-2024-0014", reason = "generational-arena (unmaintained): transitive via abi_stable, no fixed version exists" },
+    { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained): transitive via abi_stable, no fixed version exists" },
 ]
 
 # ---------------------------------------------------------------------------
