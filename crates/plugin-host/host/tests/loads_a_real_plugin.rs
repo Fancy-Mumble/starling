@@ -353,6 +353,39 @@ fn a_plugin_can_be_switched_off_and_on_at_runtime() {
 }
 
 #[test]
+#[cfg(not(feature = "wasm-plugins"))]
+fn a_wasm_plugin_is_refused_with_the_reason_rather_than_skipped() {
+    // The WASM backend is compiled out by default, so an operator who drops a
+    // `.wasm` component in the directory gets a server that does not run it.
+    // What they must not get is silence: a file the scanner picks up and the
+    // loader ignores looks identical to a plugin that loaded and does nothing,
+    // and the difference is one build flag.
+    let dir = scratch("wasm-off");
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    std::fs::write(dir.join("component.wasm"), b"\0asm\x01\0\0\0").expect("write a stub component");
+
+    let bridge = Arc::new(Recorder::with_config(&[(
+        "plugins_dir",
+        &dir.display().to_string(),
+    )]));
+    let host = Host::new(bridge as Arc<dyn HostBridge>);
+
+    let (listed, _) = host.list_plugins();
+    assert_eq!(listed.len(), 1, "the file is seen, not skipped");
+    let error = listed[0]
+        .load_error
+        .as_deref()
+        .expect("a wasm file must be refused, not quietly dropped");
+    assert!(
+        error.contains("wasm-plugins"),
+        "the refusal has to name the feature to turn on: {error}"
+    );
+    assert_eq!(listed[0].kind, "wasm", "and be reported as what it is");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_file_that_is_not_a_plugin_is_reported_rather_than_ignored() {
     // A binary nobody can see is a binary nobody can remove, and the startup
     // scan retries it every boot.
