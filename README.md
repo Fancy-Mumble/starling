@@ -12,7 +12,8 @@ The bird is Dusk, for the hour the murmurations happen.
 
 **A gateway in front, independent gRPC services behind it, and media planes that
 bypass the gateway entirely.** Architecture:
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Wire compatibility:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). What each service owns and what
+it calls: [`docs/SERVICES.md`](docs/SERVICES.md). Wire compatibility:
 [`docs/PROTOCOL-COMPATIBILITY.md`](docs/PROTOCOL-COMPATIBILITY.md). Config:
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Storage:
 [`docs/STORAGE.md`](docs/STORAGE.md). Admin plane:
@@ -126,6 +127,16 @@ Keep the `--build`. Compose builds only when the image is *missing*, so a stale
 runs the same binary picked by `command`, so that failure surfaces as a service
 exiting with `no service named "..."`, which says nothing about the image.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/deployment-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/diagrams/deployment.svg">
+  <img alt="Container topology, and the four exposure problems it has to solve" src="docs/diagrams/deployment.svg">
+</picture>
+
+Source: [`docs/diagrams/deployment.puml`](docs/diagrams/deployment.puml). The
+same picture is the compose stack with the load balancers replaced by published
+ports.
+
 Then connect a Mumble client to `localhost:64738`. `--wait` returns once every
 container is healthy, and health here is a TCP connect: this build has no HTTP
 `/healthz` to probe, so it means the listener is up, not that the caches are
@@ -178,6 +189,15 @@ a TOML block.
 
 The gateway's own tier is `core`, which it never consults. A tier says what the
 gateway does while a service is unhealthy.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/services-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/diagrams/services.svg">
+  <img alt="Every service, grouped by the protocol it speaks to a client" src="docs/diagrams/services.svg">
+</picture>
+
+Source: [`docs/diagrams/services.puml`](docs/diagrams/services.puml). What each
+one owns and what it calls: [`docs/SERVICES.md`](docs/SERVICES.md).
 
 ## Quality gates
 

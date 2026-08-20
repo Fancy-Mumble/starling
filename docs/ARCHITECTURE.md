@@ -92,6 +92,15 @@ expect.
 
 **It owns backpressure toward the client**, see §5.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/gateway-internals-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="diagrams/gateway-internals.svg">
+  <img alt="The gateway's five parts, and what it deliberately does not know" src="diagrams/gateway-internals.svg">
+</picture>
+
+Source:
+[`diagrams/gateway-internals.puml`](diagrams/gateway-internals.puml).
+
 ## 3. Four planes
 
 | Plane | Transport | Path |
@@ -190,6 +199,10 @@ record itself.
 is required for it, see `PORTING-PLAN.md` R1 and §6.
 
 ## 4. Services and tiers
+
+This section argues the split. What each service owns, what it calls and what
+calls it is [`SERVICES.md`](SERVICES.md), which also carries the call graph, the
+login sequence and the audio budget as diagrams.
 
 `tier` is not documentation, the gateway reads it and behaves accordingly.
 
@@ -346,8 +359,16 @@ control overflow, requests expired.
 
 ### Shard keys are decided now, not at deployment
 
-A shard key cannot be retrofitted, it changes every caller. `scaling.puml` has
-the per-service table; three of them are load-bearing:
+A shard key cannot be retrofitted, it changes every caller.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/scaling-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="diagrams/scaling.svg">
+  <img alt="The shard key per service: what scales out, what scales within a bound, and what does not" src="diagrams/scaling.svg">
+</picture>
+
+Source: [`diagrams/scaling.puml`](diagrams/scaling.puml), which has the
+per-service table. Three of them are load-bearing:
 
 **`voice` shards by channel, never by client.** Audio routing is per channel, so
 a channel's members must share a pod. Client affinity (`sessionAffinity: ClientIP`)
