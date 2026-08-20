@@ -175,7 +175,8 @@ impl<'a> Host<'a> {
 
     /// Create a sub-channel under `parent` (or return an existing same-named
     /// child) with the given standard, content-agnostic channel properties.
-    /// See [`PluginContext::create_channel`] for the parameter meaning.
+    /// See [`PluginContext::create_channel`](crate::PluginContext::create_channel)
+    /// for the parameter meaning.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -358,7 +359,8 @@ impl<'a> Host<'a> {
     // ---- Server-originated request/response bridge --------------------
 
     /// Deliver a typed response for a server-originated request back to the
-    /// host (the return leg of [`PluginContext::send_request_response`]).
+    /// host (the return leg of
+    /// [`PluginContext::send_request_response`](crate::PluginContext::send_request_response)).
     ///
     /// Unlike [`send_to_sessions`](Self::send_to_sessions), this does **not**
     /// reach the client directly: the host routes the `payload` by

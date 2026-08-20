@@ -1,7 +1,7 @@
 //! Declarative `macro_rules!` macros for building component-laden
 //! [`InteractionResponse`](crate::InteractionResponse) values.
 //!
-//! These are pure sugar over the builders in [`crate::client_manifest`]
+//! These are pure sugar over the builders in [`mod@crate::client_manifest`]
 //! and [`crate::commands`].  They exist so the common shape of a
 //! plugin response - a Markdown body plus a handful of buttons or a
 //! modal form - can be written without repeating `InteractionResponse::`
@@ -53,7 +53,7 @@ macro_rules! row {
     };
 }
 
-/// Build a floating-overlay [`crate::InteractionResponse`] (a\n/// title-less [`crate::ResponseKind::ShowModal`]) from a body and\n/// zero or more [`crate::ActionRow`]s.\n///\n/// The first argument is the Markdown body (`impl Into<String>`); the\n/// remaining arguments are rows, typically produced by the `row!`\n/// macro.  Returns an `InteractionResponse` so callers can chain\n/// `.ephemeral()`, `.with_correlation_id(...)`, etc.\n///\n/// This macro is sugar over [`crate::InteractionResponse::message`],\n/// which lowers to a `ShowModal` with an empty `title`.  Use\n/// [`show_modal!`] when you need a titled modal form, or\n/// [`chat_message!`] when the payload should be persisted in the\n/// chat history instead of rendered as a transient overlay.\n///\n/// ```ignore\n/// use mumble_plugin_api::{message, row, Button};\n/// let resp = message!(\n///     \"Hello, world\",\n///     row![ Button::new(\"again\", \"Again\") ],\n/// )\n/// .ephemeral();\n/// ```
+/// Build a floating-overlay [`crate::InteractionResponse`] (a\n/// title-less [`crate::ResponseKind::ShowModal`]) from a body and\n/// zero or more [`crate::ActionRow`]s.\n///\n/// The first argument is the Markdown body (`impl Into<String>`); the\n/// remaining arguments are rows, typically produced by the `row!`\n/// macro.  Returns an `InteractionResponse` so callers can chain\n/// `.ephemeral()`, `.with_correlation_id(...)`, etc.\n///\n/// This macro is sugar over [`crate::InteractionResponse::message`],\n/// which lowers to a `ShowModal` with an empty `title`.  Use\n/// [`show_modal!`](crate::show_modal) when you need a titled modal form, or\n/// [`chat_message!`](crate::chat_message) when the payload should be persisted in the\n/// chat history instead of rendered as a transient overlay.\n///\n/// ```ignore\n/// use mumble_plugin_api::{message, row, Button};\n/// let resp = message!(\n///     \"Hello, world\",\n///     row![ Button::new(\"again\", \"Again\") ],\n/// )\n/// .ephemeral();\n/// ```
 #[macro_export]
 macro_rules! message {
     ($content:expr $(, $row:expr)* $(,)?) => {{
@@ -76,7 +76,7 @@ macro_rules! message {
 /// whole list), plus `.ephemeral()` or `.with_correlation_id(...)`,
 /// on the returned [`crate::InteractionResponse`].
 ///
-/// Unlike [`message!`], the resulting payload is **not** rendered as
+/// Unlike [`message!`](crate::message), the resulting payload is **not** rendered as
 /// a transient floating card; it appears inline in the chat scroll
 /// alongside user-sent messages and participates in scroll, pinning,
 /// and history.

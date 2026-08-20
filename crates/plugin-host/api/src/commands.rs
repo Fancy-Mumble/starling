@@ -519,7 +519,7 @@ impl InteractionResponse {
         self
     }
 
-    /// Append an [`ActionRow`] of components to an overlay or
+    /// Append an [`ActionRow`](crate::ActionRow) of components to an overlay or
     /// chat-message response.  No-op (with a `debug_assert`) on
     /// other response kinds.
     #[must_use]

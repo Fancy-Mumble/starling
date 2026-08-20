@@ -15,8 +15,8 @@
 //!
 //! [`starling_plugin_host`] does the loading and the dispatching; this service
 //! is what makes it a Starling service. It supplies the bridge the host reaches
-//! the server through ([`bridge`]), the event feed it dispatches from
-//! ([`events`]), and the wire plane plugin traffic arrives on.
+//! the server through (`bridge.rs`), the event feed it dispatches from
+//! (`events.rs`), and the wire plane plugin traffic arrives on.
 //!
 //! Every call into the host runs on the blocking pool. Plugin hooks are
 //! synchronous by contract and a plugin may do anything inside one -- open a

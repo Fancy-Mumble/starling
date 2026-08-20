@@ -446,8 +446,10 @@ pub enum ResponseKind {
         ephemeral: bool,
     },
     /// Inject a *literal* chat message into the client's chat
-    /// history, exactly like a [`mumble_protocol::proto::mumble_tcp::TextMessage`]
-    /// authored by the plugin.
+    /// history, exactly like a Mumble `TextMessage` authored by the plugin.
+    ///
+    /// Not a link: the type lives in the client's protocol crate, which
+    /// nothing here depends on and rustdoc therefore cannot resolve.
     ///
     /// Unlike [`Self::ShowModal`] (which renders as a transient
     /// floating overlay / modal), `ChatMessage` is persisted in the
