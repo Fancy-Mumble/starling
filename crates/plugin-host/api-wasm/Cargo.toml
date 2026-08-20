@@ -1,0 +1,36 @@
+# The guest half of the WASM plugin contract: what a WebAssembly plugin is
+# built against, generated from the same `../wit` the host loads components
+# through. Lifted from the C++ server's `3rdparty/mumble-plugin-host/api-wasm`.
+#
+# Here even though this repository's host ships with `wasm-plugins` off, because
+# the *guest* side is what plugin authors depend on, and making them keep a
+# checkout of the C++ server to build a plugin for this one is the thing the
+# lift exists to end. Nothing in Starling links it.
+#
+# Edition 2021 for the same reason the two native `api` crates are: it is held
+# to a published contract, and an edition migration is a change to it.
+[package]
+name = "mumble-plugin-api-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Guest-side authoring bindings for WebAssembly Mumble plugins."
+license = "MIT"
+
+[dependencies]
+# Keep the major aligned with the host's `wasmtime` so the component-model /
+# WIT encodings match between guest (`wit-bindgen`) and host (`wasmtime`).
+wit-bindgen.workspace = true
+
+[dev-dependencies]
+# Only so the test below can compare the two halves of the WASM contract. A
+# guest never links the native API, and must not start.
+mumble-plugin-api.workspace = true
+
+# NOTE: this crate deliberately does NOT take the workspace lint table. Most of
+# its surface is `wit-bindgen` output, which carries no documentation and would
+# trip `missing_docs`, and the generated component glue is `unsafe extern "C"`.
+# The hand-written wrappers in `src/lib.rs` are documented.
+[lints.rust]
+unsafe_code = "allow"
+unused_crate_dependencies = "warn"
