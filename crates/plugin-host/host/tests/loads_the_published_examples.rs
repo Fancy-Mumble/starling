@@ -1,16 +1,17 @@
 //! The published example plugins, loaded by this host.
 //!
-//! `loads_a_real_plugin.rs` proves the host can load a plugin. This proves
-//! something narrower and more valuable: that it can load plugins **it did not
-//! build**, compiled against the *other* copy of `mumble-plugin-api` -- the one
-//! still in the C++ server's tree, which
-//! [fancy-plugin-example](https://github.com/Fancy-Mumble/fancy-plugin-example)
-//! depends on by path.
+//! `loads_a_real_plugin.rs` proves the host can load a plugin it built itself,
+//! in the same workspace, in the same profile. This proves the part that
+//! actually matters to somebody writing a plugin: that a binary built
+//! **somewhere else** loads here.
 //!
-//! That is the invariant `docs/PLUGIN-HOST-PLAN.md` §3 claims and nothing else
-//! here checks: a plugin binary built against either tree loads in either
-//! server. Two things have to hold for one of these files to load at all, and
-//! both are exactly what would break if the lift had drifted:
+//! [fancy-plugin-example](https://github.com/Fancy-Mumble/fancy-plugin-example)
+//! is a separate repository, a separate Cargo workspace, and depends on this
+//! one's `mumble-plugin-api` over git at a pinned commit. Its plugins are built
+//! in release with `lto = true` and `strip = "symbols"`; this host is built in
+//! debug. Nothing is shared but the ABI.
+//!
+//! Two things have to hold for one of those files to load at all:
 //!
 //! 1. the `__mumble_plugin_abi_version` the binary exports equals the
 //!    `PLUGIN_ABI_VERSION` this host was built with, and
@@ -19,20 +20,24 @@
 //!
 //! A field reordered, a method added, a dependency at a different version: any
 //! of them fails (2) with a vtable-layout error rather than loading and
-//! misbehaving. So a green run here is a real statement about the ABI, not a
-//! statement about this repository compiling.
+//! misbehaving. So a green run here is a statement about the ABI, not about
+//! this repository compiling.
+//!
+//! # What this used to check, and why it stopped
+//!
+//! The examples originally depended on the *C++ server's* copy of the API by
+//! path, so this file checked something stronger: that a binary built against
+//! either tree loaded in either server. It did, on 2026-08-20, across all six.
+//! The dependency then moved here, because Starling is where the API is
+//! maintained and asking a plugin author to check out a C++ server to build a
+//! Rust plugin is a tax with nothing behind it.
+//!
+//! The two copies of the API remain semantically identical -- the surviving
+//! differences are import ordering and line wrapping from `cargo fmt` -- and
+//! the C++ tree's is frozen. Should that stop being true, this file is not what
+//! will notice.
 //!
 //! # Getting the artefacts
-//!
-//! The examples are a separate repository, checked out beside this one, which
-//! is the layout its own README documents:
-//!
-//! ```text
-//! <parent>/
-//! ├── starling/                 # this repo
-//! ├── fancy-plugin-example/     # the examples
-//! └── mumble-server/            # what their api path dependency points at
-//! ```
 //!
 //! ```sh
 //! cd ../fancy-plugin-example
@@ -40,6 +45,10 @@
 //!     -p fancy-info-card -p fancy-feedback-form -p fancy-chat-card \
 //!     -p fancy-quick-poll
 //! ```
+//!
+//! Nothing else needs checking out. To build them against a *working tree*
+//! rather than the pinned commit, uncomment the `[patch]` block at the foot of
+//! that repository's root `Cargo.toml`.
 //!
 //! `fancy-greeter-wasm` is deliberately not in that list: it is a WebAssembly
 //! component, needs `wasm-tools component new` after the build, and this host
@@ -239,9 +248,9 @@ fn the_inventory_is_printed_so_a_green_run_can_be_read() {
     };
 
     eprintln!(
-        "\n  loaded {} of {} staged files, in a host built from this repository's\n  \
-         copy of mumble-plugin-api; every binary below was compiled against the\n  \
-         C++ server's copy:\n",
+        "\n  loaded {} of {} staged files. Every binary below was built in a\n  \
+         separate workspace, in release, against this repository's\n  \
+         mumble-plugin-api fetched over git at a pinned commit:\n",
         host.loaded_count(),
         staged.len()
     );

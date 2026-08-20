@@ -226,11 +226,37 @@ but receives no new work. (The alternative, splitting `mumble-plugin-host` into
 its own repo consumed by both, is more moving parts and only worth it if the
 C++ server outlives the plan for it.)
 
-Two things named above did not come across. `api-wasm` is the *guest* SDK --
-what a WASM plugin is built against, not something a host needs -- so it stays
-where the plugins that use it are. The five heavier plugins stayed too; each
-needs evaluating against Starling on its own terms (M5), and `friends` is the
-one that earns its place now as the host's exit test.
+`api-wasm` came across too, in a second pass, though nothing in Starling links
+it: it is the *guest* SDK, what a WASM plugin is built against rather than
+anything a host needs. It is here because leaving it behind meant a plugin
+author still had to check out a C++ server to build a plugin for this one,
+which is the tax the lift exists to end. A test in that crate holds its ABI
+constant equal to the native crate's `WASM_ABI_VERSION`, since the two are
+constants in separate crates that nothing else ties together.
+
+The five heavier plugins did not come across; each needs evaluating against
+Starling on its own terms (M5), and `friends` is the one that earns its place
+now as the host's exit test.
+
+### Who depends on the API
+
+Starling is the maintained copy, and plugin authors take it from here, over git:
+
+```toml
+mumble-plugin-api = { git = "https://github.com/Fancy-Mumble/starling.git", branch = "main" }
+```
+
+That is what
+[fancy-plugin-example](https://github.com/Fancy-Mumble/fancy-plugin-example)
+does as of 2026-08-20, replacing a path dependency on a sibling checkout of the
+C++ server. All seven of its plugins -- the six native ones and the WASM
+component -- build with nothing checked out beside them, and its CI no longer
+clones a server to build a plugin.
+
+The C++ tree keeps its copy and still works; it is frozen. The two remain
+semantically identical, the only differences being import ordering and line
+wrapping from `cargo fmt`. Nothing enforces that, and nothing needs to while
+one of them is not changing.
 
 Editions differ on purpose: `api` and `api-derive` stayed on 2021 because they
 are held to a published ABI and an edition migration is a change to it, while
