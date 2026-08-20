@@ -1,0 +1,122 @@
+' Body of deployment.puml / deployment-dark.puml. No start marker, so PlantUML
+' will not render this file directly, and naming one in a comment here breaks
+' the include. See README.md.
+'
+' Every colour is a wrapper variable so the dark render is dark throughout.
+' Both post-render passes in README.md are required for either half.
+
+' Widened into a fallback stack by a post-render pass, see README.md.
+skinparam defaultFontName Inter
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 20
+skinparam ranksep 45
+skinparam defaultTextAlignment center
+
+title Deployment: one image, four exposure problems
+
+header
+<b>One image.</b>  The entrypoint takes a service name: Kubernetes runs <b>args: ["text"]</b>, compose runs <b>command: text</b>.
+endheader
+
+actor "legacy Mumble\nclient" as legacy $c_neutral
+actor "Fancy client" as fancy $c_blue
+
+package "cluster" as K8S $c_faint {
+
+  node "**Service: LoadBalancer**\n**TCP** 64738" as lbtcp $c_red
+  node "**Service: LoadBalancer**\n**UDP** 64738\nsessionAffinity: **none**" as lbudp $c_red
+  node "**Ingress**\nHTTPS" as ing $c_green2
+
+  node "**gateway** pods\nreplicas: N\nstateful per connection,\n**resumable elsewhere**" as gwpod $c_gw
+  node "**session store**\nsequence + replay buffer\n**«not built»**: in-process,\ndies with the pod" as sstore $c_gw2
+  node "**voice** pods\nreplicas: N\nholds ciphers + membership cache" as vpod $c_core
+  node "**files/http** pods\nstateless" as fpod $c_green
+  node "**essential** pods\nsession · permissions\nmetadata · userdata" as epod $c_ess
+  node "**optional** pods\npush · audit · social · ..." as opod $c_green
+  node "**directory**\nsingleton per server instance\nno inbound port" as dpod $c_indigo
+}
+
+cloud "**publist.mumble.info**" as publist $c_indigo
+dpod -[$l_indigo]-> publist : hourly HTTPS
+note right of dpod $c_indigo
+  No `Service`, no `Ingress`, no port: outbound only.
+  **replicas: 1** is a correctness bound, not a capacity one.
+  Each replica announces on its own timer, so two replicas
+  are two registrations of the same server.
+end note
+
+legacy --> lbtcp
+fancy  --> lbtcp
+lbtcp  --> gwpod
+
+legacy --> lbudp
+fancy  --> lbudp
+lbudp  --> vpod
+
+fancy --> ing
+ing   --> fpod
+
+gwpod -[$l_blue]-> epod : gRPC + circuit breaker
+gwpod -[$l_blue]-> opod : gRPC
+gwpod -[$l_blue]-> vpod : gRPC\n(signalling + UDPTunnel only)
+gwpod -[$l_blue]-> sstore : sequence + replay
+vpod  -[$l_blue].-> epod : membership snapshot
+
+note right of lbtcp $c_red
+  **1. The gateway cannot use an Ingress.**
+  `Ingress` is HTTP/HTTPS only; Mumble is raw TCP+TLS.
+  Needs `Service type=LoadBalancer` or Gateway API `TCPRoute`.
+end note
+
+note right of lbudp $c_red
+  **2. Client affinity is the wrong affinity.**
+  Audio routes per channel, so a channel's members must share a
+  pod. `sessionAffinity: ClientIP` pins each *client*, scattering
+  a channel across pods, and there is **no inter-pod audio path**.
+  Discord assigns a *channel* to a voice server and tells the
+  client which. Mumble has no such field, and **a legacy client**
+  **sends UDP to the port it made TCP to**, so it cannot be
+  redirected. In order of increasing capability:
+  · one voice pod per server instance, vertical only
+  · a forwarding mesh between pods, costs a hop
+  · shard by channel + an explicit endpoint in `ServerSync` for
+    Fancy clients; legacy stays on the advertised pod
+  See scaling.puml.
+end note
+
+note bottom of vpod $c_core
+  **3. A restarted voice pod has cold caches.**
+  Ciphers and the membership cache do not survive, and audio
+  arriving before it re-subscribes is dropped.
+  `/readyz` gates on **cache warm-up**, not on the process being
+  alive, and must be a *different* endpoint from `/healthz`.
+end note
+
+note right of sstore $c_gw2
+  **4. RESUME, or a rolling deploy is a DDoS.**
+  Draining a pod holding 10 000 clients means 10 000 full floods
+  of every ChannelState and UserState at once. A sequence number
+  replays only the gap, but it must **outlive the pod**, or a
+  client landing elsewhere has nothing to resume against.
+  Legacy clients cannot resume: stagger readiness and send a
+  jittered reconnect hint.
+end note
+
+note bottom of ing $c_green2
+  files/http is the only component speaking HTTP, so it is the
+  only one that gets TLS termination and a CDN for free.
+end note
+
+note as COMPOSE $c_card
+  **docker compose**: the same picture with the load balancers
+  replaced by published ports. **Twenty-one containers** from one
+  image, started in tier order, differing only in `command`.
+  voice publishes UDP 64738 and the gateway TCP 64738, so a
+  legacy client still sees one host:port pair.
+  **--all-in-one** collapses every pod into one process.
+  **«not built»: no in-process pipes.** A service resolves its own
+  endpoint through the broker, which cannot know it before it has
+  registered, so every service falls back to its local socket.
+end note

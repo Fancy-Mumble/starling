@@ -1,139 +1,23 @@
 @startuml deployment
+' Light render. The body is deployment.iuml, shared with deployment-dark.puml,
+' which supplies the same variables in dark values.
 !theme plain
-skinparam componentStyle rectangle
-skinparam shadowing false
-skinparam nodesep 20
-skinparam ranksep 45
-skinparam defaultTextAlignment center
 
-title Deployment: one image, three exposure problems
+!$c_blue    = "#E3F2FD"
+!$c_card    = "#FFFFFF"
+!$c_core    = "#FFF8E1"
+!$c_ess     = "#FFEBEE"
+!$c_faint   = "#F5F5F5"
+!$c_green   = "#E8F5E9"
+!$c_green2  = "#C8E6C9"
+!$c_gw      = "#FFE9D6"
+!$c_gw2     = "#FFE0B2"
+!$c_indigo  = "#EDE7F6"
+!$c_neutral = "#EEEEEE"
+!$c_red     = "#FFCDD2"
 
-header
-<b>One image.</b>  The entrypoint takes a service name, so Kubernetes runs <b>args: ["text"]</b> and compose runs <b>command: text</b>.
-Twenty-four Dockerfiles would be twenty-four things to keep in sync, and it makes <b>--all-in-one</b> an argument rather than a build.
-endheader
+!$l_blue    = "#1565C0"
+!$l_indigo  = "#4527A0"
 
-actor "legacy Mumble\nclient" as legacy #EEEEEE
-actor "Fancy client" as fancy #E3F2FD
-
-package "cluster" as K8S #F5F5F5 {
-
-  node "**Service: LoadBalancer**\n**TCP** 64738\n«NOT an Ingress»" as lbtcp #FFCDD2
-  node "**Service: LoadBalancer**\n**UDP** 64738\n**NOT** sessionAffinity: ClientIP" as lbudp #FFCDD2
-  node "**Ingress**\nHTTPS\n«the only one that fits»" as ing #C8E6C9
-
-  node "**gateway** pods\nreplicas: N\nstateful per connection,\n**but resumable elsewhere**" as gwpod #FFE9D6
-  node "**session store**\nsequence + replay buffer\nmeant to outlive any gateway pod\n**«not built»**, in-process today" as sstore #FFE0B2
-  node "**voice** pods\nreplicas: N\nholds ciphers + membership cache" as vpod #FFF8E1
-  node "**files/http** pods\nstateless" as fpod #E8F5E9
-  node "**essential** pods\nsession · permissions\nmetadata · userdata" as epod #FFEBEE
-  node "**optional** pods\npush · audit · polls · ..." as opod #E8F5E9
-  node "**directory**\nsingleton per server instance\nno inbound port at all" as dpod #EDE7F6
-}
-
-cloud "**publist.mumble.info**" as publist #EDE7F6
-dpod -[#4527A0]-> publist : hourly HTTPS
-note right of dpod #EDE7F6
-  **The one pod nothing connects to.** No `Service`, no
-  `Ingress`, no port; it only makes an outbound request, so
-  there is nothing to expose and nothing to load balance.
-  **replicas: 1**, and that is a correctness bound rather than a
-  capacity one: each replica announces on its own hourly timer,
-  so two of them are two registrations of the same server.
-end note
-
-legacy --> lbtcp
-fancy  --> lbtcp
-lbtcp  --> gwpod
-
-legacy --> lbudp
-fancy  --> lbudp
-lbudp  --> vpod
-
-fancy --> ing
-ing   --> fpod
-
-gwpod -[#1565C0]-> epod : gRPC + circuit breaker
-gwpod -[#1565C0]-> opod : gRPC
-gwpod -[#1565C0]-> vpod : gRPC\n(signalling + UDPTunnel only)
-gwpod -[#1565C0]-> sstore : sequence + replay
-vpod  -[#1565C0].-> epod : membership snapshot
-
-note right of sstore #FFE0B2
-  **Problem 4: RESUME, or a rolling deploy is a DDoS.**
-  Drain a gateway pod holding 10 000 clients and all of
-  them reconnect and pull a full flood of every
-  ChannelState and UserState at once, into metadata and
-  session-view, simultaneously.
-  With sequence numbers a client replays only the gap -
-  but the sequence and its replay buffer must **outlive the pod**,
-  or a resuming client landing on a different pod has nothing
-  to resume against.
-  Legacy clients cannot resume. They get the full flood,
-  so stagger readiness and send a jittered reconnect hint.
-end note
-
-note right of lbtcp #FFCDD2
-  **Problem 1: the gateway cannot use an Ingress.**
-  Kubernetes `Ingress` is HTTP/HTTPS only, and Mumble is
-  raw TCP+TLS. It needs `Service type=LoadBalancer`, or
-  Gateway API `TCPRoute`.
-  This is also why the component is called the **gateway**
-  and not `ingress` - naming it after a resource it can
-  never use is a trap waiting for the next person.
-end note
-
-note right of lbudp #FFCDD2
-  **Problem 2: client affinity is the wrong affinity.**
-  Audio routing is **per channel**, so a channel's members must
-  share a voice pod. `sessionAffinity: ClientIP` pins each
-  *client*, which scatters a channel across pods, and there is
-  **no inter-pod audio path** in this design. It makes things
-  worse, not better.
-  Discord assigns a voice *channel* to a voice server and **tells**
-  the client which one. Mumble has no such field, and
-  **a legacy client sends UDP to the port it made TCP to**,
-  so it cannot be redirected.
-  So, in order of increasing capability:
-  · **one voice pod per server instance** - vertical only, honest
-  · **a forwarding mesh between pods** - scales, costs a hop
-  · **shard by channel + an explicit endpoint in `ServerSync`** for
-    Fancy clients; legacy stays on the advertised pod
-  See scaling.puml.
-end note
-
-note bottom of vpod #FFF8E1
-  **Problem 3: a restarted voice pod has cold caches.**
-  It holds ciphers and a membership cache, neither of which
-  survives. Audio arriving before it re-subscribes is dropped
-  with nothing to show for it.
-  So `/readyz` must gate on **cache warm-up**, not on the
-  process being alive - and it must be a *different* endpoint
-  from `/healthz`, or Kubernetes will route to a cold pod.
-end note
-
-note bottom of ing #C8E6C9
-  files/http is the only component speaking HTTP, so it is
-  the only one that gets TLS termination, an Ingress and a
-  CDN for free. That is the whole reason bulk transfer was
-  moved off the control stream.
-end note
-
-note as COMPOSE #FFFFFF
-  **docker compose** is the same picture with the load
-  balancers replaced by published ports. `docker-compose.yml`
-  runs it: **twenty-one containers** from one image, started in
-  tier order, each differing only in its `command`.
-  voice does not need co-locating there, it publishes UDP
-  64738 while the gateway publishes TCP 64738, so a legacy
-  client still sees one host:port pair.
-  **--all-in-one** collapses every pod into one container:
-  same binary, same TOML, one process.
-  **«not built»: it is not using in-process pipes.** A service
-  resolves its *own* endpoint through the broker, which cannot
-  know it before it has registered, so every service falls back
-  to the configured local socket. The mode works; the transport
-  underneath is a socket, not a pipe.
-end note
-
+!include deployment.iuml
 @enduml

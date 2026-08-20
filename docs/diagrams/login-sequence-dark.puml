@@ -1,0 +1,56 @@
+@startuml login-sequence-dark
+' Dark render. The body is login-sequence.iuml, shared with login-sequence.puml.
+'
+' Dark throughout, not a dark border around a white picture: the participants,
+' the notes and the canvas are all dark and every glyph is light. Overriding
+' only the canvas leaves the boxes white, which on a dark page is worse than no
+' dark render at all.
+'
+' These sit after !theme, which would otherwise reset them.
+!theme plain
+
+!$c_client = "#17293D"
+!$c_gw     = "#3D2A17"
+!$c_ess    = "#33191C"
+!$c_core   = "#332B14"
+!$c_hub    = "#38321A"
+!$c_box    = "#161B22"
+!$c_note   = "#161B22"
+
+skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
+skinparam titleFontColor #E6EDF3
+skinparam headerFontColor #9198A1
+skinparam ArrowColor #8B949E
+skinparam ArrowFontColor #E6EDF3
+skinparam actorFontColor #E6EDF3
+skinparam actorBorderColor #8B949E
+skinparam participantFontColor #E6EDF3
+skinparam participantBorderColor #30363D
+skinparam sequenceLifeLineBorderColor #30363D
+skinparam sequenceGroupBackgroundColor #1C2126
+' The group *body* is a separate skinparam from the group label, and left
+' unset it renders white, which put the four refusals in white on white.
+skinparam sequenceGroupBodyBackgroundColor #0D1117
+skinparam sequenceGroupBorderColor #30363D
+skinparam sequenceGroupFontColor #E6EDF3
+skinparam sequenceDividerBackgroundColor #1C2126
+skinparam sequenceDividerFontColor #E6EDF3
+skinparam sequenceBoxBorderColor #30363D
+skinparam sequenceBoxFontColor #9198A1
+skinparam noteBackgroundColor #161B22
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
+skinparam legendBackgroundColor #161B22
+skinparam legendBorderColor #30363D
+skinparam legendFontColor #E6EDF3
+
+' The `== divider ==` rules and the lifeline are drawn black by the theme, and
+' no skinparam reaches them: there is a SequenceDividerBorderThickness but no
+' matching colour. One style rule covers every line in the diagram.
+<style>
+sequenceDiagram { LineColor #8B949E }
+</style>
+
+!include login-sequence.iuml
+@enduml

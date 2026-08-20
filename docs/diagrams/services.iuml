@@ -1,0 +1,259 @@
+' The body of services.puml / services-dark.puml. Not a diagram on its own: it
+' carries no start marker, so PlantUML will not render this file directly.
+'
+' Careful: the start and end markers must not appear in this file at all, not
+' even inside a comment. PlantUML scans for them lexically, so a comment naming
+' one opens a second diagram here and the include fails with a line number
+' pointing at neither file. See README.md.
+'
+' Split out because the README ships a light and a dark render of this diagram
+' and the two must not drift. Every colour is a variable the wrapper supplies,
+' so the dark render is dark throughout rather than a dark canvas behind white
+' cards, which is worse than shipping no dark render at all.
+'
+' The post-render passes in README.md are not optional for either half.
+
+' A post-render step widens this single font name into a fallback stack, so a
+' viewer without Inter gets a sans-serif rather than the monospace a missing
+' font can fall back to.
+skinparam defaultFontName Inter
+
+' $n_ink is the *name* of the control-plane line colour, not the colour. The
+' dark wrapper brightens that line to near-white, so a legend hard-coding
+' "black" would describe a light grey line as black in half the renders.
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 12
+skinparam ranksep 40
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title Services, grouped by the protocol they speak to a client
+
+header
+<b>FOUR PLANES, GROUPED BY PROTOCOL.</b>  Control is Mumble-over-TCP through the gateway.
+Realtime is UDP or WebRTC <b>straight to the service</b>.  Bulk and admin are plain HTTP.
+The gateway routes on the <b>16-bit type in the frame header</b> and never parses a payload, so a new service is a TOML block, not a release.
+Shard keys: <b>scaling.puml</b>.   Gateway internals: <b>gateway-internals.puml</b>.   Rationale: <b>ARCHITECTURE.md</b>.
+endheader
+
+actor "legacy Mumble\nclient" as legacy $c_neutral
+actor "Fancy client" as fancy $c_blue
+actor "**operator**" as oper $c_purple
+cloud "**publist.mumble.info**\nthe public server list" as publist $c_indigo
+
+component "**gateway**\nTLS · framing · rate limit\n**single writer per client socket**\nroutes by type, config-driven" as gw $c_gw
+
+database "**session store**\n«gateway infrastructure, not a service»\nsequence number + bounded replay ring\nno client, no message type, no tier\n--\n**«not built»: the ring is in-process**, so it does\nnot outlive a pod and RESUME cannot cross one" as sstore $c_gw2
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**control plane**, gRPC only; no client reaches these directly" as CTRL $c_faint {
+
+  package "essential, down means nobody logs in" as ESS $c_ess {
+    component "**session-lifecycle**\nVersion · Authenticate · Reject\nServerSync · CodecVersion\nCryptSetup · Ping · timeout sweep\n--\n**UserState (9)**, moves, self-mute,\nmoderator mute/deafen, priority\nspeaker, registration\n**UserStats (22)**, uptime, idle,\nclient build, certificate\n«both were routed to userdata,\nwhich had no handler for either»\n0,2,3,4,5,**9**,15,21,**22** + **1000**" as slife $c_hub
+    component "**session-view**\nthe composed live view of\nevery connected session.\nThe whole domain reads here.\nOwns nothing, writes nothing.\n**no client-facing type**" as sview $c_hub
+    component "**permissions**\nACL eval\n+ request coalescing\n12,13,20 + **1001**" as perms $c_card
+    component "**metadata**\nchannels · tree\nmembership\n6,7 + **1002**" as meta $c_card
+    component "**userdata**\nprofiles · accounts · blobs\n**SuperUser is account 0**, so a\nguest is `None`, never `0`\n**no password ⇒ not claimable**\n**by name alone**\n14,18,23 + **1003**" as users $c_card
+    component "**server-config**\nruntime-mutable,\nper server instance\n24,25 + **1013**" as scfg $c_card
+  }
+
+  package "core: a feature dies" as CORE $c_core {
+    component "**text**\nhistory: **UUIDv7**\n11 + **1005**" as text $c_card
+    component "**pchat**\nE2EE · key mgmt\nhistory: **UUIDv7**\n**1006**" as pchat $c_card
+    component "**moderation**\nbans · kicks\n«UserRemove 8 is a kick or a ban,\nso it is moderation's, not userdata's»\n--\nchecked on the **root** channel:\nremoval is from the server, not\na room. `Ban` to ban, `Ban` **or**\n`Kick` to kick. Keyed to **address**\n**and certificate**, either alone\nis trivially evaded\n8,10 + **1007**" as mod $c_card
+  }
+
+  package "optional, nobody notices" as OPT $c_green {
+    component "**plugins**  26 + **1010**\n**push** «FCM»  **1011**\n**audit** «UUIDv7»  **1012**\n**onboarding**  **1014**\n**social**  **1015**\n· reactions · receipts · typing\n· polls · watch · whiteboard\n**link-preview**  **1016**\n**context-actions**  16,17 + **1017**" as opt $c_card
+  }
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**realtime plane**, UDP / WebRTC, client connects **directly**" as RT $c_ess {
+  component "**voice**  «core»\n**mints the ciphers** · answers the ping\nUDP 64738, its own socket\n1 (tunnel), 19 + **1004**\n--\nOpus **forwarded, never transcoded**\npayloads refcounted, never copied\n--\naudio routes both ways: a datagram on its own\nsocket, or **UDPTunnel** through the gateway for\na UDP-blocked client. Membership is read from a\n`session-view` subscription, never asked per packet\n--\n**«not built»**: whisper/shout, `VoiceTarget` (19)\nis still a stub, so only channel speech routes" as voice $c_card
+  component "**screenshare**  «optional»\nsignalling only\n**1008**\n--\n**«not built»: no SFU.** There is no str0m\ndependency; media has nowhere to go" as share $c_card
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**HTTP plane**, plain HTTPS, client connects **directly**" as HTTP $c_green {
+  component "**files / http**  «optional»\nsigned URLs · uploads · blobs\nplugin binaries · audit exports\n**1009**" as files $c_card
+  component "**operator-api**  «admin»\nREST + OpenAPI\nauth **pluggable**: OIDC · JWT\nmTLS · token\ndefault **off**, localhost-bound" as opapi $c_purple
+}
+
+' ═══════════════════════════════════════════════════════════════════════════
+package "**outward plane**, this server talking about itself" as OUT $c_indigo {
+  component "**directory**  «optional»\nhourly announcement to the\npublic Mumble server list\n--\n**no client, no wire type, no endpoint**\nnothing dials it; it dials out" as dirsvc $c_card
+}
+
+' ══════════════════════ control: TCP through the gateway ═══════════════════
+legacy -[$l_ink]-> gw : **TCP 64738**\nTLS + framing
+fancy  -[$l_ink]-> gw : **TCP 64738**\n+ **zstd** stream «not built»
+
+gw -[$l_blue]-> CTRL  : gRPC
+gw -[$l_blue]-> RT : gRPC, signalling\nand UDPTunnel only
+gw -[$l_blue]-> files : gRPC, mint a signed URL
+note on link $c_blue
+  Payload forwarded **verbatim**, already protobuf, never
+  re-encoded. A **local socket** when co-located, a Unix socket,
+  or a named pipe on Windows, and TCP when not.
+  **Circuit breaker per service**, inbound shed by `tier`.
+  **RESUME**: a sequence number per session, so a rolling deploy
+  is not 10 000 simultaneous full floods. **«not built»**: the
+  ring is in-process, so it does not survive the pod it is in.
+end note
+
+gw -[$l_amber]-> sstore : stamp · replay
+note on link $c_gw2
+  **Why this is not in a tier.** `tier` decides what the gateway does
+  when a dependency is down, and both answers are wrong here:
+  **essential** would reject logins over a lost *optimisation*, and
+  **optional** claims nobody notices, false, because its absence
+  bites at the worst possible moment and the resulting herd can
+  saturate metadata, which *is* essential.
+  It is not a service at all: no client reaches it, it has no
+  message type, and it is never scaled on its own. It is the
+  gateway's own durable state, externalised so a pod can die.
+  **Legacy clients can never RESUME**, so staggered drain and
+  jittered reconnect hints are required regardless. This store
+  optimises a path that must already survive without it, which is
+  what "not essential" means.
+  It is reported in readiness as a **warning**, never as unready.
+end note
+
+' ══════════════════════ realtime: no gateway hop ═══════════════════════════
+legacy -[$l_red]-> voice : **UDP 64738**
+fancy  -[$l_red]-> voice : **UDP 64738**
+note on link $c_ess
+  Same port, different protocol, **different process**, murmur
+  binds these separately, Server.cpp:125 vs 193. So audio never
+  traverses the gateway. Only UDPTunnel, the UDP-blocked
+  fallback, comes through the control plane.
+  **Affinity is by channel, never by client.**
+  Per-packet cost is **N seals, not one**: every listener needs
+  the frame under their own key.
+end note
+
+fancy -[$l_red]-> share : **WebRTC / ICE**
+note on link $c_ess
+  Media direct to the SFU; only signalling via the gateway.
+  str0m is **ICE-lite**: it ignores trickled candidates, its own
+  rides in the SDP answer. Never trickle ICE through the control
+  plane, and retry offers until answered.
+end note
+
+' ══════════════════════ HTTP: bulk and admin ═══════════════════════════════
+fancy  -[$l_green]-> files : **HTTPS**, signed URL
+legacy -[$l_green]-> files : **HTTPS**
+oper   -[$l_purple]-> opapi : **HTTPS + REST**
+
+' ══════════════════════ outward: the only edge that leaves ═════════════════
+dirsvc -[$l_indigo]-> publist : **HTTPS POST**, hourly
+note on link $c_indigo
+  The only connection Starling **opens** to the internet, and the
+  only place it publishes anything about itself. Authenticated by
+  the server's **own TLS certificate as a client certificate**, so
+  the list keys an entry to the same fingerprint clients pin and
+  nobody can update somebody else's listing.
+  Refused unless the operator set a name, a secret and a URL, and
+  **never** for a password-protected server, a public list is a
+  directory of servers people can join. Both rules are murmur's.
+  The count comes from **session-view**, not from a gateway: with
+  two gateways either one sees a fraction.
+end note
+
+legacy -[$l_red].-> voice : **UDP ping**, unauthenticated
+note on link $c_ess
+  How a server browser measures a server it has never connected
+  to: version, users, limits. Answered from the packet path, so
+  the numbers are **pushed in on a timer**, a fetch per ping
+  would make an open UDP port a lever on session-view.
+  murmur's `allowping` gates **this** ping only. Gating the
+  connectivity ping a connected peer sends would silently push
+  every client onto tunnelled audio.
+end note
+
+' ══════════════════════ the two halves of session ══════════════════════════
+slife -[$l_blue].-> sview : session up · down · moved · flags
+slife -[$l_blue]-> voice : mint a CryptSetup payload
+note on link $c_ess
+  **Voice mints the key, because voice is what uses it** to seal
+  UDP. Key material never crosses a service boundary; a
+  client-requested resync takes the same path.
+end note
+
+' ══════════════════════ session-view is the edge for the domain ════════════
+CORE -[$l_blue].-> sview : **one** composed snapshot stream
+OPT  -[$l_blue].-> sview
+RT   -[$l_blue].-> sview
+gw   -[$l_blue].-> sview
+note on link $c_hub
+  **Read here and nowhere else**, otherwise every service depends
+  on four others, with four caches each to keep warm.
+  It **forwards but never decides**, and is a
+  **subscription hub, not a proxy**, nothing on the audio path
+  makes a request.
+  **Every mailbox is bounded**, with a shed policy.
+end note
+
+sview -[$l_blue].-> users : profile changes
+sview -[$l_blue].-> perms : groups + current-channel perms
+sview -[$l_blue].-> meta  : channel · tree · membership
+sview -[$l_blue].-> scfg  : limits · bandwidth
+
+note bottom of sview $c_hub
+  **A stale deny is safe; a stale grant is a security bug.**
+  A revocation invalidates the view before it is acknowledged;
+  a grant may arrive lazily.
+end note
+
+opapi -[$l_purple]-> ESS : gRPC, **operator** context
+note on link $c_purple
+  **The one thing that does not read through session-view**, and
+  must not: that view is of *connected* users, while an operator
+  edits registered accounts, offline bans and config.
+  No service accepts an unauthenticated call.
+  **Fail closed on audit.**
+end note
+
+note as OPLOG $c_gw2
+  **The operator log, every service writes it, no service owns it.**
+  Distinct from `tracing`, which is a developer's dial and defaults
+  to `warn`. This is the record an operator keeps, **who connected,**
+  **what was refused, what an administrator changed**, categorised
+  (server · session · channel · message · permission · security ·
+  plugin · admin) and levelled independently of `RUST_LOG`.
+  Configured under `[logging]`, written by a **dedicated OS thread**
+  behind a bounded queue so a slow disk cannot stall the voice path,
+  and **overflow is counted, never silent**.
+  It is not on this diagram as a component because it is not one:
+  every service holds a handle, and the writer is process-wide.
+end note
+
+note bottom of ESS $c_card
+  **Each service owns its own schema.** No service reads
+  another's tables. One migration tool, many schemas.
+  Built: `sqlx` over the `Any` driver, so the backend is chosen
+  by URL scheme, **SQLite, MySQL or PostgreSQL**. With no
+  `[storage]` block a service gets its own SQLite file named
+  after it, under the shared data directory.
+  Twelve services keep one: userdata, metadata, server-config,
+  text, pchat, moderation, audit, push, files, plugins,
+  onboarding, permissions. The rest hold no durable state at all.
+  `permissions` is the newest, and the one whose store is
+  **optional**: it starts without one and says so, because an
+  unreachable database must not mean an unauthorised server.
+end note
+
+legend bottom
+|= line |= plane |= transport |
+| <color:$l_ink>**$n_ink**</color> | control | Mumble over TCP+TLS, through the gateway, ordered per client |
+| <color:$l_red>**red**</color> | realtime | UDP or WebRTC, **direct to the service** |
+| <color:$l_green>**green**</color> | bulk | HTTPS, signed URL, out of band |
+| <color:$l_purple>**purple**</color> | admin | HTTPS + REST in, gRPC out, pluggable auth, default off |
+| <color:$l_indigo>**indigo**</color> | outward | HTTPS out to the public server list, the only edge Starling opens |
+| <color:$l_blue>**blue**</color> | internal | gRPC, solid is a call, dotted is a cached subscription |
+Anything marked **«not built»** is drawn because the design depends on it, and
+labelled because it does not exist yet. See `README.md` in this directory.
+endlegend

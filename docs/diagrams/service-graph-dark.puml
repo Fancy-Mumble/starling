@@ -1,0 +1,41 @@
+@startuml service-graph-dark
+' Dark render. The body is service-graph.iuml, shared with service-graph.puml.
+'
+' Dark throughout, not a dark border around a white picture: the cards, the
+' notes and the canvas are all dark and every glyph is light. Overriding only
+' the canvas leaves the cards white, which on a dark page is worse than no dark
+' render at all.
+'
+' These sit after !theme, which would otherwise reset them.
+!theme plain
+
+!$c_gw    = "#3D2A17"
+!$c_ess   = "#33191C"
+!$c_core  = "#332B14"
+!$c_opt   = "#16301C"
+!$c_int   = "#1C2126"
+!$c_card  = "#161B22"
+!$c_hub   = "#38321A"
+!$c_opapi = "#2E1F33"
+!$c_rt    = "#13292A"
+!$c_note  = "#161B22"
+
+skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
+skinparam titleFontColor #E6EDF3
+skinparam headerFontColor #9198A1
+skinparam ArrowColor #8B949E
+skinparam ArrowFontColor #E6EDF3
+skinparam componentFontColor #E6EDF3
+skinparam componentBorderColor #30363D
+skinparam packageFontColor #E6EDF3
+skinparam packageBorderColor #30363D
+skinparam noteBackgroundColor #161B22
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
+skinparam legendBackgroundColor #161B22
+skinparam legendBorderColor #30363D
+skinparam legendFontColor #E6EDF3
+
+!include service-graph.iuml
+@enduml

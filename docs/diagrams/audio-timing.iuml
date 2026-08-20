@@ -1,0 +1,65 @@
+' Body of audio-timing.puml / audio-timing-dark.puml. No start marker, so
+' PlantUML will not render this file directly, and naming one in a comment here
+' breaks the include. See README.md.
+'
+' Stage order: services/voice/src/router.rs. What each stage costs and why the
+' flat lanes are flat: ../SERVICES.md §4.
+'
+' Four documented timing constructs this build rejects, each found by bisecting
+' against an error naming only a line number: `X has state, state`, a
+' `0 <-> 10 : label` constraint, a `line:` suffix on a highlight colour, and a
+' `:` inside a lane label. The packet markers and the highlight carry explicit
+' fills because no skinparam reaches either; the waveform needs the style block
+' in the wrapper for the same reason.
+
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam timingFontSize 12
+
+title The 10 ms budget
+
+header
+<b>Widths are order, not measurement.</b>  Measured: the <b>10 ms period</b>, and <b>17.8 us</b> of control-plane overhead per message.
+Lanes: a <b>speaker</b> at 50 packets/s, <b>voice</b> on its own UDP socket, <b>membership</b> from a session-view subscription, the <b>gateway</b>.
+endheader
+
+concise "**speaker**" as CL
+robust "**voice**" as V
+robust "**membership**" as S
+robust "**gateway**" as G
+
+@CL
+0 is "frame n" $c_pkt
+1 is {-}
+10 is "frame n+1" $c_pkt
+11 is {-}
+20 is "frame n+2" $c_pkt
+
+@V
+0 is Idle
+1 is Attribute
+2 is Decrypt
+3 is Decode
+4 is Route
+5 is Seal
+8 is Send
+9 is Idle
+11 is Attribute
+12 is Decrypt
+13 is Decode
+14 is Route
+15 is Seal
+18 is Send
+19 is Idle
+
+@S
+0 is Warm
+20 is Warm
+
+@G
+0 is "not on this path"
+20 is "not on this path"
+
+highlight 0 to 10 $c_frame : **one 10 ms frame**
+
+caption \n**Route** reads a cached snapshot; a request here would put a round trip inside the budget.  **Seal** is N seals, one per listener, and that number sizes the pod.

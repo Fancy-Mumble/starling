@@ -1,0 +1,15 @@
+@startuml login-sequence
+' Light render. The body is login-sequence.iuml, shared with
+' login-sequence-dark.puml, which supplies the same variables in dark values.
+!theme plain
+
+!$c_client = "#E3F2FD"
+!$c_gw     = "#FFE9D6"
+!$c_ess    = "#FFEBEE"
+!$c_core   = "#FFF8E1"
+!$c_hub    = "#FFF9C4"
+!$c_box    = "#FAFAFA"
+!$c_note   = "#FFFFFF"
+
+!include login-sequence.iuml
+@enduml

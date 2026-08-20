@@ -1,157 +1,17 @@
 @startuml gateway-internals
+' Light render. The body is gateway-internals.iuml, shared with gateway-internals-dark.puml,
+' which supplies the same variables in dark values.
 !theme plain
-skinparam componentStyle rectangle
-skinparam shadowing false
-skinparam nodesep 20
-skinparam ranksep 48
-skinparam defaultTextAlignment center
-skinparam packageStyle rectangle
 
-title The gateway: five parts, and what it deliberately does not know
+!$c_blue    = "#E3F2FD"
+!$c_card    = "#FFFFFF"
+!$c_green   = "#E8F5E9"
+!$c_gw      = "#FFE9D6"
+!$c_gw2     = "#FFE0B2"
+!$c_hub     = "#FFF9C4"
+!$c_neutral = "#EEEEEE"
 
-header
-The gateway is the <b>only</b> component holding a client's TCP socket, and it never parses a payload.
-Those two facts give ordering and config-driven routing for free.
-endheader
+!$l_blue    = "#1565C0"
 
-actor "client" as client #E3F2FD
-component "**services**\ngRPC" as svc #E8F5E9
-
-package "starling-gateway" as GW #FFE9D6 {
-  component "**event loop**  «reactor»\nthe one place that awaits socket readiness" as loop #FFFFFF
-  component "**listener**\nTCP accept · TLS handshake\nmints the connection id\n--\n**requests a client certificate**, accepts any\nissuer, hands the SHA-1 to the services" as listener #FFFFFF
-  component "**connection**  [0..*]\none TLS stream · control framing\n«type u16 + len u32»\n--\n**two bounded queues, two policies:**\ncontrol full -> **disconnect**\naudio full -> **drop oldest, count**" as conn #FFFFFF
-  component "**router**\nreads the u16 type, looks it up in TOML,\nforwards the payload **verbatim**.\n**No generated stubs. No schemas.**" as router #FFF9C4
-  component "**limiter**\na bucket **per route**, never one shared" as lim #FFF9C4
-  component "**breaker + shedder**\na circuit breaker per service, and\ninbound shed by `tier` when one is unhealthy" as brk #FFF9C4
-  component "**resume buffer**\nsequence number per session,\nreplayed on RESUME" as res #FFE0B2
-}
-
-client -down-> listener : TCP 64738
-listener *-- conn : on accept
-loop --> listener : accept readiness
-loop --> conn : read · write readiness
-conn --> lim : inbound frame
-lim --> brk : if it passed the bucket
-brk --> router : if the tier is healthy
-router -[#1565C0]-> svc : gRPC, payload unchanged
-svc -[#1565C0]-> res : outbound frames
-res --> conn : stamped with a sequence number
-
-note right of brk #FFF9C4
-  **Deadlines alone fail slowly.** A saturated service makes
-  every caller wait the full deadline and *then* fail, burning
-  gateway capacity the whole time. Trip the breaker and shed
-  at the door instead.
-  Shedding uses the same `tier` the readiness logic does:
-  essential unhealthy rejects logins, optional unhealthy is
-  invisible.
-end note
-
-note right of res #FFE0B2
-  **Why a replay buffer and not just a reconnect.** Draining a
-  pod with 10 000 clients means 10 000 simultaneous full floods
-  of every ChannelState and UserState, a self-inflicted DDoS on
-  the services behind. A client that resumes from its last
-  sequence number replays only the gap.
-  The buffer is therefore *meant* to live **outside** this
-  process, so a resuming client can land on any pod.
-  **«not built»: today it is a `HashMap` in this process.** It
-  survives a reconnect to the same pod and nothing more, so with
-  more than one gateway RESUME does not help the case it exists
-  for. `zstd` on the Fancy stream is likewise a dependency no
-  source file uses yet.
-  Legacy clients cannot resume either way and take the full
-  flood, which is why staggered drain and jittered reconnect
-  hints are required regardless of this buffer.
-end note
-
-note right of router #FFF9C4
-  **Why the gateway can stay ignorant.**
-  The type is in the *framing*, not the protobuf
-  (Server.cpp:2040 writes it as a big-endian u16).
-  So routing needs two bytes and a lookup table.
-  A new service is a TOML block; this binary
-  never changes and links no service's code.
-end note
-
-note right of lim #FFF9C4
-  **Per route, and never silent.**
-  murmur has ONE bucket per user - 1 msg/s,
-  burst 5, silent drop. A screen-share start
-  emits several signalling messages back to
-  back, and this ate the loopback SDP offer in
-  most runs: client logged success, server
-  logged nothing.
-  Fancy clients are told they were throttled.
-  Legacy clients keep the silence they expect.
-end note
-
-note bottom of conn
-  **Single writer per client socket.** Every frame to a client
-  leaves through the one process that holds its connection, so
-  per-client ordering is preserved by construction - `ChannelState`
-  cannot arrive after the `UserState` naming it, whichever service
-  produced them. No lane rule and no version counter needed.
-end note
-
-note right of listener #E3F2FD
-  **Why it asks for a certificate it will not validate.**
-  In Mumble a certificate *is* the identity: a registered account
-  is bound to one, a ban can be issued against one, and a client
-  presenting the right one is admitted without a password.
-  None of that is reachable unless the server sends a
-  `CertificateRequest`: with `with_no_client_auth()` it never
-  does, so every peer arrives anonymous and all three mechanisms
-  are silently unreachable.
-  Clients are self-signed by design, so **any issuer is accepted**
-  and the hash is treated as an *identifier*, not as a third
-  party's opinion. Possession of the private key is still proved
-  in the handshake, so the hash cannot simply be copied.
-  `strong_cert` is set only when a chain verified against a
-  configured CA, and it is the only field an operator should key
-  a privilege off.
-end note
-
-note bottom of loop
-  **Why the loop is separate from the wire format.**
-  "Await readiness and pump gRPC" and "speak Mumble's framing"
-  are two jobs. Fused, they become one file nobody can review.
-end note
-
-note bottom of listener #FFF9C4
-  **Every way a connection ends must reach one place.**
-  The read loop breaks on a clean close, on an I/O error, a
-  crashed client, a reset, a dropped network, which is how *most*
-  disconnects actually arrive, and on a service asking for the
-  client to go. All three run the same teardown: forget the
-  registry entry, tell the services, count it.
-  Skipping it on any path leaves the connection in the registry
-  and every other client rendering a user who has gone.
-end note
-
-note left of conn #E8F5E9
-  **Why the two queue policies differ.** Dropping a control
-  message desyncs that client permanently and silently - it
-  renders the wrong world forever with nothing in any log.
-  Queueing without a bound is a memory DoS. Disconnecting is
-  the only outcome both bounded and honest, and reconnect
-  already re-syncs from scratch.
-  A late **audio** frame is worthless, so drop it and count it.
-end note
-
-note as N1 #EEEEEE
-  **Not here, on purpose:**
-  · the **cipher** - it lives in voice, with the UDP socket,
-    so one hop can seal for every listener
-  · **audio routing** - clients send UDP straight to voice
-  · **any service's schema** - see the router note
-end note
-
-legend bottom
-| solid, one arrowhead | a direct call inside the gateway |
-| <color:#1565C0>blue</color> | gRPC to or from a service |
-| filled diamond | creates and owns |
-endlegend
-
+!include gateway-internals.iuml
 @enduml

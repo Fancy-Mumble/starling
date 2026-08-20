@@ -1,0 +1,21 @@
+@startuml audio-timing
+' Light render. The body is audio-timing.iuml, shared with
+' audio-timing-dark.puml, which supplies the same variables in dark values.
+!theme plain
+
+!$c_pkt   = "#FFFFFF"
+!$c_frame = "#C8E6C9"
+
+' The waveform, the lane separators and the axis are drawn with one line colour
+' that **no skinparam reaches**: there is no TimingLineColor, and ArrowColor does
+' not apply. Left at the default the dark render draws black steps on a near
+' black canvas, visible only where the highlight happens to sit behind them.
+' The modern style API does reach it.
+<style>
+timingDiagram {
+  LineColor #333333
+}
+</style>
+
+!include audio-timing.iuml
+@enduml

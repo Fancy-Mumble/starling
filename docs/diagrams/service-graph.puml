@@ -1,0 +1,18 @@
+@startuml service-graph
+' Light render. The body is service-graph.iuml, shared with
+' service-graph-dark.puml, which supplies the same variables in dark values.
+!theme plain
+
+!$c_gw    = "#FFE9D6"
+!$c_ess   = "#FFEBEE"
+!$c_core  = "#FFF8E1"
+!$c_opt   = "#E8F5E9"
+!$c_int   = "#ECEFF1"
+!$c_card  = "#FFFFFF"
+!$c_hub   = "#FFF9C4"
+!$c_opapi = "#F3E5F5"
+!$c_rt    = "#E0F2F1"
+!$c_note  = "#FAFAFA"
+
+!include service-graph.iuml
+@enduml

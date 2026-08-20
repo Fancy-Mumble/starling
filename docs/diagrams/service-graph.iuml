@@ -1,0 +1,100 @@
+' Body of service-graph.puml / service-graph-dark.puml. No start marker, so
+' PlantUML will not render this file directly, and naming one in a comment here
+' breaks the include. See README.md.
+'
+' Every edge read from the generated gRPC client stubs each crate constructs,
+' minus test modules. Wrong here until edited when the code gains or loses one.
+
+skinparam defaultFontName Inter
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 14
+skinparam ranksep 46
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title Who calls whom
+
+header
+Call graph, not topology. Planes and transports: <b>services.puml</b>.   Rationale: <b>SERVICES.md</b> §2.
+Read from the gRPC client stubs each crate constructs. An edge not drawn here is not called.
+endheader
+
+component "**gateway**\nholds the socket · routes by type" as gw $c_gw
+
+package "essential" as ESS $c_ess {
+  component "**session-lifecycle**\n«1000»" as slife $c_card
+  component "**session-view**\n«no wire type»" as sview $c_hub
+  component "**permissions**\n«1001»" as perms $c_hub
+  component "**metadata**\n«1002»" as meta $c_card
+  component "**userdata**\n«1003»" as users $c_card
+  component "**server-config**\n«1013»" as scfg $c_hub
+}
+
+package "core" as CORE $c_core {
+  component "**voice**\n«1004»" as voice $c_card
+  component "**text**\n«1005»" as text $c_card
+  component "**pchat**\n«1006»" as pchat $c_card
+  component "**moderation**\n«1007»" as mod $c_card
+}
+
+package "optional" as OPT $c_opt {
+  component "**push**\n«1011»" as push $c_card
+  component "**audit**\n«1012»" as audit $c_hub
+  component "**onboarding**\n«1014»" as onb $c_card
+  component "**screenshare** «1008»\n**files** «1009»\n**plugins** «1010»\n**social** «1015»\n**link-preview** «1016»\n**context-actions** «1017»\n--\nclient plane in, runtime four out" as leaf $c_card
+}
+
+component "**directory**\nno gRPC surface · dials out" as dir $c_int
+
+component "**starling-runtime**\n«a library»\npermit · roster · settings · trail" as rt $c_rt
+
+' ══════════════════ 1. the gateway's stream ════════════════════════════════
+gw -[#E65100]-> ESS  : **ClientPlane.Attach**
+gw -[#E65100]-> CORE : **ClientPlane.Attach**
+gw -[#E65100]-> OPT  : **ClientPlane.Attach**
+
+' ══════════════════ 2. the read edge ═══════════════════════════════════════
+slife -[#1565C0]-> sview : **Announce** «told, not asked»
+meta  -[#1565C0].-> sview : Subscribe
+users -[#1565C0].-> sview : Subscribe
+perms -[#1565C0].-> sview : Subscribe
+voice -[#1565C0].-> sview : Subscribe
+text  -[#1565C0].-> sview : Subscribe
+mod   -[#1565C0].-> sview : Subscribe
+
+' ══════════════════ 3. direct calls, to whoever owns the answer ════════════
+slife -[#1565C0]-> users : **Authenticate** · Lookup
+slife -[#1565C0]-> voice : **Mint** · Resync
+slife -[#1565C0]-> meta  : GetTree · Enter\nListen · LastChannel
+slife -[#1565C0]-> scfg  : Get
+slife -[#1565C0]-> perms : CheckSession
+sview -[#1565C0]-> users : Lookup «cold»
+sview -[#1565C0]-> perms : Effective\nWatchInvalidations
+perms -[#1565C0]-> meta  : GetTree · Watch
+meta  -[#1565C0]-> perms : Check
+users -[#1565C0]-> meta  : LastChannels
+voice -[#1565C0]-> meta  : Watch «membership»
+voice -[#1565C0]-> scfg  : Watch
+text  -[#1565C0]-> meta  : GetTree
+text  -[#1565C0]-> push  : **Notify**
+onb   -[#1565C0]-> perms : AddTemporaryGroup
+push  -[#1565C0]-> perms : CheckSession
+dir   -[#1565C0]-> meta  : GetTree «channel count»
+dir   -[#1565C0]-> scfg  : Get «name · secret · url»
+dir   -[#1565C0]-> sview : List «user count»
+
+' ══════════════════ 4. what the runtime gives everyone ═════════════════════
+rt -[#00695C].-> perms : **permit** -> CheckSession
+rt -[#00695C].-> sview : **roster** -> Subscribe
+rt -[#00695C].-> scfg  : **settings** -> Watch
+rt -[#00695C].-> audit : **trail** -> Record
+
+legend bottom
+|= line |= edge |
+| <color:#E65100>**orange**</color> | the gateway's client plane, one bidirectional stream per service |
+| <color:#1565C0>**blue, solid**</color> | a direct call to the service that owns the answer |
+| <color:#1565C0>**blue, dotted**</color> | a subscription the caller caches |
+| <color:#00695C>**teal, dotted**</color> | a `starling-runtime` module, available to every service |
+`health` and `operator-api` are left out: each reaches every tier. See <b>SERVICES.md</b> §2.5.
+endlegend

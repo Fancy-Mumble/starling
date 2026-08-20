@@ -1,109 +1,15 @@
 @startuml scaling
+' Light render. The body is scaling.iuml, shared with scaling-dark.puml,
+' which supplies the same variables in dark values.
 !theme plain
-skinparam componentStyle rectangle
-skinparam shadowing false
-skinparam nodesep 20
-skinparam ranksep 46
-skinparam defaultTextAlignment center
-skinparam packageStyle rectangle
 
-title What scales horizontally, and what does not
+!$c_amber   = "#FFE082"
+!$c_card    = "#FFFFFF"
+!$c_green2  = "#C8E6C9"
+!$c_hub     = "#FFF9C4"
+!$c_indigo  = "#EDE7F6"
+!$c_neutral = "#EEEEEE"
+!$c_red     = "#FFCDD2"
 
-header
-<b>A shard key is a design decision, not a deployment one.</b>  Retrofitting one means changing every caller, so each service below
-declares its unit now.  <b>Green scales out.  Amber scales out within a bound.  Red does not scale out at all</b>, and the red one is
-red because of the wire protocol, not the implementation.
-endheader
-
-' ═══════════════════════════════════════════════════════════════════════════
-package "**scales out freely**: stateless over its own store" as FREE #C8E6C9 {
-  component "**permissions**\nshard: **stateless**\n--\nACL evaluation walks the tree, and a busy\nchannel produces many identical in-flight\nqueries. **Coalesce them** rather than cache:\na cache needs invalidation, coalescing\ndoes not. «Discord's data-services trick»" as perms #FFFFFF
-  component "**userdata** · **text** · **pchat**\n**moderation** · **social** · **audit**\n**push** · **files/http** · **operator-api**\nshard: **stateless**\n--\nHistory-bearing services key rows by\n**UUIDv7**: coordination-free and\ntime-sortable. A central sequence is a\nbottleneck; UUIDv4 destroys index locality." as rest #FFFFFF
-}
-
-' ═══════════════════════════════════════════════════════════════════════════
-package "**scales out, bounded by the key**" as BOUND #FFF9C4 {
-  component "**gateway**\nshard: **connection**\n--\nAny pod takes any connection. A client's\nTCP socket pins it for that connection's\nlifetime; **RESUME** lets it land elsewhere\nafter a restart." as gw #FFFFFF
-  component "**session-lifecycle**\nshard: **connection**\n--\nOne state machine per connection,\nindependent of every other." as slife #FFFFFF
-  component "**session-view**\nshard: **session id, from day one**\n--\nHolds a composed view per connected\nsession and updates all of them on every\nchange. Unsharded, that is one actor doing\nevery domain read,\n**Discord's guild-process bottleneck, relocated.**" as sview #FFE082
-  component "**metadata** · **server-config**\nshard: **server instance**\n--\nOne actor per server instance, the Discord\nguild-process pattern. Within one server\ninstance it scales **vertically only**, which\nis also the answer to multiple server\ninstances in one deployment." as meta #FFFFFF
-  component "**screenshare**\nshard: **SFU session**\n--\nEach broadcast is independent, and Fancy\nclients learn their SFU endpoint from the\nanswer, so placement is free." as share #FFFFFF
-}
-
-' ═══════════════════════════════════════════════════════════════════════════
-package "**must not scale out at all**" as SINGLE #EDE7F6 {
-  component "**directory**\nshard: **none, one per server instance**" as dir #FFFFFF
-}
-
-note bottom of SINGLE #EDE7F6
-  **Replicating this is not slower, it is wrong.** Each replica runs its own
-  hourly timer, so N of them are N announcements of one server to the public
-  list, and the list keys an entry by certificate fingerprint, which every
-  replica shares. They would overwrite each other with racing user counts.
-  It carries no request load to spread: one HTTPS POST an hour, and the counts
-  in it come from session-view rather than from anything local. So there is no
-  shard key to design, and the bound is **replicas: 1**.
-end note
-
-' ═══════════════════════════════════════════════════════════════════════════
-package "**does not scale out for legacy clients**" as PINNED #FFCDD2 {
-  component "**voice**\nshard: **channel, never client**" as voice #FFFFFF
-}
-
-note bottom of PINNED #FFCDD2
-  **Audio routing is per channel, so a channel's members must share a pod.**
-  Client affinity (`sessionAffinity: ClientIP`) is actively wrong: it scatters
-  a channel across pods, and there is **no inter-pod audio path** in this design.
-  Discord assigns a voice *channel* to a voice server and **tells** the client
-  which one. Mumble has no such field, and
-  **a legacy client sends UDP to the port it made TCP to.**
-  It cannot be redirected.
-  Three ways out, and only the last scales:
-  · **one voice pod per server instance**, vertical only, simplest, honest
-  · **a forwarding mesh between voice pods**, scales, costs a hop inside a 10 ms budget
-  · **shard by channel and hand Fancy clients an explicit endpoint** in ServerSync,
-    real scaling for Fancy, legacy pinned to the advertised pod
-end note
-
-note right of sview #FFE082
-  **Why this one is amber and not green.**
-  10 000 sessions means 10 000 composed views, all
-  maintained by one actor. Sharding by session id
-  makes it green; not choosing a key now makes it
-  the first thing to fall over, and the hardest to
-  fix, because every service in the domain calls it.
-end note
-
-note bottom of BOUND #FFFFFF
-  **Every actor mailbox is bounded and has a shed policy.**
-  An unbounded inbox converts one slow consumer into an OOM, the
-  specific failure Discord hit with Erlang process mailboxes under
-  fanout. Applies to session-view per session and metadata per
-  server instance alike.
-end note
-
-note bottom of FREE #FFFFFF
-  **Deadlines are not enough on their own.** A saturated service
-  makes every caller wait its full deadline and *then* fail, burning
-  capacity the whole time. A **circuit breaker** per service plus
-  load shedding at the gateway fails fast instead.
-end note
-
-note as BUILT #EEEEEE
-  **Nothing here is sharded yet.** Every key above is a decision recorded
-  before it becomes expensive, a shard key cannot be retrofitted, because
-  changing one changes every caller. What runs today is one process per
-  service, so the amber and red boxes are warnings about where growth stops,
-  not descriptions of a running deployment.
-end note
-
-legend bottom
-|= colour |= meaning |
-|<#C8E6C9>   | scales out freely, add pods |
-|<#FFF9C4>   | scales out along a declared key |
-|<#FFE082>   | scales out **only if** the key is designed in now |
-|<#FFCDD2>   | cannot scale out; a protocol limit, not a code one |
-|<#EDE7F6>   | must not be replicated; correctness, not capacity |
-endlegend
-
+!include scaling.iuml
 @enduml

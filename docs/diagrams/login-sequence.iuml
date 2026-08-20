@@ -1,0 +1,114 @@
+' Body of login-sequence.puml / login-sequence-dark.puml. No start marker, so
+' PlantUML will not render this file directly, and naming one in a comment here
+' breaks the include. See README.md.
+'
+' Order transcribed from services/session-lifecycle/src/handshake.rs. Why each
+' step sits where it does: ../SERVICES.md §3.
+
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam maxMessageSize 260
+' No ParticipantPadding: deprecated, and the warning is painted into the render.
+skinparam BoxPadding 10
+
+title One login, in murmur's order
+
+header
+Client-bound frames carry their <b>«type»</b> from the frame header; internal calls are gRPC.
+Call graph: <b>service-graph.puml</b>.   Why this order: <b>SERVICES.md</b> §3.
+endheader
+
+actor "Mumble\nclient" as cl $c_client
+participant "**gateway**" as gw $c_gw
+participant "**session-**\n**lifecycle**" as sl $c_ess
+box "read on the way through" $c_box
+  participant "**server-**\n**config**" as cfg $c_hub
+  participant "**userdata**" as ud $c_ess
+  participant "**permissions**" as pm $c_hub
+  participant "**metadata**" as md $c_ess
+  participant "**voice**" as vc $c_core
+  participant "**session-view**" as sv $c_hub
+end box
+
+== TLS ==
+
+cl -> gw : TCP + TLS
+gw ->> sl : `Opened` «conn, addr, cert hash, chain»
+note over gw, sl $c_note
+  Broadcast to every service. Only session-lifecycle acts on it.
+end note
+sl --> cl : **Version** «0»  · server-first
+cl -> sl : **Version** «0»
+cl -> sl : **Authenticate** «2»\nname · password · tokens · opus
+
+== Admission ==
+
+sl -> cfg : `Get`
+cfg --> sl : settings snapshot
+sl -> ud : `Authenticate`
+ud --> sl : account · profile hashes
+
+alt refused
+  sl --> cl : **Reject** «4»\nWrongServerPw · NoCertificate\nUsernameInUse · ServerFull
+  sl --> gw : `Disconnect`
+end
+
+== Landing ==
+
+sl -> sv : `Announce` «session up»
+note right of sl $c_note
+  Before the landing: permissions resolves the session through session-view.
+end note
+sl -> md : `LastChannel`
+sl -> pm : `CheckSession`
+pm --> sl : verdict
+sl -> sv : `Announce` «channel changed»
+
+== Welcome ==
+
+sl -> vc : `Mint`
+vc --> sl : **CryptSetup** payload
+note right of vc $c_note
+  Voice mints it. Key material never leaves voice in a usable form.
+end note
+sl --> cl : **CryptSetup** «15»
+sl --> cl : **CodecVersion** «21»
+sl -> md : `GetTree`
+md --> sl : every channel
+sl --> cl : **ChannelState** «7» × N,\nbreadth-first from the root
+sl --> cl : **UserState** «9», their own
+sl -> sv : `List`
+sv --> sl : every other live session
+sl --> cl : **UserState** «9» × N
+sl --> cl : **ServerSync** «5»
+sl --> cl : **ServerConfig** «24»
+sl --> cl : **SuggestConfig** «25»
+
+== Session ==
+
+sl ->> gw : `SessionUp` «conn -> session»
+note over sl, gw $c_note
+  The gateway learns conn -> session here and nowhere else.
+end note
+sl --> cl : **UserState** «9» to everyone **else**
+
+== After the sync ==
+
+sl -> md : `RestoreListeners`
+md --> sl : their listeners
+sl --> cl : **UserState** «9» carrying them
+note right of sl $c_note
+  After ServerSync, not before (`Messages.cpp:843`).
+end note
+sl -> pm : `Effective`
+pm --> sl : permission set
+sl --> cl : **PermissionQuery** «20»  · pushed, not requested
+
+legend bottom
+|= arrow |= meaning |
+| solid | a request the sender waits on |
+| dashed | a reply, or a frame written to the client |
+| open head | fire and forget |
+Client frames ride the reply half of `ClientPlane.Attach`. No service dials the gateway.
+endlegend
