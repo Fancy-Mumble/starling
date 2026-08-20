@@ -242,6 +242,43 @@ impl Roster {
             .cloned()
     }
 
+    /// The session using `name`, matched exactly.
+    ///
+    /// A linear scan for the same reason [`Self::session_with_cert`] is one,
+    /// and read from the same kind of caller: something that was handed a name
+    /// by a user and has to find the connection behind it. An empty `name`
+    /// matches nothing, so a session that has not picked one is not everybody.
+    ///
+    /// A *label* lookup, never an identity one: two people can hold a name in
+    /// sequence, so nothing deciding who may do what may key on this.
+    #[must_use]
+    pub fn session_named(&self, name: &str) -> Option<u32> {
+        if name.is_empty() {
+            return None;
+        }
+        self.names
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(_, held)| held.as_str() == name)
+            .map(|(session, _)| *session)
+    }
+
+    /// Every session known to be connected.
+    ///
+    /// Empty on a cold roster, which means "membership is unknown" and must be
+    /// treated the way [`Self::in_channel`] is: as nobody to address, never as
+    /// a server with nobody on it.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<u32> {
+        let Ok(held) = self.channels.lock() else {
+            return Vec::new();
+        };
+        let mut sessions: Vec<u32> = held.keys().copied().collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
     /// The account behind `session`, or `None` for an unregistered guest, an
     /// unknown session, or a cold roster.
     ///
@@ -477,6 +514,39 @@ mod tests {
 
         assert_eq!(roster.in_channel(4, 0), vec![2]);
         assert_eq!(roster.channel_of(1), None);
+    }
+
+    #[test]
+    fn a_name_resolves_to_the_session_holding_it_and_nothing_resolves_to_none() {
+        let named = |session: u32, name: &str| Session {
+            session,
+            channel: 4,
+            name: name.to_owned(),
+            ..Session::default()
+        };
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![
+            named(1, "ada"),
+            named(2, ""),
+            named(3, "grace"),
+        ]));
+
+        assert_eq!(roster.session_named("grace"), Some(3));
+        assert_eq!(roster.session_named("nobody"), None);
+        // A session that has picked no name must not be what the empty string
+        // finds, or every anonymous lookup lands on whoever is first.
+        assert_eq!(roster.session_named(""), None);
+    }
+
+    #[test]
+    fn every_session_is_listed_and_a_cold_roster_lists_none() {
+        let roster = Roster::new();
+        assert!(
+            roster.sessions().is_empty(),
+            "cold means unknown, not empty"
+        );
+        let _ = roster.apply(snapshot(vec![session(3, 4), session(1, 9)]));
+        assert_eq!(roster.sessions(), vec![1, 3]);
     }
 
     #[test]
