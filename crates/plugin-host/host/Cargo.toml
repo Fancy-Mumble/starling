@@ -1,0 +1,82 @@
+# The host proper: discovery, loading, dispatch. Lifted from the C++ server's
+# `3rdparty/mumble-plugin-host/host` minus its C ABI -- `ffi.rs`, the cbindgen
+# header and the callback table are gone, replaced by the `HostBridge` trait the
+# embedding server implements. See `docs/PLUGIN-HOST-PLAN.md`.
+#
+# This crate knows nothing about Starling: it takes a `HostBridge` and a
+# directory and gives back loaded plugins. `starling-plugins` is what implements
+# the bridge.
+[package]
+name = "starling-plugin-host"
+version = "0.2.0"
+# The workspace's edition, unlike the two `api` crates beside it: nothing here
+# is held to a published ABI, so it is ordinary Starling code and reads like it.
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "loads Mumble plugin binaries and dispatches lifecycle events to them"
+license = "MIT"
+
+[features]
+# WASM component plugins loaded via wasmtime, side by side with native cdylibs.
+#
+# Off by default, which differs from the C++ server, where it is on: wasmtime is
+# a multi-minute build, and the native backend is what every shipped plugin
+# uses today. Turning it on is a build-time decision an operator who installs
+# `.wasm` plugins makes; with it off the loader refuses a `.wasm` file with a
+# message saying so rather than ignoring it.
+default = []
+wasm-plugins = ["dep:wasmtime"]
+# A locked-down WASI (no filesystem, network, args or env) in the component
+# linker, needed by guests whose toolchain embeds a WASI-importing runtime
+# (notably JavaScript plugins built with ComponentizeJS/jco).
+wasm-wasi = ["wasm-plugins", "dep:wasmtime-wasi"]
+
+[dependencies]
+mumble-plugin-api = { path = "../api" }
+
+abi_stable.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zstd.workspace = true
+
+# Pinned to the 36.x LTS line in the source tree for its backported sandbox-escape
+# fixes; 47 is the line that carries them now. Kept off the default feature set.
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ELF pre-validation: parse the binary without dlopen so a corrupt or wrong-arch
+# cdylib is rejected before its .init_array can run and take the process down.
+goblin.workspace = true
+
+[lints.rust]
+# The only place besides `mumble-plugin-api` that needs unsafe: `abi_stable`'s
+# raw library loading and the layout-independent ABI probe both take it. Every
+# unsafe block carries a SAFETY comment.
+unsafe_code = "allow"
+missing_docs = "deny"
+unused_crate_dependencies = "warn"
+unused_results = "deny"
+missing_debug_implementations = "deny"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+too_many_lines = "deny"
+excessive_nesting = "deny"
+uninlined_format_args = "warn"
+doc_markdown = "warn"
+allow_attributes_without_reason = "deny"

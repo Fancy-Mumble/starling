@@ -1,0 +1,39 @@
+# Proc-macros for plugin authors. Lifted unchanged alongside
+# `mumble-plugin-api`; see that crate's manifest for why the edition and the
+# lint block are its own rather than the workspace's.
+[package]
+name = "mumble-plugin-api-derive"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Proc-macros for ergonomic plugin authoring against mumble-plugin-api"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unused_crate_dependencies = "warn"
+unused_results = "deny"
+missing_debug_implementations = "deny"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+allow_attributes_without_reason = "deny"

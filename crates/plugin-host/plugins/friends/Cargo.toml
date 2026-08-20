@@ -1,0 +1,45 @@
+# mumble-friends: friend direct-message rooms.
+#
+# Backs a friend chat between two *registered* users (or a user's self-notepad)
+# with a detached, Signal-E2E (`signal_v1`), persisted channel: parentless, never
+# shown in the channel tree, delivered only to Fancy clients, with both users as
+# invitees. End-to-end encryption plus server persistence come for free from the
+# pchat subsystem. The host and the server ascribe no meaning to "friends" --
+# only this plugin does.
+#
+# It is here as the host's exit test as much as for its own sake: the smallest
+# shipped plugin that exercises loading, `on_client_connected`, an inbound
+# `PluginMessage` and three `PluginContext` calls.
+[package]
+name = "mumble-friends"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Friend direct-message (E2E persisted) room provisioning plugin for Fancy Mumble"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mumble-plugin-api = { path = "../../api" }
+abi_stable.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unused_crate_dependencies = "warn"
+unused_results = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+allow_attributes_without_reason = "deny"

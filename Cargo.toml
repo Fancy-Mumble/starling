@@ -49,6 +49,14 @@ members = [
     "crates/operator-api",
     "crates/migrate",
     "crates/starling",
+
+    # The plugin host and the contract plugins are built against. Lifted from
+    # the C++ server's `3rdparty/mumble-plugin-host`; the api crates keep their
+    # published names and ABI so a plugin binary loads in either server.
+    "crates/plugin-host/api",
+    "crates/plugin-host/api-derive",
+    "crates/plugin-host/host",
+    "crates/plugin-host/plugins/friends",
 ]
 
 [workspace.package]
@@ -95,6 +103,8 @@ starling-context-actions = { path = "crates/services/context-actions" }
 starling-directory = { path = "crates/services/directory" }
 starling-operator-api = { path = "crates/operator-api" }
 starling-migrate = { path = "crates/migrate" }
+starling-plugin-host = { path = "crates/plugin-host/host" }
+mumble-plugin-api = { path = "crates/plugin-host/api" }
 
 # -- wire -------------------------------------------------------------------
 bytes = "1"
@@ -184,6 +194,28 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bitflags = "2.13"
 async-trait = "0.1"
+
+# -- the plugin boundary ----------------------------------------------------
+# The ABI a plugin binary is built against. Held at the same version the C++
+# server's host uses: the two must agree byte for byte or a plugin loads in one
+# server and not the other.
+abi_stable = "0.11"
+# Proc-macros for plugin authors, used only by `mumble-plugin-api-derive`.
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full", "extra-traits"] }
+# ELF pre-validation before `dlopen`, so a corrupt or wrong-arch plugin binary
+# is rejected before any code inside it runs. Linux only.
+goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
+# The WASM plugin backend, behind `starling-plugin-host/wasm-plugins` and off by
+# default. Pinned to an LTS line for its backported sandbox-escape fixes.
+wasmtime = { version = "47", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "cranelift",
+    "std",
+] }
+wasmtime-wasi = "47"
 
 # -- Workspace-wide lints ---------------------------------------------------
 # The same lint set as the client and plugin-host workspaces, so all three hold
