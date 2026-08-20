@@ -1795,7 +1795,12 @@ fn server_sync(session: u32, config: &Snapshot) -> tcp::ServerSync {
 fn server_config(config: &Snapshot, sfu: bool) -> tcp::ServerConfig {
     tcp::ServerConfig {
         max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(config.welcome_text.clone()),
+        // No welcome text, murmur parity (`Messages.cpp:876`): the client
+        // prints a welcome line for `ServerSync` and again for any
+        // `ServerConfig` that carries one (`mumble/Messages.cpp:136,202`), so
+        // a handshake that fills both greets every user twice. The field is
+        // for the on-demand resend (`RPC.cpp:402`), the only place murmur
+        // sets it.
         allow_html: Some(config.allow_html),
         message_length: Some(config.text_message_length),
         image_message_length: Some(config.image_message_length),
@@ -2183,6 +2188,19 @@ mod tests {
         let sync = server_sync(7, &config);
         assert_eq!(sync.max_bandwidth, Some(96_000));
         assert_eq!(sync.welcome_text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn the_welcome_text_is_said_once_not_again_in_server_config() {
+        // The client prints a welcome line for `ServerSync` and again for any
+        // `ServerConfig` that carries one (`mumble/Messages.cpp:136,202`).
+        // murmur keeps the field out of the handshake for that reason, and a
+        // handshake that filled both greeted every user twice.
+        let config = Snapshot {
+            welcome_text: "hello".to_owned(),
+            ..Snapshot::default()
+        };
+        assert_eq!(server_config(&config, false).welcome_text, None);
     }
 
     #[test]
