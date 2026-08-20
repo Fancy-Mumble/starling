@@ -13,6 +13,36 @@ it -- proven end to end against the real `mumble-friends` cdylib in
 `crates/plugin-host/host/tests/loads_a_real_plugin.rs`, which loads it, watches
 a client arrive, and asserts the reply comes back.
 
+### The ABI claim, checked
+
+§3 claims a plugin binary built against either tree loads in either server.
+That is now tested rather than asserted:
+`crates/plugin-host/host/tests/loads_the_published_examples.rs` loads all six
+native plugins from
+[fancy-plugin-example](https://github.com/Fancy-Mumble/fancy-plugin-example) --
+`chat-card`, `feedback-form`, `gallery-showcase`, `greeter`, `info-card`,
+`quick-poll` -- and every one of them was compiled against the **C++ server's**
+copy of `mumble-plugin-api`, which is what that repository depends on by path.
+Nothing rebuilt them against this tree's copy in between. All six load, name
+themselves, advertise a parseable `info_json`, carry their slash commands
+across, and receive a client-connected event.
+
+The result is not vacuous, which was checked the only way it can be: bumping
+this tree's `PLUGIN_ABI_VERSION` from 3 to 4 makes all six fail with
+`has ABI version 3 but host expects 4`, and every test in that file goes red.
+Two things have to hold for one of those binaries to load -- the exported
+version probe matching, and `abi_stable`'s layout check passing on
+`MumblePlugin`'s vtable, `PluginContext`'s, `ClientInfo` and `PluginError` --
+and a field reordered or a method added fails the second with a layout error
+rather than loading and misbehaving.
+
+**The seventh example is not covered.** `greeter-wasm` is a WebAssembly
+component built against `WASM_ABI_VERSION`, a separate constant on a backend
+this host compiles out by default; proving it needs the `wasm32` target,
+`wasm-tools`, and a build with `--features wasm-plugins`. The host does at
+least refuse a `.wasm` file with a message naming the feature, rather than
+scanning it and silently doing nothing.
+
 What is *not* there, so nobody has to find out by trying:
 
 - **Installing over the wire.** The host installs from bytes -- digest-checked,
