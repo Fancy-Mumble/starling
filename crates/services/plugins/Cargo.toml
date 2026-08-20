@@ -14,8 +14,15 @@ publish.workspace = true
 starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+# The host itself, which knows how to load a plugin binary and nothing about
+# Starling. This crate is what closes that gap: it implements the bridge the
+# host reaches the server through.
+starling-plugin-host.workspace = true
 
 prost.workspace = true
+# `spawn_blocking`, which every call into the host goes through, and the
+# `Handle` the bridge blocks on from the other side.
+tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
