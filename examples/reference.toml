@@ -370,6 +370,30 @@ max_upload = "512MiB"
 # unheard from before it is reaped, in milliseconds (default 30000, murmur's).
 # max_users = "100"
 # timeout_ms = "30000"
+#
+# [services.plugins.options]
+# Where plugin binaries are found, and where an install writes. Unset -- the
+# default -- means no directory is scanned and no plugin is ever loaded, which
+# is the right default for something that runs code inside the server.
+# plugins_dir = "/var/lib/starling/plugins"
+#
+# Plugins that ship with the deployment, comma separated. Uninstall refuses
+# them, so an operator cannot delete half of a feature the server assumes.
+# builtin_plugins = "fancy-friends"
+#
+# Per-plugin settings, under `plugin.<name>.`. Two are the host's own:
+# `enabled` gates whether a discovered plugin is started, and `source` records
+# where an installed one came from. Anything else in the namespace belongs to
+# that plugin, which reads it without the prefix and cannot see any other's.
+#
+# A discovered plugin is NOT started unless its `enabled` is truthy
+# (`true`/`1`/`yes`/`on`): dropping a binary in the directory installs it,
+# switching it on is a second decision.
+#
+# These are seeds, not the authority. Anything written through the admin
+# surface -- switching a plugin off, say -- is stored and wins from then on, so
+# editing a key here has no effect once it has been set at runtime.
+# "plugin.fancy-friends.enabled" = "true"
 
 
 # ---------------------------------------------------------------------------

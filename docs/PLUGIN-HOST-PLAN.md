@@ -5,6 +5,42 @@ How the Fancy plugin host moves from the C++ server into Starling. Written
 Companion to `docs/FANCY-PARITY.md` §1, which names this the single
 highest-leverage piece of work left.
 
+## Status, 2026-08-20
+
+**M0 through M3 are built and green; M4 is half done; M5 is open.** A plugin
+binary is loaded, started, told about clients, and answers messages addressed to
+it -- proven end to end against the real `mumble-friends` cdylib in
+`crates/plugin-host/host/tests/loads_a_real_plugin.rs`, which loads it, watches
+a client arrive, and asserts the reply comes back.
+
+What is *not* there, so nobody has to find out by trying:
+
+- **Installing over the wire.** The host installs from bytes -- digest-checked,
+  name-sanitised, rolled back on a bad load -- but nothing fetches the bytes:
+  `files` exposes signed URLs and `Stat`, not a read, so this needs an HTTP
+  client the service does not have. `Install` refuses with that reason. The
+  working path is to put the binary in `plugins_dir` and enable it.
+- **The operator routes.** Administration goes through `PluginsRpc` today;
+  `/v1/plugins` on `operator-api` is not written, so an operator reaches it by
+  gRPC rather than by REST.
+- **The WASM backend.** Lifted behind `starling-plugin-host/wasm-plugins` and
+  **off by default**, unlike the C++ server where it is on. wasmtime is a
+  multi-minute build and no shipped plugin needs it yet. The loader refuses a
+  `.wasm` file with a message saying which feature to turn on.
+- **The five heavier plugins.** Only `friends` came across. `audit`, `calendar`,
+  `file-server`, `link-preview` and `live-doc` are still in the C++ tree.
+- **`provision_live_doc_bridge` is deliberately gone**, not overlooked. It
+  hard-coded two plugin names in the host, which is what `docs/STORAGE.md` L6
+  forbids. Live documents will not persist until something above the host grants
+  that capability generically -- see open question 1, which this makes urgent
+  rather than theoretical.
+
+Two additive proto fields were needed and are in: `Opaque.payload_type`
+(without it a plugin cannot tell one of its own messages from another, and
+`friends` dispatches on exactly this) and `PluginDescriptor.info_json` (what a
+client renders a plugin's manifest from). Both are new field numbers on proto3
+messages, so nothing already on the wire changes meaning.
+
 ## 0. The good news: it is not a C++ port
 
 The C++ server's plugin host is already Rust. `src/murmur/PluginHostManager.cpp`
@@ -109,7 +145,7 @@ Plugin hooks are synchronous and plugins own their own tokio runtimes
 | `send_plugin_data` (deprecated) | ditto | ditto, type 26 |
 | `is_session_active` / `all_sessions` / `sessions_in_channel` / `find_session_by_name` / `current_channel` | `qhUsers` under `qrwlVoiceThread` read lock | `Roster` + session-view snapshot cache held by the service |
 | `user_has_channel_access` / `has_permission` | `ChanACL::` checks | `permissions` gRPC `Check`/`SessionCheck` |
-| `get_config` / (host-only) `set_config` | per-server DB + ini fallback | plugin KV under a reserved `cfg/` prefix, seeded from `[services.plugins]` TOML `options`; `__host_*` virtual keys answered from constants as today |
+| `get_config` / (host-only) `set_config` | per-server DB + ini fallback | plugin KV under the reserved `__host` namespace, with `[services.plugins].options` as the seed a stored value overrides. The namespace is refused to `KvGet`/`KvWrite` callers, or a plugin could write `plugin.<other>.enabled` |
 | `create_channel` / `grant_channel_access` / `revoke_channel_access` | `QMetaObject::invokeMethod` onto server thread | `metadata` gRPC `CreateRequest` + `permissions` `SetAcl`/`TemporaryGroup` |
 | `send_request_response` | C++ handler registry (`m_responseHandlers`) | Rust closure registry inside `PluginsService` (same request/response bridge, no FFI) |
 
@@ -131,10 +167,19 @@ sources:
 | `on_plugin_data` / `on_plugin_message` | wire 26 / 200 | plane `frame()`: 26 fans out to all loaded plugins; 1010 `Opaque` naming a *loaded* plugin dispatches to exactly that one, otherwise relays to clients as today |
 
 operator-api's `events.rs` already does the snapshot→event diffing with the
-right vocabulary; extract that fold into `runtime` (or replicate the ~100
-lines) so plugins and operator-api share it. `fancy-plugin-info` ships to
-each session on its connected event, unchanged wire format
-(`info.rs`: version byte, zstd bit, 64 KiB cap).
+right vocabulary. **Built as a second fold** (`plugins/src/events.rs`) rather
+than shared: the two produce different shapes -- JSON for a websocket, an
+ABI struct for a plugin -- and merging them would make one depend on the
+other's vocabulary. Two folds is one more than there should be; worth
+revisiting if a third appears. `fancy-plugin-info` ships to each session on its
+connected event, unchanged wire format (`info.rs`: version byte, zstd bit,
+64 KiB cap).
+
+The fold has to *diff*, not replay. A re-subscription after `session-view`
+restarts opens with a full snapshot, and replaying it would tell every plugin
+the whole server just connected -- a greeter would greet everybody twice. The
+same diff is what reports the clients that left while the stream was down and
+never produced a `Gone`.
 
 Note the semantics change worth accepting: session-view is eventually
 consistent (broadcast snapshots), where the C++ distributor was synchronous
@@ -143,15 +188,26 @@ harmless; a cold roster just delays a greeter by milliseconds.
 
 ## 3. Moving the crates
 
-Recommendation: **move the workspace into Starling** — `crates/plugin-host/`
-holding `api`, `api-derive`, `api-wasm`, `host`, `wit`, and the six plugins
-under `crates/plugin-host/plugins/`. Rationale: `vendor/server` is a frozen
-parity reference; Starling is where this code will be maintained. The copy
-left behind in the C++ tree keeps that server building but receives no new
-work. (Alternative if both must track each other: split
-`mumble-plugin-host` into its own repo and consume it as a submodule/path
-dep from both. More moving parts; only worth it if the C++ server stays
-alive longer than planned.)
+**Done: moved into Starling** at `crates/plugin-host/`, holding `api`,
+`api-derive`, `host`, `wit`, and `plugins/friends`. Rationale:
+`vendor/server` is a frozen parity reference; Starling is where this code will
+be maintained. The copy left behind in the C++ tree keeps that server building
+but receives no new work. (The alternative, splitting `mumble-plugin-host` into
+its own repo consumed by both, is more moving parts and only worth it if the
+C++ server outlives the plan for it.)
+
+Two things named above did not come across. `api-wasm` is the *guest* SDK --
+what a WASM plugin is built against, not something a host needs -- so it stays
+where the plugins that use it are. The five heavier plugins stayed too; each
+needs evaluating against Starling on its own terms (M5), and `friends` is the
+one that earns its place now as the host's exit test.
+
+Editions differ on purpose: `api` and `api-derive` stayed on 2021 because they
+are held to a published ABI and an edition migration is a change to it, while
+`host` took the workspace's 2024 since nothing in it is ABI-bound. Both are
+valid in one workspace. Each lifted crate also kept its own `[lints]` block
+rather than `workspace = true`; Starling's set has denials the lifted code has
+never been held to, and conforming it is a separate pass from moving it.
 
 Compatibility invariants to hold while moving:
 
@@ -189,46 +245,49 @@ Workspace friction to resolve up front:
 
 ## 4. Milestones
 
-**M0 — Lift.** Move the crates as above; delete `ffi.rs`; stub `context.rs`
-down to the `ScopedContext` config-prefixing logic worth keeping; make the
-workspace build under Starling's lints. No behavior. Exit: `cargo clippy
---workspace --all-targets -D warnings` green with the new crates as members.
+**M0 — Lift. Done.** Crates moved as above, `ffi.rs` deleted, `context.rs`
+reduced to the `ScopedContext` config scoping over the new `HostBridge` trait.
+`cargo clippy --workspace --all-targets -D warnings` is green with the new
+crates as members.
 
-**M1 — Host in the service.** `PluginsService` gains `Serve::run`: build a
-`Host` from `[services.plugins]` config (`plugins_dir`, `builtin_plugins`
-as structured `ServiceConfig` fields or `options` keys), scan, load,
-enable per the persisted registry. Registry moves from the in-memory map to
-a table (host infrastructure, not plugin-specific — STORAGE.md L6 is about
-plugin *feature* tables). `RegistryQuery` answers from the real host;
-registry re-broadcast on change. Exit: `friends` (293 lines, the simplest
-shipped plugin) loads at startup and appears in the 1010 `Registry`.
+**M1 — Host in the service. Done.** `PluginsService::build` constructs the
+`Host` on the blocking pool (loading runs `on_load`, which is arbitrary
+blocking code and calls straight back through the bridge -- on a worker thread
+that deadlocks rather than merely stalls). Configuration comes from
+`[services.plugins].options`, persisted state from the KV `__host` namespace.
+`RegistryQuery` answers from the real host and the registry is re-broadcast
+whenever the loaded set changes.
 
-**M2 — StarlingContext.** Implement the mapping table above. `get_config`
-seeded from TOML into KV on first load, never overwriting operator edits
-(mirrors `provision_live_doc_bridge`'s never-clobber rule). Exit: `friends`
-round-trips a plugin message end-to-end against a real client.
+**M2 — The bridge. Done.** The mapping table above, implemented in
+`plugins/src/bridge.rs`: KV-backed config with the TOML block as its seed,
+`Fanout` for both message shapes, `Roster` for every membership question,
+`permissions` gRPC for the two checks, and `metadata` gRPC for channel create
+and invitee grant/revoke -- with `reuse_existing`, so provisioning is
+idempotent and a second attempt cannot overwrite the first one's ACL table.
 
-**M3 — Events + dispatch.** session-view subscription → connected /
-disconnected / registration re-announce; `fancy-plugin-info` on connect;
-26 fan-out and 1010 `Opaque` single-plugin dispatch into the host; the
-request/response closure bridge. Exit: greeter-style behavior works; e2e
-plugin suites that only need the server side go green.
+**M3 — Events + dispatch. Done.** A `session-view` subscription folded into
+both the roster and a presence diff, feeding connected / disconnected /
+registration re-announce; `fancy-plugin-info` on connect; 26 fanned out to
+every loaded plugin before it is relayed; 1010 `Opaque` dispatched to the one
+plugin owning the name, and relayed between clients when none does.
+`send_request_response` is still the trait's default no-op, because nothing
+lifted so far uses the request/response bridge.
 
-**M4 — Admin.** operator-api `/v1/plugins` (GET list, POST
-`{name}/enable|disable`, POST install, DELETE) → `PluginsRpc` → host
-`set_enabled`/`install_plugin`/`uninstall_plugin`. Install fetches the
-artifact from the `files` service by `source_key`, verifies `sha256`
-(adapting `install.rs`; its HTTP marketplace path can stay for parity or
-wait), writes to `plugins_dir`, lands disabled. Hot enable/disable with
-re-announce + registry broadcast, matching the C++ toggle cycle. Exit:
-operator can install/enable/disable/uninstall live.
+**M4 — Admin. Half.** `List`, `Enable`/disable and `Uninstall` go to the host,
+with hot toggle, re-announce and registry broadcast, matching the C++ cycle.
+Two pieces remain: `Install` needs something that can fetch `source_key` from
+`files` (which exposes signed URLs and `Stat`, not a read) and hand the bytes to
+`Host::install_plugin`, which is written and tested; and operator-api still has
+no `/v1/plugins`, so administration is gRPC-only.
 
-**M5 — Hardening + parity sweep.** WASM epoch deadlines (the reference
-configures none — a guest can spin forever; add them here), fix the
-`install.rs` extraction path-sanitization gap (`cdylib_filename` from the
-manifest is joined unsanitized), carry over the fuzz targets and
-`cargo-deny` config, port the config-change → disable/enable reload cycle
-into Starling's hot-reload table (`config/reload.rs`). Exit: shipped
+**M5 — Hardening + parity sweep.** Still open, minus one: the path-traversal
+gap is **fixed** -- `install.rs` reduces a caller's name to a bare file name
+before joining it, where the original took `cdylib_filename` out of an
+attacker-writable manifest and joined it unsanitised, so an artifact could be
+written anywhere the server could write. Remaining: WASM epoch deadlines (the
+reference configures none, so a guest can spin forever), carrying over the fuzz
+targets and `cargo-deny` config, and the config-change → disable/enable reload
+cycle in Starling's hot-reload table (`config/reload.rs`). Exit: the shipped
 plugins (`audit`? see open questions, `calendar`, `file-server`,
 `link-preview`, `live-doc`) evaluated one by one against Starling.
 
@@ -239,30 +298,35 @@ exit tests.
 
 ## 5. Open questions (decisions wanted)
 
-1. **Where the shipped plugins' feature bridges go.** The C++ server wires
-   `link-preview` and `audit` through dedicated bridges
-   (`LinkPreviewBridge`, `AuditLogBridge`) and hard-codes the
+1. **Where the shipped plugins' feature bridges go. Now blocking, not
+   theoretical.** The C++ server wires `link-preview` and `audit` through
+   dedicated bridges (`LinkPreviewBridge`, `AuditLogBridge`) and hard-codes the
    live-doc↔file-server token handshake in the host
-   (`provision_live_doc_bridge`). Starling already has an `audit` *service*
-   and an opacity rule (STORAGE.md L6: the server must never know a
-   plugin's name or semantics). Porting those bridges verbatim violates the
-   rule. Options: (a) compat shims inside the plugins service, quarantined
-   and documented as debt; (b) redesign as a generic capability grant
-   plugins declare in their manifest. Recommendation: (a) for live-doc's
-   token bridge to unblock parity, (b) as the stated end state; and decide
-   whether Starling's `audit` service supersedes the `fancy-audit` plugin
-   outright.
-2. **Native backend: keep or WASM-only?** Recommendation: keep both — the
-   shipped plugins are native `abi_stable` cdylibs and rewriting six of
-   them as WASM components is a separate project. Policy: native =
-   first-party/builtin, WASM = everything installable.
-3. **Move vs. share the crates** (§3). Recommendation: move; the C++ tree
-   keeps a frozen copy.
-4. **`MUMBLE_PLUGIN_DIRS` / `MUMBLE_PLUGIN_LOG` env vars.** Keep for dev
-   convenience or fold into TOML + Starling's tracing config? Cheap either
-   way; default to TOML-first, keep `MUMBLE_PLUGIN_DIRS` honored.
-5. **Client-manifest settings surface.** The C++ server exposes each
-   enabled plugin's `client_manifest.config_schema` as editable server
-   settings and bumps a settings revision on toggle. Starling's equivalent
-   would hang off `server-config`. Defer past M4 unless a client suite
-   needs it sooner.
+   (`provision_live_doc_bridge`). All three know a plugin by name, which
+   STORAGE.md L6 forbids. **The live-doc bridge was dropped rather than lifted**,
+   so the question is no longer "which option" but "what replaces it": live
+   documents cannot persist without some way for one plugin to be granted a
+   secret another plugin owns. Options unchanged: (a) a compat shim inside the
+   plugins service, quarantined and documented as debt; (b) a generic capability
+   a plugin declares in its manifest and the host grants. Recommendation is now
+   (b) directly — (a) was only worth it to avoid a regression, and the
+   regression has already been taken. Still to decide separately: whether
+   Starling's `audit` *service* supersedes the `fancy-audit` plugin outright.
+2. **Native backend: keep or WASM-only?** Settled: both. Native is built and is
+   what every shipped plugin uses; WASM is lifted behind a feature that is off
+   by default. Policy: native = first-party/builtin, WASM = everything
+   installable. Turning the feature on and proving a component loads is its own
+   piece of work.
+3. **Move vs. share the crates** (§3). Settled: moved; the C++ tree keeps a
+   frozen copy.
+4. **`MUMBLE_PLUGIN_DIRS` / `MUMBLE_PLUGIN_LOG` env vars.** Settled for the
+   first: `MUMBLE_PLUGIN_DIRS` is still honoured, adding to the configured
+   directory rather than replacing it, because it is what a developer running
+   one build against another tree's plugins reaches for. `MUMBLE_PLUGIN_LOG` is
+   gone — plugins log through `tracing` into Starling's own telemetry, and a
+   second filter nobody knows about is worse than none.
+5. **Client-manifest settings surface.** Unchanged and still deferred. The C++
+   server exposes each enabled plugin's `client_manifest.config_schema` as
+   editable server settings and bumps a settings revision on toggle; Starling's
+   equivalent would hang off `server-config`. The manifest itself now reaches
+   clients (`PluginDescriptor.info_json`), so this is only about *editing* it.
