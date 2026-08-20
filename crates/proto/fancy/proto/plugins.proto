@@ -72,6 +72,9 @@ message PluginMessage {
   uint32 session = 3;
   bytes payload = 4;
   repeated uint32 recipients = 5;
+  // Which of the plugin's own message kinds this is. Copied, never read: see
+  // `Opaque.payload_type` in fancy/feature.proto, which this becomes.
+  string payload_type = 6;
 }
 
 message KvGetRequest {

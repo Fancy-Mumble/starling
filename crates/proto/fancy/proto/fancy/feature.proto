@@ -217,6 +217,19 @@ message PluginDescriptor {
   string name = 2;
   string version = 3;
   bool enabled = 4;
+  // What the plugin says about itself, as JSON: description, author, tags, and
+  // the client manifest a Fancy client renders its slash commands and settings
+  // panels from.
+  //
+  // Opaque here, and it stays opaque: the server neither parses nor validates
+  // it beyond checking that it *is* JSON and fits the size cap. Carried on the
+  // descriptor because a registry without it tells a client a plugin exists and
+  // nothing it would need to draw anything.
+  //
+  // Upstream's `PluginRegistryEntry` also carries a `plugin_slot`. Deliberately
+  // absent: it is the index of the plugin among those currently loaded, so it
+  // changes whenever anything is enabled or disabled. Clients key on `name`.
+  string info_json = 5;
 }
 
 message Registry {
@@ -232,6 +245,17 @@ message Opaque {
   bytes payload = 2;
   repeated uint32 recipients = 3;
   uint32 sender = 4;
+  // Which of the plugin's own message kinds this is, as the plugin names them
+  // (`"friends.open"`, `"PluginActivated"`).
+  //
+  // Not a hole in the opacity rule, and worth being precise about why: the
+  // server treats this as a string it copies, never as something it switches
+  // on. A plugin needs it to tell one of its own messages from another, and
+  // upstream's `PluginMessage` (wire 200) carries exactly this field for
+  // exactly that reason. Without it every message a plugin receives is an
+  // undifferentiated blob and the plugin has to invent its own framing inside
+  // `payload` to get the field back.
+  string payload_type = 5;
 }
 
 message Admin {
