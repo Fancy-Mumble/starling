@@ -3,7 +3,8 @@
 //! `loads_a_real_plugin.rs` proves the host can load a plugin it built itself,
 //! in the same workspace, in the same profile. This proves the part that
 //! actually matters to somebody writing a plugin: that a binary built
-//! **somewhere else** loads here.
+//! **somewhere else** loads here -- and, when the WebAssembly example has been
+//! built too, that both plugin formats load side by side in one host.
 //!
 //! [fancy-plugin-example](https://github.com/Fancy-Mumble/fancy-plugin-example)
 //! is a separate repository, a separate Cargo workspace, and depends on this
@@ -50,9 +51,23 @@
 //! rather than the pinned commit, uncomment the `[patch]` block at the foot of
 //! that repository's root `Cargo.toml`.
 //!
-//! `fancy-greeter-wasm` is deliberately not in that list: it is a WebAssembly
-//! component, needs `wasm-tools component new` after the build, and this host
-//! ships with `wasm-plugins` off. Proving the WASM half is its own exercise.
+//! The WebAssembly example is optional here, because it needs a second
+//! toolchain and a second step -- a core module is not a component:
+//!
+//! ```sh
+//! rustup target add wasm32-unknown-unknown
+//! cargo install wasm-tools
+//! cargo build --release --target wasm32-unknown-unknown -p fancy-greeter-wasm
+//! mkdir -p target/components
+//! wasm-tools component new \
+//!     target/wasm32-unknown-unknown/release/fancy_greeter_wasm.wasm \
+//!     -o target/components/fancy-greeter-wasm.wasm
+//! ```
+//!
+//! Present, it is staged alongside the natives and these tests check seven
+//! plugins instead of six -- which is the interesting part: the seventh came
+//! through wasmtime rather than `abi_stable`, and every assertion below is
+//! written against the uniform view the host presents of both.
 //!
 //! Without the artefacts every test here says so and passes. That is the right
 //! behaviour for a check that depends on a second checkout -- it must not turn
@@ -65,6 +80,12 @@ use serde as _;
 use sha2 as _;
 use thiserror as _;
 use tracing as _;
+// Feature-gated, because they are: with `wasm-plugins` off these crates are not
+// in the graph at all, and naming them unconditionally would fail to compile.
+#[cfg(feature = "wasm-plugins")]
+use wasmtime as _;
+#[cfg(feature = "wasm-wasi")]
+use wasmtime_wasi as _;
 use zstd as _;
 
 use std::collections::HashMap;
@@ -79,7 +100,7 @@ use starling_plugin_host::{Host, HostBridge, NewChannel, OutboundMessage};
 /// Hard-coded rather than derived from the file names, because the point is
 /// that the *plugin* says who it is: the host reads the name out of the loaded
 /// binary, and a file called anything at all could claim any of these.
-const EXPECTED: &[&str] = &[
+const NATIVE: &[&str] = &[
     "fancy-chat-card",
     "fancy-feedback-form",
     "fancy-gallery-showcase",
@@ -87,6 +108,14 @@ const EXPECTED: &[&str] = &[
     "fancy-info-card",
     "fancy-quick-poll",
 ];
+
+/// What the WebAssembly example calls itself.
+///
+/// Kept separate from [`NATIVE`] because it is *optional*: building it needs
+/// the `wasm32` target and a `wasm-tools` pass the native ones do not. When
+/// it is absent these tests check six plugins; when it is there they check
+/// seven, and the seventh went through an entirely different loader.
+const WASM: &str = "greeter-wasm";
 
 /// A bridge that records, grants nothing, and answers no configuration.
 ///
@@ -162,15 +191,51 @@ impl HostBridge for Recorder {
     }
 }
 
-/// Where the sibling checkout leaves its release artefacts.
-fn examples_release_dir() -> PathBuf {
+/// The sibling checkout of the examples.
+fn examples_repo() -> PathBuf {
     // `<repo>/crates/plugin-host/host` up four is the directory this repo sits
     // in, which is where the examples are checked out beside it.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../fancy-plugin-example/target/release")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../fancy-plugin-example")
 }
 
-/// Copy every example cdylib into a directory of its own.
+/// Where the native cdylibs land.
+fn examples_release_dir() -> PathBuf {
+    examples_repo().join("target/release")
+}
+
+/// Where a componentised WASM plugin might have been left.
+///
+/// Deliberately *not* `target/wasm32-unknown-unknown/release`: a **core
+/// module** and a **component** are both `.wasm`, only the second loads, and
+/// that build directory holds the first. Staging it would hand the host a core
+/// module and produce a failure that reads like a broken plugin rather than the
+/// wrong file.
+///
+/// Two locations because the repository has two conventions: its CI writes the
+/// component beside the example it came from, and `target/components` is the
+/// convenient place to collect several by hand.
+#[cfg(feature = "wasm-plugins")]
+fn example_component_dirs() -> Vec<PathBuf> {
+    let repo = examples_repo();
+    let mut dirs = vec![repo.join("target/components")];
+    if let Ok(examples) = std::fs::read_dir(repo.join("examples")) {
+        dirs.extend(examples.flatten().map(|entry| entry.path()));
+    }
+    dirs
+}
+
+/// Nowhere, when the backend that loads components is compiled out.
+///
+/// Staging a component this build cannot load would make every count below
+/// wrong, and the resulting failure reads like a broken plugin rather than what
+/// it is: a host built without wasmtime in it. The refusal itself is worth
+/// checking, and is, in `loads_a_real_plugin.rs`.
+#[cfg(not(feature = "wasm-plugins"))]
+fn example_component_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Copy every example plugin into a directory of its own.
 ///
 /// A directory of its own, and not the build directory itself: `target/release`
 /// also holds the dependencies' shared libraries and anything else cargo left
@@ -186,6 +251,38 @@ fn stage(label: &str) -> Option<(PathBuf, Vec<String>)> {
 
     let suffix = starling_plugin_host::cdylib_suffix();
     let mut staged = Vec::new();
+
+    // The WASM components, when somebody has built them. Optional on purpose:
+    // they need a second toolchain and a second build step, and the native half
+    // of this file must stay checkable without either.
+    //
+    // The *first* location that has any wins, rather than merging them. The two
+    // conventions can hold the same component under different file names
+    // (`greeter.wasm` and `fancy-greeter-wasm.wasm`), and staging both would
+    // load one plugin twice under one name -- which is a genuinely confusing
+    // failure to debug from a duplicated registry entry.
+    for candidate in example_component_dirs() {
+        let Ok(entries) = std::fs::read_dir(candidate) else {
+            continue;
+        };
+        let mut found = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(starling_plugin_host::wasm_suffix()) {
+                continue;
+            }
+            let _ = std::fs::copy(&path, dir.join(name)).ok()?;
+            staged.push(name.to_owned());
+            found = true;
+        }
+        if found {
+            break;
+        }
+    }
+
     for entry in std::fs::read_dir(&source).ok()?.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -218,20 +315,48 @@ fn skip(reason: &str) {
     );
 }
 
-/// A host with every staged example switched on.
-fn host_with_everything(label: &str) -> Option<(Host, Arc<Recorder>, Vec<String>)> {
-    let (dir, staged) = stage(label)?;
+/// A host, and the plugin names it should have loaded.
+///
+/// The expected set is not derived from what was found -- that would make every
+/// assertion below circular -- but from which *kinds* of artefact are present:
+/// the six natives always, the WASM one only when somebody has built and
+/// componentised it.
+struct Staged {
+    host: Host,
+    bridge: Arc<Recorder>,
+    files: Vec<String>,
+    expected: Vec<String>,
+}
+
+/// Build a host with every staged example switched on.
+fn host_with_everything(label: &str) -> Option<Staged> {
+    let (dir, files) = stage(label)?;
+
+    let mut expected: Vec<String> = NATIVE.iter().map(|name| (*name).to_owned()).collect();
+    if files
+        .iter()
+        .any(|file| file.ends_with(starling_plugin_host::wasm_suffix()))
+    {
+        expected.push(WASM.to_owned());
+    }
+    expected.sort();
+
     let bridge = Arc::new(Recorder::default());
     bridge
         .set_config("plugins_dir", &dir.display().to_string())
         .ok()?;
-    for name in EXPECTED {
+    for name in &expected {
         bridge
             .set_config(&format!("plugin.{name}.enabled"), "true")
             .ok()?;
     }
     let host = Host::new(Arc::clone(&bridge) as Arc<dyn HostBridge>);
-    Some((host, bridge, staged))
+    Some(Staged {
+        host,
+        bridge,
+        files,
+        expected,
+    })
 }
 
 #[test]
@@ -242,17 +367,18 @@ fn the_inventory_is_printed_so_a_green_run_can_be_read() {
     // trusting that five checks passed over an empty directory.
     //
     // Run with `-- --nocapture` to see it.
-    let Some((host, _bridge, staged)) = host_with_everything("inventory") else {
+    let Some(staged) = host_with_everything("inventory") else {
         skip("no example artefacts to inventory");
         return;
     };
+    let host = &staged.host;
 
     eprintln!(
         "\n  loaded {} of {} staged files. Every binary below was built in a\n  \
          separate workspace, in release, against this repository's\n  \
          mumble-plugin-api fetched over git at a pinned commit:\n",
         host.loaded_count(),
-        staged.len()
+        staged.files.len()
     );
     let (listed, dir) = host.list_plugins();
     for info in &listed {
@@ -270,20 +396,20 @@ fn the_inventory_is_printed_so_a_green_run_can_be_read() {
     // the summary says passed.
     assert_eq!(
         host.loaded_count(),
-        staged.len(),
+        staged.files.len(),
         "the inventory above is a list of failures"
     );
 }
 
 #[test]
 fn every_published_example_loads_in_this_host() {
-    // The headline. Each of these was compiled against the C++ server's copy of
-    // `mumble-plugin-api`; each is loaded here by the copy that moved into this
-    // repository. Nothing rebuilt them in between.
-    let Some((host, _bridge, staged)) = host_with_everything("load") else {
+    // The headline. Each of these was built in another workspace against this
+    // one's API over git, and is loaded here without being rebuilt.
+    let Some(staged) = host_with_everything("load") else {
         skip("no example artefacts to load");
         return;
     };
+    let host = &staged.host;
 
     let (listed, _dir) = host.list_plugins();
     let broken: Vec<String> = listed
@@ -301,17 +427,21 @@ fn every_published_example_loads_in_this_host() {
     );
     assert_eq!(
         listed.len(),
-        staged.len(),
+        staged.files.len(),
         "every staged file must account for exactly one plugin"
     );
 
     let mut names: Vec<String> = listed.iter().map(|info| info.plugin_name.clone()).collect();
     names.sort();
     assert_eq!(
-        names, EXPECTED,
+        names, staged.expected,
         "each plugin names itself, and the host reads that name out of the binary"
     );
-    assert_eq!(host.loaded_count(), EXPECTED.len(), "all of them started");
+    assert_eq!(
+        host.loaded_count(),
+        staged.expected.len(),
+        "all of them started"
+    );
 }
 
 #[test]
@@ -320,18 +450,18 @@ fn each_one_advertises_something_a_client_could_draw() {
     // an `RString`, gets parsed here, and is re-encoded into the envelope a
     // client reads. A layout mismatch that somehow survived the vtable check
     // would surface as garbage in this string.
-    let Some((host, _bridge, _staged)) = host_with_everything("info") else {
+    let Some(staged) = host_with_everything("info") else {
         skip("no example artefacts to inspect");
         return;
     };
 
-    let registry = host.registry();
+    let registry = staged.host.registry();
     // Without this the loop below is vacuously true over an empty registry,
     // which is exactly what a rejected-ABI run produces. Verified by bumping
     // `PLUGIN_ABI_VERSION` and watching this fail.
     assert_eq!(
         registry.len(),
-        EXPECTED.len(),
+        staged.expected.len(),
         "nothing loaded, so there is nothing being checked here"
     );
 
@@ -363,13 +493,13 @@ fn the_examples_that_declare_slash_commands_carry_them_across() {
     // structure of commands, options and components, encoded by the plugin and
     // decoded here. If the two API copies disagreed about anything in it, this
     // is where it would show.
-    let Some((host, _bridge, _staged)) = host_with_everything("manifest") else {
+    let Some(staged) = host_with_everything("manifest") else {
         skip("no example artefacts to inspect");
         return;
     };
 
     let mut with_commands = Vec::new();
-    for entry in host.registry() {
+    for entry in staged.host.registry() {
         let Ok(info) = serde_json::from_str::<serde_json::Value>(&entry.info_json) else {
             continue;
         };
@@ -405,15 +535,15 @@ fn the_examples_that_declare_slash_commands_carry_them_across() {
 
 #[test]
 fn a_client_arriving_reaches_all_of_them() {
-    // The dispatch path, over six plugins at once rather than one: every loaded
-    // plugin gets the callback, and every one of them gets its own info
-    // envelope shipped to that session.
-    let Some((host, bridge, _staged)) = host_with_everything("connect") else {
+    // The dispatch path, over every loaded plugin at once rather than one: each
+    // gets the callback, and each gets its own info envelope shipped to that
+    // session. With a component staged this crosses both loaders in one call.
+    let Some(staged) = host_with_everything("connect") else {
         skip("no example artefacts to dispatch to");
         return;
     };
 
-    host.on_client_connected(ClientInfo {
+    staged.host.on_client_connected(ClientInfo {
         server_id: 1,
         session_id: 77,
         username: "ada".into(),
@@ -421,36 +551,36 @@ fn a_client_arriving_reaches_all_of_them() {
         user_id: 3,
     });
 
-    let delivered = bridge.data.lock().expect("not poisoned").clone();
+    let delivered = staged.bridge.data.lock().expect("not poisoned").clone();
     let envelopes = delivered
         .iter()
         .filter(|(id, session)| id == "fancy-plugin-info" && *session == 77)
         .count();
     assert_eq!(
         envelopes,
-        EXPECTED.len(),
+        staged.expected.len(),
         "one info envelope per loaded plugin reaches the connecting session: {delivered:?}"
     );
 }
 
 #[test]
 fn each_plugin_is_looked_up_under_its_own_name_and_no_other() {
-    // Six plugins loaded at once is the case where scoping either holds or is
-    // found not to. Asserted from what the *host* asked the server for, which
-    // is the only side that can see across namespaces: a plugin cannot even
-    // name another's key, so asking the plugins would prove nothing.
-    let Some((host, bridge, _staged)) = host_with_everything("config") else {
+    // Several plugins loaded at once is the case where scoping either holds or
+    // is found not to. Asserted from what the *host* asked the server for,
+    // which is the only side that can see across namespaces: a plugin cannot
+    // even name another's key, so asking the plugins would prove nothing.
+    let Some(staged) = host_with_everything("config") else {
         skip("no example artefacts to configure");
         return;
     };
     assert_eq!(
-        host.loaded_count(),
-        EXPECTED.len(),
+        staged.host.loaded_count(),
+        staged.expected.len(),
         "nothing loaded, so no namespace was ever consulted"
     );
 
-    let reads = bridge.reads.lock().expect("not poisoned").clone();
-    for name in EXPECTED {
+    let reads = staged.bridge.reads.lock().expect("not poisoned").clone();
+    for name in &staged.expected {
         assert!(
             reads.contains(&format!("plugin.{name}.enabled")),
             "{name}'s own namespace was never read: {reads:?}"
@@ -462,7 +592,7 @@ fn each_plugin_is_looked_up_under_its_own_name_and_no_other() {
     for key in reads.iter().filter(|key| key.starts_with("plugin.")) {
         let named = key.trim_start_matches("plugin.");
         assert!(
-            EXPECTED.iter().any(|name| named.starts_with(name)),
+            staged.expected.iter().any(|name| named.starts_with(name)),
             "{key} belongs to no loaded plugin"
         );
     }

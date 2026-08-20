@@ -20,16 +20,18 @@ license = "MIT"
 [features]
 # WASM component plugins loaded via wasmtime, side by side with native cdylibs.
 #
-# Off by default, which differs from the C++ server, where it is on: wasmtime is
-# a multi-minute build, and the native backend is what every shipped plugin
-# uses today. Turning it on is a build-time decision an operator who installs
-# `.wasm` plugins makes; with it off the loader refuses a `.wasm` file with a
-# message saying so rather than ignoring it.
-default = []
+# On by default, as it is in the C++ server. It was off here for a while, on the
+# reasoning that wasmtime is a multi-minute build and no shipped plugin needed
+# it; that turned out to be the wrong trade. A server that silently cannot run
+# half the plugin formats it documents is a bug report waiting to happen, and
+# the cost is paid once per clean build by the person compiling rather than
+# every time by the person deploying.
+default = ["wasm-plugins", "wasm-wasi"]
 wasm-plugins = ["dep:wasmtime"]
 # A locked-down WASI (no filesystem, network, args or env) in the component
 # linker, needed by guests whose toolchain embeds a WASI-importing runtime
-# (notably JavaScript plugins built with ComponentizeJS/jco).
+# (notably JavaScript plugins built with ComponentizeJS/jco). A pure Rust guest
+# ignores these imports, so this costs such a plugin nothing.
 wasm-wasi = ["wasm-plugins", "dep:wasmtime-wasi"]
 
 [dependencies]

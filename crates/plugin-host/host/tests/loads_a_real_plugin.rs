@@ -23,6 +23,12 @@ use serde_json as _;
 use sha2 as _;
 use thiserror as _;
 use tracing as _;
+// Feature-gated, because they are: with `wasm-plugins` off these crates are not
+// in the graph at all, and naming them unconditionally would fail to compile.
+#[cfg(feature = "wasm-plugins")]
+use wasmtime as _;
+#[cfg(feature = "wasm-wasi")]
+use wasmtime_wasi as _;
 use zstd as _;
 
 use std::collections::HashMap;
@@ -353,13 +359,45 @@ fn a_plugin_can_be_switched_off_and_on_at_runtime() {
 }
 
 #[test]
+#[cfg(feature = "wasm-plugins")]
+fn a_wasm_file_that_is_not_a_component_is_reported_rather_than_ignored() {
+    // The WASM counterpart of the native decoy below, and a mistake that is
+    // easy to make: `cargo build --target wasm32-unknown-unknown` produces a
+    // *core module*, and only a *component* loads. Both are `.wasm`, so the
+    // only thing standing between an operator and a silent nothing is that the
+    // host says which it got.
+    let dir = scratch("wasm-core-module");
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    // A well-formed core module header, which is exactly what the wrong build
+    // step leaves behind.
+    std::fs::write(dir.join("module.wasm"), b"\0asm\x01\0\0\0").expect("write a core module");
+
+    let bridge = Arc::new(Recorder::with_config(&[(
+        "plugins_dir",
+        &dir.display().to_string(),
+    )]));
+    let host = Host::new(bridge as Arc<dyn HostBridge>);
+
+    assert_eq!(host.loaded_count(), 0);
+    let (listed, _) = host.list_plugins();
+    assert_eq!(listed.len(), 1, "the file is seen, not skipped");
+    assert!(
+        listed[0].load_error.is_some(),
+        "the operator is told why, not left to guess"
+    );
+    assert_eq!(listed[0].kind, "wasm", "and it is reported as what it is");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(not(feature = "wasm-plugins"))]
 fn a_wasm_plugin_is_refused_with_the_reason_rather_than_skipped() {
-    // The WASM backend is compiled out by default, so an operator who drops a
-    // `.wasm` component in the directory gets a server that does not run it.
-    // What they must not get is silence: a file the scanner picks up and the
-    // loader ignores looks identical to a plugin that loaded and does nothing,
-    // and the difference is one build flag.
+    // With the WASM backend compiled out, an operator who drops a component in
+    // the directory gets a server that does not run it. What they must not get
+    // is silence: a file the scanner picks up and the loader ignores looks
+    // identical to a plugin that loaded and does nothing, and the difference is
+    // one build flag.
     let dir = scratch("wasm-off");
     std::fs::create_dir_all(&dir).expect("scratch directory");
     std::fs::write(dir.join("component.wasm"), b"\0asm\x01\0\0\0").expect("write a stub component");

@@ -36,12 +36,18 @@ version probe matching, and `abi_stable`'s layout check passing on
 and a field reordered or a method added fails the second with a layout error
 rather than loading and misbehaving.
 
-**The seventh example is not covered.** `greeter-wasm` is a WebAssembly
-component built against `WASM_ABI_VERSION`, a separate constant on a backend
-this host compiles out by default; proving it needs the `wasm32` target,
-`wasm-tools`, and a build with `--features wasm-plugins`. The host does at
-least refuse a `.wasm` file with a message naming the feature, rather than
-scanning it and silently doing nothing.
+**The seventh example is covered too, when it has been built.** `greeter-wasm`
+is a WebAssembly component built against `WASM_ABI_VERSION` -- a separate
+constant, checked by a separate loader -- and it loads in the same host, in the
+same directory scan, as the six native cdylibs. It is optional in that test
+rather than required, because producing it needs the `wasm32` target and a
+`wasm-tools component new` pass that the native examples do not; present, the
+assertions count seven plugins instead of six.
+
+Worth knowing, because it is the mistake the toolchain invites: `cargo build
+--target wasm32-unknown-unknown` produces a **core module**, and only a
+**component** loads. Both are `.wasm`. The host reports which it got rather
+than skipping the file.
 
 What is *not* there, so nobody has to find out by trying:
 
@@ -53,10 +59,12 @@ What is *not* there, so nobody has to find out by trying:
 - **The operator routes.** Administration goes through `PluginsRpc` today;
   `/v1/plugins` on `operator-api` is not written, so an operator reaches it by
   gRPC rather than by REST.
-- **The WASM backend.** Lifted behind `starling-plugin-host/wasm-plugins` and
-  **off by default**, unlike the C++ server where it is on. wasmtime is a
-  multi-minute build and no shipped plugin needs it yet. The loader refuses a
-  `.wasm` file with a message saying which feature to turn on.
+- ~~**The WASM backend.**~~ Built, and on by default as in the C++ server. It
+  was off for a while, on the reasoning that wasmtime is a multi-minute build
+  and nothing shipped needed it; a server that silently cannot run half the
+  plugin formats it documents is not worth the saved minute. `wasm-plugins` and
+  `wasm-wasi` are both default features now, and a component loads beside a
+  native cdylib in one directory scan.
 - **The five heavier plugins.** Only `friends` came across. `audit`, `calendar`,
   `file-server`, `link-preview` and `live-doc` are still in the C++ tree.
 - **`provision_live_doc_bridge` is deliberately gone**, not overlooked. It

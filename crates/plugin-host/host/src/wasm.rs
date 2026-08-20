@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use abi_stable::sabi_trait::TD_Opaque;
-use abi_stable::std_types::{RArc, RErr, ROk, ROption, RResult, RSlice, RStr, RString, RVec};
+use abi_stable::std_types::{RArc, RErr, ROk, ROption, RSlice, RStr, RString, RVec};
 use mumble_plugin_api::client_manifest as ncm;
 use mumble_plugin_api::{
     ClientInfo, MumblePlugin, MumblePlugin_TO, PluginContext_TO, PluginError, PluginMessageIn,
@@ -265,9 +265,10 @@ impl MumblePlugin for WasmPlugin {
         // hook so guests receive native values instead of raw JSON. Anything
         // that is not a well-formed "Interaction" falls through to the generic
         // `on-plugin-message` hook unchanged.
-        if msg.payload_type.as_str() == INTERACTION_PAYLOAD_TYPE {
-            if let Ok(interaction) =
+        if msg.payload_type.as_str() == INTERACTION_PAYLOAD_TYPE
+            && let Ok(interaction) =
                 serde_json::from_slice::<NativeInteraction>(msg.payload.as_slice())
+        {
             {
                 let server_id = msg.server_id;
                 let sender = msg.sender_session;
@@ -403,7 +404,7 @@ impl UiHostImports for HostState {
 
 /// Load a `.wasm` component plugin and wrap it as a [`MumblePlugin_TO`] so the
 /// host can drive it exactly like a native cdylib plugin.
-pub fn load_wasm_plugin(path: &Path) -> Result<LoadedPlugin, LoadError> {
+pub(crate) fn load_wasm_plugin(path: &Path) -> Result<LoadedPlugin, LoadError> {
     let engine = engine()?;
     let component = Component::from_file(engine, path).map_err(|e| LoadError::Invalid {
         path: path.to_path_buf(),
@@ -515,8 +516,8 @@ fn ropt<T>(value: ROption<T>) -> Option<T> {
 /// Map a native [`PluginResult`] onto the WIT `result<_, plugin-error>`.
 fn native_result_to_wit(result: PluginResult<()>) -> Result<(), WitError> {
     match result {
-        RResult::ROk(()) => Ok(()),
-        RResult::RErr(e) => Err(native_err_to_wit(e)),
+        ROk(()) => Ok(()),
+        RErr(e) => Err(native_err_to_wit(e)),
     }
 }
 
@@ -870,7 +871,7 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use abi_stable::sabi_trait::TD_Opaque;
-    use abi_stable::std_types::{RArc, RNone, RResult};
+    use abi_stable::std_types::{RArc, RNone};
     use mumble_plugin_api::{ChannelId, PluginContext, PluginContext_TO};
 
     use super::*;
@@ -972,7 +973,7 @@ mod tests {
         };
 
         let res = loaded.plugin.on_plugin_message(&ctx, msg);
-        assert!(matches!(res, RResult::ROk(())), "hook returned {res:?}");
+        assert!(matches!(res, ROk(())), "hook returned {res:?}");
 
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.sends.len(), 1, "guest should echo exactly once");
