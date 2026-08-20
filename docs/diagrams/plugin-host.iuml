@@ -1,0 +1,104 @@
+' The body of plugin-host.puml / plugin-host-dark.puml. Not a diagram on its
+' own: it carries no start marker, so PlantUML will not render this file
+' directly.
+'
+' Careful: the start and end markers must not appear in this file at all, not
+' even inside a comment. PlantUML scans for them lexically, so a comment naming
+' one opens a second diagram here and the include fails with a line number
+' pointing at neither file. See README.md.
+'
+' One message: the plugin host inside the plugins service, coloured by
+' provenance - what already exists in Starling, what lifts from
+' mumble-plugin-host unchanged in role, and what is written new for the port.
+' Rationale, milestones and the context-method mapping live in
+' ../PLUGIN-HOST-PLAN.md; this repeats none of it.
+'
+' The post-render passes in README.md are not optional for either half.
+
+' A post-render step widens this single font name into a fallback stack, so a
+' viewer without Inter gets a sans-serif rather than the monospace a missing
+' font can fall back to.
+skinparam defaultFontName Inter
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam nodesep 20
+skinparam ranksep 44
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+title The plugin host in Starling, coloured by provenance
+
+header
+The host runs in-process inside the plugins service; no C ABI survives the port.
+The plugin-facing contract (MumblePlugin + PluginContext, ABI v3 / WASM v2) is unchanged, so built plugins load as-is.
+endheader
+
+actor "client" as client $c_faint
+component "**gateway**\nreads the u16 type, parses nothing" as gw $c_faint
+
+package "plugins service" as PS $c_pkg {
+  component "**plane handler**  «ClientService»\ntype 26 relay - anti-spoof, caps\ntype 1010 Query · Opaque · Admin(refused)" as plane $c_have
+  component "**PluginsRpc**  «gRPC»\nList · Enable · Install · Uninstall\nKvGet · KvScan · KvWrite" as rpc $c_have
+  component "**Host**  «lifted»\nloader (abi_stable) · wasm (wasmtime)\ninstall (sha256) · registry · info envelope" as host $c_lift
+  component "**plugins x N**  «lifted»\nnative cdylib or wasm component\neach owns its own tokio runtime" as plg $c_lift
+  component "**StarlingContext**  «new»\nimplements PluginContext over\ngRPC + Roster + KV" as ctx $c_new
+  component "**event fold**  «new»\nsession-view snapshot ->\nconnected · disconnected · registered" as ev $c_new
+  component "**registry + plugin_kv**\npersisted enable state ·\nnamespaced plugin storage" as kv $c_have
+}
+
+component "**session-view**\nbroadcast snapshots" as sv $c_faint
+component "**permissions · metadata · files**\nCheck · SetAcl · CreateRequest ·\nartifact by source_key" as svcs $c_faint
+component "**operator-api**\n/v1/plugins  «new routes»" as op $c_faint
+
+client -down-> gw : types 26 · 1010
+gw -[$l_blue]-> plane : ClientEvent stream
+op -[$l_blue]-> rpc : admin, HTTP -> gRPC
+rpc --> host : enable · disable · install · uninstall
+plane --> host : dispatch: 26 -> every plugin,\nOpaque -> one plugin by name
+host --> plg : sync hooks, via spawn_blocking:\non_load · on_client_connected · on_plugin_message
+plg --> ctx : PluginContext  «trait, unchanged»
+ctx -[$l_blue]-> svcs : access checks · channel ops ·\nHandle::block_on per call
+ctx --> kv : get_config · set_config · state
+ctx --> plane : Fanout: Opaque / 26 out to sessions
+sv -[$l_green]-> ev : snapshot stream
+ev --> host : connected · disconnected ·\nregistered (user_id change)
+host --> kv : registry rows · enable flags
+
+note right of host $c_lift
+  **What dies in the port.** The C ABI
+  (ffi.rs), the C++ callback table
+  (context.rs), the per-virtual-server
+  host, and the wire admin messages
+  146-151: Starling refuses in-band
+  Admin by design, so administration
+  is operator-api only.
+end note
+
+note right of ctx $c_new
+  **The sync/async bridge.** Hooks are
+  synchronous and plugins own their own
+  runtimes, so the service invokes hooks
+  on the blocking pool, never on a
+  runtime worker, and context methods
+  block_on a captured Handle. Precedent:
+  userdata's Argon2 hashing.
+end note
+
+note bottom of ev $c_new
+  **Eventually consistent, on purpose.**
+  The C++ distributor fed plugins
+  synchronously on the server thread.
+  None of the four events can veto, so
+  a snapshot-lagged greeter is harmless
+  and the domain edge stays session-view.
+end note
+
+legend bottom
+| «lifted», blue card | from mumble-plugin-host, role unchanged |
+| «new», amber card | new code this plan adds |
+| green card | already in Starling's plugins service today |
+| grey card | a neighbour, already built |
+| <color:$l_blue>blue edge</color> | gRPC |
+| <color:$l_green>green edge</color> | broadcast, eventually consistent |
+endlegend

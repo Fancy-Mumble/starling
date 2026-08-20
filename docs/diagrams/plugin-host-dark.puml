@@ -1,0 +1,50 @@
+@startuml plugin-host-dark
+' Dark render. The body is plugin-host.iuml, shared with plugin-host.puml.
+'
+' Dark throughout, not a dark border around a white picture: the cards, the
+' notes and the canvas are all dark and every glyph is light. Line colours are
+' brightened rather than darkened, because a line has no area and the hue that
+' reads as blue on white reads as almost black on this canvas.
+'
+' These sit after !theme, which would otherwise reset them.
+!theme plain
+
+!$c_faint = "#1C2126"
+!$c_have  = "#16301C"
+!$c_lift  = "#17293D"
+!$c_new   = "#38321A"
+!$c_pkg   = "#21262D"
+
+!$l_blue  = "#58A6FF"
+!$l_green = "#3FB950"
+
+skinparam backgroundColor #0D1117
+skinparam defaultFontColor #E6EDF3
+skinparam titleFontColor #E6EDF3
+skinparam headerFontColor #9198A1
+skinparam captionFontColor #E6EDF3
+skinparam ArrowColor #8B949E
+skinparam ArrowFontColor #E6EDF3
+skinparam actorFontColor #E6EDF3
+skinparam actorBorderColor #8B949E
+skinparam componentFontColor #E6EDF3
+skinparam componentBorderColor #30363D
+skinparam packageFontColor #E6EDF3
+skinparam packageBorderColor #30363D
+skinparam databaseFontColor #E6EDF3
+skinparam databaseBorderColor #30363D
+skinparam cloudFontColor #E6EDF3
+skinparam cloudBorderColor #30363D
+skinparam nodeFontColor #E6EDF3
+skinparam nodeBorderColor #30363D
+skinparam rectangleFontColor #E6EDF3
+skinparam rectangleBorderColor #30363D
+skinparam noteBackgroundColor #161B22
+skinparam noteBorderColor #30363D
+skinparam noteFontColor #E6EDF3
+skinparam legendBackgroundColor #161B22
+skinparam legendBorderColor #30363D
+skinparam legendFontColor #E6EDF3
+
+!include plugin-host.iuml
+@enduml

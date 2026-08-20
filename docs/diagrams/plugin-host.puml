@@ -1,0 +1,16 @@
+@startuml plugin-host
+' Light render. The body is plugin-host.iuml, shared with plugin-host-dark.puml,
+' which supplies the same variables in dark values.
+!theme plain
+
+!$c_faint = "#FAFAFA"
+!$c_have  = "#E8F5E9"
+!$c_lift  = "#E3F2FD"
+!$c_new   = "#FFF9C4"
+!$c_pkg   = "#EEEEEE"
+
+!$l_blue  = "#1565C0"
+!$l_green = "#2E7D32"
+
+!include plugin-host.iuml
+@enduml
