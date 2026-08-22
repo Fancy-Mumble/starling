@@ -33,6 +33,7 @@ pub mod ids;
 pub mod inflight;
 pub mod inproc;
 pub mod listen;
+pub mod livery;
 pub mod live;
 pub mod log;
 pub mod metrics;

@@ -260,8 +260,8 @@ impl Router {
 
     /// What a ping is currently answered with.
     #[must_use]
-    pub const fn details(&self) -> ServerDetails {
-        self.details
+    pub fn details(&self) -> &ServerDetails {
+        &self.details
     }
 
     /// Whether an unauthenticated ping is answered at all.
@@ -489,7 +489,7 @@ impl Router {
         match peer.codec().decode(&plain) {
             Ok(Datagram::Audio(packet)) => self.route(conn, packet),
             Ok(Datagram::Ping(ping)) => {
-                let details = ping.wants_details.then_some(self.details);
+                let details = ping.wants_details.then_some(self.details.clone());
                 let reply = peer.codec().encode_ping(&ping, details);
                 self.reply(conn, origin, &reply);
             }
@@ -543,7 +543,7 @@ impl Router {
         let Ok(Datagram::Ping(ping)) = ProtobufCodec.decode(frame) else {
             return false;
         };
-        let details = ping.wants_details.then_some(self.details);
+        let details = ping.wants_details.then_some(self.details.clone());
         self.datagrams
             .send_to(addr, ProtobufCodec.encode_ping(&ping, details));
         true
@@ -885,6 +885,7 @@ mod tests {
             users: 2,
             max_users: 10,
             max_bandwidth: 72_000,
+            livery_digest: Vec::new(),
         }
     }
 

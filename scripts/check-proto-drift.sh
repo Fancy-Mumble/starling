@@ -1,32 +1,39 @@
 #!/usr/bin/env bash
 # Assert that Starling's copy of the Mumble protobuf contract has not drifted
-# from the C++ server's or the client's.
+# from the client's.
 #
-# **`vendor/server` is not upstream's source of truth**; it is the Fancy fork,
-# whose proto is ~2100 lines against upstream's 639, and treating it as the
-# reference is how the field-numbering drift in PROTOCOL-COMPATIBILITY.md §1
-# went unnoticed. This check therefore proves *consistency between our trees*
-# and says nothing about Mumble compatibility; that needs a comparison against
+# **`vendor/server` is no longer checked.** The C++ fork is end-of-life, so its
+# copy is frozen and diverges by design the moment the live trees move; keeping
+# it here would fail on every real change, which is the cry-wolf failure this
+# file argues against below. It remains a valid *citation* target -- a frozen
+# tree is the ideal one, since the line numbers stop rotting -- and
+# `check-cpp-citations.py` still reads it.
+#
+# It was never upstream's source of truth either; it is the Fancy fork, whose
+# proto is ~2100 lines against upstream's 639, and treating it as the reference
+# is how the field-numbering drift in PROTOCOL-COMPATIBILITY.md §1 went
+# unnoticed. This check therefore proves *consistency between our trees* and
+# says nothing about Mumble compatibility; that needs a comparison against
 # `mumble-voip/mumble`, which has no remote configured here.
 #
-# It is also blind by construction to a rule all three trees break the same way.
+# It is also blind by construction to a rule both trees break the same way.
 # `check-proto-hygiene.py` next door covers the two that did.
 #
-# The three trees each carry their own copy of Mumble.proto / MumbleUDP.proto.
+# Both live trees carry their own copy of Mumble.proto / MumbleUDP.proto.
 # Duplicating a *generated* artifact is cheap; duplicating the *contract* is what
 # must be prevented. See docs/PORTING-PLAN.md §2.2.
 #
 # The comparison is of **wire meaning**, not bytes: comments and whitespace
 # legitimately differ between the trees (they document each side's perspective),
-# and as of writing the server and client copies differ by 272 comment lines
-# while being wire-identical. Requiring byte-identity would therefore fail on
+# and as of writing the two copies differ by hundreds of comment lines while
+# being wire-identical. Requiring byte-identity would therefore fail on
 # day one for no protocol reason, and teams learn to ignore a check that cries
 # wolf.
 #
 # **Mumble.proto is compared as a subset, not as a whole file.** Starling no
 # longer carries the epoch-0 Fancy messages M3 left in place; its copy is for
 # upstream's file verbatim, so that adopting an upstream release is a copy
-# rather than a merge. The other two trees still carry the block. Whole-file
+# rather than a merge. The client still carries the block. Whole-file
 # identity would therefore report drift on every run for a difference that is
 # the plan, which is the cry-wolf failure this file already argues against.
 #
@@ -46,11 +53,10 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Default layout: vendor/starling, vendor/server, vendor/client are siblings.
+# Default layout: vendor/starling and vendor/client are siblings.
 root="${1:-$(cd "$here/../.." && pwd)}"
 
 ours="$here/crates/proto/classic/proto"
-server="$root/vendor/server/src"
 client="$root/vendor/client/crates/mumble-protocol/proto"
 
 # Reduce a .proto to the syntax that determines the wire format: strip both
@@ -58,13 +64,12 @@ client="$root/vendor/client/crates/mumble-protocol/proto"
 # drop blank lines.
 #
 # Done in one perl pass because `/* ... */` blocks span lines, which a line-based
-# sed cannot see, the server's MumbleUDP.proto uses them and the client's does
-# not.
+# sed cannot see and one copy uses them where the other does not.
 #
-# The punctuation pass matters too: the server writes `[deprecated = true]` and
-# the client `[deprecated=true]`. Both compile to identical descriptors, so a
-# check that flagged it would be crying wolf on day one, and a check people
-# learn to ignore protects nothing.
+# The punctuation pass matters too: one copy writes `[deprecated = true]` and the
+# other `[deprecated=true]`. Both compile to identical descriptors, so a check
+# that flagged it would be crying wolf on day one, and a check people learn to
+# ignore protects nothing.
 normalise() {
     perl -0777 -pe '
         s{/\*.*?\*/}{}gs;      # block comments
@@ -154,8 +159,6 @@ check_subset() {
     rm -f /tmp/proto-drift.$$
 }
 
-check_subset Mumble.proto    "$server/Mumble.proto"    "server"
-check        MumbleUDP.proto "$server/MumbleUDP.proto" "server"
 check_subset Mumble.proto    "$client/Mumble.proto"    "client"
 check        MumbleUDP.proto "$client/MumbleUDP.proto" "client"
 
@@ -204,7 +207,6 @@ if [[ $status -ne 0 ]]; then
     echo >&2
     echo "Once decided, the copies move together:" >&2
     echo "    $ours/" >&2
-    echo "    $server/" >&2
     echo "    $client/" >&2
     echo >&2
     echo "For Mumble.proto the diff is a subset comparison, so a '-' line is a" >&2

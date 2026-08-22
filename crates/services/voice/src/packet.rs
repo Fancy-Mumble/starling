@@ -197,7 +197,7 @@ pub struct Ping {
 }
 
 /// What a server reports to a ping that asked for details.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerDetails {
     /// The server version, in Mumble's v2 packed encoding.
     pub version: u64,
@@ -207,6 +207,13 @@ pub struct ServerDetails {
     pub max_users: u32,
     /// Per-user audio bandwidth ceiling, in bits per second.
     pub max_bandwidth: u32,
+    /// Truncated SHA-256 of this server's livery, empty when none is set.
+    ///
+    /// Carried in the ping because that is where the question already is: a
+    /// client asking whether a server is up is the same client deciding whether
+    /// the branding it cached is current, and answering both costs one packet
+    /// rather than a connection.
+    pub livery_digest: Vec<u8>,
 }
 
 /// Bytes to and from [`Datagram`], for one peer's negotiated format.
@@ -440,12 +447,7 @@ impl AudioCodec for ProtobufCodec {
     }
 
     fn encode_ping(&self, ping: &Ping, details: Option<ServerDetails>) -> Bytes {
-        let details = details.unwrap_or(ServerDetails {
-            version: 0,
-            users: 0,
-            max_users: 0,
-            max_bandwidth: 0,
-        });
+        let details = details.unwrap_or_default();
         prefixed(
             PROTOBUF_PING,
             &mumble_udp::Ping {
@@ -455,6 +457,7 @@ impl AudioCodec for ProtobufCodec {
                 user_count: details.users,
                 max_user_count: details.max_users,
                 max_bandwidth_per_user: details.max_bandwidth,
+                livery_digest: details.livery_digest,
             },
         )
     }
@@ -825,13 +828,14 @@ mod tests {
             users: 7,
             max_users: 100,
             max_bandwidth: 72_000,
+            livery_digest: Vec::new(),
         };
         let ping = Ping {
             timestamp: 99,
             wants_details: true,
         };
 
-        let encoded = ProtobufCodec.encode_ping(&ping, Some(details));
+        let encoded = ProtobufCodec.encode_ping(&ping, Some(details.clone()));
         let reply = mumble_udp::Ping::decode(&encoded[1..]).expect("valid protobuf");
         assert_eq!(reply.user_count, 7);
         assert_eq!(reply.max_user_count, 100);
@@ -840,6 +844,44 @@ mod tests {
         // The legacy reply is fixed-width, so its length is the assertion.
         let legacy = LegacyCodec.encode_ping(&ping, Some(details));
         assert_eq!(legacy.len(), 1 + 8 + 16);
+    }
+
+    #[test]
+    fn the_livery_digest_rides_the_ping_a_client_already_sends() {
+        // The whole point of putting it here: no extra packet and no extra
+        // round trip, so a browser can ask two hundred servers what they look
+        // like for the cost of asking whether they are up.
+        let details = ServerDetails {
+            livery_digest: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ..ServerDetails::default()
+        };
+        let ping = Ping {
+            timestamp: 1,
+            wants_details: true,
+        };
+
+        let encoded = ProtobufCodec.encode_ping(&ping, Some(details.clone()));
+        let reply = mumble_udp::Ping::decode(&encoded[1..]).expect("valid protobuf");
+        assert_eq!(reply.livery_digest, details.livery_digest);
+
+        // Eight bytes plus a two-byte tag and a length byte. The reply's size
+        // is this responder's amplification factor, so it is asserted rather
+        // than left to drift.
+        let without = ProtobufCodec.encode_ping(&ping, Some(ServerDetails::default()));
+        assert_eq!(encoded.len() - without.len(), 11);
+    }
+
+    #[test]
+    fn a_server_with_no_livery_sends_no_digest() {
+        // Empty rather than a hash of nothing, so a client can tell "unbranded"
+        // from "branded, and here is which" and clear its cache on the former.
+        let ping = Ping {
+            timestamp: 1,
+            wants_details: true,
+        };
+        let encoded = ProtobufCodec.encode_ping(&ping, Some(ServerDetails::default()));
+        let reply = mumble_udp::Ping::decode(&encoded[1..]).expect("valid protobuf");
+        assert!(reply.livery_digest.is_empty());
     }
 
     #[test]

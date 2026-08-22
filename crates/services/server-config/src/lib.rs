@@ -42,7 +42,9 @@ use starling_proto_fancy::fancy::domain::{
 use starling_proto_fancy::serverconfig::server_config_server::{
     ServerConfig as ServerConfigRpc, ServerConfigServer,
 };
-use starling_proto_fancy::serverconfig::{GetRequest, SetRequest, Snapshot};
+use starling_proto_fancy::serverconfig::{
+    GetRequest, Livery, SetLiveryRequest, SetRequest, Snapshot,
+};
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::config::Config;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
@@ -55,6 +57,11 @@ pub mod import;
 pub mod snapshot;
 
 pub use import::import;
+// Re-exported so the name still reads as this service's own. It lives in
+// `runtime` for the reason `defaults` does: operator-api validates a livery
+// and voice hashes one, and a second copy is one copy that eventually
+// disagrees.
+pub use starling_runtime::livery;
 pub use snapshot::{apply_fields, defaults, redact};
 
 /// The schema: one row per server instance, typed columns, no EAV.
@@ -81,6 +88,16 @@ pub(crate) const SCHEMA: &[Migration<'static>] = &[
             "UPDATE server_config SET owned = '*' WHERE owned = ''",
         ],
     ),
+    Migration::new(
+        "0003_server_livery",
+        // Its own table rather than a column on `server_config`: the document
+        // has its own version counter, and sharing a row would make one Set
+        // bump the other's.
+        &["CREATE TABLE IF NOT EXISTS server_livery (\
+             server_id BIGINT PRIMARY KEY, \
+             version BIGINT NOT NULL, \
+             document BLOB NOT NULL)"],
+    ),
 ];
 
 /// The stored marker for "this row owns every field".
@@ -102,6 +119,14 @@ pub struct ServerConfigService {
     /// file when it is edited.
     owned: RwLock<HashMap<u32, BTreeSet<String>>>,
     updates: broadcast::Sender<Snapshot>,
+    /// The presentation an operator supplies, per server instance.
+    ///
+    /// Beside the settings rather than inside them: it is a document with its
+    /// own version counter and its own field set, and folding it into
+    /// `Snapshot` would mean `SetRequest.fields` carrying dotted paths that the
+    /// field-wise merge does not understand.
+    liveries: RwLock<HashMap<u32, Livery>>,
+    livery_updates: broadcast::Sender<Livery>,
     store: Option<Store>,
     fanout: Fanout,
 }
@@ -193,6 +218,40 @@ impl ServerConfigService {
             self.publish(rebuilt, &[]).await;
         }
     }
+
+    /// The livery for `scope`, or an empty one.
+    ///
+    /// Empty is a real answer, not a missing one: a server that has set no
+    /// livery is unbranded, and every caller would otherwise write the same
+    /// branch back to a default.
+    pub async fn livery(&self, scope: u32) -> Livery {
+        self.liveries
+            .read()
+            .await
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(|| Livery {
+                instance: scope,
+                ..Default::default()
+            })
+    }
+
+    /// Record `livery`, stamping the digest every reader compares against.
+    ///
+    /// The digest is computed here rather than by the caller so there is one
+    /// place it can be wrong, and so a document that reaches a subscriber
+    /// always carries the digest for the content beside it.
+    async fn publish_livery(&self, mut livery: Livery) {
+        let scope = livery.instance;
+        livery.digest = livery::digest(&livery);
+        let _ = self.liveries.write().await.insert(scope, livery.clone());
+        if let Some(store) = &self.store
+            && let Err(error) = persist_livery(store, &livery).await
+        {
+            tracing::error!(%error, "could not persist a livery change");
+        }
+        let _ = self.livery_updates.send(livery);
+    }
 }
 
 /// The stored form of the owned-field set.
@@ -235,6 +294,36 @@ async fn persist(
     .await
     .map(|_| ())
     .map_err(|error| starling_runtime::StoreError::Query(format!("server_config: {error}")))
+}
+
+async fn persist_livery(
+    store: &Store,
+    livery: &Livery,
+) -> Result<(), starling_runtime::StoreError> {
+    sqlx::query(
+        "INSERT INTO server_livery (server_id, version, document) VALUES (?, ?, ?) \
+         ON CONFLICT (server_id) DO UPDATE SET version = excluded.version, \
+         document = excluded.document",
+    )
+    .bind(i64::from(livery.instance))
+    .bind(livery.version as i64)
+    .bind(livery.encode_to_vec())
+    .execute(store.pool())
+    .await
+    .map(|_| ())
+    .map_err(|error| starling_runtime::StoreError::Query(format!("server_livery: {error}")))
+}
+
+/// The stored livery for `scope`, if one was ever written.
+async fn load_livery(store: &Store, scope: u32) -> Option<Livery> {
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT document FROM server_livery WHERE server_id = ?")
+        .bind(i64::from(scope))
+        .fetch_optional(store.pool())
+        .await
+        .ok()??;
+    let bytes: Vec<u8> = row.try_get("document").ok()?;
+    Livery::decode(bytes.as_slice()).ok()
 }
 
 /// What was persisted for `scope`: the snapshot, and the fields it owns.
@@ -312,6 +401,67 @@ impl ServerConfigRpc for ConfigRpc {
             rx,
         )))
     }
+
+    async fn get_livery(&self, request: Request<GetRequest>) -> Result<Response<Livery>, Status> {
+        let scope = scope_of(request.into_inner().scope);
+        Ok(Response::new(self.0.livery(scope).await))
+    }
+
+    async fn set_livery(
+        &self,
+        request: Request<SetLiveryRequest>,
+    ) -> Result<Response<Livery>, Status> {
+        let req = request.into_inner();
+        let scope = scope_of(req.scope);
+        let mut current = self.0.livery(scope).await;
+        let Some(values) = req.values else {
+            return Ok(Response::new(current));
+        };
+
+        // Refused rather than partially written. Unlike the settings merge, an
+        // unknown key here cannot be another service's knob, so the only thing
+        // it can be is a typo, and one whose symptom is a screen that did not
+        // change.
+        livery::apply_fields(&mut current, &values, &req.fields)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        // Validated after the merge, not before: the caller sends only the
+        // fields it is changing, so a document is only ever whole here.
+        livery::validate(&current).map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        current.instance = scope;
+        current.version += 1;
+        self.0.publish_livery(current.clone()).await;
+        Ok(Response::new(self.0.livery(scope).await))
+    }
+
+    type WatchLiveryStream = tokio_stream::wrappers::ReceiverStream<Result<Livery, Status>>;
+
+    async fn watch_livery(
+        &self,
+        request: Request<GetRequest>,
+    ) -> Result<Response<Self::WatchLiveryStream>, Status> {
+        let scope = scope_of(request.into_inner().scope);
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        // Current document first, then changes, as `watch` does: a subscriber
+        // that attached after a change must not have to ask for what it missed.
+        let _ = tx.send(Ok(self.0.livery(scope).await)).await;
+
+        let mut updates = self.0.livery_updates.subscribe();
+        drop(tokio::spawn(async move {
+            while let Ok(livery) = updates.recv().await {
+                if livery.instance != scope {
+                    continue;
+                }
+                if tx.send(Ok(livery)).await.is_err() {
+                    return;
+                }
+            }
+        }));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
 }
 
 impl ClientService for ServerConfigService {
@@ -377,12 +527,26 @@ impl Serve for ServerConfigService {
             let _ = owned.insert(scope, fields);
         }
 
+        let mut liveries = HashMap::new();
+        for scope in ctx.instances() {
+            let mut stored = match store.as_ref() {
+                Some(store) => load_livery(store, scope).await.unwrap_or_default(),
+                None => Livery::default(),
+            };
+            stored.instance = scope;
+            stored.digest = livery::digest(&stored);
+            let _ = liveries.insert(scope, stored);
+        }
+
         let (updates, _) = broadcast::channel(WATCH_BUFFER);
+        let (livery_updates, _) = broadcast::channel(WATCH_BUFFER);
         ctx.health.ready("settings loaded");
         Ok(Arc::new(Self {
             snapshots: RwLock::new(snapshots),
             owned: RwLock::new(owned),
             updates,
+            liveries: RwLock::new(liveries),
+            livery_updates,
             store,
             fanout: Fanout::default(),
         }))
@@ -477,10 +641,13 @@ mod tests {
 
     fn service() -> Arc<ServerConfigService> {
         let (updates, _) = broadcast::channel(8);
+        let (livery_updates, _) = broadcast::channel(8);
         Arc::new(ServerConfigService {
             snapshots: RwLock::new(HashMap::new()),
             owned: RwLock::new(HashMap::new()),
             updates,
+            liveries: RwLock::new(HashMap::new()),
+            livery_updates,
             store: None,
             fanout: Fanout::default(),
         })

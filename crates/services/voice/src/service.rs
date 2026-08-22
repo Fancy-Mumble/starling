@@ -450,6 +450,7 @@ impl VoiceService {
     async fn details(&self, ctx: &ServiceContext, scope: u32) -> (ServerDetails, bool) {
         let mut details = ServerDetails {
             version: MUMBLE_VERSION.encode_v2(),
+            livery_digest: Vec::new(),
             users: 0,
             max_users: DEFAULT_MAX_USERS,
             max_bandwidth: DEFAULT_MAX_BANDWIDTH,
@@ -473,6 +474,25 @@ impl VoiceService {
             details.max_users = snapshot.max_users;
             details.max_bandwidth = snapshot.max_bandwidth;
             allow_ping = snapshot.allow_ping;
+        }
+
+        // On the poll that already reads `server-config`, rather than per ping:
+        // a ping is answered from this cached snapshot, so a flood of them
+        // costs no fan-out at all, and the digest inherits that.
+        //
+        // Gated on `allow_ping` like the rest of the reply. An operator who has
+        // decided this server does not describe itself to strangers has decided
+        // this too, and `directory` already makes the same coupling by refusing
+        // to list a server whose ping is off.
+        if allow_ping
+            && let Ok(channel) = ctx.resolver.channel("server-config")
+            && let Ok(livery) = ServerConfigClient::new(channel)
+                .get_livery(ConfigRequest {
+                    scope: Some(Scope { instance: scope }),
+                })
+                .await
+        {
+            details.livery_digest = livery.into_inner().digest;
         }
 
         // The count has to be the whole server's, not this pod's. `session-view`
@@ -909,6 +929,7 @@ impl Serve for VoiceService {
                 users: 0,
                 max_users: DEFAULT_MAX_USERS,
                 max_bandwidth: DEFAULT_MAX_BANDWIDTH,
+                livery_digest: Vec::new(),
             },
         ));
 
@@ -1071,6 +1092,7 @@ mod tests {
                     users: 0,
                     max_users: DEFAULT_MAX_USERS,
                     max_bandwidth: DEFAULT_MAX_BANDWIDTH,
+                    livery_digest: Vec::new(),
                 },
             )),
             view: SessionCache::new(),

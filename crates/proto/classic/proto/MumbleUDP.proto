@@ -82,4 +82,21 @@ message Ping {
 
 	// The maximum bandwidth each user is allowed to use for sending audio to the server
 	uint32 max_bandwidth_per_user = 6;
+
+	// Fancy field numbering: upstream owns 1-999 in every upstream message and
+	// Fancy takes 1000+, docs/PROTOCOL-COMPATIBILITY.md §1. A stock Mumble
+	// client skips this and reads the ping exactly as it did before.
+
+	// Truncated SHA-256 of this server's livery, so a client can tell whether
+	// the copy it has cached is current without fetching anything. Sent only
+	// when extended information was asked for, and only while allow_ping is on;
+	// empty means no livery is set.
+	//
+	// Eight bytes rather than thirty-two because this is an unauthenticated
+	// responder answering a ~16-byte request, and the reply's size is the
+	// amplification factor. It is advisory: the document itself arrives over
+	// TLS, and the worst a forged digest achieves is a wasted fetch or a stale
+	// banner, neither of which touches anything a user reads to decide whether
+	// to trust the connection.
+	bytes livery_digest = 1000;
 }

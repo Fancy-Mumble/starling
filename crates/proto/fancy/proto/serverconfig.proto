@@ -13,6 +13,14 @@ service ServerConfig {
   // Readers cache a snapshot rather than calling per request; this is the
   // subscription that keeps it fresh.
   rpc Watch(GetRequest) returns (stream Snapshot);
+
+  // Livery: the presentation an operator supplies, carried beside the
+  // settings rather than inside them. Its own trio because `SetRequest.fields`
+  // is a flat list of names and a nested document under field-wise merge would
+  // need dotted paths the merge does not do.
+  rpc GetLivery(GetRequest) returns (Livery);
+  rpc SetLivery(SetLiveryRequest) returns (Livery);
+  rpc WatchLivery(GetRequest) returns (stream Livery);
 }
 
 message GetRequest {
@@ -26,6 +34,88 @@ message SetRequest {
   // settings do not overwrite each other.
   repeated string fields = 3;
   Snapshot values = 4;
+}
+
+message SetLiveryRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  // As SetRequest.fields, over Livery's own field names.
+  repeated string fields = 3;
+  Livery values = 4;
+}
+
+// What a server says it looks like: banner, mark, motto, palette.
+//
+// Every field is optional and empty means "keep the client's", so an operator
+// who sets only a tagline gets exactly that and nothing else changes. The
+// gradation is the feature: most servers send some of this, few send all of
+// it, and a client renders whatever subset arrived.
+//
+// Nothing here may reach a stylesheet as text and nothing here holds a URL a
+// viewer's machine fetches; see docs/OPERATOR-API.md "Livery".
+message Livery {
+  uint32 instance = 1;
+  // One per instance, bumped on every accepted SetLivery, as Snapshot.version.
+  uint64 version = 2;
+  // Truncated SHA-256 over the canonical JSON form, server-filled and ignored
+  // as input. Sent in the UDP ping so a client can decide whether to refetch
+  // without fetching. Advisory only: it travels unauthenticated.
+  bytes digest = 3;
+
+  // -- Words. --
+
+  // Replaces the host in headings. Never replaces the address a client shows
+  // beside it, which is what makes it safe to honour before authentication.
+  string display_name = 10;
+  string tagline = 11;
+  // Plain text, rendered as plain text. There is deliberately no markup, no
+  // stylesheet and no font field: each is a styling engine handed to whoever
+  // runs the server.
+  string motd = 12;
+  repeated Tag tags = 13;
+  string rules_url = 14;
+
+  // -- Artwork. Keys into the files plane, never bytes, and never a URL to a
+  //    host the client would have to trust. The keys are content hashes, so
+  //    they carry the images' identity into the digest for free. --
+
+  string banner_key = 20;
+  string icon_key = 21;
+  // Where to anchor a banner that has to crop, 0..100 each. The middle is the
+  // default and is what an unset pair means.
+  uint32 banner_focus_x = 22;
+  uint32 banner_focus_y = 23;
+
+  // -- Colour, opt-in separately from artwork. A palette per mode because a
+  //    client picks light or dark from the user's own theme, and one accent
+  //    tuned for dark would land unmodified on every light-theme user. --
+
+  Palette dark = 30;
+  Palette light = 31;
+
+  // sRGB as "#rrggbb". Hex rather than a packed uint32 because empty has to
+  // mean "keep the client's", and in a uint32 zero is black.
+  message Palette {
+    string accent = 1;
+    string surface = 2;
+    string aura_from = 3;
+    string aura_to = 4;
+  }
+
+  // Tone, not colour. A per-tag hex would be a second unclamped colour channel
+  // and would clash with whichever theme the viewer picked.
+  message Tag {
+    string label = 1;
+    enum Tone {
+      NEUTRAL = 0;
+      OK = 1;
+      WARN = 2;
+      BAD = 3;
+      ACCENT = 4;
+    }
+    Tone tone = 2;
+    string href = 3;
+  }
 }
 
 // One version per server instance, bumped on every accepted Set.

@@ -55,6 +55,16 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         .route("/v1/bans", get(list_bans).post(create_ban))
         .route("/v1/bans/{id}", delete(remove_ban))
         .route("/v1/config", get(get_config).post(set_config))
+        .route("/v1/livery", get(get_livery).post(set_livery))
+        .route(
+            "/v1/livery/banner",
+            get(get_banner).put(set_banner).delete(clear_banner),
+        )
+        .route(
+            "/v1/livery/icon",
+            get(get_icon).put(set_icon).delete(clear_icon),
+        )
+        .route("/v1/livery/preview", get(preview_livery))
         // How the server is, collected by the `health` service. The route a
         // dashboard polls; `/healthz` above stays a bare liveness probe.
         .route("/v1/health", get(get_health))
@@ -2096,6 +2106,357 @@ async fn set_config(
         .await
         .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+
+// -- Livery -----------------------------------------------------------------
+//
+// What a server says it looks like, and the artwork behind it. The document is
+// JSON on one route with the same field-wise merge `/v1/config` has; the images
+// are bytes on routes of their own, for the reason a texture is not a field on
+// an account.
+
+/// What an operator may upload as a banner, and as a mark.
+///
+/// Enforced here, at the write, rather than at delivery. A cap checked only on
+/// the way out is a cap that has already let the bytes into the database, and
+/// the failure it produces is a client that dies fetching them -- which is
+/// exactly how 5.75 MiB of channel descriptions took down every Fancy client
+/// once already.
+const MAX_BANNER_BYTES: usize = 512 * 1024;
+const MAX_ICON_BYTES: usize = 64 * 1024;
+
+/// Which livery image a route addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Art {
+    Banner,
+    Icon,
+}
+
+impl Art {
+    const fn field(self) -> &'static str {
+        match self {
+            Self::Banner => "banner_key",
+            Self::Icon => "icon_key",
+        }
+    }
+
+    const fn limit(self) -> usize {
+        match self {
+            Self::Banner => MAX_BANNER_BYTES,
+            Self::Icon => MAX_ICON_BYTES,
+        }
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Banner => "banner",
+            Self::Icon => "icon",
+        }
+    }
+}
+
+/// The image formats a client is asked to decode, sniffed from the bytes.
+///
+/// From the magic number rather than from `Content-Type`: the header is the
+/// uploader's claim about the body, and the body is what a viewer's image
+/// decoder will actually be handed.
+fn sniff(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+async fn livery_document(
+    api: &OperatorApi,
+) -> Result<starling_proto_fancy::serverconfig::Livery, (StatusCode, Json<ApiError>)> {
+    Ok(ServerConfigClient::new(dial(api, "server-config")?)
+        .get_livery(starling_proto_fancy::serverconfig::GetRequest { scope: scope() })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
+        .into_inner())
+}
+
+async fn write_livery(
+    api: &OperatorApi,
+    subject: String,
+    fields: Vec<String>,
+    values: starling_proto_fancy::serverconfig::Livery,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let _ = ServerConfigClient::new(dial(api, "server-config")?)
+        .set_livery(starling_proto_fancy::serverconfig::SetLiveryRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "server-config:write"),
+            fields,
+            values: Some(values),
+        })
+        .await
+        // The service refuses an unknown field or an unparseable colour with
+        // `invalid_argument`, and that is the operator's mistake, not a
+        // transport failure: reporting it as 502 would send them to the wrong
+        // logs entirely.
+        .map_err(|status| match status.code() {
+            tonic::Code::InvalidArgument => refuse(StatusCode::BAD_REQUEST, status.message()),
+            _ => refuse(StatusCode::BAD_GATEWAY, &status.to_string()),
+        })?;
+    Ok(())
+}
+
+async fn get_livery(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/livery")?;
+    // Never 404: a server that has set no livery is unbranded, which is an
+    // answer about its contents rather than an absence.
+    Ok(Json(starling_runtime::livery::to_json(
+        &livery_document(&api).await?,
+    )))
+}
+
+async fn set_livery(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let subject = admit(&api, &headers, "server-config:write", "POST /v1/livery")?;
+
+    // Unknown keys are refused here, unlike `/v1/config`, where one is carried
+    // into `extra` so a service can add a knob without a proto release. Livery
+    // has no second author, so a key nobody recognises can only be a typo --
+    // and its symptom would otherwise be a screen that did not change.
+    let (values, fields) = starling_runtime::livery::from_json(&body)
+        .map_err(|error| refuse(StatusCode::BAD_REQUEST, &error.to_string()))?;
+    if fields.is_empty() {
+        return Err(refuse(StatusCode::BAD_REQUEST, "no livery field was named"));
+    }
+    write_livery(&api, subject, fields, values).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn read_art(
+    api: Arc<OperatorApi>,
+    headers: HeaderMap,
+    which: Art,
+) -> Result<([(&'static str, &'static str); 1], Vec<u8>), (StatusCode, Json<ApiError>)> {
+    let _ = admit(
+        &api,
+        &headers,
+        "server-config:read",
+        &format!("GET /v1/livery/{}", which.path()),
+    )?;
+    let livery = livery_document(&api).await?;
+    let key = match which {
+        Art::Banner => livery.banner_key,
+        Art::Icon => livery.icon_key,
+    };
+    if key.is_empty() {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            "this server has no livery image of that kind",
+        ));
+    }
+    let hash = unhex(&key)
+        .ok_or_else(|| refuse(StatusCode::BAD_GATEWAY, "the stored livery key is not a hash"))?;
+    let bytes = read_blob(&api, hash).await?;
+    // The sniffed type, not the stored one: it is the same test a client's
+    // decoder applies, and serving a claim the bytes do not support is how a
+    // mismatch becomes somebody else's bug.
+    let content_type = sniff(&bytes).unwrap_or("application/octet-stream");
+    Ok(([("content-type", content_type)], bytes))
+}
+
+/// Store an image and point the document at it, in one call.
+///
+/// One call rather than two because the alternative leaves an operator whose
+/// second call failed with a document naming a blob that exists and a screen
+/// showing nothing, which is the state hardest to diagnose from outside.
+async fn write_art(
+    api: &OperatorApi,
+    headers: &HeaderMap,
+    which: Art,
+    bytes: Vec<u8>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let subject = admit(
+        api,
+        headers,
+        "server-config:write",
+        &format!("PUT /v1/livery/{}", which.path()),
+    )?;
+
+    let key = if bytes.is_empty() {
+        // Empty clears it, as an account texture does.
+        String::new()
+    } else {
+        if bytes.len() > which.limit() {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "a {} may be {} bytes and this is {}",
+                    which.path(),
+                    which.limit(),
+                    bytes.len()
+                ),
+            ));
+        }
+        if sniff(&bytes).is_none() {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "a livery image must be PNG, JPEG or WebP",
+            ));
+        }
+        // `userdata` hashes the content itself, so the key is the content's
+        // own digest. That is what carries the image's identity into the
+        // livery digest without the bytes ever being hashed twice.
+        let hash = UserDataClient::new(dial(api, "userdata")?)
+            .put_blob(starling_proto_fancy::userdata::Blob {
+                scope: scope(),
+                hash: Vec::new(),
+                bytes,
+            })
+            .await
+            .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+            .into_inner()
+            .hash;
+        hex(&hash)
+    };
+
+    let mut values = starling_proto_fancy::serverconfig::Livery::default();
+    match which {
+        Art::Banner => values.banner_key = key,
+        Art::Icon => values.icon_key = key,
+    }
+    write_livery(api, subject, vec![which.field().to_owned()], values).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_banner(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
+    read_art(api, headers, Art::Banner).await
+}
+
+async fn set_banner(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    write_art(&api, &headers, Art::Banner, body.to_vec()).await
+}
+
+async fn clear_banner(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    write_art(&api, &headers, Art::Banner, Vec::new()).await
+}
+
+async fn get_icon(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
+    read_art(api, headers, Art::Icon).await
+}
+
+async fn set_icon(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    write_art(&api, &headers, Art::Icon, body.to_vec()).await
+}
+
+async fn clear_icon(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    write_art(&api, &headers, Art::Icon, Vec::new()).await
+}
+
+/// What a client on `?mode=` will actually paint.
+///
+/// The only route whose answer differs from what was stored, and the reason it
+/// exists: a palette is the one part of this document the client may move, and
+/// an operator who cannot see that their `#0b0b0b` became something legible
+/// finds out from a support thread instead. `clamped` names every colour that
+/// had to move.
+async fn preview_livery(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Query(query): Query<PreviewQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_runtime::livery::{CONTRAST_ACCENT, CONTRAST_TEXT, clamp, parse_hex, to_hex};
+
+    let _ = admit(
+        &api,
+        &headers,
+        "server-config:read",
+        "GET /v1/livery/preview",
+    )?;
+    let dark = !query.mode.eq_ignore_ascii_case("light");
+    let livery = livery_document(&api).await?;
+
+    let palette = if dark { &livery.dark } else { &livery.light };
+    let Some(palette) = palette.clone() else {
+        // No palette for this mode is a complete answer: the client keeps its
+        // own colours, and nothing was clamped because nothing was offered.
+        return Ok(Json(serde_json::json!({
+            "mode": if dark { "dark" } else { "light" },
+            "palette": serde_json::Value::Null,
+            "clamped": Vec::<String>::new(),
+        })));
+    };
+
+    // The ground the rest is judged against: the operator's own surface when
+    // they named one, otherwise the pack's, since that is what the colour will
+    // actually sit on.
+    let ground = parse_hex(&palette.surface)
+        .unwrap_or(if dark { [0x14, 0x1d, 0x33] } else { [0xfd, 0xfb, 0xf6] });
+
+    let mut clamped = Vec::new();
+    let mut resolved = serde_json::Map::new();
+    for (name, value, target) in [
+        ("accent", &palette.accent, CONTRAST_ACCENT),
+        ("aura_from", &palette.aura_from, CONTRAST_ACCENT),
+        ("aura_to", &palette.aura_to, CONTRAST_ACCENT),
+    ] {
+        let Some(colour) = parse_hex(value) else {
+            continue;
+        };
+        let (result, moved) = clamp(colour, ground, target);
+        if moved {
+            clamped.push(name.to_owned());
+        }
+        let _ = resolved.insert(name.to_owned(), to_hex(result).into());
+    }
+    if !palette.surface.is_empty() {
+        let _ = resolved.insert("surface".to_owned(), palette.surface.into());
+    }
+
+    Ok(Json(serde_json::json!({
+        "mode": if dark { "dark" } else { "light" },
+        "palette": resolved,
+        "clamped": clamped,
+        // Stated so a caller reading the numbers knows which rule produced
+        // them rather than inferring it from the results.
+        "contrast_floor": { "accent": CONTRAST_ACCENT, "text": CONTRAST_TEXT },
+    })))
+}
+
+/// `?mode=dark` or `?mode=light`; dark when absent, as the pack's default is.
+#[derive(Deserialize)]
+struct PreviewQuery {
+    #[serde(default)]
+    mode: String,
 }
 
 /// Who the caller is, which is the cheapest way to check a credential works.
