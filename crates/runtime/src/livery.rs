@@ -68,6 +68,11 @@ pub enum Reason {
     Unknown,
     /// Past the cap carried here, counted in characters.
     TooLong(usize),
+    /// More entries than the cap carried here. Separate from `TooLong` because
+    /// the two produce different sentences, and an operator reading "tags is
+    /// longer than 4 characters" has been told the wrong thing about the wrong
+    /// unit.
+    TooMany(usize),
     /// Not `#rrggbb`. Carries what was sent, so the message can quote it.
     NotAColour(String),
     /// Not an `https://` URL.
@@ -86,6 +91,7 @@ impl std::fmt::Display for Invalid {
         match &self.reason {
             Reason::Unknown => write!(f, "no livery field is called {field}"),
             Reason::TooLong(limit) => write!(f, "{field} is longer than {limit} characters"),
+            Reason::TooMany(limit) => write!(f, "{field} may hold at most {limit}"),
             Reason::NotAColour(value) => write!(f, "{field} is {value}, which is not #rrggbb"),
             Reason::NotHttps => write!(f, "{field} must be an https:// URL"),
             Reason::OffImage => write!(f, "{field} must be between 0 and 100"),
@@ -153,7 +159,7 @@ pub fn validate(livery: &Livery) -> Result<(), Invalid> {
     cap("motd", &livery.motd, MAX_MOTD)?;
 
     if livery.tags.len() > MAX_TAGS {
-        return Err(Invalid::at("tags", Reason::TooLong(MAX_TAGS)));
+        return Err(Invalid::at("tags", Reason::TooMany(MAX_TAGS)));
     }
     for tag in &livery.tags {
         cap("tags[].label", &tag.label, MAX_TAG_LABEL)?;
@@ -893,13 +899,11 @@ mod tests {
             tags: (0..=MAX_TAGS).map(|n| tagged(&n.to_string())).collect(),
             ..Default::default()
         };
-        assert!(matches!(
-            validate(&livery),
-            Err(Invalid {
-                reason: Reason::TooLong(_),
-                ..
-            })
-        ));
+        let refused = validate(&livery).expect_err("five tags is too many");
+        assert!(matches!(refused.reason, Reason::TooMany(_)));
+        // Counted in entries, not characters: the message an operator reads has
+        // to name the unit the number is in.
+        assert_eq!(refused.to_string(), "tags may hold at most 4");
     }
 
     #[test]

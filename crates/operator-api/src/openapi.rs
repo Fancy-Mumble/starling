@@ -130,6 +130,62 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "server-config:write",
     ),
     (
+        "/v1/livery",
+        "get",
+        "Read the server's livery: banner, mark, motto, tags and palette",
+        "server-config:read",
+    ),
+    (
+        "/v1/livery",
+        "post",
+        "Change the livery; writes only the fields named, and refuses a key it \
+         does not recognise",
+        "server-config:write",
+    ),
+    (
+        "/v1/livery/banner",
+        "get",
+        "The banner image as stored, 404 when none is set",
+        "server-config:read",
+    ),
+    (
+        "/v1/livery/banner",
+        "put",
+        "Replace the banner; PNG, JPEG or WebP up to 512 KiB, empty body clears",
+        "server-config:write",
+    ),
+    (
+        "/v1/livery/banner",
+        "delete",
+        "Remove the banner",
+        "server-config:write",
+    ),
+    (
+        "/v1/livery/icon",
+        "get",
+        "The server mark as stored, 404 when none is set",
+        "server-config:read",
+    ),
+    (
+        "/v1/livery/icon",
+        "put",
+        "Replace the mark; PNG, JPEG or WebP up to 64 KiB, empty body clears",
+        "server-config:write",
+    ),
+    (
+        "/v1/livery/icon",
+        "delete",
+        "Remove the mark",
+        "server-config:write",
+    ),
+    (
+        "/v1/livery/preview",
+        "get",
+        "What a client on ?mode=dark|light will actually paint, after the \
+         contrast clamp; `clamped` names every colour that had to move",
+        "server-config:read",
+    ),
+    (
         "/v1/messages",
         "post",
         "Send a message from the server to sessions or channels",
