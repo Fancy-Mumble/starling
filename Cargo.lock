@@ -3530,6 +3530,8 @@ name = "starling-server-config"
 version = "0.2.2"
 dependencies = [
  "prost",
+ "rand 0.10.2",
+ "sha2 0.11.0",
  "sqlx",
  "starling-proto-fancy",
  "starling-runtime",

@@ -38,14 +38,16 @@ use prost::Message as _;
 use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::common::{Actor, actor};
 use starling_proto_fancy::fancy::domain::{
-    ConfigValues, LiveryDoc, ServerConfigEnvelope, livery_doc, server_config_envelope,
+    ConfigValues, LiveryDoc, OperatorTicketReply, OperatorTicketRequest, ServerConfigEnvelope,
+    livery_doc, server_config_envelope,
 };
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::serverconfig::server_config_server::{
     ServerConfig as ServerConfigRpc, ServerConfigServer,
 };
 use starling_proto_fancy::serverconfig::{
-    GetRequest, Livery, SetLiveryRequest, SetRequest, Snapshot,
+    GetRequest, Livery, SetLiveryRequest, SetRequest, Snapshot, VerifyTicketReply,
+    VerifyTicketRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
@@ -61,6 +63,7 @@ use tonic::{Request, Response, Status};
 
 pub mod import;
 pub mod snapshot;
+pub mod ticket;
 
 pub use import::import;
 // Re-exported so the name still reads as this service's own. It lives in
@@ -143,6 +146,15 @@ pub struct ServerConfigService {
     resolver: Resolver,
     /// Answers "may this session do that", against `permissions`.
     permit: Permit,
+    /// Short-lived operator tickets minted for a session with `TicketRequest`;
+    /// verified by `operator-api` over `VerifyTicket` when its own configured
+    /// authenticator does not recognise a bearer.
+    tickets: ticket::TicketStore,
+    /// Read once at construction for `operator-api`'s advertised address, the
+    /// same way every other value that needs a restart to change is: a
+    /// `TicketReply.base_url` that moved mid-deployment would only ever be
+    /// noticed by whichever ticket happened to be minted around the reload.
+    config: Arc<Config>,
     store: Option<Store>,
     fanout: Fanout,
 }
@@ -500,6 +512,27 @@ impl ServerConfigRpc for ConfigRpc {
             rx,
         )))
     }
+
+    /// Whether `token` is a ticket this process minted and has not expired.
+    ///
+    /// Called by `operator-api`, never by a client: a bearer token travels
+    /// here exactly as it arrived in `Authorization`, and this is an internal
+    /// call between two services that already trust each other's requests,
+    /// the same trust `permissions` extends to every caller of `check_session`.
+    async fn verify_ticket(
+        &self,
+        request: Request<VerifyTicketRequest>,
+    ) -> Result<Response<VerifyTicketReply>, Status> {
+        let token = request.into_inner().token;
+        Ok(Response::new(match self.0.tickets.verify(&token) {
+            Some((subject, scopes)) => VerifyTicketReply {
+                valid: true,
+                subject,
+                scopes,
+            },
+            None => VerifyTicketReply::default(),
+        }))
+    }
 }
 
 impl ClientService for ServerConfigService {
@@ -541,6 +574,9 @@ impl ClientService for ServerConfigService {
             }
             Some(server_config_envelope::Body::LiveryUpdate(update)) => {
                 self.on_livery_update(&inbound, update).await
+            }
+            Some(server_config_envelope::Body::TicketRequest(request)) => {
+                self.on_ticket_request(&inbound, request).await
             }
             // A *settings* update from a client is still refused. Nothing has
             // asked for one, and unlike livery the person sending it is not
@@ -602,6 +638,55 @@ impl ServerConfigService {
         )
         .await;
         Actions::new()
+    }
+
+    /// A connected session asking for an operator credential it can present
+    /// to the operator API, for something the control channel does not carry
+    /// (an image, today).
+    ///
+    /// Every scope actually granted is checked by
+    /// [`starling_runtime::operator_scope::grant`] against the permission
+    /// that already gates the equivalent control-channel action for this
+    /// session -- the same authority [`Self::on_livery_update`] checks for a
+    /// livery write, generalised. A ticket therefore never grants more than
+    /// this session could already do some other way; it is a shorter path to
+    /// the same authority, not a new one.
+    async fn on_ticket_request(
+        &self,
+        inbound: &Inbound,
+        request: OperatorTicketRequest,
+    ) -> Actions {
+        let outer = ServiceKind::ServerConfig.outer_type();
+        let granted =
+            starling_runtime::operator_scope::grant(&self.permit, inbound, &request.scopes).await;
+
+        let reply = if granted.is_empty() {
+            OperatorTicketReply {
+                denied_reason: "no requested scope is covered by a permission this session holds"
+                    .to_owned(),
+                ..Default::default()
+            }
+        } else {
+            let subject = format!("session:{}", inbound.session);
+            match self.tickets.issue(subject, granted.clone()) {
+                Some(issued) => OperatorTicketReply {
+                    token: issued.token,
+                    granted_scopes: granted,
+                    expires_at_ms: issued.expires_at_ms,
+                    base_url: operator_api_public_url(&self.config),
+                    denied_reason: String::new(),
+                },
+                None => OperatorTicketReply {
+                    denied_reason: "could not generate a credential".to_owned(),
+                    ..Default::default()
+                },
+            }
+        };
+
+        let envelope = ServerConfigEnvelope {
+            body: Some(server_config_envelope::Body::TicketReply(reply)),
+        };
+        vec![to_conn(inbound.conn, outer, envelope.encode_to_vec())]
     }
 
     /// The wire shape of `livery`, carrying the art the caller lacks.
@@ -798,6 +883,8 @@ impl Serve for ServerConfigService {
             livery_updates,
             resolver: ctx.resolver.clone(),
             permit: Permit::new(ctx.resolver.clone()),
+            tickets: ticket::TicketStore::default(),
+            config: Arc::clone(&ctx.config),
             store,
             fanout: Fanout::default(),
         }))
@@ -886,6 +973,23 @@ pub fn scope_of(scope: Option<Scope>) -> u32 {
     scope.map_or(1, |scope| scope.instance)
 }
 
+/// Where a client should present an operator ticket, or empty when this
+/// deployment has not said.
+///
+/// `[services.operator-api].public_url`, never `listen`: a bind address is
+/// frequently `127.0.0.1` or a `ClusterIP` nothing outside the pod can reach,
+/// and handing that back would read as a working answer until a client tried
+/// it. An operator who wants tickets to work at all names the address a
+/// client should actually use, the same field `files` and `screenshare`
+/// already sign URLs against.
+fn operator_api_public_url(config: &Config) -> String {
+    config
+        .services
+        .get("operator-api")
+        .and_then(|service| service.public_url.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,10 +998,8 @@ mod tests {
         // A resolver that reaches nothing: these tests exercise storage and the
         // merge, and a permission check with no `permissions` service behind it
         // denies, which is what the refusal test wants anyway.
-        let resolver = Resolver::new(
-            Arc::new(Config::with_defaults(std::path::Path::new("/run/starling"))),
-            starling_runtime::inproc::Broker::new(),
-        );
+        let config = Arc::new(Config::with_defaults(std::path::Path::new("/run/starling")));
+        let resolver = Resolver::new(Arc::clone(&config), starling_runtime::inproc::Broker::new());
         let (updates, _) = broadcast::channel(8);
         let (livery_updates, _) = broadcast::channel(8);
         Arc::new(ServerConfigService {
@@ -908,6 +1010,8 @@ mod tests {
             livery_updates,
             resolver: resolver.clone(),
             permit: Permit::new(resolver),
+            tickets: ticket::TicketStore::default(),
+            config,
             store: None,
             fanout: Fanout::default(),
         })
@@ -1489,5 +1593,59 @@ mod tests {
             .expect("the password is named even though it is withheld");
         assert!(password.secret, "it must say it is withheld");
         assert!(password.value.is_empty());
+    }
+
+    fn ticket_request(scopes: &[&str]) -> Inbound {
+        Inbound {
+            gateway: "test".to_owned(),
+            conn: 1,
+            session: 1,
+            scope: 1,
+            type_id: ServiceKind::ServerConfig.outer_type(),
+            payload: ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::TicketRequest(
+                    OperatorTicketRequest {
+                        scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    fn ticket_reply(actions: &Actions) -> OperatorTicketReply {
+        let action = actions.first().expect("a reply");
+        let starling_proto_fancy::control::server_action::Action::Send(send) =
+            action.action.as_ref().expect("an action")
+        else {
+            panic!("not a send");
+        };
+        let envelope = ServerConfigEnvelope::decode(send.payload.as_slice()).expect("an envelope");
+        match envelope.body {
+            Some(server_config_envelope::Body::TicketReply(reply)) => reply,
+            other => panic!("not a ticket reply: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ticket_request_with_no_permissions_service_behind_it_is_denied() {
+        // These tests' resolver reaches nothing, so every permission check
+        // fails closed -- the same property `Permit`'s own tests assert. A
+        // ticket request must fail exactly the same way a livery write does.
+        let reply = ticket_reply(
+            &service()
+                .frame(ticket_request(&["server-config:write"]))
+                .await,
+        );
+        assert!(reply.token.is_empty());
+        assert!(reply.granted_scopes.is_empty());
+        assert!(!reply.denied_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_ticket_request_naming_no_scope_this_table_knows_is_denied() {
+        let reply = ticket_reply(&service().frame(ticket_request(&["not-a-real-scope"])).await);
+        assert!(reply.token.is_empty());
+        assert!(reply.granted_scopes.is_empty());
     }
 }

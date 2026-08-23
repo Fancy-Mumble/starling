@@ -68,7 +68,7 @@ pub async fn websocket(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, (StatusCode, String)> {
-    let subject = crate::routes::admit_live(&api, &headers, "GET /v1/events")?;
+    let subject = crate::routes::admit_live(&api, &headers, "GET /v1/events").await?;
     Ok(upgrade.on_upgrade(move |socket| serve(socket, api, subject)))
 }
 

@@ -38,6 +38,7 @@ pub mod livery;
 pub mod log;
 pub mod metrics;
 pub mod names;
+pub mod operator_scope;
 pub mod permit;
 pub mod plane;
 pub mod pressure;

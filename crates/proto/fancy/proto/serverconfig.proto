@@ -21,6 +21,28 @@ service ServerConfig {
   rpc GetLivery(GetRequest) returns (Livery);
   rpc SetLivery(SetLiveryRequest) returns (Livery);
   rpc WatchLivery(GetRequest) returns (stream Livery);
+
+  // Whether a bearer token is a short-lived operator ticket this service
+  // minted, called by `operator-api` when its own configured authenticator
+  // does not recognise a credential. `server-config` is the ticket authority
+  // because minting one needs the control-channel session's live permissions,
+  // which only a frame handler ever sees; `operator-api` never learns a
+  // session id, only the token and what it is good for.
+  rpc VerifyTicket(VerifyTicketRequest) returns (VerifyTicketReply);
+}
+
+message VerifyTicketRequest {
+  // The bearer value exactly as it arrived in `Authorization`, unhashed: the
+  // ticket store only ever persists a digest of it, so the raw value has to
+  // travel here to be checked against one.
+  string token = 1;
+}
+
+message VerifyTicketReply {
+  bool valid = 1;
+  // Empty when `valid` is false.
+  string subject = 2;
+  repeated string scopes = 3;
 }
 
 message GetRequest {

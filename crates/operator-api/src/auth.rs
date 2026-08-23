@@ -204,7 +204,7 @@ impl Authenticator for SubjectMapped {
 }
 
 /// The token out of a `Bearer` header.
-fn bearer(header: Option<&str>) -> Result<&str, Refusal> {
+pub(crate) fn bearer(header: Option<&str>) -> Result<&str, Refusal> {
     let header = header.ok_or(Refusal::Missing)?;
     header
         .strip_prefix("Bearer ")

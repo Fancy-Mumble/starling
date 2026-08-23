@@ -13,6 +13,8 @@ starling-runtime.workspace = true
 sqlx.workspace = true
 
 prost.workspace = true
+rand.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

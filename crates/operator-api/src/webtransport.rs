@@ -155,7 +155,7 @@ async fn session(
         .headers()
         .get("authorization")
         .and_then(|value| value.to_str().ok());
-    let subject = match api.identify(header) {
+    let subject = match api.identify(header).await {
         Ok(identity) if identity.allows("session-view:read") => identity.subject,
         Ok(identity) => {
             tracing::info!(

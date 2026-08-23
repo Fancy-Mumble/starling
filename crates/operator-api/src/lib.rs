@@ -69,12 +69,58 @@ pub struct OperatorApi {
 impl OperatorApi {
     /// Who is asking, from an `Authorization` header.
     ///
+    /// Tried against the configured strategy first -- `token`, `mtls`, `oidc`
+    /// or `jwt`, whichever `[services.operator-api.auth]` names -- and only on
+    /// that failing, against `server-config`'s live tickets, minted for a
+    /// control-channel session that already proved it holds the permission a
+    /// scope needs (`docs/OPERATOR-API.md` "Session tickets"). In that order
+    /// so a deployment's ordinary traffic never pays for the extra round
+    /// trip: only a request the configured strategy would refuse outright
+    /// asks `server-config` at all.
+    ///
     /// # Errors
     ///
-    /// [`Refusal`] when the credential is missing, malformed, expired or
-    /// carries no scope this deployment maps.
-    pub fn identify(&self, header: Option<&str>) -> Result<Identity, Refusal> {
-        self.authenticator().identify(header)
+    /// [`Refusal`] when neither recognises the credential -- the configured
+    /// strategy's own refusal, since it names what actually went wrong with a
+    /// request that was never a ticket to begin with.
+    pub async fn identify(&self, header: Option<&str>) -> Result<Identity, Refusal> {
+        let refusal = match self.authenticator().identify(header) {
+            Ok(identity) => return Ok(identity),
+            Err(refusal) => refusal,
+        };
+        if let Ok(token) = auth::bearer(header)
+            && let Some(identity) = self.identify_ticket(token).await
+        {
+            return Ok(identity);
+        }
+        Err(refusal)
+    }
+
+    /// Ask `server-config` whether `token` is a ticket it minted.
+    ///
+    /// `None` on any failure -- `server-config` unreachable, or the token
+    /// unknown, expired, or minted by a replica other than the one this
+    /// process happened to dial -- which [`Self::identify`] reads as "not a
+    /// ticket" and falls back to the configured strategy's own refusal.
+    async fn identify_ticket(&self, token: &str) -> Option<Identity> {
+        use starling_proto_fancy::serverconfig::VerifyTicketRequest;
+        use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
+
+        let transport = self.resolver.channel("server-config").ok()?;
+        let reply = ServerConfigClient::new(transport)
+            .verify_ticket(VerifyTicketRequest {
+                token: token.to_owned(),
+            })
+            .await
+            .ok()?
+            .into_inner();
+        if !reply.valid || reply.scopes.is_empty() {
+            return None;
+        }
+        Some(Identity {
+            subject: reply.subject,
+            scopes: reply.scopes,
+        })
     }
 
     /// The authentication strategy in force.
@@ -324,6 +370,20 @@ mod tests {
             api.record(&record()).is_err(),
             "the default must refuse: an action that cannot be recorded does not happen"
         );
+    }
+
+    /// A bearer neither the configured strategy nor `server-config` (which
+    /// this resolver cannot reach) recognises still refuses -- the ticket
+    /// fallback must not turn "unreachable" into "admitted", and must not
+    /// hang the request waiting on a service that is not there.
+    #[tokio::test]
+    async fn an_unrecognised_bearer_is_refused_even_when_server_config_is_unreachable() {
+        let api = api_with_unwritable_audit(false);
+        let refusal = api
+            .identify(Some("Bearer not-a-real-token"))
+            .await
+            .expect_err("neither the static list nor an unreachable server-config admits this");
+        assert_eq!(refusal, Refusal::Rejected);
     }
 
     #[test]

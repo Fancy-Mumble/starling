@@ -239,7 +239,37 @@ message ServerConfigEnvelope {
     LiveryQuery livery_query = 4;
     LiveryDoc livery = 5;
     LiveryUpdate livery_update = 6;
+    OperatorTicketRequest ticket_request = 7;
+    OperatorTicketReply ticket_reply = 8;
   }
+}
+
+// "I already hold Write on the root channel; mint me a short-lived operator
+// credential so I can call the operator API for something the control
+// channel does not carry" -- starting with a livery image, and meant to
+// widen to whatever else this replaces from Ice's admin console (accounts,
+// ACLs, bans) as each is verified against its own permission.
+//
+// Scopes are named as `docs/OPERATOR-API.md` §2 spells them. The reply MAY
+// grant fewer than were asked for: each requested scope is checked against
+// the permission that already gates the equivalent control-channel action,
+// and the answer never grants more than that session already holds.
+message OperatorTicketRequest {
+  repeated string scopes = 1;
+}
+
+message OperatorTicketReply {
+  // Empty when nothing was granted; see `denied_reason`.
+  string token = 1;
+  repeated string granted_scopes = 2;
+  uint64 expires_at_ms = 3;
+  // The operator API's advertised address, empty when this deployment has it
+  // disabled, unreachable, or has not named one a client could use
+  // (`[services.operator-api] public_url`).
+  string base_url = 4;
+  // Set only when granted_scopes is empty, so a client can show *why* rather
+  // than a bare "nothing happened".
+  string denied_reason = 5;
 }
 
 // An admin changing the livery from a connected client.

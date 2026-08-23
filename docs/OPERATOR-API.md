@@ -85,6 +85,36 @@ match, so `userdata:*` covers `userdata:read`.
 403 from it. It is a check that a `*` credential works, not a general
 introspection route.
 
+### Session tickets
+
+A second, always-on path alongside whichever mode above is configured. A
+client already connected over the mumble control channel can ask
+`server-config` for a short-lived ticket instead of an operator typing a
+credential meant for an out-of-band console:
+
+```
+ServerConfigEnvelope{ OperatorTicketRequest{ scopes: ["server-config:write"] } }
+  -> ServerConfigEnvelope{ OperatorTicketReply{ token, granted_scopes, expires_at_ms, base_url } }
+```
+
+`server-config` grants a scope only when the session's live permission
+already covers the equivalent control-channel action -- `server-config:write`
+needs `Write` on the root channel, the same check a livery write over the
+channel makes; see `starling_runtime::operator_scope` for the full table. A
+ticket never grants more than that session could already do some other way,
+and it may grant fewer scopes than were requested.
+
+`base_url` is `[services.operator-api].public_url`, empty when unset, in
+which case a client has nowhere to present the ticket and falls back to
+asking an operator for one directly. The token itself is a 256-bit random
+value, valid for at most five minutes, held by `server-config` as a SHA-256
+digest and never persisted; a restart, or routing to a different
+`server-config` replica, invalidates every outstanding ticket the same way
+expiry would. `operator-api` accepts one wherever the configured
+authenticator refuses a bearer, by asking `server-config`'s `VerifyTicket`
+RPC -- an extra round trip paid only by a request that would otherwise be a
+bare refusal.
+
 ## 3. What every request does
 
 <picture>

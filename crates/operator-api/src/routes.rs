@@ -151,7 +151,7 @@ fn refuse(status: StatusCode, message: &str) -> (StatusCode, Json<ApiError>) {
 }
 
 /// Identify, authorise and record, in that order.
-fn admit(
+async fn admit(
     api: &OperatorApi,
     headers: &HeaderMap,
     scope: &str,
@@ -160,7 +160,7 @@ fn admit(
     let header = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
-    let identity = api.identify(header).map_err(|refusal| {
+    let identity = api.identify(header).await.map_err(|refusal| {
         let status = match refusal {
             Refusal::Missing | Refusal::Malformed => StatusCode::UNAUTHORIZED,
             Refusal::Rejected | Refusal::Unscoped => StatusCode::FORBIDDEN,
@@ -201,12 +201,13 @@ fn admit(
 /// # Errors
 ///
 /// The same statuses `admit` produces, with the reason as plain text.
-pub fn admit_live(
+pub async fn admit_live(
     api: &OperatorApi,
     headers: &HeaderMap,
     action: &str,
 ) -> Result<String, (StatusCode, String)> {
     admit(api, headers, "session-view:read", action)
+        .await
         .map_err(|(status, body)| (status, body.0.error))
 }
 
@@ -369,7 +370,7 @@ async fn list_accounts(
     headers: HeaderMap,
     Query(query): Query<AccountQuery>,
 ) -> Result<Json<Vec<AccountJson>>, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "userdata:read", "GET /v1/accounts")?;
+    let _ = admit(&api, &headers, "userdata:read", "GET /v1/accounts").await?;
     let channel = dial(&api, "userdata")?;
     let mut userdata = UserDataClient::new(channel);
 
@@ -415,7 +416,7 @@ async fn create_account(
     headers: HeaderMap,
     Json(new): Json<NewAccount>,
 ) -> Result<Json<AccountJson>, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "userdata:write", "POST /v1/accounts")?;
+    let _ = admit(&api, &headers, "userdata:write", "POST /v1/accounts").await?;
     let channel = api
         .resolver()
         .channel("userdata")
@@ -481,7 +482,8 @@ async fn update_account(
         &headers,
         "userdata:write",
         &format!("PUT /v1/accounts/{id}"),
-    )?;
+    )
+    .await?;
 
     // Absent means "leave it alone"; present-but-empty is a request to store an
     // empty password, which would leave a login that any password opens. The two
@@ -572,7 +574,8 @@ async fn delete_account(
         &headers,
         "userdata:write",
         &format!("DELETE /v1/accounts/{id}"),
-    )?;
+    )
+    .await?;
     let channel = api
         .resolver()
         .channel("userdata")
@@ -715,7 +718,8 @@ async fn get_texture(
         &headers,
         "userdata:read",
         &format!("GET /v1/accounts/{id}/texture"),
-    )?;
+    )
+    .await?;
     let Some(hash) = blob_hash(&api, id, Blob::Texture).await? else {
         return Err(refuse(StatusCode::NOT_FOUND, "this account has no texture"));
     };
@@ -736,7 +740,8 @@ async fn set_texture(
         &headers,
         "userdata:write",
         &format!("PUT /v1/accounts/{id}/texture"),
-    )?;
+    )
+    .await?;
     write_blob(&api, subject, id, Blob::Texture, body.to_vec()).await
 }
 
@@ -750,7 +755,8 @@ async fn clear_texture(
         &headers,
         "userdata:write",
         &format!("DELETE /v1/accounts/{id}/texture"),
-    )?;
+    )
+    .await?;
     write_blob(&api, subject, id, Blob::Texture, Vec::new()).await
 }
 
@@ -764,7 +770,8 @@ async fn get_comment(
         &headers,
         "userdata:read",
         &format!("GET /v1/accounts/{id}/comment"),
-    )?;
+    )
+    .await?;
     // An absent comment is an empty one. Unlike a texture there is nothing a
     // caller could do differently on 404, and every caller would have to write
     // the same branch to turn it back into "".
@@ -786,7 +793,8 @@ async fn set_comment(
         &headers,
         "userdata:write",
         &format!("PUT /v1/accounts/{id}/comment"),
-    )?;
+    )
+    .await?;
     write_blob(&api, subject, id, Blob::Comment, body.into_bytes()).await
 }
 
@@ -880,7 +888,7 @@ async fn create_ban(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     use starling_proto_fancy::moderation::BanRequest;
 
-    let subject = admit(&api, &headers, "moderation:write", "POST /v1/bans")?;
+    let subject = admit(&api, &headers, "moderation:write", "POST /v1/bans").await?;
     let (ban, session) = ban
         .resolve()
         .map_err(|why| refuse(StatusCode::BAD_REQUEST, &why))?;
@@ -915,7 +923,8 @@ async fn remove_ban(
         &headers,
         "moderation:write",
         &format!("DELETE /v1/bans/{id}"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "moderation")?;
 
     let result = ModerationClient::new(channel)
@@ -956,7 +965,8 @@ async fn kick_session(
         &headers,
         "moderation:write",
         &format!("POST /v1/sessions/{session}/kick"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "moderation")?;
 
     let result = ModerationClient::new(channel)
@@ -1011,7 +1021,8 @@ async fn set_session_state(
         &headers,
         "session:write",
         &format!("PATCH /v1/sessions/{session}"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "session-lifecycle")?;
 
     let result = SessionControlClient::new(channel)
@@ -1115,7 +1126,8 @@ async fn session_permissions(
         &headers,
         "permissions:read",
         &format!("GET /v1/sessions/{session}/permissions"),
-    )?;
+    )
+    .await?;
     let held = live_session(&api, session).await?;
     let channel = dial(&api, "permissions")?;
 
@@ -1180,7 +1192,7 @@ async fn get_log(
     use starling_proto_fancy::audit::QueryRequest;
     use starling_proto_fancy::audit::audit_client::AuditClient;
 
-    let subject = admit(&api, &headers, "audit:read", "GET /v1/log")?;
+    let subject = admit(&api, &headers, "audit:read", "GET /v1/log").await?;
     let channel = dial(&api, "audit")?;
 
     let page = AuditClient::new(channel)
@@ -1218,7 +1230,7 @@ async fn list_bans(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "moderation:read", "GET /v1/bans")?;
+    let _ = admit(&api, &headers, "moderation:read", "GET /v1/bans").await?;
     let channel = api
         .resolver()
         .channel("moderation")
@@ -1264,7 +1276,7 @@ async fn get_health(
     use starling_proto_fancy::health::health_overview_client::HealthOverviewClient;
     use starling_proto_fancy::health::{OverviewRequest, State as HealthState};
 
-    let _ = admit(&api, &headers, "server-config:read", "GET /v1/health")?;
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/health").await?;
     let channel = api
         .resolver()
         .channel("health")
@@ -1373,7 +1385,7 @@ async fn get_config(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "server-config:read", "GET /v1/config")?;
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/config").await?;
     let channel = api
         .resolver()
         .channel("server-config")
@@ -1409,7 +1421,7 @@ async fn list_channels(
     use starling_proto_fancy::metadata::TreeRequest;
     use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 
-    let _ = admit(&api, &headers, "metadata:read", "GET /v1/channels")?;
+    let _ = admit(&api, &headers, "metadata:read", "GET /v1/channels").await?;
     let channel = api
         .resolver()
         .channel("metadata")
@@ -1463,7 +1475,7 @@ async fn list_sessions(
     use starling_proto_fancy::sessionview::SubscribeRequest;
     use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 
-    let _ = admit(&api, &headers, "session-view:read", "GET /v1/sessions")?;
+    let _ = admit(&api, &headers, "session-view:read", "GET /v1/sessions").await?;
     let channel = api
         .resolver()
         .channel("session-view")
@@ -1591,7 +1603,7 @@ async fn create_channel(
     use starling_proto_fancy::metadata::metadata_client::MetadataClient;
     use starling_proto_fancy::metadata::{Channel, CreateRequest};
 
-    let subject = admit(&api, &headers, "metadata:write", "POST /v1/channels")?;
+    let subject = admit(&api, &headers, "metadata:write", "POST /v1/channels").await?;
     let channel = dial(&api, "metadata")?;
 
     let result = MetadataClient::new(channel)
@@ -1637,7 +1649,8 @@ async fn update_channel(
         &headers,
         "metadata:write",
         &format!("PUT /v1/channels/{id}"),
-    )?;
+    )
+    .await?;
 
     let mut values = Channel::default();
     let mut fields = Vec::new();
@@ -1697,7 +1710,8 @@ async fn delete_channel(
         &headers,
         "metadata:write",
         &format!("DELETE /v1/channels/{id}"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "metadata")?;
 
     let result = MetadataClient::new(channel)
@@ -1786,7 +1800,8 @@ async fn get_acl(
         &headers,
         "permissions:read",
         &format!("GET /v1/channels/{id}/acl"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "permissions")?;
 
     let set = PermissionsClient::new(channel)
@@ -1849,7 +1864,8 @@ async fn set_acl(
         &headers,
         "permissions:write",
         &format!("PUT /v1/channels/{id}/acl"),
-    )?;
+    )
+    .await?;
     let channel = dial(&api, "permissions")?;
 
     let result = PermissionsClient::new(channel)
@@ -1987,7 +2003,8 @@ async fn temporary_group(
         &headers,
         "permissions:write",
         &format!("{verb} /v1/channels/{id}/groups/{group}/members"),
-    )?;
+    )
+    .await?;
     let member = member
         .resolve()
         .map_err(|why| refuse(StatusCode::BAD_REQUEST, why))?;
@@ -2037,7 +2054,7 @@ async fn send_message(
     use starling_proto_fancy::text::AnnounceRequest;
     use starling_proto_fancy::text::text_client::TextClient;
 
-    let subject = admit(&api, &headers, "text:write", "POST /v1/messages")?;
+    let subject = admit(&api, &headers, "text:write", "POST /v1/messages").await?;
     let channel = dial(&api, "text")?;
 
     let result = TextClient::new(channel)
@@ -2072,7 +2089,7 @@ async fn set_config(
     headers: HeaderMap,
     Json(values): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "server-config:write", "POST /v1/config")?;
+    let _ = admit(&api, &headers, "server-config:write", "POST /v1/config").await?;
     let channel = api
         .resolver()
         .channel("server-config")
@@ -2213,7 +2230,7 @@ async fn get_livery(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = admit(&api, &headers, "server-config:read", "GET /v1/livery")?;
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/livery").await?;
     // Never 404: a server that has set no livery is unbranded, which is an
     // answer about its contents rather than an absence.
     Ok(Json(starling_runtime::livery::to_json(
@@ -2226,7 +2243,7 @@ async fn set_livery(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let subject = admit(&api, &headers, "server-config:write", "POST /v1/livery")?;
+    let subject = admit(&api, &headers, "server-config:write", "POST /v1/livery").await?;
 
     // Unknown keys are refused here, unlike `/v1/config`, where one is carried
     // into `extra` so a service can add a knob without a proto release. Livery
@@ -2251,7 +2268,8 @@ async fn read_art(
         &headers,
         "server-config:read",
         &format!("GET /v1/livery/{}", which.path()),
-    )?;
+    )
+    .await?;
     let livery = livery_document(&api).await?;
     let key = match which {
         Art::Banner => livery.banner_key,
@@ -2293,7 +2311,8 @@ async fn write_art(
         headers,
         "server-config:write",
         &format!("PUT /v1/livery/{}", which.path()),
-    )?;
+    )
+    .await?;
 
     let key = if bytes.is_empty() {
         // Empty clears it, as an account texture does.
@@ -2404,7 +2423,8 @@ async fn preview_livery(
         &headers,
         "server-config:read",
         "GET /v1/livery/preview",
-    )?;
+    )
+    .await?;
     let dark = !query.mode.eq_ignore_ascii_case("light");
     let livery = livery_document(&api).await?;
 
@@ -2470,7 +2490,7 @@ async fn whoami(
     State(api): State<Arc<OperatorApi>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let subject = admit(&api, &headers, "*", "POST /v1/whoami")?;
+    let subject = admit(&api, &headers, "*", "POST /v1/whoami").await?;
     Ok(Json(serde_json::json!({ "subject": subject })))
 }
 
