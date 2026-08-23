@@ -67,8 +67,8 @@ pub use import::import;
 // `runtime` for the reason `defaults` does: operator-api validates a livery
 // and voice hashes one, and a second copy is one copy that eventually
 // disagrees.
-pub use starling_runtime::livery;
 pub use snapshot::{apply_fields, defaults, redact};
+pub use starling_runtime::livery;
 
 /// The schema: one row per server instance, typed columns, no EAV.
 pub(crate) const SCHEMA: &[Migration<'static>] = &[
@@ -673,10 +673,7 @@ impl ServerConfigService {
         let hash = unhex(key)?;
         let channel = self.resolver.channel("userdata").ok()?;
         let bytes = UserDataClient::new(channel)
-            .get_blob(starling_proto_fancy::userdata::BlobRequest {
-                scope: None,
-                hash,
-            })
+            .get_blob(starling_proto_fancy::userdata::BlobRequest { scope: None, hash })
             .await
             .ok()?
             .into_inner()
@@ -997,7 +994,11 @@ mod tests {
             )
             .await;
 
-        let held = livery_reply(&service.frame(livery_query(&["aa".repeat(20).as_str()])).await);
+        let held = livery_reply(
+            &service
+                .frame(livery_query(&["aa".repeat(20).as_str()]))
+                .await,
+        );
         assert!(held.art.is_empty());
         assert_eq!(held.banner_key, "aa".repeat(20));
     }
@@ -1105,12 +1106,14 @@ mod tests {
         // Never carried in from the wire: they are the server's own.
         assert_eq!(mesh.version, 0);
         assert!(mesh.digest.is_empty());
-
     }
 
     #[test]
     fn art_is_typed_from_its_bytes_and_never_from_a_claim() {
-        assert_eq!(sniff(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]), "image/png");
+        assert_eq!(
+            sniff(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            "image/png"
+        );
         assert_eq!(sniff(&[0xff, 0xd8, 0xff, 0xe0]), "image/jpeg");
         assert_eq!(sniff(b"RIFF____WEBPVP8 "), "image/webp");
         assert_eq!(sniff(b"<html>"), "application/octet-stream");

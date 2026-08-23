@@ -2108,7 +2108,6 @@ async fn set_config(
     Ok(StatusCode::NO_CONTENT)
 }
 
-
 // -- Livery -----------------------------------------------------------------
 //
 // What a server says it looks like, and the artwork behind it. The document is
@@ -2264,8 +2263,12 @@ async fn read_art(
             "this server has no livery image of that kind",
         ));
     }
-    let hash = unhex(&key)
-        .ok_or_else(|| refuse(StatusCode::BAD_GATEWAY, "the stored livery key is not a hash"))?;
+    let hash = unhex(&key).ok_or_else(|| {
+        refuse(
+            StatusCode::BAD_GATEWAY,
+            "the stored livery key is not a hash",
+        )
+    })?;
     let bytes = read_blob(&api, hash).await?;
     // The sniffed type, not the stored one: it is the same test a client's
     // decoder applies, and serving a claim the bytes do not support is how a
@@ -2419,8 +2422,11 @@ async fn preview_livery(
     // The ground the rest is judged against: the operator's own surface when
     // they named one, otherwise the pack's, since that is what the colour will
     // actually sit on.
-    let ground = parse_hex(&palette.surface)
-        .unwrap_or(if dark { [0x14, 0x1d, 0x33] } else { [0xfd, 0xfb, 0xf6] });
+    let ground = parse_hex(&palette.surface).unwrap_or(if dark {
+        [0x14, 0x1d, 0x33]
+    } else {
+        [0xfd, 0xfb, 0xf6]
+    });
 
     let mut clamped = Vec::new();
     let mut resolved = serde_json::Map::new();

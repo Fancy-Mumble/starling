@@ -878,7 +878,10 @@ mod tests {
             tagline: "é".repeat(MAX_TAGLINE),
             ..Default::default()
         };
-        assert!(validate(&livery).is_ok(), "a cap in bytes would refuse this");
+        assert!(
+            validate(&livery).is_ok(),
+            "a cap in bytes would refuse this"
+        );
 
         let over = Livery {
             tagline: "a".repeat(MAX_TAGLINE + 1),

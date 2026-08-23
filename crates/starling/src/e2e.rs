@@ -1216,7 +1216,9 @@ async fn an_admin_changes_the_livery_over_the_connection_they_already_have() {
 
     let mut alice = Client::connect(deployment.port).await;
     let session = handshake(&mut alice, "alice").await;
-    deployment.wait_until_permitted(session, 0, Perm::WRITE.bits()).await;
+    deployment
+        .wait_until_permitted(session, 0, Perm::WRITE.bits())
+        .await;
 
     let outer = ServiceKind::ServerConfig.outer_type();
     alice
@@ -1264,7 +1266,10 @@ async fn an_admin_changes_the_livery_over_the_connection_they_already_have() {
     assert_eq!(document.tagline, "cozy corner");
     assert_eq!(document.display_name, "magical.rocks");
     assert!(document.version >= 1, "the write did not bump the version");
-    assert!(!document.digest.is_empty(), "a livery with content has a digest");
+    assert!(
+        !document.digest.is_empty(),
+        "a livery with content has a digest"
+    );
 
     deployment.stop();
 }
