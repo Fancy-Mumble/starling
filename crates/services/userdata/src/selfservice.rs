@@ -36,8 +36,8 @@ use std::collections::HashMap;
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::domain::{
-    AccountAck, AccountAction, Settings, SettingsUpdate, UserdataEnvelope, account_action,
-    userdata_envelope,
+    AccountAck, AccountAction, AccountState, Settings, SettingsUpdate, UserdataEnvelope,
+    account_action, userdata_envelope,
 };
 use starling_proto_fancy::userdata::{Account, UpdateRequest};
 use starling_runtime::ids::now_ms;
@@ -94,6 +94,12 @@ impl UserdataService {
                         ),
                     )]
                 }
+                // A guest asking about their account gets the answer, which is
+                // that there is not one. Silence here is what left the client's
+                // own account page loading for ever.
+                Some(userdata_envelope::Body::AccountQuery(_)) => {
+                    vec![self.state_reply(inbound, AccountState::default())]
+                }
                 _ => Actions::new(),
             };
         };
@@ -101,7 +107,22 @@ impl UserdataService {
         match envelope.body {
             Some(userdata_envelope::Body::Action(action)) => {
                 let ack = self.act(inbound, account, action).await;
-                vec![self.reply(inbound, ack)]
+                // The ack says whether it worked; the state says what it left
+                // behind. Both, because a client that derives the new state
+                // from a successful ack is a client that guesses, and after an
+                // UNREGISTER it would guess wrong about the only field that
+                // decides whether the page is offered at all.
+                let changed = ack.ok;
+                let mut actions = vec![self.reply(inbound, ack)];
+                if changed {
+                    let state = self.account_state(inbound, account).await;
+                    actions.push(self.state_reply(inbound, state));
+                }
+                actions
+            }
+            Some(userdata_envelope::Body::AccountQuery(_)) => {
+                let state = self.account_state(inbound, account).await;
+                vec![self.state_reply(inbound, state)]
             }
             Some(userdata_envelope::Body::SettingsQuery(_)) => {
                 vec![self.settings_reply(inbound, account)]
@@ -115,9 +136,12 @@ impl UserdataService {
                 vec![self.settings_reply(inbound, account)]
             }
             // Server to client, or an empty envelope.
-            Some(userdata_envelope::Body::Ack(_) | userdata_envelope::Body::Settings(_)) | None => {
-                Actions::new()
-            }
+            Some(
+                userdata_envelope::Body::Ack(_)
+                | userdata_envelope::Body::Settings(_)
+                | userdata_envelope::Body::Account(_),
+            )
+            | None => Actions::new(),
         }
     }
 
@@ -146,6 +170,9 @@ impl UserdataService {
         match kind {
             account_action::Kind::Unspecified => refuse(action.kind, "no action was named"),
             account_action::Kind::SetPassword => self.set_password(inbound, account, &action).await,
+            account_action::Kind::ClearPassword => {
+                self.clear_password(inbound, account, &action).await
+            }
             account_action::Kind::SetEmail => self.set_email(inbound, account, &action).await,
             account_action::Kind::Rename => self.rename_self(inbound, account, &action).await,
             account_action::Kind::EnableTotp => self.enable_totp(inbound, account, &action).await,
@@ -156,11 +183,21 @@ impl UserdataService {
 
     /// Whether the action carries this account's current password.
     ///
+    /// An account with **no** stored password is proved by its certificate,
+    /// which is the only way to reach it and is therefore what the session
+    /// already presented. Demanding a password there refused every action such
+    /// an account can take, starting with the one that gives it a password, and
+    /// `Accounts::update` carries this same carve-out one layer down - so the
+    /// two disagreed and this one, being first, always won.
+    ///
     /// On the blocking pool, never inline: it is 210 000 PBKDF2 rounds, and a
     /// runtime worker spending 30 ms on one client's typo is 30 ms of everybody
     /// else's audio and text queued behind it. It is also free to trigger, so
     /// inline it would be a lever an unauthenticated peer can pull.
     async fn proves_password(&self, scope: u32, account: u64, action: &AccountAction) -> bool {
+        if !self.accounts.has_password(scope, account) {
+            return true;
+        }
         let accounts = self.accounts.clone();
         let given = action.current_password.clone();
         tokio::task::spawn_blocking(move || accounts.password_matches(scope, account, &given))
@@ -195,6 +232,33 @@ impl UserdataService {
         };
         self.applied(inbound, account, action.kind, "password", request)
             .await
+    }
+
+    /// Back to certificate-only login.
+    ///
+    /// Gated on the connection's certificate being the account's, and that gate
+    /// is the whole point: an account with neither a password nor a matching
+    /// certificate cannot be logged into by anyone, its owner included, and no
+    /// self-service path can put it back.
+    async fn clear_password(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        action: &AccountAction,
+    ) -> AccountAck {
+        if !self.cert_matches(inbound, account).await {
+            return refuse(
+                action.kind,
+                "connect with the certificate this account is bound to first",
+            );
+        }
+        match self.accounts.clear_password(inbound.scope, account).await {
+            Ok(()) => {
+                self.record_change(inbound, account, "password");
+                ok(action.kind)
+            }
+            Err(why) => refuse(action.kind, &why),
+        }
     }
 
     async fn set_email(
@@ -286,10 +350,16 @@ impl UserdataService {
                     },
                 );
             }
+            let name = self
+                .accounts
+                .by_id(inbound.scope, account)
+                .map(|stored| stored.name)
+                .unwrap_or_default();
             return AccountAck {
                 kind: action.kind,
                 ok: true,
                 detail: "scan this, then send the code it shows".to_owned(),
+                totp_uri: otpauth_uri(&self.issuer(inbound.scope), &name, &shown),
                 totp_secret: shown,
             };
         }
@@ -364,13 +434,80 @@ impl UserdataService {
 
     /// The account behind a session, or `None` for a guest.
     async fn account_of(&self, scope: u32, session: u32) -> Option<u64> {
+        self.view_of(scope, session).await.and_then(|other| {
+            starling_proto_fancy::identity::account(other.registered, other.account)
+        })
+    }
+
+    /// The session-view's record of one session.
+    ///
+    /// Named for the view rather than the session because `directory` next door
+    /// already owns `session_of`, which asks the mirror image: given an account,
+    /// which session is it on.
+    async fn view_of(
+        &self,
+        scope: u32,
+        session: u32,
+    ) -> Option<starling_proto_fancy::sessionview::Session> {
         self.sessions(scope)
             .await
-            .iter()
+            .into_iter()
             .find(|other| other.session == session)
-            .and_then(|other| {
-                starling_proto_fancy::identity::account(other.registered, other.account)
-            })
+    }
+
+    /// Whether this connection holds the certificate the account is bound to.
+    ///
+    /// An account with no certificate on file answers `false`: there is nothing
+    /// for the connection to match, and treating "neither has one" as a match
+    /// is how the password comes off an account that then admits nobody.
+    async fn cert_matches(&self, inbound: &Inbound, account: u64) -> bool {
+        let Some(stored) = self.accounts.by_id(inbound.scope, account) else {
+            return false;
+        };
+        if stored.cert_hash.is_empty() {
+            return false;
+        }
+        self.view_of(inbound.scope, inbound.session)
+            .await
+            .is_some_and(|other| other.cert_hash == stored.cert_hash)
+    }
+
+    /// Everything the owner's own client shows about their account.
+    ///
+    /// Nothing secret is on it, by construction: the password is a hash this
+    /// never reads, and the TOTP secret is sent once, in the ack that hands it
+    /// out. What is here is what a client needs to decide which controls to
+    /// offer - clearing the password needs `cert_matches_session`, and enabling
+    /// a second factor needs to know there is not one already.
+    async fn account_state(&self, inbound: &Inbound, account: u64) -> AccountState {
+        let Some(stored) = self.accounts.by_id(inbound.scope, account) else {
+            // Registered a moment ago and gone now: an UNREGISTER that worked.
+            return AccountState::default();
+        };
+        AccountState {
+            registered: true,
+            id: stored.id,
+            name: stored.name,
+            email: stored.email,
+            has_password: self.accounts.has_password(inbound.scope, account),
+            totp_enabled: self.accounts.totp_enabled(inbound.scope, account),
+            cert_matches_session: self.cert_matches(inbound, account).await,
+            cert_hash: stored.cert_hash,
+        }
+    }
+
+    /// What an authenticator app should call this server.
+    ///
+    /// The directory name where the operator set one - it is the only name this
+    /// server has for itself - and the protocol's own name where they did not,
+    /// because a blank issuer makes every server one entry in the app's list.
+    fn issuer(&self, scope: u32) -> String {
+        let listed = self.settings.get(scope).registry_name;
+        if listed.is_empty() {
+            "Mumble".to_owned()
+        } else {
+            listed
+        }
     }
 
     /// This account's stored settings, as a delivery.
@@ -434,6 +571,22 @@ impl UserdataService {
         )
     }
 
+    /// Wrap an account snapshot for the connection that asked.
+    fn state_reply(
+        &self,
+        inbound: &Inbound,
+        state: AccountState,
+    ) -> starling_proto_fancy::control::ServerAction {
+        to_conn(
+            inbound.conn,
+            outer_type(),
+            UserdataEnvelope {
+                body: Some(userdata_envelope::Body::Account(state)),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     /// Put the change in the operator's record.
     ///
     /// Every one of these is somebody's account changing, which is precisely
@@ -463,6 +616,7 @@ fn refuse(kind: i32, detail: &str) -> AccountAck {
         ok: false,
         detail: detail.to_owned(),
         totp_secret: String::new(),
+        totp_uri: String::new(),
     }
 }
 
@@ -472,7 +626,39 @@ const fn ok(kind: i32) -> AccountAck {
         ok: true,
         detail: String::new(),
         totp_secret: String::new(),
+        totp_uri: String::new(),
     }
+}
+
+/// The enrolment as an `otpauth://` URI, which is what a QR code encodes.
+///
+/// Built here rather than left to the client because the issuer is the server's
+/// name for itself, and a client that invents one puts a different label in
+/// every user's authenticator for the same server.
+fn otpauth_uri(issuer: &str, account: &str, secret: &str) -> String {
+    format!(
+        "otpauth://totp/{}:{}?secret={secret}&issuer={}",
+        percent_encode(issuer),
+        percent_encode(account),
+        percent_encode(issuer),
+    )
+}
+
+/// Percent-encode everything an `otpauth` label or issuer may not carry raw.
+///
+/// A server name is operator-set free text, so it arrives with spaces, colons
+/// and `&` in it; each of those ends a field early and silently enrols the user
+/// against a truncated label.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// The server instance, in the shape every request carries it.
@@ -581,6 +767,88 @@ mod tests {
                 .accounts
                 .password_matches(1, account, "correct horse"),
             "the password must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_answers_for_itself() {
+        // The question the client's account page asks on open. Until this
+        // existed the page had no way to be told anything and sat loading.
+        let (service, account) = service().await;
+        let state = service.account_state(&inbound(), account).await;
+        assert!(state.registered);
+        assert_eq!(state.name, "ada");
+        assert!(state.has_password);
+        assert!(!state.totp_enabled);
+        // No session-view behind this service, so no certificate can match; the
+        // page reads that as "clearing the password is not offered".
+        assert!(!state.cert_matches_session);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_account_says_it_is_gone() {
+        // The one state a client cannot derive from a successful ack: after an
+        // UNREGISTER there is nothing left to describe, and a page that assumed
+        // otherwise would go on offering to rename it.
+        let (service, account) = service().await;
+        assert!(
+            service
+                .act(
+                    &inbound(),
+                    account,
+                    action(account_action::Kind::Unregister, "correct horse"),
+                )
+                .await
+                .ok
+        );
+        assert!(!service.account_state(&inbound(), account).await.registered);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_only_account_can_give_itself_a_password() {
+        // It has no password to prove, so demanding one refused the only route
+        // it has to acquiring one - the account could never be secured at all.
+        let (service, account) = service().await;
+        service
+            .accounts
+            .clear_password(1, account)
+            .await
+            .expect("cleared");
+
+        let mut request = action(account_action::Kind::SetPassword, "");
+        request.value = "hunter2".to_owned();
+        assert!(service.act(&inbound(), account, request).await.ok);
+        assert!(service.accounts.password_matches(1, account, "hunter2"));
+    }
+
+    #[tokio::test]
+    async fn the_password_does_not_come_off_without_the_certificate() {
+        // Otherwise the account has neither, and nobody - the owner included -
+        // can log into it again.
+        let (service, account) = service().await;
+        let ack = service
+            .act(
+                &inbound(),
+                account,
+                action(account_action::Kind::ClearPassword, "correct horse"),
+            )
+            .await;
+        assert!(!ack.ok);
+        assert!(
+            service
+                .accounts
+                .password_matches(1, account, "correct horse")
+        );
+    }
+
+    #[test]
+    fn an_enrolment_uri_survives_a_server_name_with_punctuation_in_it() {
+        // Operator-set free text: a raw space or `&` ends the field early and
+        // enrols the user against a truncated label.
+        let uri = otpauth_uri("Ada & Co", "ada", "JBSWY3DP");
+        assert_eq!(
+            uri,
+            "otpauth://totp/Ada%20%26%20Co:ada?secret=JBSWY3DP&issuer=Ada%20%26%20Co"
         );
     }
 

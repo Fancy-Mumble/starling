@@ -776,6 +776,52 @@ impl Accounts {
         Ok(())
     }
 
+    /// Whether a password may be used to log in as this account.
+    ///
+    /// Not the same question as [`Accounts::password_matches`] with an empty
+    /// string, which is `false` for every account: this one is what the owner's
+    /// own client shows them, and "no password, reached by certificate" is a
+    /// state they are allowed to be in and to see.
+    #[must_use]
+    pub fn has_password(&self, scope: u32, id: u64) -> bool {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(&(scope, id))
+                    .map(|record| record.password.is_some())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Take the password off, back to certificate-only login.
+    ///
+    /// Its own method for the reason [`Accounts::set_totp`] is: `update`'s
+    /// `"password"` arm always *sets* one, so asking it for this would store the
+    /// empty string as a password, which is a password every guess matches.
+    ///
+    /// # Errors
+    ///
+    /// A message when there is no such account.
+    pub async fn clear_password(&self, scope: u32, id: u64) -> Result<(), String> {
+        let Some(mut record) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, id)).cloned())
+        else {
+            return Err("no such account".to_owned());
+        };
+        record.password = None;
+        record.account.last_active_ms = now_ms();
+        self.write(scope, &record).await;
+        if let Ok(mut cache) = self.cache.lock() {
+            let _ = cache.insert((scope, id), record);
+        }
+        Ok(())
+    }
+
     /// Whether this server instance's SuperUser has a password set.
     ///
     /// For the operator surface, which should be able to say "the administrator
