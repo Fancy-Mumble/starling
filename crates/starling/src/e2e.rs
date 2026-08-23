@@ -1186,6 +1186,141 @@ async fn handshake_epoch1(client: &mut Client, username: &str) -> (u32, Option<u
     (session, client.announced_fancy_version)
 }
 
+/// An admin changing the livery over the connection they already have.
+///
+/// The whole point of the client-channel path: no operator token is typed,
+/// no second surface is exposed, and the identity is the session the frame
+/// arrived on. This proves the authorised half; the refusal is next door.
+#[tokio::test]
+async fn an_admin_changes_the_livery_over_the_connection_they_already_have() {
+    use starling_proto_fancy::fancy::domain::{
+        LiveryDoc, LiveryQuery, LiveryUpdate, ServerConfigEnvelope, server_config_envelope,
+    };
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+    use starling_proto_fancy::types::ServiceKind;
+
+    let data_dir = TempDir::new("livery-write");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // Livery is a property of the server, so the permission is `Write` on the
+    // root channel - murmur's rule for every administrative write.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let session = handshake(&mut alice, "alice").await;
+    deployment.wait_until_permitted(session, 0, Perm::WRITE.bits()).await;
+
+    let outer = ServiceKind::ServerConfig.outer_type();
+    alice
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryUpdate(LiveryUpdate {
+                    fields: vec!["tagline".to_owned(), "display_name".to_owned()],
+                    values: Some(LiveryDoc {
+                        tagline: "cozy corner".to_owned(),
+                        display_name: "magical.rocks".to_owned(),
+                        ..Default::default()
+                    }),
+                })),
+            },
+        )
+        .await;
+
+    // Read it back the way the connect screen does, which also proves the two
+    // halves of 1013 agree about the document.
+    alice
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryQuery(LiveryQuery {
+                    have_keys: Vec::new(),
+                })),
+            },
+        )
+        .await;
+
+    let document = loop {
+        let (type_id, payload) = alice.recv().await;
+        if type_id != outer {
+            continue;
+        }
+        let envelope = ServerConfigEnvelope::decode(payload.as_slice()).expect("an envelope");
+        if let Some(server_config_envelope::Body::Livery(doc)) = envelope.body
+            && !doc.tagline.is_empty()
+        {
+            break doc;
+        }
+    };
+
+    assert_eq!(document.tagline, "cozy corner");
+    assert_eq!(document.display_name, "magical.rocks");
+    assert!(document.version >= 1, "the write did not bump the version");
+    assert!(!document.digest.is_empty(), "a livery with content has a digest");
+
+    deployment.stop();
+}
+
+/// The same write from somebody who may not make it.
+///
+/// Refused *out loud*. A write accepted and dropped shows the admin their
+/// change on screen and leaves nothing in any log, which is the failure
+/// `moderation::on_user_remove` records having shipped once.
+#[tokio::test]
+async fn a_client_without_write_is_told_the_livery_change_was_refused() {
+    use starling_proto_fancy::fancy::domain::{
+        LiveryDoc, LiveryUpdate, ServerConfigEnvelope, server_config_envelope,
+    };
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::types::ServiceKind;
+
+    let data_dir = TempDir::new("livery-refused");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // No grant: the default ACL gives `all` no Write at the root.
+    let mut mallory = Client::connect(deployment.port).await;
+    let _ = handshake(&mut mallory, "mallory").await;
+
+    mallory
+        .send(
+            ServiceKind::ServerConfig.outer_type(),
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryUpdate(LiveryUpdate {
+                    fields: vec!["tagline".to_owned()],
+                    values: Some(LiveryDoc {
+                        tagline: "not allowed".to_owned(),
+                        ..Default::default()
+                    }),
+                })),
+            },
+        )
+        .await;
+
+    // Wire type 12 is upstream's PermissionDenied.
+    let denied = loop {
+        let (type_id, payload) = mallory.recv().await;
+        if type_id == 12 {
+            break tcp::PermissionDenied::decode(payload.as_slice())
+                .expect("a well-formed PermissionDenied");
+        }
+    };
+    assert_eq!(
+        denied.permission,
+        Some(Perm::WRITE.bits()),
+        "the client has to be told which permission it lacked"
+    );
+
+    deployment.stop();
+}
+
 #[tokio::test]
 async fn a_client_on_our_epoch_is_told_which_fancy_features_exist() {
     // The gap that made every encrypted channel carry nothing. Starling

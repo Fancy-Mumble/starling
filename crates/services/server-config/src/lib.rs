@@ -36,9 +36,11 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use starling_proto_fancy::common::Scope;
+use starling_proto_fancy::common::{Actor, actor};
 use starling_proto_fancy::fancy::domain::{
     ConfigValues, LiveryDoc, ServerConfigEnvelope, livery_doc, server_config_envelope,
 };
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::serverconfig::server_config_server::{
     ServerConfig as ServerConfigRpc, ServerConfigServer,
 };
@@ -48,6 +50,7 @@ use starling_proto_fancy::serverconfig::{
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
 use starling_runtime::config::Config;
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
 };
@@ -103,6 +106,10 @@ pub(crate) const SCHEMA: &[Migration<'static>] = &[
     ),
 ];
 
+/// Livery is a property of the server, not of a room, so the permission that
+/// governs it is checked here — murmur's rule for every administrative write.
+const ROOT_CHANNEL: u32 = 0;
+
 /// The stored marker for "this row owns every field".
 ///
 /// Only ever written by the migration above, for rows that predate the column.
@@ -134,6 +141,8 @@ pub struct ServerConfigService {
     /// artwork. Held rather than taken per call because `frame` is handed an
     /// `Inbound` and no context.
     resolver: Resolver,
+    /// Answers "may this session do that", against `permissions`.
+    permit: Permit,
     store: Option<Store>,
     fanout: Fanout,
 }
@@ -248,7 +257,7 @@ impl ServerConfigService {
     /// The digest is computed here rather than by the caller so there is one
     /// place it can be wrong, and so a document that reaches a subscriber
     /// always carries the digest for the content beside it.
-    async fn publish_livery(&self, mut livery: Livery) {
+    async fn publish_livery(&self, mut livery: Livery, actor: Option<Actor>) {
         let scope = livery.instance;
         livery.digest = livery::digest(&livery);
         let _ = self.liveries.write().await.insert(scope, livery.clone());
@@ -256,6 +265,9 @@ impl ServerConfigService {
             && let Err(error) = persist_livery(store, &livery).await
         {
             tracing::error!(%error, "could not persist a livery change");
+        }
+        if let Some(actor) = &actor {
+            tracing::info!(?actor, version = livery.version, "livery changed");
         }
 
         // Connected clients repaint without reconnecting. Pushed without the
@@ -457,7 +469,7 @@ impl ServerConfigRpc for ConfigRpc {
 
         current.instance = scope;
         current.version += 1;
-        self.0.publish_livery(current.clone()).await;
+        self.0.publish_livery(current.clone(), req.actor).await;
         Ok(Response::new(self.0.livery(scope).await))
     }
 
@@ -527,15 +539,71 @@ impl ClientService for ServerConfigService {
                 };
                 vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
             }
-            // An update from a client is refused rather than half-applied:
-            // changing operational settings is an operator action, and the
-            // operator plane carries an identity this one does not.
+            Some(server_config_envelope::Body::LiveryUpdate(update)) => {
+                self.on_livery_update(&inbound, update).await
+            }
+            // A *settings* update from a client is still refused. Nothing has
+            // asked for one, and unlike livery the person sending it is not
+            // looking at the thing they are changing.
             _ => Actions::new(),
         }
     }
 }
 
 impl ServerConfigService {
+    /// An admin changing the livery from a connected client.
+    ///
+    /// Authorised as murmur authorises every other administrative write:
+    /// `Write` on the **root** channel, because livery is a property of the
+    /// server rather than of a room. The identity is the session the frame
+    /// arrived on, which the handshake established and a client cannot assert.
+    ///
+    /// Refused loudly. An unauthorised write that is accepted and dropped shows
+    /// the admin their change on screen and nothing in any log, which is the
+    /// failure `moderation::on_user_remove` records having shipped once.
+    async fn on_livery_update(
+        &self,
+        inbound: &Inbound,
+        update: starling_proto_fancy::fancy::domain::LiveryUpdate,
+    ) -> Actions {
+        if !self
+            .permit
+            .allows(inbound, ROOT_CHANNEL, Perm::WRITE.bits())
+            .await
+        {
+            tracing::info!(session = inbound.session, "livery write refused");
+            return vec![permission_denied(inbound, Perm::WRITE, ROOT_CHANNEL)];
+        }
+
+        let Some(values) = update.values else {
+            return Actions::new();
+        };
+        let mut current = self.livery(inbound.scope).await;
+        let wire = from_doc(&values);
+        if let Err(error) = livery::apply_fields(&mut current, &wire, &update.fields) {
+            tracing::info!(session = inbound.session, %error, "livery write names no such field");
+            return Actions::new();
+        }
+        if let Err(error) = livery::validate(&current) {
+            tracing::info!(session = inbound.session, %error, "livery write refused as invalid");
+            return Actions::new();
+        }
+
+        current.instance = inbound.scope;
+        current.version += 1;
+        // Attributed to the session, which `audit` resolves to an account. The
+        // operator API's own file records what *operators* did; this is the
+        // other half, and a change made from a client belongs in it.
+        self.publish_livery(
+            current,
+            Some(Actor {
+                who: Some(actor::Who::Session(inbound.session)),
+            }),
+        )
+        .await;
+        Actions::new()
+    }
+
     /// The wire shape of `livery`, carrying the art the caller lacks.
     ///
     /// `have_keys` is what the client already holds, so an operator editing a
@@ -617,6 +685,45 @@ impl ServerConfigService {
     }
 }
 
+/// The mesh shape of a document that arrived on the wire.
+///
+/// The mirror of `livery_doc`, and the two planes stay separate types for the
+/// reason `PROTOCOL-REDESIGN` §7 gives: neither imports the other's common.
+fn from_doc(doc: &LiveryDoc) -> Livery {
+    use starling_proto_fancy::serverconfig::livery;
+
+    let palette = |entry: Option<&livery_doc::Palette>| {
+        entry.map(|entry| livery::Palette {
+            accent: entry.accent.clone(),
+            surface: entry.surface.clone(),
+            aura_from: entry.aura_from.clone(),
+            aura_to: entry.aura_to.clone(),
+        })
+    };
+    Livery {
+        display_name: doc.display_name.clone(),
+        tagline: doc.tagline.clone(),
+        motd: doc.motd.clone(),
+        tags: doc
+            .tags
+            .iter()
+            .map(|tag| livery::Tag {
+                label: tag.label.clone(),
+                tone: tag.tone,
+                href: tag.href.clone(),
+            })
+            .collect(),
+        rules_url: doc.rules_url.clone(),
+        banner_key: doc.banner_key.clone(),
+        icon_key: doc.icon_key.clone(),
+        banner_focus_x: doc.banner_focus_x,
+        banner_focus_y: doc.banner_focus_y,
+        dark: palette(doc.dark.as_ref()),
+        light: palette(doc.light.as_ref()),
+        ..Default::default()
+    }
+}
+
 /// The image type these bytes actually are.
 fn sniff(bytes: &[u8]) -> &'static str {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -693,6 +800,7 @@ impl Serve for ServerConfigService {
             liveries: RwLock::new(liveries),
             livery_updates,
             resolver: ctx.resolver.clone(),
+            permit: Permit::new(ctx.resolver.clone()),
             store,
             fanout: Fanout::default(),
         }))
@@ -786,6 +894,13 @@ mod tests {
     use super::*;
 
     fn service() -> Arc<ServerConfigService> {
+        // A resolver that reaches nothing: these tests exercise storage and the
+        // merge, and a permission check with no `permissions` service behind it
+        // denies, which is what the refusal test wants anyway.
+        let resolver = Resolver::new(
+            Arc::new(Config::with_defaults(std::path::Path::new("/run/starling"))),
+            starling_runtime::inproc::Broker::new(),
+        );
         let (updates, _) = broadcast::channel(8);
         let (livery_updates, _) = broadcast::channel(8);
         Arc::new(ServerConfigService {
@@ -794,10 +909,8 @@ mod tests {
             updates,
             liveries: RwLock::new(HashMap::new()),
             livery_updates,
-            resolver: Resolver::new(
-                Arc::new(Config::with_defaults(std::path::Path::new("/run/starling"))),
-                starling_runtime::inproc::Broker::new(),
-            ),
+            resolver: resolver.clone(),
+            permit: Permit::new(resolver),
             store: None,
             fanout: Fanout::default(),
         })
@@ -840,11 +953,14 @@ mod tests {
     async fn a_client_asking_for_the_livery_is_sent_the_document() {
         let service = service();
         service
-            .publish_livery(Livery {
-                instance: 1,
-                tagline: "cozy corner".to_owned(),
-                ..Default::default()
-            })
+            .publish_livery(
+                Livery {
+                    instance: 1,
+                    tagline: "cozy corner".to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
             .await;
 
         let doc = livery_reply(&service.frame(livery_query(&[])).await);
@@ -871,16 +987,125 @@ mod tests {
         // operator editing a motto must not cost the banner a second time.
         let service = service();
         service
-            .publish_livery(Livery {
-                instance: 1,
-                banner_key: "aa".repeat(20),
-                ..Default::default()
-            })
+            .publish_livery(
+                Livery {
+                    instance: 1,
+                    banner_key: "aa".repeat(20),
+                    ..Default::default()
+                },
+                None,
+            )
             .await;
 
         let held = livery_reply(&service.frame(livery_query(&["aa".repeat(20).as_str()])).await);
         assert!(held.art.is_empty());
         assert_eq!(held.banner_key, "aa".repeat(20));
+    }
+
+    /// A livery write as it arrives from a connected admin.
+    fn livery_update(fields: &[&str], values: LiveryDoc) -> Inbound {
+        Inbound {
+            gateway: "test".to_owned(),
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: ServiceKind::ServerConfig.outer_type(),
+            payload: ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryUpdate(
+                    starling_proto_fancy::fancy::domain::LiveryUpdate {
+                        fields: fields.iter().map(|f| (*f).to_owned()).collect(),
+                        values: Some(values),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_write_without_the_permission_is_refused_out_loud() {
+        // The service under test reaches no `permissions`, so the check denies.
+        // What matters is that the answer is a PermissionDenied and not silence:
+        // a write accepted and dropped shows the admin their change on screen
+        // and leaves nothing in any log.
+        let service = service();
+        let actions = service
+            .frame(livery_update(
+                &["tagline"],
+                LiveryDoc {
+                    tagline: "not allowed".to_owned(),
+                    ..Default::default()
+                },
+            ))
+            .await;
+
+        assert_eq!(actions.len(), 1, "a refusal has to be sent");
+        assert_eq!(service.livery(1).await.tagline, "", "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn a_settings_update_from_a_client_is_still_ignored() {
+        // Livery moved to the client channel; the settings half did not, and
+        // this is what keeps the two from drifting into one rule.
+        let service = service();
+        let inbound = Inbound {
+            gateway: "test".to_owned(),
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: ServiceKind::ServerConfig.outer_type(),
+            payload: ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::Update(
+                    starling_proto_fancy::fancy::domain::ConfigUpdate::default(),
+                )),
+            }
+            .encode_to_vec(),
+        };
+        assert!(service.frame(inbound).await.is_empty());
+    }
+
+    #[test]
+    fn a_wire_document_converts_to_the_mesh_one_field_for_field() {
+        // The two planes keep separate types, so this is the seam where a
+        // forgotten field would silently stop being writable from a client.
+        let doc = LiveryDoc {
+            display_name: "magical.rocks".to_owned(),
+            tagline: "cozy".to_owned(),
+            motd: "movie night".to_owned(),
+            rules_url: "https://x/rules".to_owned(),
+            banner_key: "aa".to_owned(),
+            icon_key: "bb".to_owned(),
+            banner_focus_x: 40,
+            banner_focus_y: 35,
+            tags: vec![livery_doc::Tag {
+                label: "Rules".to_owned(),
+                tone: 4,
+                href: "https://x".to_owned(),
+            }],
+            dark: Some(livery_doc::Palette {
+                accent: "#8a90ff".to_owned(),
+                surface: "#151d38".to_owned(),
+                aura_from: "#7d82ff".to_owned(),
+                aura_to: "#41b4f9".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mesh = from_doc(&doc);
+        assert_eq!(mesh.display_name, "magical.rocks");
+        assert_eq!(mesh.tagline, "cozy");
+        assert_eq!(mesh.motd, "movie night");
+        assert_eq!(mesh.rules_url, "https://x/rules");
+        assert_eq!(mesh.banner_key, "aa");
+        assert_eq!(mesh.icon_key, "bb");
+        assert_eq!(mesh.banner_focus_x, 40);
+        assert_eq!(mesh.banner_focus_y, 35);
+        assert_eq!(mesh.tags.len(), 1);
+        assert_eq!(mesh.tags[0].tone, 4);
+        assert_eq!(mesh.dark.as_ref().unwrap().aura_to, "#41b4f9");
+        // Never carried in from the wire: they are the server's own.
+        assert_eq!(mesh.version, 0);
+        assert!(mesh.digest.is_empty());
+
     }
 
     #[test]
