@@ -1936,7 +1936,7 @@ impl Serve for MetadataService {
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         ctx.health.gate("tree loaded");
-        let trees = Trees::new(&ctx.instances(), &root_name(&ctx));
+        let trees = Trees::new(&root_names(&ctx));
         let mut store = None;
         if let Ok(opened) = ctx.storage().await {
             opened.migrate(SCHEMA).await?;
@@ -2003,11 +2003,17 @@ impl Serve for MetadataService {
 }
 
 /// The root channel's name is the server's name, as it is in murmur.
-fn root_name(ctx: &ServiceContext) -> String {
+fn root_names(ctx: &ServiceContext) -> Vec<(u32, String)> {
+    if ctx.config.instances.is_empty() {
+        // The same single unnamed instance `ServiceContext::instances` invents,
+        // so the boot tree has a root for the scope everything else assumes.
+        return vec![(1, "Starling".to_owned())];
+    }
     ctx.config
         .instances
-        .first()
-        .map_or_else(|| "Starling".to_owned(), |server| server.name.clone())
+        .iter()
+        .map(|server| (server.id, server.name.clone()))
+        .collect()
 }
 
 /// The scope a request names, defaulting to the first server instance.
@@ -2056,7 +2062,7 @@ mod tests {
         );
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         MetadataService {
-            trees: Trees::new(&[1], "Starling"),
+            trees: Trees::new(&[(1, "Starling".to_owned())]),
             events,
             fanout: Fanout::default(),
             logger: Logger::null(),
@@ -2208,7 +2214,7 @@ mod tests {
         // Through `load`, not through a `SELECT`: what an operator notices
         // about a bad upgrade is a server that comes up with an empty tree, so
         // the assertion is the one the boot path makes.
-        let trees = Trees::new(&[1], "Starling");
+        let trees = Trees::new(&[(1, "Starling".to_owned())]);
         trees.load(&store).await;
         assert!(
             trees.exists(1, 7),

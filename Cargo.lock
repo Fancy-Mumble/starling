@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "starling-metadata"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "serde",

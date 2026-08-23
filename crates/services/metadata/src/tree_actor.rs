@@ -13,6 +13,7 @@ use starling_runtime::ids::now_ms;
 use starling_runtime::storage::Store;
 
 use crate::channel::is_full_for;
+use crate::ids::ROOT_CHANNEL;
 
 pub use starling_proto_fancy::channel::{
     FLAG_DETACHED, FLAG_HIDDEN, FLAG_STRUCTURAL, FLAG_TEMPORARY, is_detached,
@@ -201,6 +202,12 @@ pub struct Trees {
 struct TreeState {
     version: u64,
     next_id: u32,
+    /// What this instance's root channel is called, from configuration.
+    ///
+    /// Held apart from the channel itself because it outranks whatever the
+    /// store has: see [`Trees::load`]. Empty only for a scope configuration
+    /// never named, which is the one case the stored name is all there is.
+    root_name: String,
     channels: HashMap<u32, Channel>,
     members: HashMap<u32, Membership>,
     /// When a channel last saw somebody arrive or leave.
@@ -214,22 +221,33 @@ struct TreeState {
 }
 
 impl Trees {
-    /// One tree per server instance, each with a root channel named `root_name`.
+    /// One tree per server instance, each root channel named after its server.
+    ///
+    /// Named per instance rather than once for the deployment because the root
+    /// channel *is* the server as far as a client's tree is concerned, and two
+    /// instances sharing one process are two servers.
+    ///
+    /// A server configured with no name falls back to `"Root"`, which is what
+    /// murmur shows for the same case
+    /// (`vendor/server/src/murmur/Messages.cpp:287`); an empty root channel is
+    /// worse than a dull one.
     #[must_use]
-    pub fn new(scopes: &[u32], root_name: &str) -> Self {
+    pub fn new(roots: &[(u32, String)]) -> Self {
         let mut inner = HashMap::new();
-        for scope in scopes {
+        for (scope, name) in roots {
+            let name = if name.is_empty() { "Root" } else { name };
             let mut state = TreeState {
                 version: 1,
                 next_id: 1,
+                root_name: name.to_owned(),
                 ..TreeState::default()
             };
             let _ = state.channels.insert(
-                0,
+                ROOT_CHANNEL.0,
                 Channel {
-                    id: 0,
+                    id: ROOT_CHANNEL.0,
                     parent: None,
-                    name: root_name.to_owned(),
+                    name: name.to_owned(),
                     created_at_ms: now_ms(),
                     ..Channel::default()
                 },
@@ -264,7 +282,7 @@ impl Trees {
             let state = inner.entry(scope as u32).or_default();
             let id: i64 = row.try_get("id").unwrap_or_default();
             let parent: Option<i64> = row.try_get("parent_id").ok().flatten();
-            let channel = Channel {
+            let mut channel = Channel {
                 id: id as u32,
                 parent: parent.map(|p| p as u32),
                 name: row.try_get("name").unwrap_or_default(),
@@ -279,6 +297,24 @@ impl Trees {
                 created_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
                 ..Channel::default()
             };
+            // The root keeps the name configuration gave it, whatever the store
+            // says. murmur reaches the same place from the other side: it holds
+            // the root as `"Root"` for ever and substitutes the server's name
+            // when it serialises the channel
+            // (`vendor/server/src/murmur/Messages.cpp:287`), so the stored name
+            // is never the one anybody sees. A murmur database imported here
+            // therefore carries a literal `"Root"` row, and taking it at face
+            // value is what left an imported server calling its root "Root"
+            // while murmur had been calling it by the server's name all along.
+            //
+            // Overridden on the way in rather than on the way out because
+            // nothing else writes this table: the tree is the only copy that
+            // matters, and fixing it here fixes every reader at once - the
+            // stock `ChannelState`, the Fancy envelope, and the handshake's
+            // opening tree - instead of once per call site.
+            if channel.id == ROOT_CHANNEL.0 && !state.root_name.is_empty() {
+                channel.name = state.root_name.clone();
+            }
             state.next_id = state.next_id.max(channel.id + 1);
             let _ = state.channels.insert(channel.id, channel);
         }
@@ -1203,7 +1239,37 @@ mod tests {
     use super::*;
 
     fn trees() -> Trees {
-        Trees::new(&[1], "Starling")
+        Trees::new(&[(1, "Starling".to_owned())])
+    }
+
+    #[test]
+    fn each_instance_names_its_root_after_its_own_server() {
+        // One name for the whole deployment would have called instance 2's root
+        // after instance 1: two instances in one process are two servers, and
+        // the root channel is how each of them introduces itself.
+        let trees = Trees::new(&[(1, "First".to_owned()), (2, "Second".to_owned())]);
+        assert_eq!(root_of(&trees, 1), "First");
+        assert_eq!(root_of(&trees, 2), "Second");
+    }
+
+    #[test]
+    fn a_server_with_no_name_falls_back_to_root() {
+        // What murmur shows for an unset `registername`
+        // (`vendor/server/src/murmur/Messages.cpp:287`). An empty root channel
+        // renders as a blank line in the client's tree.
+        let trees = Trees::new(&[(1, String::new())]);
+        assert_eq!(root_of(&trees, 1), "Root");
+    }
+
+    /// The name the root channel of `scope` is presenting.
+    fn root_of(trees: &Trees, scope: u32) -> String {
+        trees
+            .snapshot(scope)
+            .channels
+            .iter()
+            .find(|channel| channel.id == 0)
+            .map(|channel| channel.name.clone())
+            .unwrap_or_default()
     }
 
     fn named(name: &str, parent: u32) -> Option<Channel> {

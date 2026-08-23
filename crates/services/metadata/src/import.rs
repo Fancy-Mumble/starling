@@ -279,11 +279,51 @@ mod tests {
         assert_eq!(written.channels, 2);
         assert_eq!(written.links, 2);
 
-        let trees = Trees::new(&[1], "Root");
+        let trees = Trees::new(&[(1, "Root".to_owned())]);
         trees.load(&store).await;
         assert!(
             trees.exists(1, 1),
             "the imported channel is not in the tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_root_is_called_after_the_server_not_root() {
+        // murmur stores the root channel as the literal "Root" for ever and
+        // swaps in the server's name only as it serialises the channel
+        // (`vendor/server/src/murmur/Messages.cpp:287`), so every murmur
+        // database imported here carries a "Root" row that nobody using murmur
+        // had ever seen. Taking that row at face value is what made an imported
+        // server introduce itself as "Root" when murmur had been calling it by
+        // the server's name all along.
+        let store = store().await;
+        let tree = Tree {
+            channels: vec![channel(0, None, "Root"), channel(1, Some(0), "Lobby")],
+            ..Tree::default()
+        };
+        let _ = import(&store, 1, &tree).await.expect("import");
+
+        let trees = Trees::new(&[(1, "Sebastian's server".to_owned())]);
+        trees.load(&store).await;
+        assert_eq!(
+            trees
+                .snapshot(1)
+                .channels
+                .iter()
+                .find(|c| c.id == 0)
+                .map(|c| c.name.as_str()),
+            Some("Sebastian's server"),
+            "the configured server name, not the stored \"Root\""
+        );
+        assert_eq!(
+            trees
+                .snapshot(1)
+                .channels
+                .iter()
+                .find(|c| c.id == 1)
+                .map(|c| c.name.as_str()),
+            Some("Lobby"),
+            "every other channel still keeps the name it was imported with"
         );
     }
 
