@@ -2,11 +2,11 @@
 //!
 //! Minted for a session that has already proven, over the control channel,
 //! that it holds the permission [`starling_runtime::operator_scope`] requires
-//! for the scopes it asked for -- see [`super::on_ticket_request`]. Verified
-//! from a different process a request away: `operator-api` calls
-//! `VerifyTicket` when its own configured authenticator does not recognise a
-//! bearer, so this store is the only place that needs to agree with itself
-//! about what a ticket token means.
+//! for the scopes it asked for -- see
+//! `ServerConfigService::on_ticket_request`. Verified from a different process
+//! a request away: `operator-api` calls `VerifyTicket` when its own configured
+//! authenticator does not recognise a bearer, so this store is the only place
+//! that needs to agree with itself about what a ticket token means.
 //!
 //! Not persisted, and not shared across a fleet of `server-config` replicas:
 //! a restart, or a second pod a load balancer happened to route the upload
