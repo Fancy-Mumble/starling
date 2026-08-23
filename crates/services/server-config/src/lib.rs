@@ -37,7 +37,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::fancy::domain::{
-    ConfigValues, ServerConfigEnvelope, server_config_envelope,
+    ConfigValues, LiveryDoc, ServerConfigEnvelope, livery_doc, server_config_envelope,
 };
 use starling_proto_fancy::serverconfig::server_config_server::{
     ServerConfig as ServerConfigRpc, ServerConfigServer,
@@ -46,8 +46,11 @@ use starling_proto_fancy::serverconfig::{
     GetRequest, Livery, SetLiveryRequest, SetRequest, Snapshot,
 };
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::channel::Resolver;
 use starling_runtime::config::Config;
-use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
+use starling_runtime::plane::{
+    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
+};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use tokio::sync::{RwLock, broadcast};
@@ -127,6 +130,10 @@ pub struct ServerConfigService {
     /// field-wise merge does not understand.
     liveries: RwLock<HashMap<u32, Livery>>,
     livery_updates: broadcast::Sender<Livery>,
+    /// Reaches `userdata`, whose content-addressed blob store holds the livery
+    /// artwork. Held rather than taken per call because `frame` is handed an
+    /// `Inbound` and no context.
+    resolver: Resolver,
     store: Option<Store>,
     fanout: Fanout,
 }
@@ -250,6 +257,25 @@ impl ServerConfigService {
         {
             tracing::error!(%error, "could not persist a livery change");
         }
+
+        // Connected clients repaint without reconnecting. Pushed without the
+        // artwork: most edits change a word, and a client that finds a key it
+        // does not hold asks for that one image rather than being sent both on
+        // every change.
+        let doc = self.livery_doc(&livery, &[]).await;
+        let envelope = ServerConfigEnvelope {
+            body: Some(server_config_envelope::Body::Livery(LiveryDoc {
+                art: Vec::new(),
+                ..doc
+            })),
+        };
+        // Session 0 is nobody, which is this codebase's "everyone".
+        self.fanout.push(broadcast_except(
+            0,
+            ServiceKind::ServerConfig.outer_type(),
+            envelope.encode_to_vec(),
+        ));
+
         let _ = self.livery_updates.send(livery);
     }
 }
@@ -493,12 +519,131 @@ impl ClientService for ServerConfigService {
                 };
                 vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
             }
+            Some(server_config_envelope::Body::LiveryQuery(query)) => {
+                let livery = self.livery(inbound.scope).await;
+                let doc = self.livery_doc(&livery, &query.have_keys).await;
+                let reply = ServerConfigEnvelope {
+                    body: Some(server_config_envelope::Body::Livery(doc)),
+                };
+                vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+            }
             // An update from a client is refused rather than half-applied:
             // changing operational settings is an operator action, and the
             // operator plane carries an identity this one does not.
             _ => Actions::new(),
         }
     }
+}
+
+impl ServerConfigService {
+    /// The wire shape of `livery`, carrying the art the caller lacks.
+    ///
+    /// `have_keys` is what the client already holds, so an operator editing a
+    /// motto sends a few hundred bytes rather than the banner again. That is the
+    /// whole reason the document carries content keys rather than bytes.
+    async fn livery_doc(&self, livery: &Livery, have_keys: &[String]) -> LiveryDoc {
+        let palette = |palette: Option<&starling_proto_fancy::serverconfig::livery::Palette>| {
+            palette.map(|palette| livery_doc::Palette {
+                accent: palette.accent.clone(),
+                surface: palette.surface.clone(),
+                aura_from: palette.aura_from.clone(),
+                aura_to: palette.aura_to.clone(),
+            })
+        };
+
+        let mut art = Vec::new();
+        for key in [&livery.banner_key, &livery.icon_key] {
+            if key.is_empty() || have_keys.iter().any(|held| held == key) {
+                continue;
+            }
+            if let Some(bytes) = self.blob(key).await {
+                art.push(livery_doc::Art {
+                    // Sniffed from the bytes rather than stored alongside them:
+                    // it is the same test the client's decoder will apply, and
+                    // a claim the bytes do not support is somebody else's bug.
+                    content_type: sniff(&bytes).to_owned(),
+                    key: key.clone(),
+                    bytes,
+                });
+            }
+        }
+
+        LiveryDoc {
+            version: livery.version,
+            digest: livery.digest.clone(),
+            display_name: livery.display_name.clone(),
+            tagline: livery.tagline.clone(),
+            motd: livery.motd.clone(),
+            tags: livery
+                .tags
+                .iter()
+                .map(|tag| livery_doc::Tag {
+                    label: tag.label.clone(),
+                    tone: tag.tone,
+                    href: tag.href.clone(),
+                })
+                .collect(),
+            rules_url: livery.rules_url.clone(),
+            banner_key: livery.banner_key.clone(),
+            icon_key: livery.icon_key.clone(),
+            banner_focus_x: livery.banner_focus_x,
+            banner_focus_y: livery.banner_focus_y,
+            dark: palette(livery.dark.as_ref()),
+            light: palette(livery.light.as_ref()),
+            art,
+        }
+    }
+
+    /// Livery artwork by its content key, from `userdata`'s blob store.
+    ///
+    /// `None` when the store cannot be reached or the key is not there. A
+    /// missing image is a connect screen without a banner, which is a rung of
+    /// the ladder rather than a failure, so nothing here refuses the document.
+    async fn blob(&self, key: &str) -> Option<Vec<u8>> {
+        use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+
+        let hash = unhex(key)?;
+        let channel = self.resolver.channel("userdata").ok()?;
+        let bytes = UserDataClient::new(channel)
+            .get_blob(starling_proto_fancy::userdata::BlobRequest {
+                scope: None,
+                hash,
+            })
+            .await
+            .ok()?
+            .into_inner()
+            .bytes;
+        (!bytes.is_empty()).then_some(bytes)
+    }
+}
+
+/// The image type these bytes actually are.
+fn sniff(bytes: &[u8]) -> &'static str {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.starts_with(PNG) {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn unhex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    (0..bytes.len())
+        .step_by(2)
+        .map(|at| {
+            std::str::from_utf8(&bytes[at..at + 2])
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect()
 }
 
 impl Serve for ServerConfigService {
@@ -547,6 +692,7 @@ impl Serve for ServerConfigService {
             updates,
             liveries: RwLock::new(liveries),
             livery_updates,
+            resolver: ctx.resolver.clone(),
             store,
             fanout: Fanout::default(),
         }))
@@ -648,9 +794,101 @@ mod tests {
             updates,
             liveries: RwLock::new(HashMap::new()),
             livery_updates,
+            resolver: Resolver::new(
+                Arc::new(Config::with_defaults(std::path::Path::new("/run/starling"))),
+                starling_runtime::inproc::Broker::new(),
+            ),
             store: None,
             fanout: Fanout::default(),
         })
+    }
+
+    /// A livery query as it arrives from a client.
+    fn livery_query(have: &[&str]) -> Inbound {
+        Inbound {
+            gateway: "test".to_owned(),
+            conn: 1,
+            session: 1,
+            scope: 1,
+            type_id: ServiceKind::ServerConfig.outer_type(),
+            payload: ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryQuery(
+                    starling_proto_fancy::fancy::domain::LiveryQuery {
+                        have_keys: have.iter().map(|key| (*key).to_owned()).collect(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    fn livery_reply(actions: &Actions) -> LiveryDoc {
+        let action = actions.first().expect("a reply");
+        let starling_proto_fancy::control::server_action::Action::Send(send) =
+            action.action.as_ref().expect("an action")
+        else {
+            panic!("not a send");
+        };
+        let envelope = ServerConfigEnvelope::decode(send.payload.as_slice()).expect("an envelope");
+        match envelope.body {
+            Some(server_config_envelope::Body::Livery(doc)) => doc,
+            other => panic!("not a livery: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_asking_for_the_livery_is_sent_the_document() {
+        let service = service();
+        service
+            .publish_livery(Livery {
+                instance: 1,
+                tagline: "cozy corner".to_owned(),
+                ..Default::default()
+            })
+            .await;
+
+        let doc = livery_reply(&service.frame(livery_query(&[])).await);
+        assert_eq!(doc.tagline, "cozy corner");
+        // The same digest the ping carries, so a client that never saw the ping
+        // still has something to cache against.
+        assert_eq!(doc.digest, service.livery(1).await.digest);
+        assert!(!doc.digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unbranded_server_answers_rather_than_going_quiet() {
+        // Silence is indistinguishable from a server that is still thinking,
+        // and the client would hold its connect screen waiting for it.
+        let doc = livery_reply(&service().frame(livery_query(&[])).await);
+        assert_eq!(doc.version, 0);
+        assert!(doc.digest.is_empty());
+        assert!(doc.art.is_empty());
+    }
+
+    #[tokio::test]
+    async fn art_the_client_already_holds_is_not_sent_again() {
+        // The whole reason the document carries content keys and not bytes: an
+        // operator editing a motto must not cost the banner a second time.
+        let service = service();
+        service
+            .publish_livery(Livery {
+                instance: 1,
+                banner_key: "aa".repeat(20),
+                ..Default::default()
+            })
+            .await;
+
+        let held = livery_reply(&service.frame(livery_query(&["aa".repeat(20).as_str()])).await);
+        assert!(held.art.is_empty());
+        assert_eq!(held.banner_key, "aa".repeat(20));
+    }
+
+    #[test]
+    fn art_is_typed_from_its_bytes_and_never_from_a_claim() {
+        assert_eq!(sniff(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]), "image/png");
+        assert_eq!(sniff(&[0xff, 0xd8, 0xff, 0xe0]), "image/jpeg");
+        assert_eq!(sniff(b"RIFF____WEBPVP8 "), "image/webp");
+        assert_eq!(sniff(b"<html>"), "application/octet-stream");
     }
 
     /// A config whose `[instances.settings]` for server 1 is `settings`.
