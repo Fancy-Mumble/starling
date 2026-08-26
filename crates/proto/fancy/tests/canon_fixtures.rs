@@ -24,6 +24,7 @@
 //! whole value here is that a drifting codec cannot quietly re-baseline itself.
 
 use prost::Message as _;
+use starling_proto_fancy::fancy::files::{FilesEnvelope, files_envelope};
 use starling_proto_fancy::fancy::pchat::{PchatEnvelope, pchat_envelope};
 use starling_proto_fancy::fancy::social::{SocialEnvelope, social_envelope};
 use starling_proto_fancy::types::ServiceKind;
@@ -35,6 +36,7 @@ use starling_proto_fancy::types::ServiceKind;
 /// catch, and putting one in the test that guards routing would be funny.
 const SOCIAL: u16 = ServiceKind::Social.outer_type();
 const PCHAT: u16 = ServiceKind::Pchat.outer_type();
+const FILES: u16 = ServiceKind::Files.outer_type();
 
 // A test target inherits the crate's dependencies and `unused_crate_dependencies`
 // judges it on its own imports, so the three this test does not touch have to be
@@ -150,6 +152,9 @@ fn starling_reads_every_frame_the_client_writes() {
             PCHAT => PchatEnvelope::decode(&frame[HEADER..])
                 .map(|envelope| envelope.body.is_some())
                 .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name)),
+            FILES => FilesEnvelope::decode(&frame[HEADER..])
+                .map(|envelope| envelope.body.is_some())
+                .unwrap_or_else(|e| panic!("{}: Starling cannot decode it: {e}", fixture.name)),
             other => panic!(
                 "{}: outer type {other} has no service in this test; a fixture \
                  for a service nothing decodes proves nothing",
@@ -163,6 +168,33 @@ fn starling_reads_every_frame_the_client_writes() {
             fixture.name
         );
     }
+}
+
+#[test]
+fn the_upload_request_asks_for_the_file_the_client_picked() {
+    // Files have no epoch-0 form, so this frame is the canon type on both
+    // ends with nothing translating between them. That makes drift here
+    // silent in the worst way: an outer type nothing routes is skipped, and
+    // the client waits out a grant that is never coming.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("file upload"))
+        .expect("the file upload fixture");
+    let envelope = FilesEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(files_envelope::Body::Upload(upload)) = envelope.body else {
+        panic!("expected an upload request, got {:?}", envelope.body);
+    };
+    assert_eq!(upload.channel, 4);
+    assert_eq!(upload.filename, "sunset.png");
+    assert_eq!(upload.content_type, "image/png");
+    assert_eq!(
+        upload.size, 4096,
+        "the size is what the ceiling is checked against before a byte moves"
+    );
+    assert_eq!(
+        upload.request_id, "r-1",
+        "the correlation is what tells one in-flight upload from another"
+    );
 }
 
 #[test]
