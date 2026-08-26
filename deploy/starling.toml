@@ -89,13 +89,15 @@ endpoint = "http://screenshare:50051"
 
 [services.files]
 endpoint = "http://files:50051"
-# The HTTP listener uploads and downloads will use. Nothing binds it yet -- this
-# service signs URLs and does not serve them in this build -- so the port compose
-# publishes answers nothing until it does.
+# The HTTP listener uploads and downloads use. The service binds this and serves
+# the URLs it signs; leave it unset to sign for storage something else serves.
 listen = "0.0.0.0:8080"
 # What the signed URLs point at, i.e. what a client must reach, not what the
 # container binds. Set this to your public name once the stack leaves localhost.
 public_url = "http://localhost:8080"
+# How long an uploaded object is kept, in seconds. Absent or 0 keeps it until
+# somebody removes it, which is the default on purpose.
+# options = { retain_seconds = "2592000" }
 
 [services.plugins]
 endpoint = "http://plugins:50051"

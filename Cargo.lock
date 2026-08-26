@@ -3230,9 +3230,13 @@ dependencies = [
 name = "starling-files"
 version = "0.2.1"
 dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
  "hmac",
  "prost",
  "rand 0.10.2",
+ "serde",
  "sha2 0.11.0",
  "sqlx",
  "starling-proto-fancy",
@@ -3242,6 +3246,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

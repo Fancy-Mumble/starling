@@ -10,12 +10,17 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 
 subtle.workspace = true
 rand.workspace = true
+serde.workspace = true
+uuid.workspace = true
 prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true
