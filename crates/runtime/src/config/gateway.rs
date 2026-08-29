@@ -132,6 +132,21 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
                 burst: 60,
             },
         ),
+        // Bulk transfer's control plane, and the reason this bucket exists:
+        // playing a shared video asks for a download URL per span it fetches.
+        // A signed URL is reused while it lasts, but the first request for one
+        // is not the only one - a second file, a save, a URL that has aged out
+        // mid-playback - and on the shared control bucket those arrive at a
+        // player as a stream that stops partway through with "Error". Nothing
+        // in the client can retry it into existence: a throttled frame is
+        // dropped, so the grant it asked for simply never comes.
+        (
+            "files".to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(10.0),
+                burst: 30,
+            },
+        ),
         // Chat. A person typing several short messages in a row legitimately
         // emits them faster than one a second, and the burst is shared with
         // every other control message their client is sending, so a client
@@ -248,6 +263,17 @@ mod tests {
             "a server with thirty channels opens thirty queries at once"
         );
         assert!(acl.rate.as_per_second() > 1.0);
+    }
+
+    #[test]
+    fn bulk_transfer_gets_more_than_one_message_a_second() {
+        // A player fetching a video asks for a signed URL more than once a
+        // second when one ages out or a second file is opened, and a dropped
+        // ask is a stream that stops with no error the client can explain.
+        let limits = GatewayConfig::default().limits;
+        let files = limits.get("files").copied().expect("files bucket");
+        assert!(files.rate.as_per_second() > 1.0);
+        assert!(files.burst >= 20);
     }
 
     #[test]

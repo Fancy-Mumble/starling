@@ -223,6 +223,18 @@ mod tests {
     }
 
     #[test]
+    fn bulk_transfer_is_not_charged_to_the_control_bucket() {
+        // `FancyFiles`(1009) on murmur's 1/s bucket is a video that plays for a
+        // few seconds and then stops: each span the player fetches may need a
+        // signed URL, the sixth request in a burst is dropped, and a dropped
+        // frame is a grant that never arrives.
+        assert_eq!(
+            router().route(1009).map(|r| r.bucket.as_str()),
+            Some("files")
+        );
+    }
+
+    #[test]
     fn the_two_human_driven_routes_have_their_own_buckets() {
         // `TextMessage`(11) used to assert `control` here, and that was the
         // bug: a person typing eight messages lost the sixth to murmur's 1/s,

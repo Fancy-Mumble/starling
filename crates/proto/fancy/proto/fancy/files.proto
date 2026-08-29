@@ -15,7 +15,75 @@ message FilesEnvelope {
     Listing listing = 5;
     ListRequest list = 6;
     Refused refused = 7;
+    ManageRequest manage = 8;
+    ManageListing managed = 9;
+    ForgetRequest forget = 10;
   }
+}
+
+// Whose files a management listing is about.
+enum Audience {
+  // The caller's own uploads, wherever they were shared. Needs no permission
+  // beyond being the person who uploaded them.
+  AUDIENCE_MINE = 0;
+  // Every file on the server, for an operator. Needs `Write` on the root.
+  AUDIENCE_EVERYONE = 1;
+}
+
+// "My shared files", and the operator's view of the same table.
+message ManageRequest {
+  string request_id = 1;
+  Audience audience = 2;
+  uint32 limit = 3;
+}
+
+message ManagedFile {
+  string key = 1;
+  uint32 channel = 2;
+  string filename = 3;
+  string content_type = 4;
+  uint64 size = 5;
+  Visibility visibility = 6;
+  uint64 shared_at_ms = 7;
+  // `0` for a share with no lifetime.
+  uint64 expires_at_ms = 8;
+  // When it was last read, or `0` if it never has been.
+  uint64 downloaded_at_ms = 9;
+  // The link, for a share that has one.
+  string share_url = 10;
+  // Who shared it, in terms that outlive their connection. `account` is `0`
+  // for a guest, and `cert` empty for a client that presented none.
+  uint64 uploader_account = 11;
+  string uploader_name = 12;
+  bytes uploader_cert = 13;
+  // Whether that person is connected right now, so a dashboard can say so.
+  bool uploader_online = 14;
+}
+
+// What the server holds, for the header of an operator's view.
+message Storage {
+  uint64 used_bytes = 1;
+  // `0` where the operator set no ceiling.
+  uint64 max_total_bytes = 2;
+  uint64 max_upload_bytes = 3;
+  uint64 file_count = 4;
+}
+
+message ManageListing {
+  string request_id = 1;
+  repeated ManagedFile files = 2;
+  // Only filled for `AUDIENCE_EVERYONE`: a user's own files say nothing about
+  // the server's disk.
+  Storage storage = 3;
+}
+
+// Remove one stored file, rows and bytes together.
+//
+// Your own needs no permission. Anyone else's needs `ResetUserContent` on the
+// root, which is murmur's bit for removing another person's content.
+message ForgetRequest {
+  string request_id = 1;
+  string key = 2;
 }
 
 // Who may reach a shared file.

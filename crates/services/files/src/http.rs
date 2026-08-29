@@ -171,7 +171,11 @@ async fn download(
     }
     // No name: the client that signed for this download already knows what it
     // asked for, and is saving it under a name of its own.
-    serve_object(&service, &key, None, &headers).await
+    let answer = serve_object(&service, &key, None, &headers).await;
+    if answer.status().is_success() {
+        service.note_read(&key).await;
+    }
+    answer
 }
 
 /// Hand over an object's bytes, or the span of them that was asked for.
@@ -242,7 +246,7 @@ async fn serve_object(
 
     let mut out = object_headers(&content_type);
     if let Some(filename) = filename {
-        name_the_download(&mut out, filename);
+        name_the_download(&mut out, filename, &content_type);
     }
     // Said on every answer, not only on a partial one: a player asks whether
     // seeking is possible by reading this off the first response it gets.
@@ -334,7 +338,13 @@ async fn share(
     if record.password_hash.is_none() {
         // A public share is just the object, and it goes out through the same
         // path a signed download takes -- ranges, headers and all.
-        return serve_object(&service, &key, Some(&record.filename), &headers).await;
+        let answer = serve_object(&service, &key, Some(&record.filename), &headers).await;
+        let served = answer.status().is_success();
+        if served {
+            service.note_read(&key).await;
+        }
+        burn_if_spent(&service, &key, served, headers.contains_key(header::RANGE)).await;
+        return answer;
     }
 
     let Some(ticket) = query.ticket.as_deref() else {
@@ -355,14 +365,37 @@ async fn share(
     let (Some(key_bytes), Some(nonce)) = (enc_key, record.enc_nonce.as_deref()) else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "could not open the file");
     };
-    serve_sealed(
+    let answer = serve_sealed(
         &service,
         &key,
         &record.content_type,
         &record.filename,
         &key_bytes,
         nonce,
-    )
+    );
+    let served = answer.status().is_success();
+    if served {
+        service.note_read(&key).await;
+    }
+    burn_if_spent(&service, &key, served, headers.contains_key(header::RANGE)).await;
+    answer
+}
+
+/// Destroy the object this answer just handed over, where the operator asked.
+///
+/// Only a whole-object answer counts. A `Range` request is a player reading a
+/// header before it reads anything else, and treating that as "downloaded"
+/// would delete the file between the first request and the second - which is
+/// how one-shot links and media playback stop being compatible.
+///
+/// The row goes before the body finishes streaming, which is deliberate: the
+/// bytes are already open on the reader's side, and a second request arriving
+/// mid-transfer must not find the object still there.
+async fn burn_if_spent(service: &Arc<FilesService>, key: &str, served: bool, ranged: bool) {
+    if !service.burns_on_read() || !served || ranged {
+        return;
+    }
+    service.forget_object(key).await;
 }
 
 /// `POST /s/{key}` -- trade the password for a single-use ticket.
@@ -396,9 +429,20 @@ async fn authorise(
             "send the password as a bearer token",
         );
     };
+    // Checked before the hash, not after: Argon2id is the only thing standing
+    // between a guesser and the file, and it is measured in milliseconds
+    // against an attacker measured in cores.
+    if !service.attempts().allowed(&key) {
+        return refuse(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many wrong passwords; try again later",
+        );
+    }
     if !crate::crypto::verify_password(&password, hash) {
+        service.attempts().failed(&key);
         return refuse(StatusCode::FORBIDDEN, "wrong password");
     }
+    service.attempts().cleared(&key);
     let Some(salt) = record.enc_salt.as_deref() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "could not open the file");
     };
@@ -469,7 +513,7 @@ fn serve_sealed(
     if let Ok(value) = "none".parse() {
         drop(out.insert(header::ACCEPT_RANGES, value));
     }
-    name_the_download(&mut out, filename);
+    name_the_download(&mut out, filename, content_type);
     let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
     });
@@ -580,12 +624,47 @@ fn password_page() -> Response {
 /// that already knows the name it asked for, while a link is opened by a
 /// browser that would otherwise name the file after the last path segment.
 ///
-/// `attachment` rather than `inline` for everything. What is being served is
-/// somebody else's upload from an origin that also serves other people's
-/// uploads, and a browser that renders one of them in that origin is the whole
-/// problem the CSP beside this exists to prevent. Losing in-browser preview of
-/// a shared photo is the cost, and it is the right way round.
-fn name_the_download(headers: &mut HeaderMap, filename: &str) {
+/// `inline` only for [`INLINE_TYPES`], and `attachment` for everything else -
+/// a shared photo opens in the browser, a shared `.html` downloads.
+/// The types a browser may render in place rather than save.
+///
+/// An allow-list, and a short one, transcribed from the epoch-0 plugin. What
+/// is *not* on it is the point: `image/svg+xml` carries script, `text/html`
+/// obviously does, and `text/plain` is sniffed into either by browsers that
+/// have historically ignored being told not to. Everything absent is served as
+/// a download, which is inert whatever it contains.
+///
+/// Rendering somebody's upload in an origin that serves other people's uploads
+/// is what the CSP beside this exists to contain; the allow-list is the second
+/// of the two, so a gap in either is not on its own a way in.
+const INLINE_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
+    "application/pdf",
+];
+
+/// Whether a browser may render this type in place.
+fn renders_inline(content_type: &str) -> bool {
+    let primary = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    INLINE_TYPES.contains(&primary.as_str())
+}
+
+fn name_the_download(headers: &mut HeaderMap, filename: &str, content_type: &str) {
     // ASCII only in the quoted form, with the real name repeated as RFC 5987
     // so anything not spellable there still arrives correctly named. A quote
     // or a backslash in the quoted form would end it early, so both go.
@@ -609,9 +688,12 @@ fn name_the_download(headers: &mut HeaderMap, filename: &str) {
             }
         })
         .collect();
-    if let Ok(value) =
-        format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}").parse()
-    {
+    let mode = if renders_inline(content_type) {
+        "inline"
+    } else {
+        "attachment"
+    };
+    if let Ok(value) = format!("{mode}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}").parse() {
         drop(headers.insert(header::CONTENT_DISPOSITION, value));
     }
 }

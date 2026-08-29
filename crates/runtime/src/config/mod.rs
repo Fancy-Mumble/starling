@@ -492,6 +492,10 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
         // signalling and tunnelled audio off it.
         ServiceKind::Permissions => Some("acl"),
         ServiceKind::Text => Some("chat"),
+        // Asking for a download URL is not a person typing: a client playing a
+        // shared video asks once per signed URL it needs, and murmur's 1/s
+        // dropped enough of those to stop the video partway through.
+        ServiceKind::Files => Some("files"),
         _ => None,
     }
 }

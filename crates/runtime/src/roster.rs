@@ -54,6 +54,9 @@ pub struct Roster {
     /// users is cheaper than the bookkeeping a reverse index would cost on
     /// every move.
     channels: Mutex<HashMap<u32, u32>>,
+    /// Where departures are announced, for a subscriber that asked to hear
+    /// them. Absent unless one did, so a roster nobody asked costs nothing.
+    departures: Mutex<Option<tokio::sync::broadcast::Sender<u32>>>,
     /// Session id to the account behind it, absent for an unregistered guest.
     ///
     /// Session ids are per connection and get recycled; an account is the
@@ -105,6 +108,14 @@ impl Roster {
             }
             Some(view_event::Event::Gone(gone)) => {
                 self.remove(gone.session);
+                // Announced as well as applied. A subscriber that has to *act*
+                // on a departure - `files`, deleting what the session shared -
+                // cannot get that from the table, which by then no longer
+                // mentions the session at all.
+                if let Some(departures) = self.departures.lock().ok().and_then(|held| held.clone())
+                {
+                    let _sent = departures.send(gone.session);
+                }
                 true
             }
             // Membership is unaffected by a config bump.
@@ -288,6 +299,24 @@ impl Roster {
     #[must_use]
     pub fn account_of(&self, session: u32) -> Option<u64> {
         self.accounts.lock().ok()?.get(&session).copied().flatten()
+    }
+
+    /// Hear about every session that goes away from now on.
+    ///
+    /// A broadcast rather than a callback: the sender is held under the same
+    /// lock the roster updates under, and running arbitrary subscriber code
+    /// there is how a slow one stops the whole table.
+    pub fn departures(&self) -> tokio::sync::broadcast::Receiver<u32> {
+        let mut held = match self.departures.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(sender) = held.as_ref() {
+            return sender.subscribe();
+        }
+        let (sender, receiver) = tokio::sync::broadcast::channel(64);
+        *held = Some(sender);
+        receiver
     }
 
     /// Every account with a session on this server right now.

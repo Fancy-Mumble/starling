@@ -102,6 +102,24 @@ url_ttl = "15m"
 # one you are testing from - it is also what share links are built from, so a
 # wrong value here is a link nobody can open.
 # public_url = "https://files.example.org"
+#
+# Sharing is gated on the `SHARE_FILES` permission, and a public or
+# password-protected link additionally on `SHARE_FILES_PUBLIC`. Neither is in
+# the default set: grant them in the ACL of the channels that should have them.
+#
+# [services.files.options]
+# How long a share may last when the uploader picks a lifetime, and the longest
+# one they may pick. Both in seconds; absent or 0 means no limit.
+# max_ttl_seconds = "604800"
+# How long any file is kept regardless of what the uploader chose.
+# retain_seconds = "2592000"
+# Everything this server will hold, across every file.
+# max_total_storage = "10GiB"
+# Destroy a file once it has been downloaded whole. Range requests do not
+# count, so a video is still playable.
+# delete_on_download = "true"
+# Destroy a session's files when the session disconnects.
+# delete_on_disconnect = "true"
 
 
 # -- Screen share -----------------------------------------------------------

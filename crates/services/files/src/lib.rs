@@ -11,6 +11,7 @@
 //! thumbnails, audit exports. Being HTTP, it can sit behind an `Ingress` and get
 //! TLS termination and a CDN for free.
 
+mod attempts;
 mod crypto;
 pub mod http;
 pub mod sign;
@@ -20,21 +21,24 @@ pub use sign::{Signature, sign, verify};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::files::{
-    FilesEnvelope, Grant, Listing, Refused, Share, UploadRequest, Visibility, files_envelope,
+    Audience, FilesEnvelope, ForgetRequest, Grant, Listing, ManageListing, ManageRequest,
+    ManagedFile, Refused, Share, Storage, UploadRequest, Visibility, files_envelope,
 };
 use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::files::files_server::{Files, FilesServer};
 use starling_proto_fancy::files::{ObjectInfo, SignRequest, SignedUrl, StatRequest, sign_request};
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::config::ByteSize;
 use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
+use starling_runtime::permit::Permit;
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
@@ -76,6 +80,58 @@ fn safe_name(filename: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// One `[services.files].options` entry read as a count of seconds, in ms.
+fn seconds(service: &starling_runtime::config::ServiceConfig, key: &str) -> Option<u64> {
+    service
+        .options
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.saturating_mul(1_000))
+}
+
+/// One `[services.files].options` entry read as a switch, off unless said.
+fn flag(service: &starling_runtime::config::ServiceConfig, key: &str) -> bool {
+    service
+        .options
+        .get(key)
+        .is_some_and(|value| matches!(value.trim(), "true" | "yes" | "1"))
+}
+
+/// The channel a server-wide permission is asked at.
+///
+/// Mumble expresses "administers this server" as holding a permission on the
+/// root, so that is where the operator questions go.
+const ROOT_CHANNEL: u32 = 0;
+
+/// What reading a channel's files costs.
+///
+/// `Enter`, and not `SeeChannel`. `SeeChannel` is not in the default set, and
+/// the rest of this server only consults it for channels flagged hidden
+/// (`metadata::visible_to`) - so requiring it here would make an unconfigured
+/// server hide every file from everybody, which is stricter than the channel
+/// the file is in. `Enter` is the permission that says a session belongs in
+/// this channel, and a channel that denies it to somebody is a channel whose
+/// files are not theirs either.
+///
+/// A hidden channel's files are covered only as far as its own `Enter` covers
+/// it. Tightening that means teaching this service about channel flags, which
+/// is `metadata`'s to know rather than this one's.
+const READ_CHANNEL: Perm = Perm::ENTER;
+
+/// Which channel an object key belongs to.
+///
+/// The key is minted here as `{channel}/{id}/{name}`, so its first component
+/// is the channel the file was shared in. Read back rather than looked up
+/// because the permission check has to happen before the row is touched, and a
+/// key naming no channel is a key for nothing - answered as channel zero,
+/// which the asker still has to hold permission on.
+fn channel_of(key: &str) -> u32 {
+    key.split('/')
+        .next()
+        .and_then(|first| first.parse().ok())
+        .unwrap_or_default()
 }
 
 /// The service whose roster tells this one who is in a channel.
@@ -135,6 +191,24 @@ const SCHEMA: &[Migration<'static>] = &[
             "CREATE INDEX IF NOT EXISTS ix_object_expiry ON object(server_id, expires_at_ms)",
         ],
     ),
+    Migration::new(
+        // Who shared it, in terms that outlive the sharing. `owner` is a
+        // session id: per connection, recycled, and meaningless the moment the
+        // uploader reconnects - so a listing could say a file belonged to
+        // whoever happens to hold that number now. These three are the person.
+        "0005_object_uploader",
+        &[
+            "ALTER TABLE object ADD COLUMN uploader_account BIGINT NULL",
+            "ALTER TABLE object ADD COLUMN uploader_name VARCHAR(190) NULL",
+            "ALTER TABLE object ADD COLUMN uploader_cert BLOB NULL",
+        ],
+    ),
+    Migration::new(
+        // When it was last read. The operator's view shows it, and it is the
+        // one column here that answers "is this file still being used".
+        "0006_object_read",
+        &["ALTER TABLE object ADD COLUMN downloaded_at_ms BIGINT NULL"],
+    ),
 ];
 
 /// The service.
@@ -163,10 +237,27 @@ pub struct FilesService {
     pending: RwLock<HashMap<String, Pending>>,
     /// Tickets minted for password shares and not yet redeemed.
     tickets: tickets::Tickets,
+    /// Wrong password guesses, so a share link cannot simply be brute-forced.
+    attempts: attempts::Attempts,
     /// Who is in which channel, so a finished upload can be announced to them.
     roster: Arc<Roster>,
+    /// Asks `permissions` whether the session in front of us may do this.
+    ///
+    /// Every route into this service goes through it. A file server that
+    /// skipped the ACL would make every channel's contents readable by anyone
+    /// who can connect, whatever the channel's own permissions say - and a
+    /// share link would be publishable by a guest.
+    permit: Permit,
     /// How long an object is kept. `0` keeps it for good.
     retain_ms: AtomicU64,
+    /// The longest lifetime an uploader may ask for. `0` is no ceiling.
+    max_ttl_ms: AtomicU64,
+    /// Bytes this server will hold across every object. `0` is no ceiling.
+    max_total_storage: AtomicU64,
+    /// Whether an object is destroyed by the first download that succeeds.
+    delete_on_download: AtomicBool,
+    /// Whether a session's uploads go when the session does.
+    delete_on_disconnect: AtomicBool,
 }
 
 impl FilesService {
@@ -229,14 +320,23 @@ impl FilesService {
         }
         self.ttl_ms.store(ttl_ms, Ordering::Relaxed);
         self.max_upload.store(max_upload, Ordering::Relaxed);
-        if let Some(retain) = service
-            .options
-            .get("retain_seconds")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            self.retain_ms
-                .store(retain.saturating_mul(1_000), Ordering::Relaxed);
+        if let Some(retain) = seconds(service, "retain_seconds") {
+            self.retain_ms.store(retain, Ordering::Relaxed);
         }
+        if let Some(ceiling) = seconds(service, "max_ttl_seconds") {
+            self.max_ttl_ms.store(ceiling, Ordering::Relaxed);
+        }
+        if let Some(cap) = service
+            .options
+            .get("max_total_storage")
+            .and_then(|value| value.parse::<ByteSize>().ok())
+        {
+            self.max_total_storage.store(cap.get(), Ordering::Relaxed);
+        }
+        self.delete_on_download
+            .store(flag(service, "delete_on_download"), Ordering::Relaxed);
+        self.delete_on_disconnect
+            .store(flag(service, "delete_on_disconnect"), Ordering::Relaxed);
     }
 }
 
@@ -342,66 +442,414 @@ impl ClientService for FilesService {
 
         let reply = match envelope.body {
             Some(files_envelope::Body::Upload(upload)) => {
-                if upload.size > self.max_upload() {
-                    FilesEnvelope {
-                        body: Some(files_envelope::Body::Refused(Refused {
-                            request_id: upload.request_id,
-                            refusal: Some(Refusal {
-                                kind: refusal::Kind::Limit as i32,
-                                detail: format!("the limit is {} bytes", self.max_upload()),
-                                retry_after_ms: 0,
-                            }),
-                        })),
-                    }
-                } else {
-                    match self.prepare_upload(&upload, inbound.session) {
-                        Ok(envelope) => envelope,
-                        Err(detail) => FilesEnvelope {
-                            body: Some(files_envelope::Body::Refused(Refused {
-                                request_id: upload.request_id,
-                                refusal: Some(Refusal {
-                                    kind: refusal::Kind::Invalid as i32,
-                                    detail,
-                                    retry_after_ms: 0,
-                                }),
-                            })),
-                        },
-                    }
-                }
+                self.answer_upload(&inbound, upload).await
             }
             Some(files_envelope::Body::Download(download)) => {
-                let url = self.grant("GET", &download.key);
-                // The share link, for a client that wants something to copy
-                // rather than something to fetch with. Read from the row, so a
-                // session-only object still answers with nothing here.
-                let record = self.share_record(&download.key).await;
-                let share_url = match &record {
-                    Some(record) if record.public => self.share_url(&download.key),
-                    _ => String::new(),
-                };
-                FilesEnvelope {
-                    body: Some(files_envelope::Body::Grant(Grant {
-                        request_id: download.request_id,
-                        url: url.url,
-                        method: url.method,
-                        expires_at_ms: url.expires_at_ms,
-                        key: download.key,
-                        share_url,
-                        share_expires_at_ms: record
-                            .and_then(|record| record.expires_at_ms)
-                            .unwrap_or_default(),
-                    })),
-                }
+                self.answer_download(&inbound, download).await
             }
-            Some(files_envelope::Body::List(request)) => FilesEnvelope {
-                body: Some(files_envelope::Body::Listing(Listing {
-                    channel: request.channel,
-                    files: self.listing(request.channel, request.limit).await,
-                })),
-            },
+            Some(files_envelope::Body::List(request)) => self.answer_list(&inbound, request).await,
+            Some(files_envelope::Body::Manage(request)) => {
+                self.answer_manage(&inbound, request).await
+            }
+            Some(files_envelope::Body::Forget(request)) => {
+                self.answer_forget(&inbound, request).await
+            }
             _ => return Actions::new(),
         };
         vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+    }
+}
+
+impl FilesService {
+    /// Answer an upload request, if the session may make one.
+    ///
+    /// Two bits, as the epoch-0 plugin had them: one to share at all, and a
+    /// second to make the share reachable by link. They are separate because
+    /// they are separate decisions - a server can want its members exchanging
+    /// files without any of them able to publish one to the open internet.
+    async fn answer_upload(&self, inbound: &Inbound, upload: UploadRequest) -> FilesEnvelope {
+        let visibility = Visibility::try_from(upload.visibility).unwrap_or(Visibility::Session);
+        let needed = if visibility == Visibility::Session {
+            Perm::SHARE_FILES
+        } else {
+            Perm::SHARE_FILES.union(Perm::SHARE_FILES_PUBLIC)
+        };
+        if !self.allows(inbound, upload.channel, needed).await {
+            self.logger.log(
+                LogEvent::notice(Category::Permission, "upload refused: not allowed")
+                    .with("channel", upload.channel)
+                    .with("session", inbound.session),
+            );
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Permission,
+                if visibility == Visibility::Session {
+                    "you may not share files here"
+                } else {
+                    "you may not share files by link here"
+                },
+            );
+        }
+        if upload.size > self.max_upload() {
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Limit,
+                &format!("the limit is {} bytes", self.max_upload()),
+            );
+        }
+        if !self.has_room_for(upload.size).await {
+            self.logger.log(
+                LogEvent::notice(Category::Admin, "upload refused: the server is full")
+                    .with("size", upload.size)
+                    .with("cap", self.max_total_storage.load(Ordering::Relaxed)),
+            );
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Limit,
+                "this server has no room for more files",
+            );
+        }
+        match self.prepare_upload(&upload, inbound.session) {
+            Ok(envelope) => envelope,
+            Err(detail) => refused(&upload.request_id, refusal::Kind::Invalid, &detail),
+        }
+    }
+
+    /// Answer a download request, if the session may read that channel.
+    ///
+    /// A key is not an authorisation. Keys travel in messages and in listings,
+    /// so one reaching a session that may not see the channel it belongs to is
+    /// ordinary rather than exceptional - and without this check, holding it
+    /// would be enough.
+    async fn answer_download(
+        &self,
+        inbound: &Inbound,
+        download: starling_proto_fancy::fancy::files::DownloadRequest,
+    ) -> FilesEnvelope {
+        let channel = channel_of(&download.key);
+        if !self.allows(inbound, channel, READ_CHANNEL).await {
+            return refused(
+                &download.request_id,
+                refusal::Kind::Permission,
+                "you may not read files from that channel",
+            );
+        }
+        let url = self.grant("GET", &download.key);
+        // The share link, for a client that wants something to copy rather
+        // than something to fetch with. Read from the row, so a session-only
+        // object still answers with nothing here.
+        let record = self.share_record(&download.key).await;
+        let share_url = match &record {
+            Some(record) if record.public => self.share_url(&download.key),
+            _ => String::new(),
+        };
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Grant(Grant {
+                request_id: download.request_id,
+                url: url.url,
+                method: url.method,
+                expires_at_ms: url.expires_at_ms,
+                key: download.key,
+                share_url,
+                share_expires_at_ms: record
+                    .and_then(|record| record.expires_at_ms)
+                    .unwrap_or_default(),
+            })),
+        }
+    }
+
+    /// Answer a listing, empty for a channel the session cannot see.
+    ///
+    /// Empty rather than a refusal: this is also how a client discovers the
+    /// service exists at all, and a channel the asker cannot see should look
+    /// like a channel with no files rather than like one it is being kept out
+    /// of.
+    async fn answer_list(
+        &self,
+        inbound: &Inbound,
+        request: starling_proto_fancy::fancy::files::ListRequest,
+    ) -> FilesEnvelope {
+        let allowed = self.allows(inbound, request.channel, READ_CHANNEL).await;
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Listing(Listing {
+                channel: request.channel,
+                files: if allowed {
+                    self.listing(request.channel, request.limit).await
+                } else {
+                    Vec::new()
+                },
+            })),
+        }
+    }
+}
+
+impl FilesService {
+    /// Answer "my shared files", or an operator's view of every file.
+    ///
+    /// Two audiences from one query, differing in the `WHERE` and in whether
+    /// the storage header is filled: a user's own files say nothing about the
+    /// server's disk, and an operator asking about the disk is not asking
+    /// about their own uploads.
+    async fn answer_manage(&self, inbound: &Inbound, request: ManageRequest) -> FilesEnvelope {
+        let audience = Audience::try_from(request.audience).unwrap_or(Audience::Mine);
+        if audience == Audience::Everyone && !self.administers(inbound).await {
+            return refused(
+                &request.request_id,
+                refusal::Kind::Permission,
+                "you do not administer this server",
+            );
+        }
+        let limit = i64::from(request.limit.clamp(1, 500));
+        let files = match audience {
+            Audience::Everyone => self.managed_files(None, limit).await,
+            // Matched on the account where there is one, so a reconnect still
+            // finds the same files; a guest has only their session id, which
+            // is why their list empties when they come back as somebody else.
+            Audience::Mine => {
+                self.managed_files(Some(self.identity_of(inbound.session)), limit)
+                    .await
+            }
+        };
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Managed(ManageListing {
+                request_id: request.request_id,
+                files,
+                storage: match audience {
+                    Audience::Everyone => Some(self.storage_stats().await),
+                    Audience::Mine => None,
+                },
+            })),
+        }
+    }
+
+    /// Remove one stored file, if it is the caller's or they may remove others'.
+    async fn answer_forget(&self, inbound: &Inbound, request: ForgetRequest) -> FilesEnvelope {
+        let Some(owner) = self.owner_of(&request.key).await else {
+            // Absent rather than refused: a key that names nothing is not a
+            // permission question, and answering it as one would say which
+            // keys exist.
+            return refused(&request.request_id, refusal::Kind::Invalid, "no such file");
+        };
+        let mine = owner.matches(&self.identity_of(inbound.session));
+        if !mine
+            && !self
+                .allows(inbound, ROOT_CHANNEL, Perm::RESET_USER_CONTENT)
+                .await
+        {
+            return refused(
+                &request.request_id,
+                refusal::Kind::Permission,
+                "that file is not yours to remove",
+            );
+        }
+        self.forget_object(&request.key).await;
+        self.logger.log(
+            LogEvent::notice(Category::Admin, "a shared file was removed")
+                .with("key", request.key.clone())
+                .with("session", inbound.session)
+                .with("own", mine),
+        );
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Managed(ManageListing {
+                request_id: request.request_id,
+                files: Vec::new(),
+                storage: None,
+            })),
+        }
+    }
+
+    /// Whether this session administers the server.
+    async fn administers(&self, inbound: &Inbound) -> bool {
+        self.allows(inbound, ROOT_CHANNEL, Perm::WRITE).await
+    }
+
+    /// Who a session is, in the terms an object row records.
+    fn identity_of(&self, session: u32) -> Uploader {
+        Uploader {
+            account: self.roster.account_of(session),
+            name: self.roster.name_of(session),
+            cert: self.roster.cert_of(session),
+        }
+    }
+
+    /// Who uploaded `key`, or `None` if there is no such object.
+    async fn owner_of(&self, key: &str) -> Option<Uploader> {
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT uploader_account, uploader_name, uploader_cert, owner FROM object \
+             WHERE server_id = ? AND k = ?",
+        )
+        .bind(1_i64)
+        .bind(key)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()??;
+        Some(Uploader {
+            account: row
+                .try_get::<Option<i64>, _>("uploader_account")
+                .ok()
+                .flatten()
+                .map(|account| account as u64),
+            name: row.try_get("uploader_name").ok().flatten(),
+            cert: row.try_get("uploader_cert").ok().flatten(),
+        })
+    }
+
+    /// The stored files, for everyone or for one person.
+    async fn managed_files(&self, mine: Option<Uploader>, limit: i64) -> Vec<ManagedFile> {
+        use sqlx::Row as _;
+        let rows =
+            match &mine {
+                Some(who) => {
+                    // An account is the person; a certificate is the keypair they
+                    // hold. Either identifies the same uploader across reconnects,
+                    // and a guest with neither has no files to find.
+                    sqlx::query(
+                    "SELECT k, channel_id, filename, content_type, size, created_at_ms, public, \
+                     password_hash, expires_at_ms, downloaded_at_ms, uploader_account, \
+                     uploader_name, uploader_cert FROM object WHERE server_id = ? \
+                     AND ((? IS NOT NULL AND uploader_account = ?) \
+                          OR (? IS NOT NULL AND uploader_cert = ?)) \
+                     ORDER BY created_at_ms DESC LIMIT ?",
+                )
+                .bind(1_i64)
+                .bind(who.account.map(|account| account as i64))
+                .bind(who.account.map(|account| account as i64))
+                .bind(who.cert.clone())
+                .bind(who.cert.clone())
+                .bind(limit)
+                .fetch_all(self.store.pool())
+                .await
+                }
+                None => sqlx::query(
+                    "SELECT k, channel_id, filename, content_type, size, created_at_ms, public, \
+                     password_hash, expires_at_ms, downloaded_at_ms, uploader_account, \
+                     uploader_name, uploader_cert FROM object WHERE server_id = ? \
+                     ORDER BY created_at_ms DESC LIMIT ?",
+                )
+                .bind(1_i64)
+                .bind(limit)
+                .fetch_all(self.store.pool())
+                .await,
+            }
+            .unwrap_or_default();
+
+        let online = self.roster.sessions();
+        rows.iter()
+            .map(|row| {
+                let key: String = row.try_get("k").unwrap_or_default();
+                let public = row.try_get::<i64, _>("public").unwrap_or_default() != 0;
+                let locked = row
+                    .try_get::<Option<String>, _>("password_hash")
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let account = row
+                    .try_get::<Option<i64>, _>("uploader_account")
+                    .ok()
+                    .flatten()
+                    .map(|account| account as u64);
+                let cert: Option<Vec<u8>> = row.try_get("uploader_cert").ok().flatten();
+                ManagedFile {
+                    channel: row.try_get::<i64, _>("channel_id").unwrap_or_default() as u32,
+                    filename: row.try_get("filename").unwrap_or_default(),
+                    content_type: row.try_get("content_type").unwrap_or_default(),
+                    size: row.try_get::<i64, _>("size").unwrap_or_default() as u64,
+                    visibility: visibility_of(public, locked) as i32,
+                    shared_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
+                    expires_at_ms: row
+                        .try_get::<Option<i64>, _>("expires_at_ms")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default() as u64,
+                    downloaded_at_ms: row
+                        .try_get::<Option<i64>, _>("downloaded_at_ms")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default() as u64,
+                    share_url: self.share_url_if(public, &key),
+                    uploader_online: online.iter().any(|&session| {
+                        (account.is_some() && self.roster.account_of(session) == account)
+                            || (cert.is_some() && self.roster.cert_of(session) == cert)
+                    }),
+                    uploader_account: account.unwrap_or_default(),
+                    uploader_name: row
+                        .try_get("uploader_name")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    uploader_cert: cert.unwrap_or_default(),
+                    key,
+                }
+            })
+            .collect()
+    }
+
+    /// What this server is holding, and what it is allowed to hold.
+    async fn storage_stats(&self) -> Storage {
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(size), 0) AS used, COUNT(*) AS files FROM object \
+             WHERE server_id = ?",
+        )
+        .bind(1_i64)
+        .fetch_one(self.store.pool())
+        .await;
+        let (used, files) = row.map_or((0, 0), |row| {
+            (
+                row.try_get::<i64, _>("used").unwrap_or_default() as u64,
+                row.try_get::<i64, _>("files").unwrap_or_default() as u64,
+            )
+        });
+        Storage {
+            used_bytes: used,
+            max_total_bytes: self.max_total_storage.load(Ordering::Relaxed),
+            max_upload_bytes: self.max_upload(),
+            file_count: files,
+        }
+    }
+
+    /// Note that an object was read, for the operator's view.
+    pub(crate) async fn note_read(&self, key: &str) {
+        let _noted =
+            sqlx::query("UPDATE object SET downloaded_at_ms = ? WHERE server_id = ? AND k = ?")
+                .bind(now_ms() as i64)
+                .bind(1_i64)
+                .bind(key)
+                .execute(self.store.pool())
+                .await;
+    }
+}
+
+impl Uploader {
+    /// Whether these two describe the same person.
+    ///
+    /// An account first, because it survives a new certificate; the
+    /// fingerprint second, because a guest has no account but may still hold a
+    /// keypair. Two uploaders with neither are never the same person - that
+    /// would make every anonymous upload everyone's.
+    fn matches(&self, other: &Self) -> bool {
+        match (self.account, other.account) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => match (self.cert.as_ref(), other.cert.as_ref()) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => false,
+            },
+        }
+    }
+}
+
+/// One refusal, correlated to the request that earned it.
+fn refused(request_id: &str, kind: refusal::Kind, detail: &str) -> FilesEnvelope {
+    FilesEnvelope {
+        body: Some(files_envelope::Body::Refused(Refused {
+            request_id: request_id.to_owned(),
+            refusal: Some(Refusal {
+                kind: kind as i32,
+                detail: detail.to_owned(),
+                retry_after_ms: 0,
+            }),
+        })),
     }
 }
 
@@ -424,10 +872,22 @@ impl Serve for FilesService {
             objects_dir: ctx.config.runtime.data_dir.join("files"),
             pending: RwLock::new(HashMap::new()),
             tickets: tickets::Tickets::default(),
+            attempts: attempts::Attempts::default(),
             roster: Arc::new(Roster::new()),
+            permit: Permit::new(ctx.resolver.clone()),
             // `retain_seconds` in `[services.files].options`: a plain number,
             // because this is the one knob and a duration grammar would be a
             // dependency for a single field.
+            max_ttl_ms: AtomicU64::new(seconds(&service, "max_ttl_seconds").unwrap_or_default()),
+            max_total_storage: AtomicU64::new(
+                service
+                    .options
+                    .get("max_total_storage")
+                    .and_then(|value| value.parse::<ByteSize>().ok())
+                    .map_or(0, ByteSize::get),
+            ),
+            delete_on_download: AtomicBool::new(flag(&service, "delete_on_download")),
+            delete_on_disconnect: AtomicBool::new(flag(&service, "delete_on_disconnect")),
             retain_ms: AtomicU64::new(
                 service
                     .options
@@ -445,6 +905,9 @@ impl Serve for FilesService {
         // the people it was shared with.
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
         let collector = tokio::spawn(Arc::clone(&self).collect_loop(ctx.shutdown.clone()));
+        let departures = tokio::spawn(
+            Arc::clone(&self).forget_departed(self.roster.departures(), ctx.shutdown.clone()),
+        );
         let listener = self.spawn_data_plane(&ctx).await;
 
         let mut configs = ctx.live.subscribe();
@@ -464,6 +927,7 @@ impl Serve for FilesService {
         }
         follower.abort();
         collector.abort();
+        departures.abort();
         if let Some(listener) = listener {
             listener.abort();
         }
@@ -520,6 +984,32 @@ impl FilesService {
         }))
     }
 
+    /// Drop each departing session's shares, for as long as the service runs.
+    ///
+    /// Subscribed even when the operator has not asked for it, so turning the
+    /// switch on takes effect at the next disconnect rather than the next
+    /// restart; `forget_session` is what reads the switch.
+    async fn forget_departed(
+        self: Arc<Self>,
+        mut departures: tokio::sync::broadcast::Receiver<u32>,
+        shutdown: starling_runtime::shutdown::Shutdown,
+    ) {
+        loop {
+            tokio::select! {
+                () = shutdown.wait() => return,
+                gone = departures.recv() => match gone {
+                    Ok(session) => self.forget_session(session).await,
+                    // Lagged: some departures were missed, and the sessions
+                    // they named are unknowable now. The sweeper is what
+                    // eventually collects those, so this keeps listening
+                    // rather than giving up on the ones still to come.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+            }
+        }
+    }
+
     /// Sweep expired objects for as long as the service runs.
     async fn collect_loop(self: Arc<Self>, shutdown: starling_runtime::shutdown::Shutdown) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -558,6 +1048,8 @@ pub(crate) struct Pending {
     pub(crate) expires_at_ms: u64,
     /// When the finished share stops answering, or `None` for never.
     pub(crate) share_expires_at_ms: Option<u64>,
+    /// Who shared it, in terms that outlive their connection.
+    pub(crate) uploader: Uploader,
     /// What a password guess is checked against, for a password share.
     pub(crate) password_hash: Option<String>,
     /// The salt and nonce prefix the bytes are sealed under.
@@ -566,6 +1058,18 @@ pub(crate) struct Pending {
     /// this one upload and then gone, while these two have to outlive it in
     /// the row so a later reader can derive the key again from the password.
     pub(crate) seal: Option<Seal>,
+}
+
+/// Who shared a file, as something still true after they disconnect.
+///
+/// Read at grant time, from the roster, because that is while the session is
+/// still there to be resolved. All three can be absent: a guest has no
+/// account, and a client that presented no certificate has no fingerprint.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Uploader {
+    pub(crate) account: Option<u64>,
+    pub(crate) name: Option<String>,
+    pub(crate) cert: Option<Vec<u8>>,
 }
 
 /// What is needed to seal one object, and what has to be kept to open it.
@@ -674,6 +1178,37 @@ impl FilesService {
         (pending.expires_at_ms > now_ms()).then_some(pending)
     }
 
+    /// Whether the client on `inbound` holds `needed` in `channel`.
+    ///
+    /// [`Permit::allows`] denies on any failure, `permissions` being
+    /// unreachable included, so there is no error case here for a caller to
+    /// get wrong: a service that cannot check is a service that says no.
+    async fn allows(&self, inbound: &Inbound, channel: u32, needed: Perm) -> bool {
+        self.permit.allows(inbound, channel, needed.bits()).await
+    }
+
+    /// Whether this server has room for `incoming` more bytes.
+    ///
+    /// Checked at grant time, before anything moves: a client told after the
+    /// transfer that the disk was full has spent the whole upload finding out.
+    /// The count is of what is *stored*, so grants in flight are not reserved -
+    /// two large uploads racing can pass the cap between them, and the data
+    /// plane's own per-object ceiling is what bounds the overshoot.
+    async fn has_room_for(&self, incoming: u64) -> bool {
+        use sqlx::Row as _;
+        let cap = self.max_total_storage.load(Ordering::Relaxed);
+        if cap == 0 {
+            return true;
+        }
+        let held: i64 = sqlx::query("SELECT COALESCE(SUM(size), 0) AS total FROM object")
+            .fetch_one(self.store.pool())
+            .await
+            .ok()
+            .and_then(|row| row.try_get("total").ok())
+            .unwrap_or_default();
+        (held as u64).saturating_add(incoming) <= cap
+    }
+
     /// Turn one upload request into the grant that answers it.
     ///
     /// `Err` is the sentence to refuse with. Only one thing is refused here -
@@ -721,8 +1256,19 @@ impl FilesService {
         // takes an hour was still shared when the person shared it, and a
         // seven-day link that becomes a six-day one because the file was large
         // is a link that expires for a reason nobody can see.
-        let share_expires_at_ms = (upload.ttl_seconds > 0)
-            .then(|| now_ms().saturating_add(upload.ttl_seconds.saturating_mul(1_000)));
+        // Clamped rather than refused: an uploader asking for longer than the
+        // operator allows gets the longest they can have, which is what they
+        // wanted the most of. A ceiling also means "forever" is no longer an
+        // option, so an upload that asked for nothing takes the ceiling too.
+        let ceiling = self.max_ttl_ms.load(Ordering::Relaxed);
+        let asked = upload.ttl_seconds.saturating_mul(1_000);
+        let lifetime = match (ceiling, asked) {
+            (0, 0) => 0,
+            (0, asked) => asked,
+            (ceiling, 0) => ceiling,
+            (ceiling, asked) => asked.min(ceiling),
+        };
+        let share_expires_at_ms = (lifetime > 0).then(|| now_ms().saturating_add(lifetime));
         self.remember_pending(
             &key,
             Pending {
@@ -734,6 +1280,11 @@ impl FilesService {
                 public,
                 expires_at_ms: url.expires_at_ms,
                 share_expires_at_ms,
+                uploader: Uploader {
+                    account: self.roster.account_of(session),
+                    name: self.roster.name_of(session),
+                    cert: self.roster.cert_of(session),
+                },
                 password_hash,
                 seal,
             },
@@ -803,6 +1354,66 @@ impl FilesService {
         &self.tickets
     }
 
+    /// The wrong-guess counter that keeps a share link from being brute-forced.
+    pub(crate) fn attempts(&self) -> &attempts::Attempts {
+        &self.attempts
+    }
+
+    /// Whether an object is destroyed by the download that just succeeded.
+    pub(crate) fn burns_on_read(&self) -> bool {
+        self.delete_on_download.load(Ordering::Relaxed)
+    }
+
+    /// Destroy one object, row and bytes together.
+    ///
+    /// Bytes after the row, as the sweeper does it: a row without its file is
+    /// a 404 on a link that still looks live, and a file without its row is
+    /// disk nobody can account for.
+    pub(crate) async fn forget_object(&self, key: &str) {
+        let deleted = sqlx::query("DELETE FROM object WHERE server_id = ? AND k = ?")
+            .bind(1_i64)
+            .bind(key)
+            .execute(self.store.pool())
+            .await;
+        if deleted.is_ok()
+            && let Some(path) = http::object_path(self.objects_dir(), key)
+        {
+            drop(tokio::fs::remove_file(path).await);
+        }
+    }
+
+    /// Drop everything a session shared, because the session is gone.
+    ///
+    /// Only where the operator asked for it. The owner is the session id, so
+    /// this is exactly the set that id can still be matched against - once the
+    /// id is reused by somebody else it would mean a different person, which
+    /// is why it happens on the disconnect rather than later.
+    async fn forget_session(&self, session: u32) {
+        use sqlx::Row as _;
+        if !self.delete_on_disconnect.load(Ordering::Relaxed) {
+            return;
+        }
+        let rows = sqlx::query("SELECT k FROM object WHERE server_id = ? AND owner = ?")
+            .bind(1_i64)
+            .bind(i64::from(session))
+            .fetch_all(self.store.pool())
+            .await
+            .unwrap_or_default();
+        for row in &rows {
+            let key: String = row.try_get("k").unwrap_or_default();
+            if !key.is_empty() {
+                self.forget_object(&key).await;
+            }
+        }
+        if !rows.is_empty() {
+            tracing::debug!(
+                session,
+                count = rows.len(),
+                "a session's shares went with it"
+            );
+        }
+    }
+
     /// The stored content type, for a download's `Content-Type`.
     pub(crate) async fn content_type_of(&self, key: &str) -> Option<String> {
         use sqlx::Row as _;
@@ -825,8 +1436,9 @@ impl FilesService {
         sqlx::query(
             "INSERT INTO object \
              (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms, \
-             public, password_hash, enc_salt, enc_nonce, expires_at_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+             public, password_hash, enc_salt, enc_nonce, expires_at_ms, \
+             uploader_account, uploader_name, uploader_cert) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(1_i64)
         .bind(key)
@@ -841,6 +1453,9 @@ impl FilesService {
         .bind(pending.seal.as_ref().map(|seal| seal.salt.to_vec()))
         .bind(pending.seal.as_ref().map(|seal| seal.nonce.to_vec()))
         .bind(pending.share_expires_at_ms.map(|at| at as i64))
+        .bind(pending.uploader.account.map(|account| account as i64))
+        .bind(pending.uploader.name.clone())
+        .bind(pending.uploader.cert.clone())
         .execute(self.store.pool())
         .await
         .map(drop)
@@ -982,11 +1597,132 @@ mod tests {
     use super::*;
     use starling_proto_fancy::fancy::files::UploadRequest;
 
+    /// A `permissions` that answers whatever the test told it to.
+    ///
+    /// A real one, served in-process, rather than a permit that waves
+    /// everything through: the gate is the thing under test in half these
+    /// cases, and a stub that could not say no would let a missing check pass.
+    #[derive(Clone)]
+    struct Gate(Arc<std::sync::atomic::AtomicU32>);
+
+    #[tonic::async_trait]
+    impl starling_proto_fancy::permissions::permissions_server::Permissions for Gate {
+        async fn check_session(
+            &self,
+            request: Request<starling_proto_fancy::permissions::SessionCheckRequest>,
+        ) -> Result<Response<starling_proto_fancy::common::Decision>, Status> {
+            let asked = request.into_inner().permission;
+            let held = self.0.load(Ordering::Relaxed);
+            Ok(Response::new(starling_proto_fancy::common::Decision {
+                // Every bit asked for must be held, which is what `Permit`
+                // promises its callers.
+                allowed: asked & held == asked,
+                ..Default::default()
+            }))
+        }
+        async fn effective(
+            &self,
+            _: Request<starling_proto_fancy::permissions::EffectiveRequest>,
+        ) -> Result<Response<starling_proto_fancy::permissions::EffectiveResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by files"))
+        }
+        async fn check(
+            &self,
+            _: Request<starling_proto_fancy::permissions::CheckRequest>,
+        ) -> Result<Response<starling_proto_fancy::common::Decision>, Status> {
+            Err(Status::unimplemented("files uses check_session"))
+        }
+        async fn get_acl(
+            &self,
+            _: Request<starling_proto_fancy::permissions::AclRequest>,
+        ) -> Result<Response<starling_proto_fancy::permissions::AclSet>, Status> {
+            Err(Status::unimplemented("not used by files"))
+        }
+        async fn set_acl(
+            &self,
+            _: Request<starling_proto_fancy::permissions::SetAclRequest>,
+        ) -> Result<Response<starling_proto_fancy::permissions::AclResult>, Status> {
+            Err(Status::unimplemented("not used by files"))
+        }
+        async fn add_temporary_group(
+            &self,
+            _: Request<starling_proto_fancy::permissions::TemporaryGroupRequest>,
+        ) -> Result<Response<starling_proto_fancy::permissions::AclResult>, Status> {
+            Err(Status::unimplemented("not used by files"))
+        }
+        async fn remove_temporary_group(
+            &self,
+            _: Request<starling_proto_fancy::permissions::TemporaryGroupRequest>,
+        ) -> Result<Response<starling_proto_fancy::permissions::AclResult>, Status> {
+            Err(Status::unimplemented("not used by files"))
+        }
+        type WatchInvalidationsStream = std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<
+                        Item = Result<starling_proto_fancy::permissions::Invalidation, Status>,
+                    > + Send,
+            >,
+        >;
+        async fn watch_invalidations(
+            &self,
+            _: Request<starling_proto_fancy::common::Scope>,
+        ) -> Result<Response<Self::WatchInvalidationsStream>, Status> {
+            Err(Status::unimplemented("not used by files"))
+        }
+    }
+
+    /// Everything this service ever asks for, as an operator would hold it.
+    ///
+    /// The tests that care about a gate take a bit away with
+    /// `service_holding`; this is the "allowed to do all of it" baseline.
+    fn everything() -> Perm {
+        Perm::SHARE_FILES
+            .union(Perm::SHARE_FILES_PUBLIC)
+            .union(Perm::WRITE)
+            .union(Perm::RESET_USER_CONTENT)
+            .union(READ_CHANNEL)
+    }
+
+    /// A resolver reaching a stub `permissions` that grants exactly `held`.
+    ///
+    /// Built per service rather than once for the suite: every `#[tokio::test]`
+    /// gets its own runtime, and a server spawned on the first one dies with
+    /// it - after which every later test sees `permissions` as unreachable and
+    /// is denied, which looks exactly like the gate working.
+    async fn gate_granting(held: Perm) -> starling_runtime::channel::Resolver {
+        use starling_proto_fancy::permissions::permissions_server::PermissionsServer;
+        use starling_runtime::transport::{InProcess, Transport as _};
+
+        let broker = starling_runtime::inproc::Broker::new();
+        let incoming = InProcess::new("permissions")
+            .bind(&broker)
+            .await
+            .expect("bind the stub");
+        let bits = Arc::new(std::sync::atomic::AtomicU32::new(held.bits()));
+        drop(tokio::spawn(async move {
+            let _served = tonic::transport::Server::builder()
+                .add_service(PermissionsServer::new(Gate(bits)))
+                .serve_with_incoming(incoming)
+                .await;
+        }));
+        let mut config =
+            starling_runtime::config::Config::with_defaults(std::path::Path::new("/run/starling"));
+        config.runtime.all_in_one = true;
+        starling_runtime::channel::Resolver::new(Arc::new(config), broker)
+    }
+
+    /// A service whose sessions hold everything.
     async fn service() -> Arc<FilesService> {
+        service_holding(everything()).await
+    }
+
+    /// A service whose sessions hold exactly `held`, and nothing else.
+    async fn service_holding(held: Perm) -> Arc<FilesService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let store = Store::open(
@@ -1007,8 +1743,14 @@ mod tests {
             objects_dir: std::env::temp_dir().join("starling-files-test"),
             pending: RwLock::new(HashMap::new()),
             tickets: tickets::Tickets::default(),
+            attempts: attempts::Attempts::default(),
             roster: Arc::new(Roster::new()),
+            permit: Permit::new(gate_granting(held).await),
             retain_ms: AtomicU64::new(0),
+            max_ttl_ms: AtomicU64::new(0),
+            max_total_storage: AtomicU64::new(0),
+            delete_on_download: AtomicBool::new(false),
+            delete_on_disconnect: AtomicBool::new(false),
         })
     }
 
@@ -1180,6 +1922,46 @@ mod tests {
         }
         let request = builder
             .body(axum::body::Body::from(body))
+            .expect("a request");
+        let response = http::router(Arc::clone(service))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// One share-route request carrying a `Range`.
+    async fn ranged(
+        service: &Arc<FilesService>,
+        path: &str,
+        range: &str,
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("range", range)
+            .body(axum::body::Body::empty())
             .expect("a request");
         let response = http::router(Arc::clone(service))
             .oneshot(request)
@@ -1439,6 +2221,465 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_without_share_files_cannot_upload_at_all() {
+        let service = service_holding(READ_CHANNEL).await;
+        let envelope = ask(&service, upload_as(Visibility::Session, "", 2)).await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn share_files_alone_does_not_buy_a_public_link() {
+        // The two bits are separate for exactly this: a server can want its
+        // members exchanging files without any of them able to publish one to
+        // the open internet.
+        let service = service_holding(Perm::SHARE_FILES.union(READ_CHANNEL)).await;
+
+        let allowed = ask(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert!(
+            matches!(allowed.body, Some(files_envelope::Body::Grant(_))),
+            "a session share is what SHARE_FILES is for"
+        );
+
+        for visibility in [Visibility::Public, Visibility::Password] {
+            let refused = ask(&service, upload_as(visibility, "hunter2", 2)).await;
+            assert!(
+                matches!(refused.body, Some(files_envelope::Body::Refused(_))),
+                "{visibility:?} needs SHARE_FILES_PUBLIC, got {:?}",
+                refused.body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_is_not_an_authorisation_to_download_it() {
+        // Keys travel in messages and in listings, so one reaching a session
+        // that cannot see the channel is ordinary rather than exceptional.
+        // Without the check, holding it would be enough.
+        let service = service_holding(Perm::SHARE_FILES).await;
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Download(starling_proto_fancy::fancy::files::DownloadRequest {
+                request_id: "d1".to_owned(),
+                key: "4/018f/secret.txt".to_owned(),
+            }),
+        )
+        .await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_you_cannot_see_lists_as_empty_rather_than_as_forbidden() {
+        // Empty rather than refused because this is also how a client finds
+        // out the service exists: a channel the asker cannot see should look
+        // like one with no files, not like one it is being kept out of.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        assert_eq!(service.listing(4, 50).await.len(), 1, "it is really there");
+
+        let blind = service_holding(Perm::SHARE_FILES).await;
+        let envelope = ask_body(
+            &blind,
+            files_envelope::Body::List(starling_proto_fancy::fancy::files::ListRequest {
+                channel: 4,
+                limit: 50,
+                before_key: String::new(),
+            }),
+        )
+        .await;
+        let Some(files_envelope::Body::Listing(listing)) = envelope.body else {
+            panic!("expected a listing, got {:?}", envelope.body);
+        };
+        assert!(listing.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_share_link_stops_taking_guesses_after_enough_wrong_ones() {
+        // A share link is a public address with a secret behind it, which makes
+        // it the one thing here that can simply be guessed at.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Password, "hunter2", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        let path = format!("/s/{}", grant.key);
+
+        for _ in 0..attempts::MAX_FAILURES {
+            let (status, ..) = call(&service, "POST", &path, Some("wrong"), None, Vec::new()).await;
+            assert_eq!(status, 403);
+        }
+        let (status, ..) = call(&service, "POST", &path, Some("wrong"), None, Vec::new()).await;
+        assert_eq!(status, 429, "the guessing stops");
+        let (status, ..) = call(&service, "POST", &path, Some("hunter2"), None, Vec::new()).await;
+        assert_eq!(
+            status, 429,
+            "and the right password waits with the rest: answering it now would \
+             say which of the two the guesser had just found"
+        );
+    }
+
+    /// One management request, from the session `ask` uses.
+    async fn manage(service: &Arc<FilesService>, audience: Audience) -> FilesEnvelope {
+        ask_body(
+            service,
+            files_envelope::Body::Manage(ManageRequest {
+                request_id: "m1".to_owned(),
+                audience: audience as i32,
+                limit: 100,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_operator_sees_every_file_and_what_the_disk_is_doing() {
+        let service = service().await;
+        service
+            .max_total_storage
+            .store(1_000_000, Ordering::Relaxed);
+        for _ in 0..3 {
+            let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+            assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        }
+
+        let Some(files_envelope::Body::Managed(listing)) =
+            manage(&service, Audience::Everyone).await.body
+        else {
+            panic!("expected a listing");
+        };
+        assert_eq!(listing.files.len(), 3);
+        let storage = listing
+            .storage
+            .expect("an operator's view says what is held");
+        assert_eq!(storage.file_count, 3);
+        assert_eq!(storage.used_bytes, 6);
+        assert_eq!(storage.max_total_bytes, 1_000_000);
+        assert!(storage.max_upload_bytes > 0);
+        assert!(
+            listing.files.iter().all(|file| !file.filename.is_empty()),
+            "each row carries what a dashboard renders"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_remembers_when_it_was_last_read() {
+        // The one column that answers "is anybody still using this", which is
+        // what an operator clearing space needs.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let before = &manage(&service, Audience::Everyone).await;
+        let Some(files_envelope::Body::Managed(listing)) = &before.body else {
+            panic!("expected a listing");
+        };
+        assert_eq!(listing.files[0].downloaded_at_ms, 0, "never read yet");
+
+        let (status, ..) = call(
+            &service,
+            "GET",
+            &format!("/s/{}", grant.key),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let Some(files_envelope::Body::Managed(listing)) =
+            manage(&service, Audience::Everyone).await.body
+        else {
+            panic!("expected a listing");
+        };
+        assert!(listing.files[0].downloaded_at_ms > 0, "and now it has been");
+    }
+
+    #[tokio::test]
+    async fn a_user_without_write_on_the_root_gets_no_operator_view() {
+        let service = service_holding(Perm::SHARE_FILES.union(READ_CHANNEL)).await;
+        let envelope = manage(&service, Audience::Everyone).await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn my_files_are_the_ones_i_uploaded_and_no_others() {
+        // The roster has nobody in these tests, so an upload records no
+        // account and no certificate - which is the guest case, and the one
+        // where "mine" must come back empty rather than come back as
+        // everyone's.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let Some(files_envelope::Body::Managed(listing)) =
+            manage(&service, Audience::Mine).await.body
+        else {
+            panic!("expected a listing");
+        };
+        assert!(
+            listing.files.is_empty(),
+            "an upload with no identity on it belongs to nobody, not to everybody"
+        );
+        assert!(
+            listing.storage.is_none(),
+            "a user's own files say nothing about the server's disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_file_takes_its_row_and_its_bytes() {
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Forget(ForgetRequest {
+                request_id: "f1".to_owned(),
+                key: grant.key.clone(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(envelope.body, Some(files_envelope::Body::Managed(_))),
+            "expected an acknowledgement, got {:?}",
+            envelope.body
+        );
+        assert!(service.listing(4, 50).await.is_empty());
+        assert!(
+            http::object_path(service.objects_dir(), &grant.key).is_some_and(|path| !path.exists()),
+            "the bytes went too"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_somebody_elses_file_needs_the_permission_for_it() {
+        // The uploads here carry no identity, so none of them are the caller's
+        // - which makes this exactly the "somebody else's" path.
+        let service = service_holding(Perm::SHARE_FILES.union(READ_CHANNEL)).await;
+        let grant = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Forget(ForgetRequest {
+                request_id: "f1".to_owned(),
+                key: grant.key.clone(),
+            }),
+        )
+        .await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+        assert_eq!(
+            service.listing(4, 50).await.len(),
+            1,
+            "and it is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_file_that_does_not_exist_says_so_without_asking_permission() {
+        let service = service_holding(Perm::SHARE_FILES).await;
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Forget(ForgetRequest {
+                request_id: "f1".to_owned(),
+                key: "4/nothing/here.txt".to_owned(),
+            }),
+        )
+        .await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Invalid as i32,
+            "a key that names nothing is not a permission question"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_photo_opens_in_the_browser_and_a_page_does_not() {
+        // The epoch-0 allow-list. What is absent from it is the point: an
+        // uploaded `.html` rendered in this origin is cross-site scripting
+        // with a progress bar.
+        let service = service().await;
+        for (name, mime, expected) in [
+            ("holiday.png", "image/png", "inline"),
+            ("notes.html", "text/html", "attachment"),
+            ("drawing.svg", "image/svg+xml", "attachment"),
+        ] {
+            let grant = grant_for(
+                &service,
+                UploadRequest {
+                    filename: name.to_owned(),
+                    content_type: mime.to_owned(),
+                    ..upload_as(Visibility::Public, "", 2)
+                },
+            )
+            .await;
+            assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+            let (_, headers, _) = call(
+                &service,
+                "GET",
+                &format!("/s/{}", grant.key),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await;
+            let disposition = headers
+                .get("content-disposition")
+                .expect("a share link names its download");
+            assert!(
+                disposition.starts_with(expected),
+                "{name} ({mime}) should be {expected}, got {disposition}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_longer_than_the_operator_allows_is_clamped_not_refused() {
+        // Clamped because the uploader wanted the most they could have, and a
+        // refusal here would make the option unusable rather than bounded.
+        let service = service().await;
+        service.max_ttl_ms.store(3_600_000, Ordering::Relaxed);
+
+        let grant = grant_for(&service, upload_lasting(Visibility::Public, 604_800, 2)).await;
+        let asked_for = now_ms() + 604_800_000;
+        assert!(
+            grant.share_expires_at_ms < asked_for,
+            "a week was asked for and the ceiling is an hour"
+        );
+        assert!(grant.share_expires_at_ms > now_ms());
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_also_ends_shares_that_asked_for_nothing() {
+        // Otherwise the ceiling is advice: an uploader who picks "never" would
+        // simply opt out of the operator's limit.
+        let service = service().await;
+        service.max_ttl_ms.store(3_600_000, Ordering::Relaxed);
+
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert!(
+            grant.share_expires_at_ms > now_ms(),
+            "forever is not on offer where a ceiling is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_past_the_total_cap_is_refused_before_a_byte_moves() {
+        let service = service().await;
+        service.max_upload.store(8_192, Ordering::Relaxed);
+        service.max_total_storage.store(4_096, Ordering::Relaxed);
+
+        let first = grant_for(&service, upload_as(Visibility::Session, "", 4_000)).await;
+        assert_eq!(put_through(&service, &first, &vec![0u8; 4_000]).await, 201);
+
+        let envelope = ask(&service, upload_as(Visibility::Session, "", 4_000)).await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Limit as i32,
+            "refused at grant time: a client told after the transfer has already \
+             spent the whole upload finding out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_share_is_gone_after_it_is_read() {
+        let service = service().await;
+        service.delete_on_download.store(true, Ordering::Relaxed);
+
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        let path = format!("/s/{}", grant.key);
+
+        let (status, _, body) = call(&service, "GET", &path, None, None, Vec::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hi", "the reader still gets the file");
+
+        let (status, ..) = call(&service, "GET", &path, None, None, Vec::new()).await;
+        assert_eq!(status, 404, "and nobody gets it twice");
+    }
+
+    #[tokio::test]
+    async fn a_range_request_does_not_spend_a_one_shot_share() {
+        // A player asks for a header before it asks for anything else. Counting
+        // that as the download would delete the file between a video's first
+        // request and its second.
+        let service = service().await;
+        service.delete_on_download.store(true, Ordering::Relaxed);
+
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 10)).await;
+        assert_eq!(put_through(&service, &grant, b"0123456789").await, 201);
+        let path = format!("/s/{}", grant.key);
+
+        let (status, ..) = ranged(&service, &path, "bytes=0-3").await;
+        assert_eq!(status, 206);
+        let (status, ..) = ranged(&service, &path, "bytes=4-9").await;
+        assert_eq!(status, 206, "still there for the rest of the file");
+    }
+
+    #[tokio::test]
+    async fn a_session_share_goes_when_the_session_does_if_the_operator_asked() {
+        let service = service().await;
+        service.delete_on_disconnect.store(true, Ordering::Relaxed);
+
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        assert_eq!(service.listing(4, 50).await.len(), 1);
+
+        // `ask` sends as session 7, which is the owner recorded on the row.
+        service.forget_session(7).await;
+        assert!(
+            service.listing(4, 50).await.is_empty(),
+            "the row went with the session"
+        );
+        assert!(
+            http::object_path(service.objects_dir(), &grant.key).is_some_and(|path| !path.exists()),
+            "and so did the bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn shares_outlive_a_disconnect_unless_the_operator_said_otherwise() {
+        // The default, and the one that must not change by accident: a channel
+        // losing every attachment because somebody closed their client is a
+        // worse server than one that keeps files around.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        service.forget_session(7).await;
+        assert_eq!(service.listing(4, 50).await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_share_with_a_lifetime_says_when_it_ends_and_stops_when_it_does() {
         let service = service().await;
         let grant = grant_for(&service, upload_lasting(Visibility::Public, 3_600, 2)).await;
@@ -1656,6 +2897,26 @@ mod tests {
         FilesEnvelope::decode(sent.payload.as_slice()).expect("a files envelope")
     }
 
+    /// One frame in, one frame out, for a body that is not an upload.
+    async fn ask_body(service: &Arc<FilesService>, body: files_envelope::Body) -> FilesEnvelope {
+        let actions = service
+            .frame(Inbound {
+                conn: 1,
+                session: 2,
+                type_id: ServiceKind::Files.outer_type(),
+                payload: FilesEnvelope { body: Some(body) }.encode_to_vec(),
+                gateway: String::new(),
+                scope: 1,
+            })
+            .await;
+        let action = actions.into_iter().next().expect("a reply");
+        let Some(starling_proto_fancy::control::server_action::Action::Send(sent)) = action.action
+        else {
+            panic!("a reply is a send");
+        };
+        FilesEnvelope::decode(sent.payload.as_slice()).expect("a files envelope")
+    }
+
     fn upload_of(filename: &str, size: u64) -> UploadRequest {
         UploadRequest {
             request_id: "r1".to_owned(),
@@ -1786,6 +3047,7 @@ mod tests {
             public: false,
             expires_at_ms: now_ms() + 60_000,
             share_expires_at_ms: None,
+            uploader: Uploader::default(),
             password_hash: None,
             seal: None,
         };
@@ -1819,6 +3081,7 @@ mod tests {
             public: false,
             expires_at_ms: now_ms() + 60_000,
             share_expires_at_ms: None,
+            uploader: Uploader::default(),
             password_hash: None,
             seal: None,
         };
@@ -1856,6 +3119,7 @@ mod tests {
             public: false,
             expires_at_ms: now_ms() + 60_000,
             share_expires_at_ms: None,
+            uploader: Uploader::default(),
             password_hash: None,
             seal: None,
         };
