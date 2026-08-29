@@ -154,6 +154,16 @@ webpki-roots = "1"
 # Parsing a `Date` response header, which is how the clock skew that breaks
 # signed assertions is detected.
 httpdate = "1"
+# Decoding and shrinking the picture a link preview found. Only the formats a
+# page actually points `og:image` at, and no default features: the rest of the
+# crate is decoders for formats no web page uses, and every one of them is code
+# that would run on bytes a stranger chose.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+] }
 
 # -- data -------------------------------------------------------------------
 sqlx = { version = "0.9", default-features = false, features = [

@@ -485,6 +485,27 @@ viewer's network and learn their address. Fetching here moves both to the server
 which is the point, and makes the SSRF guard enforceable: a deny list covering
 loopback, link-local, and the private ranges that hold a cloud metadata service.
 
+The picture is the same argument carried through. An `og:image` names a host the
+page does not have to own, so it is vetted, resolved and capped in its own right,
+and then **shrunk here and sent as bytes**: naming the URL instead would hand
+that host one request per member of the channel, which is the probe the service
+exists to prevent. What travels is a thumbnail (640 on its longest side, JPEG,
+or PNG where the original had transparency to keep), because the bytes are paid
+for once per viewer on the same connection as the conversation. The decode is
+gated on the *header's* dimensions rather than the file's size, since a small
+file can describe an enormous pixel buffer.
+
+**The fetch announces itself as Discord's crawler**, which is worth stating
+plainly because it is not true. The large sites publish `OpenGraph` metadata to
+an allow-list of *named* crawlers and to nobody else: Reddit answers
+`Discordbot`, `facebookexternalhit` and `Slackbot-LinkExpanding` with a full set
+of tags, and answers an honest `Starling/0.2` — or a browser string, or anything
+merely containing "bot" — with an eight-kilobyte script shell titled "Reddit".
+YouTube serves `og:title` in its first two kilobytes to a known crawler and
+buries it behind 690 KiB of script otherwise. The choice is between a preview
+service that does not work on the sites people paste and a header that is not
+strictly true; `preview_user_agent` is how an operator makes the other choice.
+
 ### `context-actions` — the menu entries a plugin adds, and the triggers back
 
 The server never learns what an action does. Each entry carries the plugin's own

@@ -559,13 +559,31 @@ message PreviewRequest {
 
 // Fetched by the server, never by the client, so a chat link cannot be used to
 // probe a viewer's network. The fetch is SSRF-guarded on the server side.
+//
+// The picture travels the same way and for the same reason. `image` carries the
+// bytes themselves, fetched and downscaled here, because the alternative -
+// naming the origin's URL and letting each viewer load it - hands that origin
+// one request per member of the channel, which is the probe the whole service
+// exists to prevent. It is a thumbnail and not the original: a preview is a
+// card in a chat log, and the megabyte behind an `og:image` buys nothing at
+// that size while every recipient pays for it.
 message Preview {
   string request_id = 1;
   string url = 2;
   string title = 3;
   string description = 4;
+  // Reserved for a full-resolution image held by the files service, which
+  // nothing stores yet. `image` below is the thumbnail every client renders.
   string image_key = 5;
   string site = 6;
+  // The downscaled preview image, empty when the page offered none, when the
+  // fetch failed, or when the operator has switched images off.
+  bytes image = 7;
+  // The MIME type of `image` (`image/jpeg`), empty when `image` is.
+  string image_mime = 8;
+  // The size of `image` itself, not of the original the page pointed at.
+  uint32 image_width = 9;
+  uint32 image_height = 10;
 }
 
 message PreviewError {

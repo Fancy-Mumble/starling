@@ -11,11 +11,12 @@
 
 pub mod fetch;
 pub mod parse;
+pub mod thumbnail;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use fetch::{FetchError, Fetcher, Limits};
+pub use fetch::{DEFAULT_USER_AGENT, FetchError, Fetcher, Limits};
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{
@@ -265,6 +266,19 @@ impl LinkPreviewService {
             let body = match fetcher.fetch(&url).await {
                 Ok(page) => {
                     let card = parse::card(&page.html);
+                    // A second fetch, of a second host, before the answer goes
+                    // out: the card is worth more with the picture on it, and
+                    // the picture is only safe to show because the server is
+                    // the one that went and got it.
+                    let picture = picture_for(&fetcher, &page.url, &card).await;
+                    // A page that never named itself is labelled with its
+                    // host, which is what a reader wanted from that line
+                    // anyway: where this link goes.
+                    let site = if card.site.is_empty() {
+                        host_of(&page.url)
+                    } else {
+                        card.site
+                    };
                     link_preview_envelope::Body::Preview(Preview {
                         request_id: request.request_id,
                         // Where it *ended up*: a preview of a shortened link
@@ -272,14 +286,24 @@ impl LinkPreviewService {
                         url: page.url,
                         title: card.title,
                         description: card.description,
-                        site: card.site,
+                        site,
                         // Left empty, and this is the honest state rather than
-                        // an oversight: `image_key` names an object in the
-                        // files service, and nothing here stores one yet.
-                        // Putting the remote URL in it would send every viewer
-                        // to fetch it, which is the network probe this whole
-                        // service exists to prevent.
+                        // an oversight: `image_key` names a full-resolution
+                        // object in the files service, and nothing here stores
+                        // one yet. The thumbnail below is what clients render,
+                        // and it travels as bytes precisely so no viewer has to
+                        // contact the origin to see it.
                         image_key: String::new(),
+                        image: picture
+                            .as_ref()
+                            .map(|thumb| thumb.bytes.clone())
+                            .unwrap_or_default(),
+                        image_mime: picture
+                            .as_ref()
+                            .map(|thumb| thumb.mime.to_owned())
+                            .unwrap_or_default(),
+                        image_width: picture.as_ref().map_or(0, |thumb| thumb.width),
+                        image_height: picture.as_ref().map_or(0, |thumb| thumb.height),
                     })
                 }
                 Err(error) => {
@@ -313,6 +337,85 @@ impl LinkPreviewService {
     }
 }
 
+/// The bare host of `url`, as a label for a page that named no site.
+///
+/// `www.` goes, because "www.rust-lang.org" is not what anybody calls it, and
+/// the point of the line is recognition.
+fn host_of(url: &str) -> String {
+    let rest = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let host = rest
+        .split('@')
+        .next_back()
+        .unwrap_or(rest)
+        .split(':')
+        .next()
+        .unwrap_or(rest);
+    host.strip_prefix("www.").unwrap_or(host).to_owned()
+}
+
+/// Fetch and shrink the picture `card` points at, if it points at one.
+///
+/// `None` covers every way this does not happen - the page named no image, the
+/// URL is one the guard refuses, the host would not answer, the file is past
+/// the cap, the bytes are not a picture the decoder knows. All of them are the
+/// same outcome for a reader: a card with words and no picture, which is the
+/// preview they would have had anyway. None of them may cost the *preview*,
+/// which is why this cannot return an error the caller might propagate.
+async fn picture_for(
+    fetcher: &Fetcher,
+    page_url: &str,
+    card: &parse::Card,
+) -> Option<thumbnail::Thumbnail> {
+    if card.image.is_empty() {
+        return None;
+    }
+    let limits = fetcher.limits();
+    if limits.image_bytes == 0 {
+        return None;
+    }
+    // What the page *says* it is, before a byte is fetched: a page describing
+    // a 30000x30000 image has already told us the decode would be refused, and
+    // a request saved is a request a stranger did not get the server to make.
+    let claimed = u64::from(card.image_width) * u64::from(card.image_height);
+    if claimed > u64::from(limits.image_pixels) {
+        tracing::debug!(
+            url = %card.image,
+            width = card.image_width,
+            height = card.image_height,
+            "preview image skipped: the page describes it as too large"
+        );
+        return None;
+    }
+
+    // Resolved against the page it was found on, because `og:image` is a
+    // relative path as often as not, and then vetted in its own right: the
+    // image is a *different* host from the page, and an SSRF guard that
+    // checked only the page would be a guard around the front door of a house
+    // with two.
+    let url = fetch::join(page_url, &card.image);
+    // Belt and braces, and the braces are the ones that hold: `fetch_image`
+    // vets every hop of its own accord, so this is the early-out that saves a
+    // socket rather than the check the guard depends on.
+    if !fetcher.private_is_allowed()
+        && let Err(refusal) = vet(&url)
+    {
+        tracing::debug!(%url, reason = refusal.reason(), "preview image refused");
+        return None;
+    }
+    match fetcher.fetch_image(&url).await {
+        Ok(image) => thumbnail::shrink(&image.bytes, limits.image_edge, limits.image_pixels),
+        Err(error) => {
+            tracing::debug!(%url, ?error, "preview image could not be fetched");
+            None
+        }
+    }
+}
+
 impl Serve for LinkPreviewService {
     const NAME: &'static str = "link-preview";
 
@@ -339,11 +442,32 @@ impl Serve for LinkPreviewService {
                 // Zero would mean "never fetch anything", silently, and an
                 // operator who wants that switches the service off.
                 .max(1),
+            image_bytes: service
+                .option::<usize>("preview_image_max_bytes")
+                .unwrap_or(default.image_bytes),
+            image_edge: service
+                .option::<u32>("preview_image_edge")
+                .unwrap_or(default.image_edge)
+                // A zero-pixel thumbnail is not a smaller picture, it is a
+                // decode that produces nothing. An operator switching images
+                // off has `preview_image_max_bytes` for that.
+                .max(16),
+            image_pixels: service
+                .option::<u32>("preview_image_max_pixels")
+                .unwrap_or(default.image_pixels),
         };
+        // Which crawler the fetch claims to be is an operator's call, because
+        // it is the one setting here with a cost outside the deployment: the
+        // default is the one that makes previews work on the sites people
+        // paste, and an operator who would rather be honest about it than have
+        // Reddit links preview says so here. See `DEFAULT_USER_AGENT`.
+        let agent = service
+            .option::<String>("preview_user_agent")
+            .unwrap_or_default();
         Ok(Arc::new(Self {
             fanout: Fanout::default(),
             logger: ctx.logger,
-            fetcher: Fetcher::new(limits),
+            fetcher: Fetcher::new(limits).announcing(&agent),
         }))
     }
 
@@ -356,6 +480,18 @@ impl Serve for LinkPreviewService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_that_names_no_site_is_labelled_with_its_host() {
+        assert_eq!(host_of("https://www.rust-lang.org/learn"), "rust-lang.org");
+        assert_eq!(
+            host_of("https://de.wikipedia.org/wiki/Jean-Baptiste_Auriol"),
+            "de.wikipedia.org"
+        );
+        // The port and any credentials belong to the connection, not to the
+        // label a reader is shown.
+        assert_eq!(host_of("http://user:pw@example.org:8080/a"), "example.org");
+    }
 
     #[test]
     fn the_cloud_metadata_address_is_refused() {

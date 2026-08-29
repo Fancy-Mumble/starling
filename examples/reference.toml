@@ -353,13 +353,32 @@ max_upload = "512MiB"
 #
 # [services.link-preview.options]
 # How long to wait on a page, in milliseconds (default 5000), how much of it to
-# read (default 262144), how many redirects to follow (default 3), and how many
+# read (default 1048576), how many redirects to follow (default 3), and how many
 # fetches may run at once (default 8). They bound work a stranger asks for
 # against a host the stranger picked, so the defaults are deliberately mean.
+# The read stops at `</head>`, so the byte cap is a ceiling for the pages that
+# bury their metadata behind hundreds of kilobytes of script rather than what an
+# ordinary page costs.
 # preview_timeout_ms = "5000"
-# preview_max_bytes = "262144"
+# preview_max_bytes = "1048576"
 # preview_redirects = "3"
 # preview_concurrency = "8"
+# The picture on the card is fetched here too, and travels as bytes, so no
+# viewer contacts the origin to see it. How much of one may be downloaded
+# (default 2 MiB, and "0" switches pictures off entirely), how large the
+# thumbnail that goes out may be (default 640 on its longest side), and how
+# many pixels the server will decode (default 40000000 -- the gate against a
+# small file describing an enormous image).
+# preview_image_max_bytes = "2097152"
+# preview_image_edge = "640"
+# preview_image_max_pixels = "40000000"
+# What the fetch calls itself. The default is Discord's crawler, and that is a
+# decision: Reddit and YouTube publish their OpenGraph tags to an allow-list of
+# named crawlers and answer anything else -- an honest "Starling/0.2" included
+# -- with a script shell carrying no metadata at all. Set this to whatever you
+# would rather send; blank keeps the default, since a request with no
+# user-agent is refused outright by a good share of the web.
+# preview_user_agent = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 #
 # [services.screenshare.options]
 # The UDP port the SFU binds for media; 0 lets the OS pick.

@@ -30,12 +30,22 @@ pub struct Card {
     pub site: String,
     /// The `og:image` URL, as the page gave it.
     ///
-    /// **Not** what goes on the wire. `Preview.image_key` names an object in
-    /// the files service, and putting a remote URL there would send every
-    /// viewer to fetch it, which is precisely the network probe that having
-    /// the server fetch previews exists to prevent. Kept because the fetch that
-    /// stores it needs somewhere to start.
+    /// **Not** what goes on the wire: sending it would have every viewer load
+    /// the origin's picture, which is precisely the network probe that having
+    /// the server fetch previews exists to prevent. It is where the *server's*
+    /// image fetch starts, and only the bytes it brings back travel.
+    ///
+    /// Relative as often as not (`/static/card.png`), so a caller resolves it
+    /// against the page's own URL before it means anything.
     pub image: String,
+    /// What the page says the image measures, or `0` where it did not say.
+    ///
+    /// A hint, and used as one: the bytes that travel are downscaled and carry
+    /// their own size. This is what lets a fetch decline a picture the page
+    /// itself describes as enormous without spending a request to find out.
+    pub image_width: u32,
+    /// The height the page claims, paired with [`Card::image_width`].
+    pub image_height: u32,
 }
 
 /// Read `html` for what it says about itself.
@@ -50,6 +60,14 @@ pub fn card(html: &str) -> Card {
     let take = |slot: &mut String, value: String| {
         if slot.is_empty() && !value.is_empty() {
             *slot = value;
+        }
+    };
+    // Same rule for the dimensions, and unparseable means absent: a page that
+    // writes `og:image:width` as "large" has said nothing about the size, which
+    // is exactly the state a `0` already means.
+    let take_number = |slot: &mut u32, value: &str| {
+        if *slot == 0 {
+            *slot = value.trim().parse().unwrap_or(0);
         }
     };
 
@@ -67,8 +85,26 @@ pub fn card(html: &str) -> Card {
             "og:description" | "twitter:description" | "description" => {
                 take(&mut card.description, content);
             }
-            "og:site_name" | "twitter:site" => take(&mut card.site, content),
-            "og:image" | "twitter:image" => take(&mut card.image, content),
+            // `twitter:site` is deliberately not here: by Twitter's own
+            // definition it is an @handle for an account, not the name of a
+            // publication, so reading it as one labelled cards "@rustlang" and
+            // "@github". A page that names no site gets its host, which the
+            // caller fills in because it is the only one that knows the URL.
+            "og:site_name" => take(&mut card.site, content),
+            // `og:image:secure_url` before `og:image`, and both before
+            // Twitter's: a page that offers https for the same picture is
+            // offering the one a fetch can actually use.
+            "og:image:secure_url"
+            | "og:image"
+            | "og:image:url"
+            | "twitter:image"
+            | "twitter:image:src" => take(&mut card.image, content),
+            "og:image:width" | "twitter:image:width" => {
+                take_number(&mut card.image_width, &content);
+            }
+            "og:image:height" | "twitter:image:height" => {
+                take_number(&mut card.image_height, &content);
+            }
             _ => {}
         }
     }
@@ -315,6 +351,40 @@ mod tests {
                </head>"#,
         );
         assert_eq!(card.title, "First");
+    }
+
+    #[test]
+    fn the_picture_and_the_size_it_claims_are_both_read() {
+        let card = card(
+            r#"<head>
+                 <meta property="og:image" content="https://cdn.example/card.png">
+                 <meta property="og:image:width" content="1200">
+                 <meta property="og:image:height" content="630">
+               </head>"#,
+        );
+        assert_eq!(card.image, "https://cdn.example/card.png");
+        assert_eq!((card.image_width, card.image_height), (1200, 630));
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_the_same_as_no_size() {
+        // The dimensions are a hint used to decline enormous pictures early. A
+        // page that writes "large" has said nothing, and nothing is `0`, not a
+        // refusal and not a panic.
+        let card = card(
+            r#"<head>
+                 <meta property="og:image" content="/c.png">
+                 <meta property="og:image:width" content="large">
+               </head>"#,
+        );
+        assert_eq!(card.image_width, 0);
+        assert_eq!(card.image, "/c.png");
+    }
+
+    #[test]
+    fn twitter_names_the_picture_when_opengraph_does_not() {
+        let card = card(r#"<head><meta name="twitter:image" content="/t.png"></head>"#);
+        assert_eq!(card.image, "/t.png");
     }
 
     #[test]

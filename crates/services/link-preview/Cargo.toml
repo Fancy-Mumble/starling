@@ -17,6 +17,7 @@ bytes.workspace = true
 hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
+image.workspace = true
 prost.workspace = true
 rustls.workspace = true
 tokio.workspace = true
