@@ -24,7 +24,7 @@
 //! whole value here is that a drifting codec cannot quietly re-baseline itself.
 
 use prost::Message as _;
-use starling_proto_fancy::fancy::files::{FilesEnvelope, files_envelope};
+use starling_proto_fancy::fancy::files::{FilesEnvelope, Visibility, files_envelope};
 use starling_proto_fancy::fancy::pchat::{PchatEnvelope, pchat_envelope};
 use starling_proto_fancy::fancy::social::{SocialEnvelope, social_envelope};
 use starling_proto_fancy::types::ServiceKind;
@@ -194,6 +194,34 @@ fn the_upload_request_asks_for_the_file_the_client_picked() {
     assert_eq!(
         upload.request_id, "r-1",
         "the correlation is what tells one in-flight upload from another"
+    );
+}
+
+#[test]
+fn a_password_share_asks_for_exactly_that() {
+    // The two fields that decide who may reach the file. They default to a
+    // session share, so the fixture above - which sets neither - would keep
+    // passing if this end read the visibility off the wrong tag entirely. The
+    // failure that would cause is the worst kind here: a file the uploader
+    // locked, served to anyone.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.contains("with a password"))
+        .expect("the password upload fixture");
+    let envelope = FilesEnvelope::decode(&fixture.frame[HEADER..]).expect("decodes");
+    let Some(files_envelope::Body::Upload(upload)) = envelope.body else {
+        panic!("expected an upload request, got {:?}", envelope.body);
+    };
+    assert_eq!(
+        upload.visibility,
+        Visibility::Password as i32,
+        "reading this as anything else publishes a file that was meant to be locked"
+    );
+    assert_eq!(upload.password, "hunter2");
+    assert_eq!(
+        upload.ttl_seconds, 604_800,
+        "and the lifetime with them: a share that outlived the week it was \
+         given is the same failure as one that was never locked"
     );
 }
 

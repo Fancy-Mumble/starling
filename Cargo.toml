@@ -184,6 +184,12 @@ sha2 = "0.11"
 rand = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+# Password hashing, and the KDF that turns a share's password into the key its
+# bytes are sealed with. Only `files` needs either.
+argon2 = "0.5"
+# The audited STREAM construction over XChaCha20-Poly1305, so a password-
+# protected object is encrypted in bounded memory however large it is.
+aead-stream = { version = "0.6", features = ["alloc"] }
 # RS256, for the assertion a service account is authenticated by. Already in the
 # tree as the one rustls provider the workspace enables, so this is the signer
 # that is here anyway rather than a second RSA implementation beside it.

@@ -10,16 +10,21 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+aead-stream.workspace = true
+argon2.workspace = true
 axum.workspace = true
 bytes.workspace = true
+chacha20poly1305.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+zeroize.workspace = true
 
 subtle.workspace = true
 rand.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 prost.workspace = true
 tokio.workspace = true
@@ -29,6 +34,9 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true
+# Driving the router directly in tests, without binding a port.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

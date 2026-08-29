@@ -94,8 +94,13 @@ channel_count_limit = 1000
 max_upload = "512MiB"
 # How long a download link stays valid.
 url_ttl = "15m"
-# What download links point at. Set this once the server is reachable under a
-# name other than the one you are testing from.
+# Where the bytes are served from. Without it nothing serves them: uploads are
+# still signed for, and every download 404s.
+# listen = "127.0.0.1:64739"
+# What links point at, which is what a reverse proxy in front of `listen`
+# answers to. Set this once the server is reachable under a name other than the
+# one you are testing from - it is also what share links are built from, so a
+# wrong value here is a link nobody can open.
 # public_url = "https://files.example.org"
 
 

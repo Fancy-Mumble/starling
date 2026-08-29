@@ -11,8 +11,10 @@
 //! thumbnails, audit exports. Being HTTP, it can sit behind an `Ingress` and get
 //! TLS termination and a CDN for free.
 
+mod crypto;
 pub mod http;
 pub mod sign;
+mod tickets;
 
 pub use sign::{Signature, sign, verify};
 
@@ -24,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::files::{
-    FilesEnvelope, Grant, Listing, Refused, Share, files_envelope,
+    FilesEnvelope, Grant, Listing, Refused, Share, UploadRequest, Visibility, files_envelope,
 };
 use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::files::files_server::{Files, FilesServer};
@@ -40,6 +42,7 @@ use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use tonic::{Request, Response, Status};
+use zeroize::Zeroizing;
 
 /// A client's filename, reduced to something that can be a path component.
 ///
@@ -108,6 +111,30 @@ const SCHEMA: &[Migration<'static>] = &[
             "CREATE INDEX IF NOT EXISTS ix_object_age ON object(server_id, created_at_ms)",
         ],
     ),
+    Migration::new(
+        // A share behind a password. `public` stayed the coarse "reachable by
+        // link" it always was, and these three say what reaching it costs:
+        // the hash a guess is checked against, and the salt and nonce the
+        // bytes were sealed under. All three are null together or set
+        // together - a row with a hash and no salt would be a file nothing
+        // could open, and one with a salt and no hash a file anything could.
+        "0003_object_password",
+        &[
+            "ALTER TABLE object ADD COLUMN password_hash VARCHAR(255) NULL",
+            "ALTER TABLE object ADD COLUMN enc_salt BLOB NULL",
+            "ALTER TABLE object ADD COLUMN enc_nonce BLOB NULL",
+        ],
+    ),
+    Migration::new(
+        // A share the uploader put a clock on. Null means it outlives every
+        // clock but the operator's own `retain_seconds`, which is the answer
+        // every object gave before this column existed.
+        "0004_object_expiry",
+        &[
+            "ALTER TABLE object ADD COLUMN expires_at_ms BIGINT NULL",
+            "CREATE INDEX IF NOT EXISTS ix_object_expiry ON object(server_id, expires_at_ms)",
+        ],
+    ),
 ];
 
 /// The service.
@@ -134,6 +161,8 @@ pub struct FilesService {
     objects_dir: PathBuf,
     /// Grants minted but not yet spent, keyed by object key.
     pending: RwLock<HashMap<String, Pending>>,
+    /// Tickets minted for password shares and not yet redeemed.
+    tickets: tickets::Tickets,
     /// Who is in which channel, so a finished upload can be announced to them.
     roster: Arc<Roster>,
     /// How long an object is kept. `0` keeps it for good.
@@ -325,43 +354,31 @@ impl ClientService for FilesService {
                         })),
                     }
                 } else {
-                    // Keyed by a fresh id, not by filename: two people sharing
-                    // `screenshot.png` in one channel must not be the same
-                    // object, and the second must not overwrite the first.
-                    let key = format!(
-                        "{}/{}/{}",
-                        upload.channel,
-                        uuid::Uuid::now_v7().simple(),
-                        safe_name(&upload.filename)
-                    );
-                    let url = self.grant("PUT", &key);
-                    self.remember_pending(
-                        &key,
-                        Pending {
-                            channel: upload.channel,
-                            owner: inbound.session,
-                            filename: upload.filename.clone(),
-                            content_type: upload.content_type.clone(),
-                            size: upload.size,
-                            // Epoch 1 has one axis: reachable by link, or only
-                            // by the people the share is announced to.
-                            public: false,
-                            expires_at_ms: url.expires_at_ms,
+                    match self.prepare_upload(&upload, inbound.session) {
+                        Ok(envelope) => envelope,
+                        Err(detail) => FilesEnvelope {
+                            body: Some(files_envelope::Body::Refused(Refused {
+                                request_id: upload.request_id,
+                                refusal: Some(Refusal {
+                                    kind: refusal::Kind::Invalid as i32,
+                                    detail,
+                                    retry_after_ms: 0,
+                                }),
+                            })),
                         },
-                    );
-                    FilesEnvelope {
-                        body: Some(files_envelope::Body::Grant(Grant {
-                            request_id: upload.request_id,
-                            url: url.url,
-                            method: url.method,
-                            expires_at_ms: url.expires_at_ms,
-                            key,
-                        })),
                     }
                 }
             }
             Some(files_envelope::Body::Download(download)) => {
                 let url = self.grant("GET", &download.key);
+                // The share link, for a client that wants something to copy
+                // rather than something to fetch with. Read from the row, so a
+                // session-only object still answers with nothing here.
+                let record = self.share_record(&download.key).await;
+                let share_url = match &record {
+                    Some(record) if record.public => self.share_url(&download.key),
+                    _ => String::new(),
+                };
                 FilesEnvelope {
                     body: Some(files_envelope::Body::Grant(Grant {
                         request_id: download.request_id,
@@ -369,6 +386,10 @@ impl ClientService for FilesService {
                         method: url.method,
                         expires_at_ms: url.expires_at_ms,
                         key: download.key,
+                        share_url,
+                        share_expires_at_ms: record
+                            .and_then(|record| record.expires_at_ms)
+                            .unwrap_or_default(),
                     })),
                 }
             }
@@ -402,6 +423,7 @@ impl Serve for FilesService {
             logger: ctx.logger.clone(),
             objects_dir: ctx.config.runtime.data_dir.join("files"),
             pending: RwLock::new(HashMap::new()),
+            tickets: tickets::Tickets::default(),
             roster: Arc::new(Roster::new()),
             // `retain_seconds` in `[services.files].options`: a plain number,
             // because this is the one knob and a duration grammar would be a
@@ -505,10 +527,12 @@ impl FilesService {
             tokio::select! {
                 () = shutdown.wait() => return,
                 _ = tick.tick() => {
-                    let retain = self.retain_ms.load(Ordering::Relaxed);
-                    if retain > 0 {
-                        let _collected = self.collect_expired(retain).await;
-                    }
+                    // Unconditional now: even with no blanket retention there
+                    // are objects to collect, because a share can carry a
+                    // lifetime of its own.
+                    let _collected = self
+                        .collect_expired(self.retain_ms.load(Ordering::Relaxed))
+                        .await;
                 }
             }
         }
@@ -530,7 +554,84 @@ pub(crate) struct Pending {
     /// The ceiling this grant was signed for, in bytes.
     pub(crate) size: u64,
     pub(crate) public: bool,
+    /// When the *grant* stops being spendable. Not the share's own clock.
     pub(crate) expires_at_ms: u64,
+    /// When the finished share stops answering, or `None` for never.
+    pub(crate) share_expires_at_ms: Option<u64>,
+    /// What a password guess is checked against, for a password share.
+    pub(crate) password_hash: Option<String>,
+    /// The salt and nonce prefix the bytes are sealed under.
+    ///
+    /// Alongside the key rather than instead of it: the key is spent sealing
+    /// this one upload and then gone, while these two have to outlive it in
+    /// the row so a later reader can derive the key again from the password.
+    pub(crate) seal: Option<Seal>,
+}
+
+/// What is needed to seal one object, and what has to be kept to open it.
+#[derive(Clone)]
+pub(crate) struct Seal {
+    pub(crate) salt: [u8; crypto::ENC_SALT_BYTES],
+    pub(crate) nonce: [u8; crypto::ENC_NONCE_PREFIX_BYTES],
+    /// Derived once, when the upload was granted.
+    ///
+    /// Here rather than derived again at `PUT` time because Argon2id is meant
+    /// to be slow, and the data plane is where the bytes are already waiting.
+    pub(crate) key: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for Seal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the key: `Pending` is `Debug`, and a tracing call that printed
+        // one would put the only secret protecting the object in a log.
+        formatter.write_str("Seal")
+    }
+}
+
+impl Pending {
+    /// How this upload asked to be shared.
+    fn visibility(&self) -> Visibility {
+        visibility_of(self.public, self.password_hash.is_some())
+    }
+}
+
+/// The two stored facts, read back as the one thing they say.
+///
+/// A password always implies a link - a password on a share nobody can reach
+/// protects nothing - so the hash is checked first and `public` only decides
+/// between the remaining two.
+fn visibility_of(public: bool, locked: bool) -> Visibility {
+    match (public, locked) {
+        (_, true) => Visibility::Password,
+        (true, false) => Visibility::Public,
+        (false, false) => Visibility::Session,
+    }
+}
+
+/// One stored object, as the share routes need to know it.
+#[derive(Debug, Clone)]
+pub(crate) struct ShareRecord {
+    pub(crate) filename: String,
+    pub(crate) content_type: String,
+    /// Reachable by link at all. A session-only object is not.
+    pub(crate) public: bool,
+    /// Set when the link also costs a password.
+    pub(crate) password_hash: Option<String>,
+    pub(crate) enc_salt: Option<Vec<u8>>,
+    pub(crate) enc_nonce: Option<Vec<u8>>,
+    /// When this share stops answering, or `None` for never.
+    pub(crate) expires_at_ms: Option<u64>,
+}
+
+impl ShareRecord {
+    /// Whether this share's time is up.
+    ///
+    /// Asked on every read rather than left to the sweeper: the sweeper runs on
+    /// a timer, and "expires in seven days" that keeps working until the next
+    /// sweep is a promise the server did not keep.
+    pub(crate) fn expired(&self) -> bool {
+        self.expires_at_ms.is_some_and(|at| at <= now_ms())
+    }
 }
 
 impl FilesService {
@@ -573,6 +674,135 @@ impl FilesService {
         (pending.expires_at_ms > now_ms()).then_some(pending)
     }
 
+    /// Turn one upload request into the grant that answers it.
+    ///
+    /// `Err` is the sentence to refuse with. Only one thing is refused here -
+    /// a password share with no password - and it is refused rather than
+    /// quietly downgraded to a public one, because the difference between
+    /// those two is the whole of what the uploader asked for.
+    fn prepare_upload(
+        &self,
+        upload: &UploadRequest,
+        session: u32,
+    ) -> Result<FilesEnvelope, String> {
+        let visibility = Visibility::try_from(upload.visibility).unwrap_or(Visibility::Session);
+        let password = upload.password.trim();
+        if visibility == Visibility::Password && password.is_empty() {
+            return Err("a password share needs a password".to_owned());
+        }
+
+        // Sealed before the bytes exist, so the data plane has only cheap work
+        // to do once they start arriving: Argon2id twice here, nothing there.
+        let (password_hash, seal) = if visibility == Visibility::Password {
+            let salt = crypto::generate_salt().map_err(|_| "could not prepare the share")?;
+            let nonce =
+                crypto::generate_nonce_prefix().map_err(|_| "could not prepare the share")?;
+            let key =
+                crypto::derive_key(password, &salt).map_err(|_| "could not prepare the share")?;
+            let hash =
+                crypto::hash_password(password).map_err(|_| "could not prepare the share")?;
+            (Some(hash), Some(Seal { salt, nonce, key }))
+        } else {
+            (None, None)
+        };
+
+        // Keyed by a fresh id, not by filename: two people sharing
+        // `screenshot.png` in one channel must not be the same object, and the
+        // second must not overwrite the first.
+        let key = format!(
+            "{}/{}/{}",
+            upload.channel,
+            uuid::Uuid::now_v7().simple(),
+            safe_name(&upload.filename)
+        );
+        let url = self.grant("PUT", &key);
+        let public = visibility != Visibility::Session;
+        // Counted from the ask rather than from the arrival: an upload that
+        // takes an hour was still shared when the person shared it, and a
+        // seven-day link that becomes a six-day one because the file was large
+        // is a link that expires for a reason nobody can see.
+        let share_expires_at_ms = (upload.ttl_seconds > 0)
+            .then(|| now_ms().saturating_add(upload.ttl_seconds.saturating_mul(1_000)));
+        self.remember_pending(
+            &key,
+            Pending {
+                channel: upload.channel,
+                owner: session,
+                filename: upload.filename.clone(),
+                content_type: upload.content_type.clone(),
+                size: upload.size,
+                public,
+                expires_at_ms: url.expires_at_ms,
+                share_expires_at_ms,
+                password_hash,
+                seal,
+            },
+        );
+        Ok(FilesEnvelope {
+            body: Some(files_envelope::Body::Grant(Grant {
+                request_id: upload.request_id.clone(),
+                url: url.url,
+                method: url.method,
+                expires_at_ms: url.expires_at_ms,
+                share_url: self.share_url_if(public, &key),
+                share_expires_at_ms: share_expires_at_ms.unwrap_or_default(),
+                key,
+            })),
+        })
+    }
+
+    /// Where an object answers to anyone holding the link.
+    ///
+    /// A different path from the signed one, and deliberately not a variant of
+    /// it: `/s/` is served without a signature, so the two must never be
+    /// reachable at the same address by accident. No key can collide with the
+    /// prefix, because every key begins with a channel id and channel ids are
+    /// digits.
+    fn share_url(&self, key: &str) -> String {
+        format!("{}/s/{key}", self.public_url().trim_end_matches('/'))
+    }
+
+    /// The link for a share that has one, or empty for a session share.
+    fn share_url_if(&self, public: bool, key: &str) -> String {
+        if public {
+            self.share_url(key)
+        } else {
+            String::new()
+        }
+    }
+
+    /// One object, as the unsigned share routes need it.
+    pub(crate) async fn share_record(&self, key: &str) -> Option<ShareRecord> {
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT filename, content_type, public, password_hash, enc_salt, enc_nonce, \
+             expires_at_ms FROM object WHERE server_id = ? AND k = ?",
+        )
+        .bind(1_i64)
+        .bind(key)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()??;
+        Some(ShareRecord {
+            filename: row.try_get("filename").unwrap_or_default(),
+            content_type: row.try_get("content_type").unwrap_or_default(),
+            public: row.try_get::<i64, _>("public").unwrap_or_default() != 0,
+            password_hash: row.try_get("password_hash").ok().flatten(),
+            enc_salt: row.try_get("enc_salt").ok().flatten(),
+            enc_nonce: row.try_get("enc_nonce").ok().flatten(),
+            expires_at_ms: row
+                .try_get::<Option<i64>, _>("expires_at_ms")
+                .ok()
+                .flatten()
+                .map(|at| at as u64),
+        })
+    }
+
+    /// The tickets minted for this server's password shares.
+    pub(crate) fn tickets(&self) -> &tickets::Tickets {
+        &self.tickets
+    }
+
     /// The stored content type, for a download's `Content-Type`.
     pub(crate) async fn content_type_of(&self, key: &str) -> Option<String> {
         use sqlx::Row as _;
@@ -594,8 +824,9 @@ impl FilesService {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO object \
-             (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms, public) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+             (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms, \
+             public, password_hash, enc_salt, enc_nonce, expires_at_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
         )
         .bind(1_i64)
         .bind(key)
@@ -606,6 +837,10 @@ impl FilesService {
         .bind(size as i64)
         .bind(now as i64)
         .bind(i64::from(pending.public))
+        .bind(pending.password_hash.clone())
+        .bind(pending.seal.as_ref().map(|seal| seal.salt.to_vec()))
+        .bind(pending.seal.as_ref().map(|seal| seal.nonce.to_vec()))
+        .bind(pending.share_expires_at_ms.map(|at| at as i64))
         .execute(self.store.pool())
         .await
         .map(drop)
@@ -625,6 +860,9 @@ impl FilesService {
                 size,
                 shared_at_ms: now_ms(),
                 public: pending.public,
+                visibility: pending.visibility() as i32,
+                share_url: self.share_url_if(pending.public, key),
+                expires_at_ms: pending.share_expires_at_ms.unwrap_or_default(),
             })),
         };
         // The uploader included: it learns the final key and size from the same
@@ -647,25 +885,44 @@ impl FilesService {
         // make the server read its whole table on request.
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query(
-            "SELECT k, owner, filename, size, created_at_ms, public FROM object \
-             WHERE server_id = ? AND channel_id = ? ORDER BY created_at_ms DESC LIMIT ?",
+            "SELECT k, owner, filename, size, created_at_ms, public, password_hash, \
+             expires_at_ms FROM object WHERE server_id = ? AND channel_id = ? \
+             AND (expires_at_ms IS NULL OR expires_at_ms > ?) \
+             ORDER BY created_at_ms DESC LIMIT ?",
         )
         .bind(1_i64)
         .bind(i64::from(channel))
+        .bind(now_ms() as i64)
         .bind(i64::from(limit))
         .fetch_all(self.store.pool())
         .await
         .unwrap_or_default();
 
         rows.iter()
-            .map(|row| Share {
-                key: row.try_get("k").unwrap_or_default(),
-                channel,
-                owner: row.try_get::<i64, _>("owner").unwrap_or_default() as u32,
-                filename: row.try_get("filename").unwrap_or_default(),
-                size: row.try_get::<i64, _>("size").unwrap_or_default() as u64,
-                shared_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
-                public: row.try_get::<i64, _>("public").unwrap_or_default() != 0,
+            .map(|row| {
+                let key: String = row.try_get("k").unwrap_or_default();
+                let public = row.try_get::<i64, _>("public").unwrap_or_default() != 0;
+                let locked = row
+                    .try_get::<Option<String>, _>("password_hash")
+                    .ok()
+                    .flatten()
+                    .is_some();
+                Share {
+                    channel,
+                    owner: row.try_get::<i64, _>("owner").unwrap_or_default() as u32,
+                    filename: row.try_get("filename").unwrap_or_default(),
+                    size: row.try_get::<i64, _>("size").unwrap_or_default() as u64,
+                    shared_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
+                    public,
+                    visibility: visibility_of(public, locked) as i32,
+                    share_url: self.share_url_if(public, &key),
+                    expires_at_ms: row
+                        .try_get::<Option<i64>, _>("expires_at_ms")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default() as u64,
+                    key,
+                }
             })
             .collect()
     }
@@ -677,16 +934,23 @@ impl FilesService {
     /// a disk that fills for reasons nobody can see.
     pub(crate) async fn collect_expired(&self, older_than_ms: u64) -> u64 {
         use sqlx::Row as _;
-        if older_than_ms == 0 {
-            return 0;
-        }
-        let cutoff = now_ms().saturating_sub(older_than_ms);
-        let rows = sqlx::query("SELECT k FROM object WHERE server_id = ? AND created_at_ms < ?")
-            .bind(1_i64)
-            .bind(cutoff as i64)
-            .fetch_all(self.store.pool())
-            .await
-            .unwrap_or_default();
+        // Two clocks, either of which can be the one that ends an object: the
+        // operator's blanket retention, and the lifetime the uploader chose.
+        // A share past its own expiry goes even where the operator keeps files
+        // for good, which is the whole of what choosing one buys.
+        let cutoff = (older_than_ms > 0).then(|| now_ms().saturating_sub(older_than_ms));
+        let rows = sqlx::query(
+            "SELECT k FROM object WHERE server_id = ? \
+             AND ((? > 0 AND created_at_ms < ?) \
+                  OR (expires_at_ms IS NOT NULL AND expires_at_ms <= ?))",
+        )
+        .bind(1_i64)
+        .bind(cutoff.unwrap_or_default() as i64)
+        .bind(cutoff.unwrap_or_default() as i64)
+        .bind(now_ms() as i64)
+        .fetch_all(self.store.pool())
+        .await
+        .unwrap_or_default();
 
         let mut collected = 0;
         for row in &rows {
@@ -742,6 +1006,7 @@ mod tests {
             logger: Logger::null(),
             objects_dir: std::env::temp_dir().join("starling-files-test"),
             pending: RwLock::new(HashMap::new()),
+            tickets: tickets::Tickets::default(),
             roster: Arc::new(Roster::new()),
             retain_ms: AtomicU64::new(0),
         })
@@ -827,7 +1092,7 @@ mod tests {
                 filename: "big.bin".to_owned(),
                 content_type: "application/octet-stream".to_owned(),
                 size: 4096,
-                sha256: Vec::new(),
+                ..UploadRequest::default()
             })),
         };
         let actions = service
@@ -841,6 +1106,523 @@ mod tests {
             })
             .await;
         assert_eq!(actions.len(), 1);
+    }
+
+    /// One request through the router, answered by the real handler.
+    async fn fetch(
+        service: &Arc<FilesService>,
+        key: &str,
+        range: Option<&str>,
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let expires = now_ms() + 60_000;
+        let signature = sign(&service.secret, "GET", key, expires);
+        let mut builder = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{key}?expires={expires}&sig={signature}"));
+        if let Some(range) = range {
+            builder = builder.header("range", range);
+        }
+        let request = builder.body(axum::body::Body::empty()).expect("a request");
+
+        let response = http::router(Arc::clone(service))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// An object on disk, under a key this service will serve.
+    fn put_object(service: &Arc<FilesService>, key: &str, bytes: &[u8]) {
+        let path = http::object_path(service.objects_dir(), key).expect("a path");
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the object directory");
+        std::fs::write(&path, bytes).expect("the object");
+    }
+
+    /// One request through the router, with whatever a share link carries.
+    async fn call(
+        service: &Arc<FilesService>,
+        method: &str,
+        uri: &str,
+        auth: Option<&str>,
+        accept: Option<&str>,
+        body: Vec<u8>,
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(auth) = auth {
+            builder = builder.header("authorization", format!("Bearer {auth}"));
+        }
+        if let Some(accept) = accept {
+            builder = builder.header("accept", accept);
+        }
+        let request = builder
+            .body(axum::body::Body::from(body))
+            .expect("a request");
+        let response = http::router(Arc::clone(service))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// Ask for an upload the way a client does, and read the grant back.
+    async fn grant_for(service: &Arc<FilesService>, request: UploadRequest) -> Grant {
+        match ask(service, request).await.body {
+            Some(files_envelope::Body::Grant(grant)) => grant,
+            other => panic!("expected a grant, got {other:?}"),
+        }
+    }
+
+    /// One upload request, as a client would send it.
+    fn upload_as(visibility: Visibility, password: &str, size: u64) -> UploadRequest {
+        UploadRequest {
+            request_id: "r1".to_owned(),
+            channel: 4,
+            filename: "secret plan.txt".to_owned(),
+            content_type: "text/plain".to_owned(),
+            size,
+            visibility: visibility as i32,
+            password: password.to_owned(),
+            ..UploadRequest::default()
+        }
+    }
+
+    /// The same, with a lifetime on it.
+    fn upload_lasting(visibility: Visibility, ttl_seconds: u64, size: u64) -> UploadRequest {
+        UploadRequest {
+            ttl_seconds,
+            ..upload_as(visibility, "", size)
+        }
+    }
+
+    /// Put `bytes` through the granted URL, the way the client streams them.
+    async fn put_through(service: &Arc<FilesService>, grant: &Grant, bytes: &[u8]) -> u16 {
+        let uri = grant
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("the granted URL points at this service");
+        call(service, "PUT", uri, None, None, bytes.to_vec())
+            .await
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_public_share_is_reachable_with_no_signature_at_all() {
+        // The whole point of the option: somebody with no account, no client
+        // and no session opens the link and gets the file.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 11)).await;
+        assert!(
+            grant.share_url.starts_with("https://files.example.org/s/"),
+            "a public share is granted a link to hand out: {}",
+            grant.share_url
+        );
+        assert_eq!(put_through(&service, &grant, b"hello there").await, 201);
+
+        let (status, headers, body) = call(
+            &service,
+            "GET",
+            &format!("/s/{}", grant.key),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello there");
+        assert!(
+            headers
+                .get("content-disposition")
+                .is_some_and(|value| value.contains("secret plan.txt")),
+            "a link opened in a browser saves under the name it was shared as"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_share_is_not_reachable_by_link() {
+        // The default has to stay what it was: a file shared into a channel is
+        // for the channel, and the share route must not quietly widen it.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Session, "", 5)).await;
+        assert_eq!(grant.share_url, "", "a session share has no link");
+        assert_eq!(put_through(&service, &grant, b"inner").await, 201);
+
+        let (status, ..) = call(
+            &service,
+            "GET",
+            &format!("/s/{}", grant.key),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "and it is answered as absent, not as forbidden: telling the \
+             difference would make the route a way to test whether a key is real"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_share_opens_only_for_the_password() {
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Password, "hunter2", 12)).await;
+        assert_eq!(put_through(&service, &grant, b"the contents").await, 201);
+        let path = format!("/s/{}", grant.key);
+
+        // The bytes on disk are not the bytes that went in.
+        let stored =
+            std::fs::read(http::object_path(service.objects_dir(), &grant.key).expect("a path"))
+                .expect("the stored object");
+        assert_ne!(
+            stored, b"the contents",
+            "a password share is sealed at rest"
+        );
+
+        // No ticket, no file.
+        let (status, ..) = call(&service, "GET", &path, None, None, Vec::new()).await;
+        assert_eq!(status, 401);
+
+        // The wrong password buys nothing.
+        let (status, ..) = call(&service, "POST", &path, Some("hunter3"), None, Vec::new()).await;
+        assert_eq!(status, 403);
+
+        // The right one buys a ticket, and the ticket opens it.
+        let (status, _, body) =
+            call(&service, "POST", &path, Some("hunter2"), None, Vec::new()).await;
+        assert_eq!(status, 200);
+        let ticket = String::from_utf8(body)
+            .expect("json")
+            .split('"')
+            .nth(3)
+            .expect("a ticket in the json")
+            .to_owned();
+        let (status, _, body) = call(
+            &service,
+            "GET",
+            &format!("{path}?ticket={ticket}"),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"the contents");
+
+        // And the ticket is spent: a link that kept working would be a link
+        // that no longer needs the password.
+        let (status, ..) = call(
+            &service,
+            "GET",
+            &format!("{path}?ticket={ticket}"),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn a_password_share_opened_in_a_browser_gets_somewhere_to_type_it() {
+        // A JSON 401 in a browser window is a dead end for the person the link
+        // was sent to, who has the password and nowhere to put it.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Password, "hunter2", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let (status, headers, body) = call(
+            &service,
+            "GET",
+            &format!("/s/{}", grant.key),
+            None,
+            Some("text/html,application/xhtml+xml"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert!(
+            headers
+                .get("content-type")
+                .is_some_and(|value| value.starts_with("text/html")),
+            "a browser gets a page"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("password"));
+    }
+
+    #[tokio::test]
+    async fn a_password_share_with_no_password_is_refused_rather_than_widened() {
+        // The one way this could go quietly wrong: treating a missing password
+        // as "public" would publish a file the uploader meant to lock.
+        let service = service().await;
+        let envelope = ask(&service, upload_as(Visibility::Password, "  ", 5)).await;
+        assert!(
+            matches!(envelope.body, Some(files_envelope::Body::Refused(_))),
+            "expected a refusal, got {:?}",
+            envelope.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_says_how_each_file_may_be_reached() {
+        // What the composer reads to draw the badge on an existing card.
+        let service = service().await;
+        for (visibility, password) in [
+            (Visibility::Session, ""),
+            (Visibility::Public, ""),
+            (Visibility::Password, "hunter2"),
+        ] {
+            let grant = grant_for(&service, upload_as(visibility, password, 2)).await;
+            assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        }
+        let listed = service.listing(4, 50).await;
+        let mut seen: Vec<i32> = listed.iter().map(|share| share.visibility).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![
+                Visibility::Session as i32,
+                Visibility::Public as i32,
+                Visibility::Password as i32,
+            ],
+            "each of the three comes back as what it was uploaded as"
+        );
+        for share in &listed {
+            let linked = share.visibility != Visibility::Session as i32;
+            assert_eq!(
+                !share.share_url.is_empty(),
+                linked,
+                "a link is listed for exactly the shares that have one"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_share_with_a_lifetime_says_when_it_ends_and_stops_when_it_does() {
+        let service = service().await;
+        let grant = grant_for(&service, upload_lasting(Visibility::Public, 3_600, 2)).await;
+        assert!(
+            grant.share_expires_at_ms > now_ms(),
+            "the server states the moment, so every reader agrees on it"
+        );
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let path = format!("/s/{}", grant.key);
+        let (status, ..) = call(&service, "GET", &path, None, None, Vec::new()).await;
+        assert_eq!(status, 200, "still inside its lifetime");
+
+        // Wound forward by hand rather than by waiting an hour: what is being
+        // tested is that the stored moment is honoured, not the clock.
+        let _wound = sqlx::query("UPDATE object SET expires_at_ms = ? WHERE k = ?")
+            .bind((now_ms() - 1) as i64)
+            .bind(&grant.key)
+            .execute(service.store.pool())
+            .await
+            .expect("wind the clock forward");
+
+        let (status, ..) = call(&service, "GET", &path, None, None, Vec::new()).await;
+        assert_eq!(
+            status, 404,
+            "expired on the read, not only on the next sweep: a link that keeps \
+             working until a timer fires is a promise the server did not keep"
+        );
+        assert!(
+            service.listing(4, 50).await.is_empty(),
+            "and it is gone from the listing too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_without_a_lifetime_never_expires() {
+        // The default has to stay "forever": a file that vanished because the
+        // uploader did not pick a lifetime would be a file lost to a default.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Public, "", 2)).await;
+        assert_eq!(grant.share_expires_at_ms, 0);
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+
+        let collected = service.collect_expired(0).await;
+        assert_eq!(collected, 0, "the sweeper leaves it alone");
+        let (status, ..) = call(
+            &service,
+            "GET",
+            &format!("/s/{}", grant.key),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_collects_a_share_whose_own_time_is_up() {
+        // Even with no blanket retention: `retain_seconds` is the operator's
+        // clock, and a per-share lifetime has to hold without one.
+        let service = service().await;
+        let grant = grant_for(&service, upload_lasting(Visibility::Public, 3_600, 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        let _wound = sqlx::query("UPDATE object SET expires_at_ms = ? WHERE k = ?")
+            .bind((now_ms() - 1) as i64)
+            .bind(&grant.key)
+            .execute(service.store.pool())
+            .await
+            .expect("wind the clock forward");
+
+        assert_eq!(
+            service.collect_expired(0).await,
+            1,
+            "the row and the bytes go"
+        );
+        assert!(
+            http::object_path(service.objects_dir(), &grant.key).is_some_and(|path| !path.exists()),
+            "the bytes are gone from disk, not only from the table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_hands_back_only_the_range_it_was_asked_for() {
+        // Without this a video is unplayable: a player asks for a header and a
+        // seek point, and a listener that can only answer with whole objects
+        // makes it spend the entire file to show one frame.
+        let service = service().await;
+        let object: Vec<u8> = (0..50_000_u32).map(|byte| (byte % 251) as u8).collect();
+        put_object(&service, "9/ranged/clip.mp4", &object);
+
+        let (status, headers, body) =
+            fetch(&service, "9/ranged/clip.mp4", Some("bytes=1000-1999")).await;
+
+        assert_eq!(status, 206, "a partial answer to a partial ask");
+        assert_eq!(
+            headers.get("content-range").map(String::as_str),
+            Some("bytes 1000-1999/50000"),
+            "the real length is how a player learns how long the file is"
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some("1000")
+        );
+        assert_eq!(body.as_slice(), &object[1000..2000]);
+    }
+
+    #[tokio::test]
+    async fn a_download_says_it_answers_ranges_even_when_none_was_asked_for() {
+        // Read off the first response: a player decides whether seeking is
+        // possible before it asks for a second byte.
+        let service = service().await;
+        put_object(&service, "9/plain/note.txt", b"hello");
+
+        let (status, headers, body) = fetch(&service, "9/plain/note.txt", None).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("accept-ranges").map(String::as_str),
+            Some("bytes")
+        );
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("5"));
+        assert_eq!(body.as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn an_open_ended_range_is_answered_from_where_it_starts_to_the_end() {
+        // `bytes=N-` is what a seek turns into.
+        let service = service().await;
+        put_object(&service, "9/seek/clip.mp4", &vec![7_u8; 4_096]);
+
+        let (status, headers, body) = fetch(&service, "9/seek/clip.mp4", Some("bytes=4000-")).await;
+
+        assert_eq!(status, 206);
+        assert_eq!(
+            headers.get("content-range").map(String::as_str),
+            Some("bytes 4000-4095/4096")
+        );
+        assert_eq!(body.len(), 96);
+    }
+
+    #[tokio::test]
+    async fn a_range_past_the_end_is_refused_with_the_length() {
+        // The length in the 416 is what stops a player asking again forever.
+        let service = service().await;
+        put_object(&service, "9/short/clip.mp4", b"tiny");
+
+        let (status, headers, _) = fetch(&service, "9/short/clip.mp4", Some("bytes=900-999")).await;
+
+        assert_eq!(status, 416);
+        assert_eq!(
+            headers.get("content-range").map(String::as_str),
+            Some("bytes */4")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_without_a_valid_grant_is_still_refused() {
+        // Ranging is not a way around the signature.
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let service = service().await;
+        put_object(&service, "9/guarded/clip.mp4", b"secret");
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/9/guarded/clip.mp4?expires=99999999999999&sig=deadbeef")
+            .header("range", "bytes=0-3")
+            .body(axum::body::Body::empty())
+            .expect("a request");
+        let response = http::router(Arc::clone(&service))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+
+        assert_eq!(response.status().as_u16(), 403);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
+        assert!(!body.starts_with(b"secr"), "no bytes leak past the check");
     }
 
     #[tokio::test]
@@ -881,7 +1663,7 @@ mod tests {
             filename: filename.to_owned(),
             content_type: "image/png".to_owned(),
             size,
-            sha256: Vec::new(),
+            ..UploadRequest::default()
         }
     }
 
@@ -1003,6 +1785,9 @@ mod tests {
             size: 100,
             public: false,
             expires_at_ms: now_ms() + 60_000,
+            share_expires_at_ms: None,
+            password_hash: None,
+            seal: None,
         };
         service
             .record_object("3/abc/notes.pdf", &pending, 84, now_ms())
@@ -1033,6 +1818,9 @@ mod tests {
             size: 10,
             public: false,
             expires_at_ms: now_ms() + 60_000,
+            share_expires_at_ms: None,
+            password_hash: None,
+            seal: None,
         };
         // One well past the horizon, one just made.
         service
@@ -1067,6 +1855,9 @@ mod tests {
             size: 10,
             public: false,
             expires_at_ms: now_ms() + 60_000,
+            share_expires_at_ms: None,
+            password_hash: None,
+            seal: None,
         };
         service
             .record_object("3/keep/keep.bin", &pending, 10, 0)

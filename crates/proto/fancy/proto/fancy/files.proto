@@ -18,6 +18,20 @@ message FilesEnvelope {
   }
 }
 
+// Who may reach a shared file.
+//
+// One axis, three points, ordered by how far the file travels. `SESSION` is
+// zero because it is what an upload that says nothing gets: a client too old
+// to know about this field asks for the narrowest sharing, never the widest.
+enum Visibility {
+  // Only the people the share is announced to, each fetch signed for.
+  VISIBILITY_SESSION = 0;
+  // Anyone holding the link, with no account and no signature.
+  VISIBILITY_PUBLIC = 1;
+  // Anyone holding the link who also knows the password.
+  VISIBILITY_PASSWORD = 2;
+}
+
 message UploadRequest {
   string request_id = 1;
   uint32 channel = 2;
@@ -25,6 +39,16 @@ message UploadRequest {
   string content_type = 4;
   uint64 size = 5;
   bytes sha256 = 6;
+  Visibility visibility = 7;
+  // How long the share should last, in seconds. `0` means it never expires,
+  // which is also what an upload that says nothing gets.
+  uint64 ttl_seconds = 9;
+  // The password for a `VISIBILITY_PASSWORD` share, and nothing otherwise.
+  //
+  // Sent once, on the control connection, and never stored: the server keeps
+  // an Argon2id hash to check against, and derives the file's encryption key
+  // from the same secret. Losing the password loses the file.
+  string password = 8;
 }
 
 message DownloadRequest {
@@ -38,6 +62,20 @@ message Grant {
   string method = 3;
   uint64 expires_at_ms = 4;
   string key = 5;
+  // Where this object will answer to anyone holding the link, once the bytes
+  // are in. Empty for a session share, which has no such address.
+  //
+  // Carried here rather than built by the client because the address is the
+  // server's to state: it is the operator's `public_url`, which the client
+  // never sees, and it does not expire the way `url` does.
+  string share_url = 6;
+  // When the finished share stops answering, or `0` for never.
+  //
+  // Distinct from `expires_at_ms` above, which is the moment this URL stops
+  // being spendable: one is the life of the link, the other the life of the
+  // file. The server's number rather than the client's arithmetic, so every
+  // reader agrees about when it goes.
+  uint64 share_expires_at_ms = 7;
 }
 
 message Share {
@@ -47,7 +85,14 @@ message Share {
   string filename = 4;
   uint64 size = 5;
   uint64 shared_at_ms = 6;
+  // Reachable by link at all. Kept as the coarse question every reader had
+  // before there were two ways of answering it; `visibility` says which.
   bool public = 7;
+  Visibility visibility = 8;
+  // The link, for a share that has one. Empty otherwise.
+  string share_url = 9;
+  // When this share stops answering, or `0` for never.
+  uint64 expires_at_ms = 10;
 }
 
 message ListRequest {
