@@ -12,7 +12,10 @@ use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
 use super::helpers::{SessionStats, generate_ice_creds};
-use super::{REMB_BITRATE_BPS, REMB_INTERVAL, STATS_INTERVAL, SfuConfig};
+use super::{
+    REMB_BITRATE_BPS, REMB_INTERVAL, STATS_INTERVAL, SfuConfig, VIEWER_BWE_DESIRED_BPS,
+    VIEWER_BWE_INITIAL_BPS,
+};
 
 // ---------------------------------------------------------------------------
 // BroadcastSession
@@ -293,6 +296,15 @@ impl BroadcastSession {
         Self::negotiate_peer(rtc_config, config, socket, sdp)
     }
 
+    /// Create a sending peer (one per viewer).
+    ///
+    /// Unlike the broadcaster's peer this keeps str0m's standard extension
+    /// map, so `TransportSequenceNumber` is negotiated and the viewer sends
+    /// TWCC feedback. `enable_bwe` is what finally consumes it: without it
+    /// those reports arrived and were dropped, and this leg had no bandwidth
+    /// estimate of any kind. Enabling it also swaps str0m's null pacer for the
+    /// leaky bucket, so a keyframe no longer leaves for the viewer as one
+    /// wire-speed burst.
     fn create_sending_peer(
         config: &SfuConfig,
         socket: &UdpSocket,
@@ -301,8 +313,14 @@ impl BroadcastSession {
         let rtc_config = RtcConfig::new()
             .set_ice_lite(true)
             .set_local_ice_credentials(generate_ice_creds())
+            .enable_bwe(Some(Bitrate::from(VIEWER_BWE_INITIAL_BPS)))
             .set_stats_interval(Some(STATS_INTERVAL));
-        Self::negotiate_peer(rtc_config, config, socket, sdp)
+        let (mut rtc, answer) = Self::negotiate_peer(rtc_config, config, socket, sdp)?;
+        // str0m's probe controller stays idle until something states an upper
+        // bound to probe toward.
+        rtc.bwe()
+            .set_desired_bitrate(Bitrate::from(VIEWER_BWE_DESIRED_BPS));
+        Ok((rtc, answer))
     }
 
     fn negotiate_peer(

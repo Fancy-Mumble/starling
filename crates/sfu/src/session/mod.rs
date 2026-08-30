@@ -29,6 +29,12 @@ const STATS_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const REMB_INTERVAL: Duration = Duration::from_secs(1);
 const REMB_BITRATE_BPS: u64 = 50_000_000;
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Starting point for a viewer's downlink estimate. str0m probes up from
+/// here, so it only has to be a plausible opening bid, not a limit.
+const VIEWER_BWE_INITIAL_BPS: f64 = 2_500_000.0;
+/// Ceiling we ask str0m to probe toward on a viewer leg. Without a desired
+/// bitrate str0m never probes at all, so the estimate could only fall.
+const VIEWER_BWE_DESIRED_BPS: f64 = 20_000_000.0;
 const MAX_BATCH_DRAIN: usize = 200;
 const ICE_UFRAG_LEN: usize = 8;
 const ICE_PASS_LEN: usize = 24;

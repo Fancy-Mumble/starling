@@ -93,6 +93,27 @@ impl BroadcastSession {
                     );
                     keyframe_requests.push(req);
                 }
+                // The downlink estimate for THIS viewer. Logged for now; it is
+                // what a per-viewer layer selector will decide on.
+                Ok(Output::Event(Event::EgressBitrateEstimate(estimate))) => {
+                    debug!("SFU: viewer {viewer_id} downlink estimate: {estimate:?}");
+                }
+                // Per-mid egress counters, including the loss the viewer is
+                // actually seeing - the one number nothing on this leg used to
+                // report anywhere.
+                Ok(Output::Event(Event::MediaEgressStats(egress))) => {
+                    debug!(
+                        "SFU: viewer {viewer_id} egress mid={} bytes={} packets={} \
+                         loss={:?} rtt={:?} plis={} nacks={}",
+                        egress.mid,
+                        egress.bytes,
+                        egress.packets,
+                        egress.loss,
+                        egress.rtt,
+                        egress.plis,
+                        egress.nacks,
+                    );
+                }
                 Ok(Output::Event(ev)) => {
                     trace!("SFU: viewer {viewer_id} event: {ev:?}");
                 }
