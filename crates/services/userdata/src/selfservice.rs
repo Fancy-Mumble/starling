@@ -69,6 +69,20 @@ const fn needs_password(kind: account_action::Kind) -> bool {
     !matches!(kind, account_action::Kind::Unspecified)
 }
 
+/// The prefix in an account's settings map that belongs to the server.
+///
+/// Everything under it is what the server keeps *about* this account rather
+/// than what the account keeps for itself: which greeting they have been
+/// shown, and whatever else comes to be recorded there. A client may write
+/// any other key it likes.
+pub const RESERVED_PREFIX: &str = "srv.";
+
+/// Whether `key` belongs to the server rather than to the account.
+#[must_use]
+pub fn is_reserved(key: &str) -> bool {
+    key.starts_with(RESERVED_PREFIX)
+}
+
 impl UserdataService {
     /// A frame on the userdata envelope.
     pub(crate) async fn on_self_service(&self, inbound: &Inbound) -> Actions {
@@ -532,14 +546,44 @@ impl UserdataService {
     }
 
     /// Apply a settings change: `set` wins over `unset` for a key in both.
+    ///
+    /// Keys under [`RESERVED_PREFIX`] are dropped rather than written. This
+    /// map is the account's own settings and a client may write what it
+    /// likes into it - which is right for a client's own preferences and
+    /// wrong for anything the *server* keeps about them. Without this a user
+    /// could write their own `srv.greet.…` entry and mark a greeting
+    /// dismissed that they were never shown, which is the whole of what the
+    /// ledger is for.
+    ///
+    /// Dropped silently to the client, and logged here: a refusal would have
+    /// to be a new ack arm, and there is no legitimate client that sends
+    /// one - anything doing so is either probing or broken, and both are
+    /// things to read about in a log rather than to answer politely.
     async fn write_settings(&self, scope: u32, account: u64, update: SettingsUpdate) {
         let Some(mut stored) = self.accounts.by_id(scope, account) else {
             return;
         };
-        for key in &update.unset {
+
+        let refused = update
+            .unset
+            .iter()
+            .filter(|key| is_reserved(key))
+            .chain(update.set.keys().filter(|key| is_reserved(key)))
+            .count();
+        if refused > 0 {
+            tracing::info!(
+                account,
+                refused,
+                "refused a settings write under the reserved prefix"
+            );
+        }
+
+        for key in update.unset.iter().filter(|key| !is_reserved(key)) {
             let _ = stored.settings.remove(key);
         }
-        stored.settings.extend(update.set);
+        stored
+            .settings
+            .extend(update.set.into_iter().filter(|(key, _)| !is_reserved(key)));
 
         let request = UpdateRequest {
             scope: Some(in_scope(scope)),
@@ -1031,6 +1075,80 @@ mod tests {
             stored.settings.get("push").map(String::as_str),
             Some("on"),
             "unsetting one key must not clear the rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_write_the_servers_own_keys() {
+        // The ledger of which greeting somebody has been shown lives under
+        // this prefix. A user who could write it themselves could dismiss a
+        // greeting they were never shown, which is the one thing the record
+        // exists to know.
+        let (service, account) = service().await;
+        let mut set = HashMap::new();
+        let _ = set.insert("srv.greet.rules".to_owned(), "9".to_owned());
+        let _ = set.insert("theme".to_owned(), "dark".to_owned());
+        service
+            .write_settings(
+                1,
+                account,
+                SettingsUpdate {
+                    set,
+                    unset: Vec::new(),
+                },
+            )
+            .await;
+
+        let stored = service.accounts.by_id(1, account).expect("account");
+        assert!(
+            !stored.settings.contains_key("srv.greet.rules"),
+            "a reserved key must not be written by a client"
+        );
+        // The rest of the same message still lands: one refused key is not
+        // grounds for discarding a legitimate preference beside it.
+        assert_eq!(
+            stored.settings.get("theme").map(String::as_str),
+            Some("dark")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_clear_the_servers_own_keys_either() {
+        // The other half, and the one that is easy to miss: refusing writes
+        // while allowing unsets would let a user delete their own record and
+        // be shown the greeting again, which is the same forgery backwards.
+        let (service, account) = service().await;
+        let mut stored = service.accounts.by_id(1, account).expect("account");
+        let _ = stored
+            .settings
+            .insert("srv.greet.rules".to_owned(), "9".to_owned());
+        let request = UpdateRequest {
+            scope: Some(in_scope(1)),
+            actor: None,
+            id: account,
+            fields: vec!["settings".to_owned()],
+            values: Some(stored),
+            password: String::new(),
+            current_password: String::new(),
+        };
+        let _ = service.accounts.update(1, request).await.expect("stored");
+
+        service
+            .write_settings(
+                1,
+                account,
+                SettingsUpdate {
+                    set: HashMap::new(),
+                    unset: vec!["srv.greet.rules".to_owned()],
+                },
+            )
+            .await;
+
+        let after = service.accounts.by_id(1, account).expect("account");
+        assert_eq!(
+            after.settings.get("srv.greet.rules").map(String::as_str),
+            Some("9"),
+            "a client must not be able to clear the server's own record"
         );
     }
 
