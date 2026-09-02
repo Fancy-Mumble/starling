@@ -226,7 +226,16 @@ abi_stable = "0.11"
 # The Rust port of Yjs, wire-compatible with the browser's, used by `live-doc`.
 yrs = "0.27"
 # Signs the short-lived token a live-doc WebSocket handshake is admitted by.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+#
+# Held at 9, which signs with `ring` -- already in this tree under rustls and
+# quinn, so it costs no new crypto. **Do not bump to 11 without reading this.**
+# 11 replaced that with a provider you must pick: `rust_crypto` is one feature
+# covering every algorithm, so it drags in `rsa`, which carries RUSTSEC-2023-0071
+# (Marvin, no patch) and fails cargo-deny; `aws_lc_rs` is the other, and that is
+# aws-lc-sys and the OpenSSL licence. live-doc signs HS256 and nothing else, so
+# neither is worth taking. `default-features = false` also drops the PEM reader,
+# which a token minted `from_secret` never needs.
+jsonwebtoken = { version = "9", default-features = false }
 # `rustls`, not the platform stack: the runtime image is distroless-ish and has
 # no system OpenSSL to link against.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }

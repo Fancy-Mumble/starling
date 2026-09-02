@@ -30,6 +30,14 @@ ignore = [
     # them, or if either is upgraded to an actual vulnerability.
     { id = "RUSTSEC-2024-0014", reason = "generational-arena (unmaintained): transitive via abi_stable, no fixed version exists" },
     { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained): transitive via abi_stable, no fixed version exists" },
+
+    # Arrives through `yrs`, the Rust port of Yjs and the whole substance of the
+    # `live-doc` plugin -- its CRDT has to be wire-compatible with the browser's,
+    # so there is no swapping it out. An unmaintained notice rather than a
+    # vulnerability, and no patched version exists to move to. Clears when yrs
+    # moves to `compact_str` or `smol_str`, which its own tree is the only thing
+    # holding up.
+    { id = "RUSTSEC-2026-0215", reason = "smallstr (unmaintained): transitive via yrs, no fixed version exists" },
 ]
 
 # ---------------------------------------------------------------------------
