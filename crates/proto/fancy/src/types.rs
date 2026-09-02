@@ -26,6 +26,20 @@ pub const BURNED_MAX: u16 = 999;
 /// First outer type available to a service.
 pub const SERVICE_BASE: u16 = 1000;
 
+/// The wire epoch this table describes, as a peer announces it in
+/// `Version.fancy_protocol`.
+///
+/// Epoch 0 is the interleaved 100-999 layout above, which every Fancy build
+/// shipped before the renumbering speaks; epoch 1 is this file. It lives here
+/// rather than beside the handshake that announces it because it is a property
+/// of the numbering, and two readers need it: the handshake, to say which
+/// epoch Starling speaks, and the gateway, to decide whether a given peer can
+/// read a frame at all. A peer on epoch 0 has no reading for `SERVICE_BASE`
+/// and up, and the shipped client treats an id it cannot map as a fatal read
+/// error rather than something to skip -- so writing one to it closes the
+/// connection.
+pub const FANCY_PROTOCOL_EPOCH: u32 = 1;
+
 /// A compressed batch of frames, unwrapped before anything is routed.
 ///
 /// **Not a service, and deliberately far from where they are allocated.** This

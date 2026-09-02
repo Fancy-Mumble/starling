@@ -768,7 +768,15 @@ impl Gateway {
         bucket: &str,
         retry_after_ms: u32,
     ) {
-        if !handle.is_fancy() {
+        let outer = ServiceKind::SessionLifecycle.outer_type();
+        // On the epoch, not on `is_fancy()`. This notice *is* a service outer
+        // type, so the question is whether the peer can read one, and a Fancy
+        // 0.3.0 client answers `is_fancy()` yes while having no reading for
+        // 1000 at all -- its decoder treats the unknown id as a fatal read
+        // error, so the courtesy of explaining a throttle cost it the
+        // connection. Silence is the correct thing to give a peer that cannot
+        // parse the explanation.
+        if !handle.accepts(outer) {
             return;
         }
         use prost::Message as _;
@@ -784,7 +792,6 @@ impl Gateway {
             ),
         };
         let payload = envelope.encode_to_vec();
-        let outer = ServiceKind::SessionLifecycle.outer_type();
         let _ = handle.send(
             Lane::Control,
             Outbound::whole(codec::frame(outer, &payload)),

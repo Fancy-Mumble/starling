@@ -1117,6 +1117,20 @@ async fn handshake_as(
     session
 }
 
+/// The handshake for a test whose subject is a Fancy service.
+///
+/// Every service outer type is epoch-1 only, and the gateway withholds one from
+/// a peer that never announced the epoch, so a test that talks to a service has
+/// to connect the way a real Fancy client does -- which is the point: these
+/// used to pass over an ungated fan-out, and an epoch-0 client was being handed
+/// frames its decoder treats as a fatal read error.
+///
+/// Returns just the session id, which is all these callers want; the announced
+/// feature version is what `handshake_epoch1` exists to assert on.
+async fn handshake_fancy(client: &mut Client, username: &str) -> u32 {
+    handshake_epoch1(client, username).await.0
+}
+
 /// The wire epoch this server speaks, as a client announces it.
 ///
 /// `handshake_as` above deliberately does not send this: its clients are the
@@ -1215,7 +1229,7 @@ async fn an_admin_changes_the_livery_over_the_connection_they_already_have() {
         .await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let session = handshake(&mut alice, "alice").await;
+    let session = handshake_fancy(&mut alice, "alice").await;
     deployment
         .wait_until_permitted(session, 0, Perm::WRITE.bits())
         .await;
@@ -1345,6 +1359,138 @@ async fn a_client_on_our_epoch_is_told_which_fancy_features_exist() {
     assert!(
         announced >= starling_gate::FancyVersion::new(0, 2, 12).to_wire(),
         "below 0.2.12 a client tunnels everything instead of speaking natively"
+    );
+
+    deployment.stop();
+}
+
+/// A Fancy version from before the renumbering, wire-encoded.
+///
+/// `major << 48 | minor << 32 | patch << 16`, so this is 0.3.0 -- a real
+/// released client, and the one the report came from.
+const PRE_EPOCH_FANCY_VERSION: u64 = 3 << 32;
+
+#[tokio::test]
+async fn a_fancy_client_from_before_the_renumbering_is_told_to_update() {
+    // The other half of withholding. The gateway is right to keep service
+    // frames away from this peer, but on its own that is a silent downgrade:
+    // chat and reactions stop working and the user has nothing to read about
+    // why. `TextMessage` is upstream and frozen, so it is the one channel that
+    // reaches a peer of any epoch.
+    let data_dir = TempDir::new("outdated-notice");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // `fancy_version` set and no `fancy_protocol`: exactly a 0.3.0 client.
+    let mut legacy = Client::connect(deployment.port).await;
+    let _ = handshake_as(
+        &mut legacy,
+        tcp::Authenticate {
+            username: Some("legacy".to_owned()),
+            ..tcp::Authenticate::default()
+        },
+        Some(PRE_EPOCH_FANCY_VERSION),
+    )
+    .await;
+
+    let mut notice = None;
+    while let Some((type_id, payload)) = legacy.next_frame(Duration::from_secs(2)).await {
+        if type_id == 11 {
+            notice = tcp::TextMessage::decode(payload.as_slice()).ok();
+            break;
+        }
+    }
+
+    let notice = notice.expect("a client on the older epoch is told why things do not work");
+    assert!(
+        notice.message.contains("out of date"),
+        "the notice has to say what is wrong: {}",
+        notice.message
+    );
+    assert_eq!(
+        notice.actor, None,
+        "actorless, so it renders as a server notice rather than a whisper"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_stock_mumble_client_is_not_told_its_client_is_out_of_date() {
+    // It is epoch 0 too, and it is using this server exactly as it should. On a
+    // public server it is also most of the room, so a warning aimed at the
+    // wrong population is worse than none at all.
+    let data_dir = TempDir::new("stock-no-notice");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut stock = Client::connect(deployment.port).await;
+    let _ = handshake(&mut stock, "stock").await;
+
+    while let Some((type_id, payload)) = stock.next_frame(Duration::from_secs(2)).await {
+        if type_id == 11 {
+            let text = tcp::TextMessage::decode(payload.as_slice()).unwrap_or_default();
+            assert!(
+                !text.message.contains("out of date"),
+                "a stock client has no Fancy build to update: {}",
+                text.message
+            );
+        }
+    }
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn a_client_on_the_older_epoch_is_never_handed_a_service_frame() {
+    // The delivery half of the epoch rule, and the half that was missing. The
+    // handshake correctly withheld the feature version from an epoch-0 peer
+    // (the test below), but nothing gated the *fan-out*: a service addresses an
+    // audience it never enumerates, so one epoch-1 client's pchat traffic was
+    // relayed to every member of the channel at outer type 1006 -- including
+    // peers whose decoder cannot map that id.
+    //
+    // For those peers it is not a dropped feature. `mumble-protocol`'s codec
+    // turns an unknown type into `Error::UnknownMessageType` and the read loop
+    // treats it as fatal, so the frame cost a 0.3.0 client its connection: it
+    // was dropped whenever a develop client spoke, and could not get back in
+    // while one was connected, because its own arrival was what prompted the
+    // other client to send.
+    let data_dir = TempDir::new("epoch-gate");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // The shipped client: it announces no epoch, because it was built before
+    // there was one to announce.
+    let mut legacy = Client::connect(deployment.port).await;
+    let _ = handshake(&mut legacy, "legacy").await;
+
+    let mut modern = Client::connect(deployment.port).await;
+    let (_, _) = handshake_epoch1(&mut modern, "modern").await;
+
+    let envelope = fancy::pchat::PchatEnvelope {
+        body: Some(fancy::pchat::pchat_envelope::Body::Message(
+            fancy::pchat::Message {
+                message_id: "01234567-89ab-7def-8123-456789abcdef".to_owned(),
+                channel: 0,
+                ciphertext: b"not plaintext".to_vec(),
+                epoch: 1,
+                protocol: fancy::pchat::Protocol::SignalV1 as i32,
+                ..fancy::pchat::Message::default()
+            },
+        )),
+    };
+    modern
+        .send_raw(PCHAT_OUTER_TYPE, &envelope.encode_to_vec())
+        .await;
+
+    // Everything the legacy peer is handed while that crosses the server.
+    let mut seen = Vec::new();
+    while let Some((type_id, _)) = legacy.next_frame(Duration::from_secs(2)).await {
+        seen.push(type_id);
+    }
+
+    assert!(
+        seen.iter()
+            .all(|&type_id| type_id < starling_proto_fancy::types::SERVICE_BASE),
+        "an epoch-0 peer was handed a service outer type it cannot decode: {seen:?}"
     );
 
     deployment.stop();
@@ -5048,9 +5194,9 @@ async fn a_reaction_reaches_the_channel_including_the_person_who_sent_it() {
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let _ = handshake(&mut bob, "bob").await;
+    let _ = handshake_fancy(&mut bob, "bob").await;
 
     alice
         .send(
@@ -5089,9 +5235,9 @@ async fn a_typing_indicator_names_the_typist_and_is_not_echoed_to_them() {
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let _ = handshake(&mut bob, "bob").await;
+    let _ = handshake_fancy(&mut bob, "bob").await;
 
     alice
         .send(
@@ -5176,9 +5322,9 @@ async fn a_screen_share_announcement_reaches_the_channel_and_names_the_real_pres
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let _ = handshake(&mut bob, "bob").await;
+    let _ = handshake_fancy(&mut bob, "bob").await;
 
     alice
         .send(
@@ -5222,11 +5368,11 @@ async fn a_screen_share_offer_is_relayed_to_the_one_session_it_names() {
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let bob_session = handshake(&mut bob, "bob").await;
+    let bob_session = handshake_fancy(&mut bob, "bob").await;
     let mut carol = Client::connect(deployment.port).await;
-    let _ = handshake(&mut carol, "carol").await;
+    let _ = handshake_fancy(&mut carol, "carol").await;
 
     alice
         .send(
@@ -5287,9 +5433,9 @@ async fn a_presenter_who_drops_ends_their_screen_share_for_everyone_else() {
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let _ = handshake(&mut alice, "alice").await;
+    let _ = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let _ = handshake(&mut bob, "bob").await;
+    let _ = handshake_fancy(&mut bob, "bob").await;
 
     alice
         .send(
@@ -5328,9 +5474,9 @@ async fn a_poll_and_its_vote_carry_the_identity_and_the_channel_the_server_resol
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let bob_session = handshake(&mut bob, "bob").await;
+    let bob_session = handshake_fancy(&mut bob, "bob").await;
 
     alice
         .send(
@@ -5393,9 +5539,9 @@ async fn a_scheduled_message_is_stored_timed_and_delivered_to_the_channel() {
     // With a client certificate: the owner of a message due later has to
     // outlive the connection that scheduled it, and only a certificate does.
     let mut alice = Client::connect_with_certificate(deployment.port, data_dir.path()).await;
-    let _ = handshake(&mut alice, "alice").await;
+    let _ = handshake_fancy(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
-    let _ = handshake(&mut bob, "bob").await;
+    let _ = handshake_fancy(&mut bob, "bob").await;
 
     let due_at = starling_runtime::ids::now_ms() + 2_000;
     alice
@@ -5474,7 +5620,7 @@ async fn a_scheduled_message_can_be_cancelled_and_then_never_arrives() {
     let deployment = Deployment::start(data_dir.path()).await;
 
     let mut alice = Client::connect_with_certificate(deployment.port, data_dir.path()).await;
-    let _ = handshake(&mut alice, "alice").await;
+    let _ = handshake_fancy(&mut alice, "alice").await;
 
     alice
         .send(

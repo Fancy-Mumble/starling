@@ -99,6 +99,15 @@ pub struct PendingConnection {
     pub reported: ReportedStats,
     /// The Fancy version the peer announced, 0 for a stock client.
     pub fancy_version: u64,
+    /// The wire epoch the peer announced, 0 for every client built before the
+    /// renumbering (`docs/PROTOCOL-COMPATIBILITY.md` 2a).
+    ///
+    /// Carried through to the gateway because it is the gateway, not this
+    /// service, that decides what may be written to a connection. A peer on
+    /// epoch 0 has no reading for a service outer type at all, and the shipped
+    /// client treats an id it does not know as a fatal decode error rather
+    /// than something to skip, so sending it one closes the connection.
+    pub fancy_protocol: u32,
     /// What the peer said it can actually do, from its `Hello`.
     ///
     /// Separate from `fancy_version` for the reason the epoch is separate from
@@ -312,6 +321,7 @@ impl Connections {
             pending.os = version.os.clone().unwrap_or_default();
             pending.os_version = version.os_version.clone().unwrap_or_default();
             pending.fancy_version = fancy_version(version);
+            pending.fancy_protocol = fancy_protocol(version);
         }
     }
 
@@ -714,6 +724,17 @@ impl Connections {
 #[must_use]
 pub fn fancy_version(version: &tcp::Version) -> u64 {
     version.fancy_version.unwrap_or_default()
+}
+
+/// The wire epoch a peer announced, or 0.
+///
+/// Absent means epoch 0, the interleaved 100-999 layout every Fancy build
+/// shipped before the renumbering speaks, and *not* "unknown": a peer that
+/// says nothing has told us which numbering it reads, because there was only
+/// one to read when it was built (`docs/PROTOCOL-COMPATIBILITY.md` 2a).
+#[must_use]
+pub fn fancy_protocol(version: &tcp::Version) -> u32 {
+    version.fancy_protocol.unwrap_or_default()
 }
 
 #[cfg(test)]

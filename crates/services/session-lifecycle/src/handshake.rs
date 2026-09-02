@@ -88,7 +88,11 @@ const FLAG_DETACHED: u32 = 4;
 /// type ≥ 1000. Starling has never spoken epoch 0's interleaved 100-999 layout,
 /// and cannot, `docs/PROTOCOL-COMPATIBILITY.md` §2 explains why that range is
 /// unroutable, and §3 is the scheme this number names.
-const FANCY_PROTOCOL: u32 = 1;
+///
+/// Re-exported from the type table rather than spelled again: the gateway gates
+/// delivery on the same number, and two copies of it is one copy that can be
+/// changed alone.
+const FANCY_PROTOCOL: u32 = starling_proto_fancy::types::FANCY_PROTOCOL_EPOCH;
 
 /// The Fancy feature level Starling serves, announced only to epoch-1 peers.
 ///
@@ -552,6 +556,12 @@ impl Handshake {
             pending.mumble_version,
             config,
         ));
+        actions.extend(outdated_epoch_warning(
+            inbound.conn,
+            pending.fancy_version,
+            pending.fancy_protocol,
+            config,
+        ));
 
         // The gateway learns the conn↔session mapping from this and nothing
         // else, so it is sent after the client's own view is complete.
@@ -566,6 +576,11 @@ impl Handshake {
                 name: name.to_owned(),
                 channel,
                 fancy_version: pending.fancy_version,
+                // What the gateway gates delivery on. Sent here rather than
+                // derived there because this is the only place the peer's
+                // `Version` is read, and a gateway guessing the epoch from the
+                // product version is the mistake this field exists to stop.
+                fancy_protocol: pending.fancy_protocol,
             })),
         });
 
@@ -1757,6 +1772,58 @@ fn listener_warning(conn: u64, mumble_version: u64, config: &Snapshot) -> Action
     vec![to_conn(conn, TEXT_MESSAGE, warning.encode_to_vec())]
 }
 
+/// Tell a Fancy client on the older wire epoch that it is out of date.
+///
+/// The counterpart to the gateway's delivery gate. That gate is what stops a
+/// service outer type reaching a peer whose decoder treats an unknown id as
+/// fatal, and it is correct, but on its own it turns a crash into a silence:
+/// the user sees reactions, typing and encrypted chat quietly not working, with
+/// nothing anywhere saying why. The server knows exactly why, and this is the
+/// one channel it can say so on.
+///
+/// `TextMessage` because it is upstream and frozen, so it is the only thing
+/// that reaches *every* peer regardless of epoch. Everything this client is
+/// missing is, by definition, carried on messages it cannot read.
+///
+/// **Only a Fancy client that named an older epoch.** A stock Mumble client is
+/// epoch 0 too and is using this server exactly as it should; telling it to
+/// upgrade would be wrong, and it is the larger population. `fancy_version`
+/// non-zero is what separates "a Fancy build from before the renumbering" from
+/// "not a Fancy build at all".
+fn outdated_epoch_warning(
+    conn: u64,
+    fancy_version: u64,
+    fancy_protocol: u32,
+    config: &Snapshot,
+) -> Actions {
+    if fancy_version == 0 || fancy_protocol == FANCY_PROTOCOL {
+        return Actions::new();
+    }
+
+    // Markup only where the server allows it, for the reason the listener
+    // warning gives: a client with `allow_html` off renders the tags literally,
+    // and a warning that arrives looking broken is worse than none.
+    let message = if config.allow_html {
+        "<b>[WARNING]</b>: Your Fancy Mumble client is <b>out of date</b> and speaks an \
+         older version of this server's protocol. Chat, reactions, typing \
+         indicators and encrypted messages <b>will not work</b> until you update. \
+         Everything else, including voice, is unaffected."
+    } else {
+        "[WARNING]: Your Fancy Mumble client is out of date and speaks an older version \
+         of this server's protocol. Chat, reactions, typing indicators and \
+         encrypted messages will not work until you update. Everything else, including \
+         voice, is unaffected."
+    };
+
+    // No actor, so a client renders it as a server notice rather than as a
+    // whisper from a user who does not exist.
+    let warning = tcp::TextMessage {
+        message: message.to_owned(),
+        ..tcp::TextMessage::default()
+    };
+    vec![to_conn(conn, TEXT_MESSAGE, warning.encode_to_vec())]
+}
+
 /// A gain map as the wire carries it.
 ///
 /// Sorted by channel, because the map is a `HashMap` and an unstable order would
@@ -2174,6 +2241,106 @@ mod tests {
     #[test]
     fn the_codec_offer_is_opus() {
         assert_eq!(codec_version().opus, Some(true));
+    }
+
+    /// The `TextMessage` an `Actions` carries, if it carries exactly one.
+    fn only_warning(actions: &Actions) -> Option<tcp::TextMessage> {
+        let [action] = actions.as_slice() else {
+            return None;
+        };
+        let Some(server_action::Action::Send(send)) = &action.action else {
+            return None;
+        };
+        assert_eq!(send.r#type, u32::from(TEXT_MESSAGE), "warnings are chat");
+        tcp::TextMessage::decode(send.payload.as_slice()).ok()
+    }
+
+    #[test]
+    fn a_fancy_client_on_the_older_epoch_is_told_it_is_out_of_date() {
+        // The gateway withholds every service frame from this peer, correctly
+        // and silently. Without this the user's whole experience of that is
+        // chat and reactions quietly not working, with nothing to read.
+        let config = Snapshot::default();
+        let actions = outdated_epoch_warning(1, FANCY_VERSION.to_wire(), 0, &config);
+        let warning = only_warning(&actions).expect("one TextMessage");
+        assert!(
+            warning.message.contains("out of date"),
+            "the notice has to say what is wrong: {}",
+            warning.message
+        );
+        assert_eq!(
+            warning.actor, None,
+            "actorless, so a client draws it as a server notice and not as a whisper"
+        );
+    }
+
+    #[test]
+    fn a_stock_mumble_client_is_never_told_to_update() {
+        // Epoch 0 as well, and using this server exactly as it should. It is
+        // also the larger population, so getting this wrong means telling most
+        // of a public server to install something they do not want.
+        let config = Snapshot::default();
+        assert!(
+            outdated_epoch_warning(1, 0, 0, &config).is_empty(),
+            "a client that never claimed Fancy has nothing to update to"
+        );
+    }
+
+    #[test]
+    fn a_client_on_our_epoch_is_not_warned() {
+        let config = Snapshot::default();
+        assert!(
+            outdated_epoch_warning(1, FANCY_VERSION.to_wire(), FANCY_PROTOCOL, &config).is_empty(),
+            "the peer speaks this wire; there is nothing to warn about"
+        );
+    }
+
+    #[test]
+    fn neither_warning_reaches_the_wire_with_the_gaps_its_source_is_wrapped_at() {
+        // Both messages are wrapped across source lines with a trailing
+        // backslash, which strips the newline *and* the indentation after it.
+        // Lose the backslash and the literal keeps that indentation: the string
+        // still compiles, the test still passes, and the user reads a warning
+        // with a dozen spaces in the middle of it.
+        let config = Snapshot {
+            allow_html: true,
+            listeners_per_channel: 1,
+            listeners_per_user: 1,
+            ..Snapshot::default()
+        };
+        for actions in [
+            outdated_epoch_warning(1, FANCY_VERSION.to_wire(), 0, &config),
+            listener_warning(1, 0, &config),
+        ] {
+            let warning = only_warning(&actions).expect("one TextMessage");
+            assert!(
+                !warning.message.contains("  "),
+                "a run of spaces survived the wrap: {}",
+                warning.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_too_old_for_listeners_is_warned_only_where_listeners_exist() {
+        // Upstream gates this on both ceilings being non-zero: on a server that
+        // permits no listeners at all there is nothing to be overheard by, and
+        // the warning is noise about a feature nobody can use.
+        let old = 0_u64;
+        let with_listeners = Snapshot {
+            listeners_per_channel: 1,
+            listeners_per_user: 1,
+            ..Snapshot::default()
+        };
+        assert!(only_warning(&listener_warning(1, old, &with_listeners)).is_some());
+        assert!(
+            listener_warning(1, old, &Snapshot::default()).is_empty(),
+            "no listeners configured, nothing to warn about"
+        );
+        assert!(
+            listener_warning(1, LISTENERS_SINCE, &with_listeners).is_empty(),
+            "a client new enough to render a listener needs no warning"
+        );
     }
 
     #[test]

@@ -97,6 +97,15 @@ pub struct ClientHandle {
     session: AtomicU32,
     /// The Fancy version the client announced, 0 for a stock client.
     fancy_version: AtomicU32,
+    /// The wire epoch the client announced, 0 for every build that predates
+    /// the renumbering (`docs/PROTOCOL-COMPATIBILITY.md` 2a).
+    ///
+    /// Separate from `fancy_version` because they answer different questions.
+    /// A version says which features a build has; an epoch says which numbers
+    /// its decoder can read, and only the second one decides whether a frame
+    /// is safe to write. Conflating them is what let a service outer type
+    /// reach a peer that treats an unknown id as fatal.
+    fancy_protocol: AtomicU32,
     /// The resume token, which is what the replay ring is keyed by.
     pub token: String,
     /// Whether this peer's frames carry a sequence number.
@@ -162,8 +171,11 @@ impl ClientHandle {
 
     /// Whether the peer announced a Fancy version.
     ///
-    /// It decides two things a legacy client must not be given: a throttle
-    /// notice, and a resume sequence number.
+    /// **Never gate a frame on this.** It answers "does this build have Fancy
+    /// features", which is not the same question as "can this peer read what I
+    /// am about to write", and the gap between them is not academic: a Fancy
+    /// 0.3.0 client answers yes here and still cannot decode a single service
+    /// outer type. Delivery asks [`Self::accepts`], which reads the epoch.
     #[must_use]
     pub fn is_fancy(&self) -> bool {
         self.fancy_version.load(Ordering::Acquire) != 0
@@ -173,6 +185,31 @@ impl ClientHandle {
     pub fn set_fancy(&self, version: u64) {
         self.fancy_version
             .store((version & u64::from(u32::MAX)) as u32, Ordering::Release);
+    }
+
+    /// Record the announced wire epoch.
+    pub fn set_epoch(&self, epoch: u32) {
+        self.fancy_protocol.store(epoch, Ordering::Release);
+    }
+
+    /// Whether a frame of `type_id` may be written to this peer.
+    ///
+    /// The one rule, in the one place, because the cost of forgetting it is
+    /// not a dropped feature but a closed connection: the shipped Fancy client
+    /// decodes a frame by mapping its id to a known type and treats a failure
+    /// as a fatal read error, so a service outer type sent to a peer that
+    /// speaks the 100-999 layout kills the connection outright. It cannot be
+    /// gated at the service, either -- a service fans out one payload to an
+    /// audience it never enumerates, and the epoch is a property of each
+    /// recipient.
+    ///
+    /// Upstream types (0-99) are always allowed: they are frozen, and they are
+    /// the whole conversation with a stock Mumble client.
+    #[must_use]
+    pub fn accepts(&self, type_id: u16) -> bool {
+        type_id < starling_proto_fancy::types::SERVICE_BASE
+            || self.fancy_protocol.load(Ordering::Acquire)
+                == starling_proto_fancy::types::FANCY_PROTOCOL_EPOCH
     }
 
     /// Whether this peer's frames carry a sequence number.
@@ -354,6 +391,7 @@ pub(crate) fn channel(
         conn,
         session: AtomicU32::new(0),
         fancy_version: AtomicU32::new(0),
+        fancy_protocol: AtomicU32::new(0),
         token,
         control: tx,
         sequenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),

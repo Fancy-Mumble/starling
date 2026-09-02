@@ -144,6 +144,12 @@ message SessionUp {
   uint32 channel = 5;
   // The Fancy extension version the client announced, 0 for a stock client.
   uint64 fancy_version = 6;
+  // The wire epoch the client announced (Version.fancy_protocol), 0 for every
+  // client built before the renumbering. The gateway needs it to decide what
+  // it may put on this connection: a service outer type means nothing to a
+  // peer on the 100-999 layout, and its decoder treats the unknown id as
+  // fatal. See docs/PROTOCOL-COMPATIBILITY.md 2a.
+  uint32 fancy_protocol = 7;
 }
 
 message SessionDown {

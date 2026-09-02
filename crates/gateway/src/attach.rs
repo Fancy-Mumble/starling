@@ -453,6 +453,7 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
             ctx.registry.bind_session(up.session, up.conn);
             if let Some(handle) = ctx.registry.by_conn(up.conn) {
                 handle.set_fancy(up.fancy_version);
+                handle.set_epoch(up.fancy_protocol);
             }
         }
         Some(server_action::Action::SessionDown(down)) => {
@@ -506,6 +507,11 @@ fn replay_to(replay: &starling_proto_fancy::control::Replay, ctx: &AttachContext
         "replaying"
     );
     for frame in frames {
+        // The ring holds what was written to *everyone*, so a replay can offer
+        // a frame this peer was never eligible for. Same rule, same reason.
+        if !handle.accepts(frame.type_id) {
+            continue;
+        }
         let prefix =
             starling_proto::codec::header(frame.type_id, frame.payload.len(), Some(frame.seq));
         let queued = handle.send(
@@ -567,6 +573,23 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
 
     for handle in targets {
         if send.except.contains(&handle.session()) {
+            continue;
+        }
+        // A service addresses an audience, never a wire epoch, so this is the
+        // only point that knows both the type and who is about to read it. A
+        // peer on epoch 0 cannot map a service outer type to anything and its
+        // decoder treats that as fatal, so the frame it cannot use would cost
+        // it the connection rather than the feature.
+        if !handle.accepts(type_id) {
+            ctx.metrics
+                .counter("starling_gateway_frames_withheld_by_epoch")
+                .inc();
+            tracing::debug!(
+                conn = handle.conn,
+                session = handle.session(),
+                type_id,
+                "withholding a service frame from a peer on the older wire epoch"
+            );
             continue;
         }
         // Stamped for everybody, because the ring is what a resume replays
