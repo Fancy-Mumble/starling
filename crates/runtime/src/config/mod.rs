@@ -279,6 +279,23 @@ impl Config {
             }
             let _ = config.services.insert(kind.name().to_owned(), service);
         }
+        // The plugins that ship in the image are on unless an operator says
+        // otherwise. A plugin is discovered from `plugins_dir` but loaded only
+        // if its `enabled` key says so, and a server that ships a plugin doing
+        // nothing until somebody finds the right key reads as a broken feature
+        // rather than an off one. Turning one off is still a single key.
+        //
+        // These are defaults, so the file wins; and a value written through the
+        // admin surface wins from then on, which is what makes "disable this
+        // plugin" survive a restart.
+        if let Some(plugins) = config.services.get_mut("plugins") {
+            for name in ["fancy-friends", "fancy-live-doc"] {
+                let _ = plugins
+                    .options
+                    .insert(format!("plugin.{name}.enabled"), "true".to_owned());
+            }
+        }
+
         // Not a `ServiceKind`: it owns no wire type and the gateway never
         // routes to it directly (`docs/ARCHITECTURE.md` §4). It still needs a
         // real endpoint, because every other service subscribes to it over

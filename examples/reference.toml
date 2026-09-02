@@ -398,7 +398,7 @@ max_upload = "512MiB"
 #
 # Plugins that ship with the deployment, comma separated. Uninstall refuses
 # them, so an operator cannot delete half of a feature the server assumes.
-# builtin_plugins = "fancy-friends"
+# builtin_plugins = "fancy-friends,fancy-live-doc"
 #
 # Per-plugin settings, under `plugin.<name>.`. Two are the host's own:
 # `enabled` gates whether a discovered plugin is started, and `source` records
@@ -412,7 +412,21 @@ max_upload = "512MiB"
 # These are seeds, not the authority. Anything written through the admin
 # surface -- switching a plugin off, say -- is stored and wins from then on, so
 # editing a key here has no effect once it has been set at runtime.
+# The two the container image carries are seeded on rather than off. An image
+# that ships a feature doing nothing until somebody finds the right key reads
+# as broken rather than as switched off, and turning one off is still this one
+# key. A deployment that builds its own image and sets no `plugins_dir` loads
+# neither, seeds or not.
 # "plugin.fancy-friends.enabled" = "true"
+# "plugin.fancy-live-doc.enabled" = "true"
+#
+# live-doc serves its own WebSocket, so it has a listener of its own; and it
+# persists a document through the files service, which needs an admin token
+# this file must not invent -- until one is supplied a document lives only as
+# long as the room does. `crates/plugin-host/plugins/live-doc/README.md` has
+# the full key list.
+# "plugin.fancy-live-doc.port" = "64740"
+# "plugin.fancy-live-doc.state_path" = "/var/lib/starling/live-doc"
 
 
 # ---------------------------------------------------------------------------

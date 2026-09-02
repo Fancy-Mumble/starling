@@ -268,6 +268,13 @@ pub const TABLE: &[(&str, Reload)] = &[
     // table and argues that the services should declare their options before
     // this row is split rather than after.
     ("services.*.options.*", Reload::Restart),
+    // The plugin host is the one service whose option keys are themselves
+    // dotted -- `plugin.<name>.<key>`, scoped by the name a plugin registers --
+    // so they are three segments past `options` and the catch-all above, whose
+    // `*` is one segment, cannot reach them. Restart is the honest answer and
+    // not a placeholder: a plugin is a cdylib opened at startup, and turning
+    // one on or off is the host loading or dropping it.
+    ("services.plugins.options.plugin.*.*", Reload::Restart),
     ("instances.*.id", Reload::Restart),
     ("instances.*.name", Reload::Restart),
     ("instances.*.port", Reload::Restart),

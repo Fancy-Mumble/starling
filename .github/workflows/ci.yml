@@ -146,6 +146,71 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   # ----------------------------------------------------------------
+  # The shipped plugin binaries.
+  #
+  # A plugin is a cdylib the server opens at runtime, so "it compiles" is not
+  # the interesting question - the `test` job above already answers that for
+  # every workspace member. What this job produces is the artefact a release
+  # and the container image install, built in release like the ones that ship.
+  #
+  # This used to live in the C++ fork (`.github/workflows/plugin-host.yml`),
+  # which is EOL. Starling's `mumble-plugin-api` is that tree's, unchanged and
+  # at the same ABI, so the binaries are interchangeable; the build moved here
+  # because the fork it was in is not maintained any more.
+  # ----------------------------------------------------------------
+  plugins:
+    name: Plugin cdylibs
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plugins
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      # Named one by one rather than `--workspace`: this is the list of things
+      # that ship as loadable plugins, and it should be a list somebody has to
+      # edit deliberately when it changes.
+      - name: Build plugin cdylibs (release)
+        run: cargo build --release -p mumble-friends -p mumble-live-doc
+
+      # The loader rejects a plugin whose ABI probe disagrees with the host's,
+      # and it is far cheaper to learn that here than from a server that came
+      # up with no plugins. `friends` is the host's own exit test.
+      - name: Loader accepts what was built
+        if: runner.os == 'Linux'
+        run: cargo test -p starling-plugin-host --test loads_a_real_plugin
+
+      - name: Upload plugin cdylibs
+        uses: actions/upload-artifact@v7
+        with:
+          name: starling-plugins-${{ matrix.os }}
+          path: |
+            target/release/libmumble_friends.so
+            target/release/libmumble_live_doc.so
+            target/release/mumble_friends.dll
+            target/release/mumble_live_doc.dll
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
   # Dependency hygiene. Matters more here than in the client: this is a
   # network server that terminates TLS for untrusted peers.
   # ----------------------------------------------------------------

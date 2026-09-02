@@ -1,0 +1,76 @@
+# mumble-live-doc: real-time collaborative documents.
+#
+# A channel-scoped document every viewer edits at once. The client asks the
+# plugin to open one; the plugin replies with a short-lived JWT and a WebSocket
+# URL, announces the document to the rest of the channel, and from then on is a
+# broker for Yjs CRDT updates between the editors.
+#
+# It is the first plugin here to own a socket. `friends` proves the loading
+# path; this one proves a plugin may run a server of its own beside the one
+# hosting it, on its own port and its own runtime.
+[package]
+name = "mumble-live-doc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Collaborative Live Document plugin for Mumble - real-time co-editing via Yjs CRDT over WebSocket"
+license = "MIT"
+
+[lib]
+# `cdylib` is what the host loads; `rlib` is what the tests link.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mumble-plugin-api = { path = "../../api" }
+abi_stable.workspace = true
+
+# Its own runtime and its own listener: the host's runtime belongs to the
+# server, and a plugin that blocked it would stall every session on the box.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "fs"] }
+axum = { workspace = true, features = ["ws"] }
+futures-util.workspace = true
+
+# The CRDT itself - the Rust port of Yjs, wire-compatible with the browser's.
+yrs.workspace = true
+
+# Minted when a document is opened, verified at the WebSocket handshake: the
+# WS port is reachable without a Mumble session, so the token is what ties a
+# connection back to one.
+jsonwebtoken.workspace = true
+
+# The file-server bridge that persists a document. Optional at runtime - see
+# `persistence.rs` - but not optional to compile.
+reqwest.workspace = true
+
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-tungstenite.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unused_crate_dependencies = "warn"
+unused_results = "deny"
+missing_debug_implementations = "deny"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+allow_attributes_without_reason = "deny"

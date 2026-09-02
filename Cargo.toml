@@ -58,6 +58,7 @@ members = [
     "crates/plugin-host/api-wasm",
     "crates/plugin-host/host",
     "crates/plugin-host/plugins/friends",
+    "crates/plugin-host/plugins/live-doc",
 ]
 
 [workspace.package]
@@ -218,6 +219,19 @@ async-trait = "0.1"
 # server's host uses: the two must agree byte for byte or a plugin loads in one
 # server and not the other.
 abi_stable = "0.11"
+# Plugin-side dependencies. Declared here rather than in the plugin so the
+# workspace keeps one version of each - a plugin is loaded into the server's
+# own process, and two copies of a TLS stack in one address space is exactly
+# the sort of thing that is discovered at runtime.
+# The Rust port of Yjs, wire-compatible with the browser's, used by `live-doc`.
+yrs = "0.27"
+# Signs the short-lived token a live-doc WebSocket handshake is admitted by.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# `rustls`, not the platform stack: the runtime image is distroless-ish and has
+# no system OpenSSL to link against.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# Drives the WebSocket end of live-doc's own tests.
+tokio-tungstenite = "0.30"
 # Proc-macros for plugin authors, used only by `mumble-plugin-api-derive`.
 proc-macro2 = "1"
 quote = "1"
