@@ -1340,6 +1340,185 @@ async fn a_client_without_write_is_told_the_livery_change_was_refused() {
     deployment.stop();
 }
 
+/// An admin reading and changing the settings over the connection they have.
+///
+/// The other half of 1013, and for a long time the half that did nothing: the
+/// server answered a query nobody sent and refused every write, so the client's
+/// settings screen showed "this server may not support runtime settings" to an
+/// admin of a server that supports them.
+#[tokio::test]
+async fn an_admin_reads_and_changes_the_server_settings_over_their_connection() {
+    use starling_proto_fancy::fancy::domain::{
+        ConfigQuery, ConfigUpdate, ConfigValues, ServerConfigEnvelope, Setting,
+        server_config_envelope, setting,
+    };
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+    use starling_proto_fancy::types::ServiceKind;
+
+    /// The next settings snapshot to arrive, ignoring everything else.
+    async fn values(alice: &mut Client, outer: u16) -> ConfigValues {
+        loop {
+            let (type_id, payload) = alice.recv().await;
+            if type_id != outer {
+                continue;
+            }
+            let envelope = ServerConfigEnvelope::decode(payload.as_slice()).expect("an envelope");
+            if let Some(server_config_envelope::Body::Values(values)) = envelope.body {
+                return values;
+            }
+        }
+    }
+
+    /// What one setting reads as on the wire.
+    fn read(settings: &[Setting], key: &str) -> String {
+        settings
+            .iter()
+            .find(|setting| setting.key == key)
+            .map(|setting| setting.value.clone())
+            .unwrap_or_default()
+    }
+
+    let data_dir = TempDir::new("settings-write");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // A property of the server, so the gate is `Write` on the root channel -
+    // murmur's rule for every administrative write, and the same one livery
+    // is held to next door.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let session = handshake_fancy(&mut alice, "alice").await;
+    deployment
+        .wait_until_permitted(session, 0, Perm::WRITE.bits())
+        .await;
+
+    let outer = ServiceKind::ServerConfig.outer_type();
+    alice
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::Query(ConfigQuery {})),
+            },
+        )
+        .await;
+    let before = values(&mut alice, outer).await;
+    assert!(
+        before.settings.iter().any(|s| s.key == "welcome_text"),
+        "the schema a client builds its form from has to come with the values"
+    );
+    assert!(
+        before
+            .settings
+            .iter()
+            .any(|s| s.key == "password" && s.secret && s.value.is_empty()),
+        "a secret is named so a client can tell 'not set' from 'withheld'"
+    );
+    // The kind reaches the client too, and this one decides whether an operator
+    // is handed a formatting toolbar or a box of raw tags.
+    assert_eq!(
+        before
+            .settings
+            .iter()
+            .find(|s| s.key == "welcome_text")
+            .map(Setting::kind),
+        Some(setting::Kind::Html),
+        "the welcome text has to arrive declared as the markup it is"
+    );
+
+    alice
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::Update(ConfigUpdate {
+                    values: [
+                        ("welcome_text".to_owned(), "cozy corner".to_owned()),
+                        ("max_users".to_owned(), "42".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                })),
+            },
+        )
+        .await;
+
+    // The save is answered with the stamped snapshot, so the screen shows what
+    // the server holds rather than what was typed at it.
+    let after = values(&mut alice, outer).await;
+    assert_eq!(read(&after.settings, "welcome_text"), "cozy corner");
+    assert_eq!(read(&after.settings, "max_users"), "42");
+    assert!(
+        after.version > before.version,
+        "a write that changed something has to move the version"
+    );
+
+    deployment.stop();
+}
+
+/// The same read from somebody who may not make it.
+///
+/// Silence rather than a refusal, the way `audit` answers an unauthorised
+/// query: the settings are what this server may be talked into doing, and the
+/// list of them is an inventory of what to try.
+#[tokio::test]
+async fn a_client_without_write_is_not_sent_the_server_settings() {
+    use starling_proto_fancy::fancy::domain::{
+        ConfigQuery, LiveryQuery, ServerConfigEnvelope, server_config_envelope,
+    };
+    use starling_proto_fancy::types::ServiceKind;
+
+    let data_dir = TempDir::new("settings-refused");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // No grant: the default ACL gives `all` no Write at the root.
+    let mut mallory = Client::connect(deployment.port).await;
+    let _ = handshake_fancy(&mut mallory, "mallory").await;
+
+    let outer = ServiceKind::ServerConfig.outer_type();
+    mallory
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::Query(ConfigQuery {})),
+            },
+        )
+        .await;
+    // Chased by something this session *may* have, so the test proves an
+    // ordering rather than waiting out a timeout: the livery comes back and
+    // the settings never do.
+    mallory
+        .send(
+            outer,
+            &ServerConfigEnvelope {
+                body: Some(server_config_envelope::Body::LiveryQuery(LiveryQuery {
+                    have_keys: Vec::new(),
+                })),
+            },
+        )
+        .await;
+
+    loop {
+        let (type_id, payload) = mallory.recv().await;
+        if type_id != outer {
+            continue;
+        }
+        let envelope = ServerConfigEnvelope::decode(payload.as_slice()).expect("an envelope");
+        match envelope.body {
+            Some(server_config_envelope::Body::Livery(_)) => break,
+            other => panic!("the settings were sent to a client without Write: {other:?}"),
+        }
+    }
+
+    deployment.stop();
+}
+
 #[tokio::test]
 async fn a_client_on_our_epoch_is_told_which_fancy_features_exist() {
     // The gap that made every encrypted channel carry nothing. Starling

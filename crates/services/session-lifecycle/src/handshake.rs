@@ -42,6 +42,7 @@ use starling_proto_fancy::userdata::{AuthRequest, auth_result};
 use starling_proto_fancy::voice::MintRequest;
 use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_runtime::channel::Resolver;
+use starling_runtime::greeting::{self, Greetings};
 use starling_runtime::log::{Category, LogEvent};
 use starling_runtime::plane::{
     Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn, to_sessions,
@@ -115,6 +116,10 @@ pub struct Handshake {
     resolver: Resolver,
     fanout: Fanout,
     ctx: ServiceContext,
+    /// The greeting graph, followed rather than fetched: it is read on
+    /// every single connect, and a `Get` per login would put
+    /// `server-config` on the critical path of a handshake.
+    greetings: Greetings,
 }
 
 /// The `Version` Starling sends first, before the client has said anything.
@@ -251,10 +256,53 @@ impl Handshake {
     /// A handshake over `resolver`.
     #[must_use]
     pub fn new(resolver: Resolver, fanout: Fanout, ctx: ServiceContext) -> Self {
+        let greetings = Greetings::new(Resolver::clone(&resolver));
+        // Dropped on purpose: the subscription lives as long as the
+        // process, and there is nowhere here to hold a handle that would
+        // outlive it. `Settings::watch` is dropped the same way.
+        drop(greetings.watch(&ctx.instances()));
         Self {
             resolver,
             fanout,
             ctx,
+            greetings,
+        }
+    }
+
+    /// What this peer is greeted with, and the graph it came from.
+    ///
+    /// Falls through to the operator's plain `welcome_text` whenever no
+    /// greeting matches - which covers a server with no graph, a graph
+    /// that is switched off, and a graph whose conditions this server
+    /// cannot answer. All three are the same answer to a client and all
+    /// three are correct: a welcome message is not allowed to be the
+    /// reason somebody sees nothing.
+    fn greeting_for(
+        &self,
+        instance: u32,
+        identity: &Identity,
+        config: &Snapshot,
+        pending: &PendingConnection,
+    ) -> String {
+        let graph = self.greetings.get(instance);
+        let facts = greeting::Facts {
+            client_version: Some(pending.mumble_version),
+            os: greeting::normalise_os(&pending.os),
+            registered: Some(identity.account.is_some()),
+            strong_cert: Some(pending.strong_cert),
+            // Not gathered yet. Each answers Unknown rather than a default,
+            // so a condition that needs one withholds its greeting instead
+            // of matching on a zero: account age needs `created_at_ms`
+            // carried through from the auth reply, groups cost an ACL read
+            // this path does not make, and country needs a geo-IP database
+            // this server does not have.
+            account_age_s: None,
+            groups: None,
+            country: None,
+        };
+        match greeting::choose(&graph, &facts) {
+            Some(greet) => greeting::compose(&graph, greet, config.allow_html),
+            None => config.welcome_text.clone(),
         }
     }
 
@@ -525,6 +573,8 @@ impl Handshake {
         let account = identity.account;
         let name = identity.name.as_str();
 
+        let welcome = self.greeting_for(inbound.scope, identity, config, pending);
+
         let mut actions = Vec::new();
         actions.push(self.crypt_setup(inbound, session, pending).await);
         actions.push(to_conn(inbound.conn, 21, codec_version().encode_to_vec()));
@@ -539,7 +589,7 @@ impl Handshake {
         actions.push(to_conn(
             inbound.conn,
             5,
-            server_sync(session, config).encode_to_vec(),
+            server_sync(session, config, &welcome).encode_to_vec(),
         ));
         actions.push(to_conn(
             inbound.conn,
@@ -1843,11 +1893,15 @@ fn volume_adjustments(volume: &HashMap<u32, f32>) -> Vec<tcp::user_state::Volume
 }
 
 /// `ServerSync`: the message that ends the handshake.
-fn server_sync(session: u32, config: &Snapshot) -> tcp::ServerSync {
+fn server_sync(session: u32, config: &Snapshot, welcome: &str) -> tcp::ServerSync {
     tcp::ServerSync {
         session: Some(session),
         max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(config.welcome_text.clone()),
+        // Sent only when there is something to say. murmur omits the field
+        // rather than sending an empty one (`Messages.cpp:819`), and a
+        // client that receives an empty string prints a blank line into
+        // the log where a welcome would go.
+        welcome_text: (!welcome.is_empty()).then(|| welcome.to_owned()),
         // Permissions in the root channel, which the client uses to grey out
         // actions before it has asked about them.
         permissions: Some(u64::from(u32::MAX)),
@@ -2349,12 +2403,192 @@ mod tests {
         // which is how a server's uplink disappears.
         let config = Snapshot {
             max_bandwidth: 96_000,
-            welcome_text: "hello".to_owned(),
             ..Snapshot::default()
         };
-        let sync = server_sync(7, &config);
+        let sync = server_sync(7, &config, "hello");
         assert_eq!(sync.max_bandwidth, Some(96_000));
         assert_eq!(sync.welcome_text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn an_empty_welcome_is_omitted_rather_than_sent_blank() {
+        // murmur omits the field (`Messages.cpp:819`); a client handed an
+        // empty string prints a blank line where a welcome would go.
+        let sync = server_sync(7, &Snapshot::default(), "");
+        assert_eq!(sync.welcome_text, None);
+    }
+
+    /// The greeting a graph picks reaches a client through the field it
+    /// always did, which is the whole of the stock-client story.
+    mod greeting_selection {
+        use super::*;
+        use starling_proto_fancy::serverconfig::greeting_node::{
+            Body, ClientVersion, Filter, Greet, client_version, filter,
+        };
+        use starling_proto_fancy::serverconfig::{
+            Greeting, GreetingEdge, GreetingNode, GreetingPort,
+        };
+
+        /// A version in the wire's own packing.
+        ///
+        /// A helper rather than a hex literal, because a literal is exactly how
+        /// this goes wrong: `v(1, 5, 0)` reads like 1.5.0 and is not, and a
+        /// fixture that packs one way while the wire packs another still compares
+        /// equal to itself, so every test passes and the server matches nobody.
+        const fn v(major: u64, minor: u64, patch: u64) -> u64 {
+            (major << 48) | (minor << 32) | (patch << 16)
+        }
+
+        fn node(id: &str, body: Body) -> GreetingNode {
+            GreetingNode {
+                id: id.into(),
+                x: 0,
+                y: 0,
+                body: Some(body),
+            }
+        }
+
+        /// Greet anyone below 1.5.0, through the filter a gate-free graph
+        /// still needs to turn an unanswerable version into a definite no.
+        fn outdated_graph() -> Greeting {
+            Greeting {
+                enabled: true,
+                nodes: vec![
+                    node(
+                        "old",
+                        Body::ClientVersion(ClientVersion {
+                            op: client_version::Op::Lt as i32,
+                            version: v(1, 5, 0),
+                        }),
+                    ),
+                    node(
+                        "f",
+                        Body::Filter(Filter {
+                            unknown_becomes: filter::Unknown::IsNo as i32,
+                        }),
+                    ),
+                    node(
+                        "greet",
+                        Body::Greet(Greet {
+                            html: "<b>Please update.</b>".to_owned(),
+                            plain: "Please update.".to_owned(),
+                            once: true,
+                        }),
+                    ),
+                ],
+                edges: vec![
+                    GreetingEdge {
+                        id: "e1".into(),
+                        from: "old".into(),
+                        to: "f".into(),
+                        port: i32::from(GreetingPort::A),
+                    },
+                    GreetingEdge {
+                        id: "e2".into(),
+                        from: "f".into(),
+                        to: "greet".into(),
+                        port: i32::from(GreetingPort::When),
+                    },
+                ],
+                ..Greeting::default()
+            }
+        }
+
+        fn facts(version: u64) -> greeting::Facts {
+            greeting::Facts {
+                client_version: Some(version),
+                registered: Some(true),
+                strong_cert: Some(false),
+                ..Default::default()
+            }
+        }
+
+        fn chosen(graph: &Greeting, version: u64, allow_html: bool) -> Option<String> {
+            greeting::choose(graph, &facts(version))
+                .map(|greet| greeting::compose(graph, greet, allow_html))
+        }
+
+        #[test]
+        fn a_matching_graph_replaces_the_plain_welcome_text() {
+            let graph = outdated_graph();
+            assert_eq!(
+                chosen(&graph, v(1, 4, 0), false).as_deref(),
+                Some("Please update.")
+            );
+        }
+
+        #[test]
+        fn a_graph_that_matches_nobody_leaves_the_welcome_text_alone() {
+            // What `greeting_for` does with a None: the operator's own
+            // welcome_text goes out, exactly as it did before any of this.
+            let graph = outdated_graph();
+            assert!(chosen(&graph, v(1, 5, 735), false).is_none());
+        }
+
+        #[test]
+        fn a_server_that_forbids_markup_is_sent_the_plain_body() {
+            // A client with allow_html off renders tags literally, which
+            // turns a greeting into what looks like a broken server.
+            let graph = outdated_graph();
+            let plain = chosen(&graph, v(1, 4, 0), false).unwrap();
+            let html = chosen(&graph, v(1, 4, 0), true).unwrap();
+            assert!(!plain.contains('<'));
+            assert!(html.contains("<b>"));
+        }
+
+        #[test]
+        fn a_disabled_graph_falls_back_even_though_it_would_have_matched() {
+            let graph = Greeting {
+                enabled: false,
+                ..outdated_graph()
+            };
+            assert!(chosen(&graph, v(1, 4, 0), false).is_none());
+        }
+
+        #[test]
+        fn the_chosen_text_is_what_server_sync_carries() {
+            // The stock-client path end to end: whatever the graph picked
+            // travels in the field every Mumble client has always read.
+            let graph = outdated_graph();
+            let text = chosen(&graph, v(1, 4, 0), false).unwrap();
+            let sync = server_sync(7, &Snapshot::default(), &text);
+            assert_eq!(sync.welcome_text.as_deref(), Some("Please update."));
+        }
+    }
+
+    mod os_normalisation {
+        use starling_proto_fancy::serverconfig::greeting_node::operating_system::Os;
+        use starling_runtime::greeting::normalise_os;
+
+        #[test]
+        fn reads_both_clients_spellings_as_the_same_system() {
+            // The Fancy client sends `std::env::consts::OS`; stock Mumble
+            // sends prose. An operator picking Windows means both.
+            assert_eq!(normalise_os("windows"), Some(Os::Windows));
+            assert_eq!(normalise_os("Microsoft Windows 11"), Some(Os::Windows));
+            assert_eq!(normalise_os("macos"), Some(Os::Macos));
+            assert_eq!(normalise_os("Mac OS X 14.2"), Some(Os::Macos));
+            assert_eq!(normalise_os("linux"), Some(Os::Linux));
+        }
+
+        #[test]
+        fn still_reads_the_spelling_stock_mumble_used_to_send() {
+            assert_eq!(normalise_os("X11"), Some(Os::Linux));
+        }
+
+        #[test]
+        fn does_not_call_android_a_linux() {
+            // It is one, but an operator who picked Android meant the phone.
+            assert_eq!(normalise_os("Android 14"), Some(Os::Android));
+        }
+
+        #[test]
+        fn answers_nothing_for_something_it_has_never_heard_of() {
+            // Unknown, not a guess: a client this server does not recognise
+            // is not Windows, and the condition withholds rather than matches.
+            assert_eq!(normalise_os("Haiku"), None);
+            assert_eq!(normalise_os(""), None);
+        }
     }
 
     #[test]

@@ -46,8 +46,8 @@ use starling_proto_fancy::serverconfig::server_config_server::{
     ServerConfig as ServerConfigRpc, ServerConfigServer,
 };
 use starling_proto_fancy::serverconfig::{
-    GetRequest, Livery, SetLiveryRequest, SetRequest, Snapshot, VerifyTicketReply,
-    VerifyTicketRequest,
+    GetRequest, Greeting, Livery, SetGreetingRequest, SetLiveryRequest, SetRequest, Snapshot,
+    VerifyTicketReply, VerifyTicketRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
@@ -71,6 +71,7 @@ pub use import::import;
 // and voice hashes one, and a second copy is one copy that eventually
 // disagrees.
 pub use snapshot::{apply_fields, defaults, redact};
+pub use starling_runtime::greeting as greeting_doc;
 pub use starling_runtime::livery;
 
 /// The schema: one row per server instance, typed columns, no EAV.
@@ -103,6 +104,15 @@ pub(crate) const SCHEMA: &[Migration<'static>] = &[
         // has its own version counter, and sharing a row would make one Set
         // bump the other's.
         &["CREATE TABLE IF NOT EXISTS server_livery (\
+             server_id BIGINT PRIMARY KEY, \
+             version BIGINT NOT NULL, \
+             document BLOB NOT NULL)"],
+    ),
+    Migration::new(
+        "0004_server_greeting",
+        // Beside the livery and for the same reason: its own version
+        // counter, so one Set does not bump the other's.
+        &["CREATE TABLE IF NOT EXISTS server_greeting (\
              server_id BIGINT PRIMARY KEY, \
              version BIGINT NOT NULL, \
              document BLOB NOT NULL)"],
@@ -140,6 +150,8 @@ pub struct ServerConfigService {
     /// field-wise merge does not understand.
     liveries: RwLock<HashMap<u32, Livery>>,
     livery_updates: broadcast::Sender<Livery>,
+    greetings: RwLock<HashMap<u32, Greeting>>,
+    greeting_updates: broadcast::Sender<Greeting>,
     /// Reaches `userdata`, whose content-addressed blob store holds the livery
     /// artwork. Held rather than taken per call because `frame` is handed an
     /// `Inbound` and no context.
@@ -302,6 +314,44 @@ impl ServerConfigService {
 
         let _ = self.livery_updates.send(livery);
     }
+
+    /// The greeting graph for `scope`, or an empty one.
+    ///
+    /// Empty is a real answer, as it is for livery: a server that has drawn
+    /// no graph greets with its plain `welcome_text`, and every caller would
+    /// otherwise write the same branch back to a default.
+    pub async fn greeting(&self, scope: u32) -> Greeting {
+        self.greetings
+            .read()
+            .await
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(|| Greeting {
+                instance: scope,
+                ..Default::default()
+            })
+    }
+
+    /// Record `greeting`, stamping the digest every reader compares against.
+    ///
+    /// Deliberately not pushed to connected clients, which is where this
+    /// parts company with livery: a greeting is read at the moment somebody
+    /// arrives, so a session already in the room has been greeted and has
+    /// nothing to repaint. Livery is the window they are still looking at.
+    async fn publish_greeting(&self, mut greeting: Greeting, actor: Option<Actor>) {
+        let scope = greeting.instance;
+        greeting.digest = greeting_doc::digest(&greeting);
+        let _ = self.greetings.write().await.insert(scope, greeting.clone());
+        if let Some(store) = &self.store
+            && let Err(error) = persist_greeting(store, &greeting).await
+        {
+            tracing::error!(%error, "could not persist a greeting change");
+        }
+        if let Some(actor) = &actor {
+            tracing::info!(?actor, version = greeting.version, "greeting changed");
+        }
+        let _ = self.greeting_updates.send(greeting);
+    }
 }
 
 /// The stored form of the owned-field set.
@@ -362,6 +412,36 @@ async fn persist_livery(
     .await
     .map(|_| ())
     .map_err(|error| starling_runtime::StoreError::Query(format!("server_livery: {error}")))
+}
+
+async fn persist_greeting(
+    store: &Store,
+    greeting: &Greeting,
+) -> Result<(), starling_runtime::StoreError> {
+    sqlx::query(
+        "INSERT INTO server_greeting (server_id, version, document) VALUES (?, ?, ?) \
+         ON CONFLICT (server_id) DO UPDATE SET version = excluded.version, \
+         document = excluded.document",
+    )
+    .bind(i64::from(greeting.instance))
+    .bind(greeting.version as i64)
+    .bind(greeting.encode_to_vec())
+    .execute(store.pool())
+    .await
+    .map(|_| ())
+    .map_err(|error| starling_runtime::StoreError::Query(format!("server_greeting: {error}")))
+}
+
+/// The stored greeting for `scope`, if one was ever written.
+async fn load_greeting(store: &Store, scope: u32) -> Option<Greeting> {
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT document FROM server_greeting WHERE server_id = ?")
+        .bind(i64::from(scope))
+        .fetch_optional(store.pool())
+        .await
+        .ok()??;
+    let bytes: Vec<u8> = row.try_get("document").ok()?;
+    Greeting::decode(bytes.as_slice()).ok()
 }
 
 /// The stored livery for `scope`, if one was ever written.
@@ -513,6 +593,76 @@ impl ServerConfigRpc for ConfigRpc {
         )))
     }
 
+    async fn get_greeting(
+        &self,
+        request: Request<GetRequest>,
+    ) -> Result<Response<Greeting>, Status> {
+        let scope = scope_of(request.into_inner().scope);
+        Ok(Response::new(self.0.greeting(scope).await))
+    }
+
+    /// Replace the whole graph.
+    ///
+    /// Whole rather than field-wise, which is where this parts company with
+    /// `set_livery`: a graph is nodes and the wires between them, and a
+    /// field-wise merge of two halves of one drawing produces wires with no
+    /// nodes on their ends. Two operators editing the same canvas is a
+    /// last-writer-wins, and the version says which write that was.
+    async fn set_greeting(
+        &self,
+        request: Request<SetGreetingRequest>,
+    ) -> Result<Response<Greeting>, Status> {
+        let req = request.into_inner();
+        let scope = scope_of(req.scope);
+        let Some(mut values) = req.values else {
+            return Ok(Response::new(self.0.greeting(scope).await));
+        };
+
+        // Refused whole, never partially written: a graph that half-applied
+        // is one whose greeting goes to the wrong people until somebody
+        // notices, which is the worst way to find out.
+        greeting_doc::validate(&values)
+            .map_err(|problems| Status::invalid_argument(describe_greeting_problems(&problems)))?;
+
+        let current = self.0.greeting(scope).await;
+        values.instance = scope;
+        // Read back from what is stored and incremented here, never taken
+        // from the caller: a version a client chooses is a version a client
+        // can send backwards, and every dismissal is compared against it.
+        values.version = current.version + 1;
+        values.updated_at_ms = starling_runtime::ids::now_ms();
+        values.updated_by = req.actor.as_ref().map(describe_actor).unwrap_or_default();
+        self.0.publish_greeting(values, req.actor).await;
+        Ok(Response::new(self.0.greeting(scope).await))
+    }
+
+    type WatchGreetingStream = tokio_stream::wrappers::ReceiverStream<Result<Greeting, Status>>;
+
+    async fn watch_greeting(
+        &self,
+        request: Request<GetRequest>,
+    ) -> Result<Response<Self::WatchGreetingStream>, Status> {
+        let scope = scope_of(request.into_inner().scope);
+        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        // Current document first, then changes, as the other watches do.
+        let _ = tx.send(Ok(self.0.greeting(scope).await)).await;
+
+        let mut updates = self.0.greeting_updates.subscribe();
+        drop(tokio::spawn(async move {
+            while let Ok(greeting) = updates.recv().await {
+                if greeting.instance != scope {
+                    continue;
+                }
+                if tx.send(Ok(greeting)).await.is_err() {
+                    return;
+                }
+            }
+        }));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
     /// Whether `token` is a ticket this process minted and has not expired.
     ///
     /// Called by `operator-api`, never by a client: a bearer token travels
@@ -555,14 +705,28 @@ impl ClientService for ServerConfigService {
         };
         match envelope.body {
             Some(server_config_envelope::Body::Query(_)) => {
-                let snapshot = self.snapshot(inbound.scope).await;
-                let reply = ServerConfigEnvelope {
-                    body: Some(server_config_envelope::Body::Values(ConfigValues {
-                        settings: redact(&snapshot),
-                        version: snapshot.version,
-                    })),
-                };
-                vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+                // Read-gated as murmur gates its administration console, and
+                // as the epoch-0 fork gated the broadcast this replaces: the
+                // settings are what a server may be talked into doing, and the
+                // list of them is an inventory of what to try. Answered with
+                // silence rather than a refusal, the way `audit` answers an
+                // unauthorised query.
+                if !self
+                    .permit
+                    .allows(&inbound, ROOT_CHANNEL, Perm::WRITE.bits())
+                    .await
+                {
+                    tracing::info!(session = inbound.session, "settings read refused");
+                    return Actions::new();
+                }
+                vec![to_conn(
+                    inbound.conn,
+                    outer,
+                    self.values(inbound.scope).await.encode_to_vec(),
+                )]
+            }
+            Some(server_config_envelope::Body::Update(update)) => {
+                self.on_settings_update(&inbound, &update.values).await
             }
             Some(server_config_envelope::Body::LiveryQuery(query)) => {
                 let livery = self.livery(inbound.scope).await;
@@ -578,15 +742,92 @@ impl ClientService for ServerConfigService {
             Some(server_config_envelope::Body::TicketRequest(request)) => {
                 self.on_ticket_request(&inbound, request).await
             }
-            // A *settings* update from a client is still refused. Nothing has
-            // asked for one, and unlike livery the person sending it is not
-            // looking at the thing they are changing.
+            // The rest are server->client bodies; a client sending one is
+            // either confused or probing, and neither deserves an answer.
             _ => Actions::new(),
         }
     }
 }
 
 impl ServerConfigService {
+    /// The wire form of the settings for `scope`, secrets withheld.
+    ///
+    /// One place rather than two, because the answer to a query and the
+    /// confirmation after a write must be the same shape: a save that echoed a
+    /// snapshot built differently is how a form ends up showing one thing and
+    /// the server holding another.
+    async fn values(&self, scope: u32) -> ServerConfigEnvelope {
+        let snapshot = self.snapshot(scope).await;
+        ServerConfigEnvelope {
+            body: Some(server_config_envelope::Body::Values(ConfigValues {
+                settings: redact(&snapshot),
+                version: snapshot.version,
+            })),
+        }
+    }
+
+    /// An admin changing a setting from a connected client.
+    ///
+    /// Authorised exactly as [`Self::on_livery_update`] is, and for the same
+    /// reason: these are properties of the server, so murmur's gate on them is
+    /// `Write` on the **root** channel. The identity is the session the frame
+    /// arrived on, which the handshake established and a client cannot assert.
+    ///
+    /// Only the named fields are written, and only those become the operator's.
+    /// A whole-snapshot write would freeze every setting they never touched at
+    /// whatever the deployment file said the day they first opened the screen.
+    async fn on_settings_update(
+        &self,
+        inbound: &Inbound,
+        values: &HashMap<String, String>,
+    ) -> Actions {
+        if !self
+            .permit
+            .allows(inbound, ROOT_CHANNEL, Perm::WRITE.bits())
+            .await
+        {
+            tracing::info!(session = inbound.session, "settings write refused");
+            return vec![permission_denied(inbound, Perm::WRITE, ROOT_CHANNEL)];
+        }
+
+        let outer = ServiceKind::ServerConfig.outer_type();
+        let mut current = self.snapshot(inbound.scope).await;
+        let written = snapshot::apply_wire(&mut current, values);
+        if written.is_empty() {
+            // Nothing was written, so nothing may be claimed and the version
+            // must not move: a bump with no change makes every other client
+            // discard a snapshot it correctly holds.
+            tracing::info!(
+                session = inbound.session,
+                "a settings write named nothing this server can set"
+            );
+            return vec![to_conn(
+                inbound.conn,
+                outer,
+                self.values(inbound.scope).await.encode_to_vec(),
+            )];
+        }
+
+        current.version += 1;
+        tracing::info!(
+            session = inbound.session,
+            settings = written.join(", "),
+            "settings changed from a connected client"
+        );
+        self.publish(current, &written).await;
+
+        // Answered to the one who asked rather than broadcast. Every other
+        // admin would have to be picked out of the roster by permission to
+        // receive it, and the settings are not something to hand the room on
+        // the strength of "they probably all have Write"; a screen opened
+        // later asks, and gets the change then.
+        vec![to_conn(
+            inbound.conn,
+            outer,
+            self.values(inbound.scope).await.encode_to_vec(),
+        )]
+    }
+
     /// An admin changing the livery from a connected client.
     ///
     /// Authorised as murmur authorises every other administrative write:
@@ -872,8 +1113,20 @@ impl Serve for ServerConfigService {
             let _ = liveries.insert(scope, stored);
         }
 
+        let mut greetings = HashMap::new();
+        for scope in ctx.instances() {
+            let mut stored = match store.as_ref() {
+                Some(store) => load_greeting(store, scope).await.unwrap_or_default(),
+                None => Greeting::default(),
+            };
+            stored.instance = scope;
+            stored.digest = greeting_doc::digest(&stored);
+            let _ = greetings.insert(scope, stored);
+        }
+
         let (updates, _) = broadcast::channel(WATCH_BUFFER);
         let (livery_updates, _) = broadcast::channel(WATCH_BUFFER);
+        let (greeting_updates, _) = broadcast::channel(WATCH_BUFFER);
         ctx.health.ready("settings loaded");
         Ok(Arc::new(Self {
             snapshots: RwLock::new(snapshots),
@@ -881,6 +1134,8 @@ impl Serve for ServerConfigService {
             updates,
             liveries: RwLock::new(liveries),
             livery_updates,
+            greetings: RwLock::new(greetings),
+            greeting_updates,
             resolver: ctx.resolver.clone(),
             permit: Permit::new(ctx.resolver.clone()),
             tickets: ticket::TicketStore::default(),
@@ -990,6 +1245,51 @@ fn operator_api_public_url(config: &Config) -> String {
         .unwrap_or_default()
 }
 
+/// The refusal message for a graph that will not be stored.
+///
+/// Every entry names the node, because an operator looking at a canvas of
+/// forty of them cannot act on "invalid graph".
+fn describe_greeting_problems(problems: &[greeting_doc::Invalid]) -> String {
+    problems
+        .iter()
+        .map(|problem| {
+            let what = match &problem.reason {
+                greeting_doc::Reason::TooLarge(n) => format!("too large ({n})"),
+                greeting_doc::Reason::TooLong(n) => format!("too long ({n} characters)"),
+                greeting_doc::Reason::DuplicateId => "duplicate id".to_owned(),
+                greeting_doc::Reason::DanglingEdge => "wire to a node that is not there".to_owned(),
+                greeting_doc::Reason::BadPort => "wire lands where it cannot".to_owned(),
+                greeting_doc::Reason::UndecidedIntoGate => {
+                    "a gate takes a settled answer: wire it through a filter first".to_owned()
+                }
+                greeting_doc::Reason::Cycle => "the wires close a loop".to_owned(),
+                greeting_doc::Reason::Empty => "node carries nothing".to_owned(),
+                greeting_doc::Reason::BadCountry => "not a country code".to_owned(),
+            };
+            if problem.node.is_empty() {
+                what
+            } else {
+                format!("{}: {what}", problem.node)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Who made a change, for the document's own record of it.
+///
+/// A session id is per connection and recycled, so it is written as one
+/// ("session 7") rather than as an identity: what this field is for is
+/// telling an operator which of them touched it last, not proving anything.
+fn describe_actor(actor: &Actor) -> String {
+    match actor.who.as_ref() {
+        Some(actor::Who::Session(session)) => format!("session {session}"),
+        Some(actor::Who::Operator(operator)) => operator.subject.clone(),
+        Some(actor::Who::Internal(_)) => "the server".to_owned(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,12 +1302,15 @@ mod tests {
         let resolver = Resolver::new(Arc::clone(&config), starling_runtime::inproc::Broker::new());
         let (updates, _) = broadcast::channel(8);
         let (livery_updates, _) = broadcast::channel(8);
+        let (greeting_updates, _) = broadcast::channel(8);
         Arc::new(ServerConfigService {
             snapshots: RwLock::new(HashMap::new()),
             owned: RwLock::new(HashMap::new()),
             updates,
             liveries: RwLock::new(HashMap::new()),
             livery_updates,
+            greetings: RwLock::new(HashMap::new()),
+            greeting_updates,
             resolver: resolver.clone(),
             permit: Permit::new(resolver),
             tickets: ticket::TicketStore::default(),
@@ -1148,25 +1451,55 @@ mod tests {
         assert_eq!(service.livery(1).await.tagline, "", "nothing was written");
     }
 
-    #[tokio::test]
-    async fn a_settings_update_from_a_client_is_still_ignored() {
-        // Livery moved to the client channel; the settings half did not, and
-        // this is what keeps the two from drifting into one rule.
-        let service = service();
-        let inbound = Inbound {
+    /// One frame carrying `body`, from a session with no permissions behind it.
+    fn frame_from_client(body: server_config_envelope::Body) -> Inbound {
+        Inbound {
             gateway: "test".to_owned(),
             conn: 1,
             session: 7,
             scope: 1,
             type_id: ServiceKind::ServerConfig.outer_type(),
-            payload: ServerConfigEnvelope {
-                body: Some(server_config_envelope::Body::Update(
-                    starling_proto_fancy::fancy::domain::ConfigUpdate::default(),
-                )),
-            }
-            .encode_to_vec(),
+            payload: ServerConfigEnvelope { body: Some(body) }.encode_to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_settings_write_without_the_permission_is_refused_out_loud() {
+        // The service under test reaches no `permissions`, so the check denies.
+        // Loudly, like the livery write beside it: a change accepted and
+        // dropped shows the admin their new value on screen and leaves the
+        // server holding the old one.
+        let service = service();
+        let update = starling_proto_fancy::fancy::domain::ConfigUpdate {
+            values: HashMap::from([("welcome_text".to_owned(), "not allowed".to_owned())]),
         };
-        assert!(service.frame(inbound).await.is_empty());
+        let actions = service
+            .frame(frame_from_client(server_config_envelope::Body::Update(
+                update,
+            )))
+            .await;
+
+        assert_eq!(actions.len(), 1, "a refusal has to be sent");
+        assert_eq!(
+            service.snapshot(1).await.welcome_text,
+            defaults(1).welcome_text,
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settings_read_without_the_permission_is_answered_with_silence() {
+        // The settings are what this server may be talked into doing, and the
+        // list of them is an inventory of what to try. Silence rather than a
+        // refusal, the way `audit` answers an unauthorised query.
+        let service = service();
+        let actions = service
+            .frame(frame_from_client(server_config_envelope::Body::Query(
+                starling_proto_fancy::fancy::domain::ConfigQuery {},
+            )))
+            .await;
+
+        assert!(actions.is_empty(), "an unauthorised read is not answered");
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         .route("/v1/bans/{id}", delete(remove_ban))
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/livery", get(get_livery).post(set_livery))
+        .route("/v1/greeting", get(get_greeting).post(set_greeting))
         .route(
             "/v1/livery/banner",
             get(get_banner).put(set_banner).delete(clear_banner),
@@ -2224,6 +2225,56 @@ async fn write_livery(
             _ => refuse(StatusCode::BAD_GATEWAY, &status.to_string()),
         })?;
     Ok(())
+}
+
+/// The greeting graph an operator drew.
+///
+/// Never 404: a server that has drawn no graph greets with its plain
+/// `welcome_text`, which is an answer about its contents rather than an
+/// absence - the same reasoning `/v1/livery` gives.
+async fn get_greeting(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/greeting").await?;
+    let graph = ServerConfigClient::new(dial(api.as_ref(), "server-config")?)
+        .get_greeting(starling_proto_fancy::serverconfig::GetRequest { scope: scope() })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
+        .into_inner();
+    Ok(Json(starling_runtime::greeting::to_json(&graph)))
+}
+
+/// Replace the graph.
+///
+/// Whole rather than field-wise, unlike `/v1/livery`: a graph is nodes and
+/// the wires between them, and merging two halves of one drawing produces
+/// wires with no nodes on their ends.
+async fn set_greeting(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let subject = admit(&api, &headers, "server-config:write", "POST /v1/greeting").await?;
+
+    // Shape first, then the graph's own rules. Both are the operator's
+    // mistake rather than a transport failure, so both are 400 - a 502
+    // would send them to the wrong logs entirely.
+    let values = starling_runtime::greeting::from_json(&body)
+        .map_err(|error| refuse(StatusCode::BAD_REQUEST, &error))?;
+
+    let _ = ServerConfigClient::new(dial(api.as_ref(), "server-config")?)
+        .set_greeting(starling_proto_fancy::serverconfig::SetGreetingRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "server-config:write"),
+            values: Some(values),
+        })
+        .await
+        .map_err(|status| match status.code() {
+            tonic::Code::InvalidArgument => refuse(StatusCode::BAD_REQUEST, status.message()),
+            _ => refuse(StatusCode::BAD_GATEWAY, &status.to_string()),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_livery(

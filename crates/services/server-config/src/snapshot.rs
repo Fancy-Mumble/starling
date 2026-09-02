@@ -134,18 +134,111 @@ struct Row {
     /// How to project it out of a snapshot. A function rather than a second
     /// table, so a row cannot describe one setting and read another.
     read: fn(&Snapshot) -> String,
+    /// How to put a typed-in value back, answering false when the text does
+    /// not fit the field. Beside `read` for the same reason `read` is beside
+    /// `kind`: a row that read one setting and wrote another would be a form
+    /// whose fields swap under an operator, and nothing about it would look
+    /// wrong.
+    write: fn(&mut Snapshot, &str) -> bool,
+}
+
+/// Parse a whole number, or refuse it.
+///
+/// Refusing rather than saturating: "12 users" is a mistake, and the two
+/// plausible coercions of it -- 12 and 0 -- are a limit the operator did not
+/// ask for either way.
+fn set_u32(target: &mut u32, value: &str) -> bool {
+    match value.trim().parse::<u32>() {
+        Ok(parsed) => {
+            *target = parsed;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Parse a flag the way every client that renders one sends it.
+///
+/// `1`/`0` as well as the words, because a checkbox has been serialised both
+/// ways for as long as there have been forms, and a setting that silently
+/// ignores one of them is a switch that does nothing.
+fn set_bool(target: &mut bool, value: &str) -> bool {
+    match value.trim() {
+        "true" | "1" => {
+            *target = true;
+            true
+        }
+        "false" | "0" => {
+            *target = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Write an admin's typed-in values into `current`, and name what they changed.
+///
+/// The wire carries every value as text because a form does: a client renders
+/// what [`redact`] describes and hands back what was typed. The schema is the
+/// only thing that knows `max_users` is a number, so the coercion belongs here
+/// rather than in the service -- one table, one answer, and a knob added to
+/// `SCHEMA` becomes settable from a client with no second edit.
+///
+/// The returned list is what the service records as the operator's, so a value
+/// that could not be read must not be on it: a field claimed but never written
+/// stops following the deployment file while showing whatever it happened to
+/// hold.
+///
+/// A key with no schema row goes to `extra`, the same place [`apply_fields`]
+/// puts it, so a service can add an operator-facing knob without a proto change
+/// and have it settable from the admin screen the same day.
+#[must_use]
+pub fn apply_wire(
+    current: &mut Snapshot,
+    values: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    // Sorted, because the field list is persisted and logged, and a set that
+    // reorders itself every call makes two identical writes look different.
+    let ordered: std::collections::BTreeMap<&String, &String> = values.iter().collect();
+    let mut written = Vec::new();
+    for (key, value) in ordered {
+        match SCHEMA.iter().find(|row| row.key == key.as_str()) {
+            Some(row) => {
+                if (row.write)(current, value) {
+                    written.push(key.clone());
+                } else {
+                    // Reported rather than ignored: an operator who typed
+                    // "many" into a limit is owed the reason their change did
+                    // not take, and the only place that can say so is here.
+                    tracing::info!(
+                        field = key.as_str(),
+                        "ignoring a settings write whose value does not fit the field"
+                    );
+                }
+            }
+            None => {
+                let _ = current.extra.insert(key.clone(), value.clone());
+                written.push(key.clone());
+            }
+        }
+    }
+    written
 }
 
 /// Every operator-editable setting, in the order a form should show them.
 const SCHEMA: &[Row] = &[
     Row {
         key: "welcome_text",
-        kind: Kind::Text,
+        kind: Kind::Html,
         group: "General",
         label: "Welcome text",
-        help: "Shown to each user once, on connect.",
+        help: "Shown to each user once, on connect. Formatting is kept; a client renders it through its own allow-list.",
         secret: false,
         read: |s| s.welcome_text.clone(),
+        write: |s, v| {
+            s.welcome_text = v.to_owned();
+            true
+        },
     },
     Row {
         key: "password",
@@ -155,6 +248,10 @@ const SCHEMA: &[Row] = &[
         help: "Required to connect. Empty means the server is open.",
         secret: true,
         read: |_| String::new(),
+        write: |s, v| {
+            s.password = v.to_owned();
+            true
+        },
     },
     Row {
         key: "max_users",
@@ -164,6 +261,7 @@ const SCHEMA: &[Row] = &[
         help: "Connections beyond this are rejected as full.",
         secret: false,
         read: |s| s.max_users.to_string(),
+        write: |s, v| set_u32(&mut s.max_users, v),
     },
     Row {
         key: "max_bandwidth",
@@ -173,6 +271,7 @@ const SCHEMA: &[Row] = &[
         help: "Bits per second per speaking user.",
         secret: false,
         read: |s| s.max_bandwidth.to_string(),
+        write: |s, v| set_u32(&mut s.max_bandwidth, v),
     },
     Row {
         key: "allow_recording",
@@ -182,6 +281,7 @@ const SCHEMA: &[Row] = &[
         help: "Whether clients may record, and announce that they are.",
         secret: false,
         read: |s| s.allow_recording.to_string(),
+        write: |s, v| set_bool(&mut s.allow_recording, v),
     },
     Row {
         key: "broadcast_listener_volume_adjustments",
@@ -191,6 +291,7 @@ const SCHEMA: &[Row] = &[
         help: "Tell everyone when a user changes a per-channel volume.",
         secret: false,
         read: |s| s.broadcast_listener_volume_adjustments.to_string(),
+        write: |s, v| set_bool(&mut s.broadcast_listener_volume_adjustments, v),
     },
     Row {
         key: "text_message_length",
@@ -200,6 +301,7 @@ const SCHEMA: &[Row] = &[
         help: "Characters, measured after markup is stripped.",
         secret: false,
         read: |s| s.text_message_length.to_string(),
+        write: |s, v| set_u32(&mut s.text_message_length, v),
     },
     Row {
         key: "image_message_length",
@@ -209,6 +311,7 @@ const SCHEMA: &[Row] = &[
         help: "Bytes, for a message that is an image rather than text.",
         secret: false,
         read: |s| s.image_message_length.to_string(),
+        write: |s, v| set_u32(&mut s.image_message_length, v),
     },
     Row {
         key: "allow_html",
@@ -218,6 +321,7 @@ const SCHEMA: &[Row] = &[
         help: "Whether messages may carry markup.",
         secret: false,
         read: |s| s.allow_html.to_string(),
+        write: |s, v| set_bool(&mut s.allow_html, v),
     },
     Row {
         key: "channel_nesting_limit",
@@ -227,6 +331,7 @@ const SCHEMA: &[Row] = &[
         help: "How deep the channel tree may go.",
         secret: false,
         read: |s| s.channel_nesting_limit.to_string(),
+        write: |s, v| set_u32(&mut s.channel_nesting_limit, v),
     },
     Row {
         key: "users_per_channel",
@@ -236,6 +341,7 @@ const SCHEMA: &[Row] = &[
         help: "Occupants any one channel may hold. Zero is unlimited, and a channel with its own limit uses that instead.",
         secret: false,
         read: |s| s.users_per_channel.to_string(),
+        write: |s, v| set_u32(&mut s.users_per_channel, v),
     },
     Row {
         key: "channel_name_regex",
@@ -245,6 +351,10 @@ const SCHEMA: &[Row] = &[
         help: "A channel name must match this whole. Empty means no restriction.",
         secret: false,
         read: |s| s.channel_name_regex.clone(),
+        write: |s, v| {
+            s.channel_name_regex = v.to_owned();
+            true
+        },
     },
     Row {
         key: "default_channel",
@@ -254,6 +364,7 @@ const SCHEMA: &[Row] = &[
         help: "Where a user lands when nothing better is known. Zero is the root.",
         secret: false,
         read: |s| s.default_channel.to_string(),
+        write: |s, v| set_u32(&mut s.default_channel, v),
     },
     Row {
         key: "remember_channel",
@@ -263,6 +374,7 @@ const SCHEMA: &[Row] = &[
         help: "Put a registered user back in the channel they left.",
         secret: false,
         read: |s| s.remember_channel.to_string(),
+        write: |s, v| set_bool(&mut s.remember_channel, v),
     },
     Row {
         key: "remember_channel_duration",
@@ -272,6 +384,7 @@ const SCHEMA: &[Row] = &[
         help: "Seconds since they disconnected before that memory expires. Zero is forever.",
         secret: false,
         read: |s| s.remember_channel_duration.to_string(),
+        write: |s, v| set_u32(&mut s.remember_channel_duration, v),
     },
     Row {
         key: "message_limit",
@@ -281,6 +394,7 @@ const SCHEMA: &[Row] = &[
         help: "Sustained rate before a client is throttled.",
         secret: false,
         read: |s| s.message_limit.to_string(),
+        write: |s, v| set_u32(&mut s.message_limit, v),
     },
     Row {
         key: "message_burst",
@@ -290,6 +404,7 @@ const SCHEMA: &[Row] = &[
         help: "How many may arrive at once before the rate applies.",
         secret: false,
         read: |s| s.message_burst.to_string(),
+        write: |s, v| set_u32(&mut s.message_burst, v),
     },
     Row {
         key: "cert_required",
@@ -299,6 +414,7 @@ const SCHEMA: &[Row] = &[
         help: "Refuse connections from users without one.",
         secret: false,
         read: |s| s.cert_required.to_string(),
+        write: |s, v| set_bool(&mut s.cert_required, v),
     },
     Row {
         key: "user_name_regex",
@@ -308,6 +424,10 @@ const SCHEMA: &[Row] = &[
         help: "A user name must match this whole, at login and at registration. Empty means no restriction.",
         secret: false,
         read: |s| s.user_name_regex.clone(),
+        write: |s, v| {
+            s.user_name_regex = v.to_owned();
+            true
+        },
     },
     Row {
         key: "allow_ping",
@@ -317,6 +437,7 @@ const SCHEMA: &[Row] = &[
         help: "Also gates public-list registration: a listing nobody can measure is a dead entry.",
         secret: false,
         read: |s| s.allow_ping.to_string(),
+        write: |s, v| set_bool(&mut s.allow_ping, v),
     },
     Row {
         key: "registry_name",
@@ -326,6 +447,10 @@ const SCHEMA: &[Row] = &[
         help: "How the server appears in the public list.",
         secret: false,
         read: |s| s.registry_name.clone(),
+        write: |s, v| {
+            s.registry_name = v.to_owned();
+            true
+        },
     },
     Row {
         key: "registry_url",
@@ -335,6 +460,10 @@ const SCHEMA: &[Row] = &[
         help: "The page a listing links to. Registration refuses to run without one.",
         secret: false,
         read: |s| s.registry_url.clone(),
+        write: |s, v| {
+            s.registry_url = v.to_owned();
+            true
+        },
     },
     Row {
         key: "registry_hostname",
@@ -344,6 +473,10 @@ const SCHEMA: &[Row] = &[
         help: "The address the public list should reach this server at.",
         secret: false,
         read: |s| s.registry_hostname.clone(),
+        write: |s, v| {
+            s.registry_hostname = v.to_owned();
+            true
+        },
     },
     Row {
         key: "registry_location",
@@ -353,6 +486,10 @@ const SCHEMA: &[Row] = &[
         help: "ISO country code, shown beside the listing.",
         secret: false,
         read: |s| s.registry_location.clone(),
+        write: |s, v| {
+            s.registry_location = v.to_owned();
+            true
+        },
     },
     Row {
         key: "registry_password",
@@ -362,12 +499,136 @@ const SCHEMA: &[Row] = &[
         help: "Proves to the public list that a later update is this same server.",
         secret: true,
         read: |_| String::new(),
+        write: |s, v| {
+            s.registry_password = v.to_owned();
+            true
+        },
     },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The map a client sends, from pairs.
+    fn wire(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_typed_in_value_reaches_the_field_its_schema_row_describes() {
+        // The whole read/write pairing: a form renders what `redact` said and
+        // hands the text back, so every kind has to survive the round trip in
+        // the type the snapshot holds it as.
+        let mut current = defaults(1);
+        let written = apply_wire(
+            &mut current,
+            &wire(&[
+                ("welcome_text", "hello"),
+                ("max_users", "42"),
+                ("allow_html", "false"),
+                ("cert_required", "1"),
+            ]),
+        );
+
+        assert_eq!(current.welcome_text, "hello");
+        assert_eq!(current.max_users, 42);
+        assert!(!current.allow_html);
+        assert!(current.cert_required);
+        assert_eq!(
+            written,
+            vec![
+                "allow_html".to_owned(),
+                "cert_required".to_owned(),
+                "max_users".to_owned(),
+                "welcome_text".to_owned(),
+            ],
+            "the claimed fields are sorted, so two identical writes look identical"
+        );
+    }
+
+    #[test]
+    fn the_welcome_text_is_advertised_as_markup_rather_than_guessed_at() {
+        // Every client that renders it puts it through an HTML allow-list, so
+        // whoever writes it is writing markup whether or not they were offered
+        // a toolbar. Stated here so a client does not have to infer it from the
+        // key - which is what one of them did, with a regex over the label.
+        let welcome = redact(&defaults(1))
+            .into_iter()
+            .find(|setting| setting.key == "welcome_text")
+            .expect("the welcome text is an editable setting");
+        assert_eq!(welcome.kind(), Kind::Html);
+    }
+
+    #[test]
+    fn a_value_that_does_not_fit_the_field_is_refused_rather_than_coerced() {
+        // Both plausible readings of "many" - the parse prefix and zero - are a
+        // limit the operator did not ask for, and claiming the field would stop
+        // it following the deployment file while holding one of them.
+        let mut current = defaults(1);
+        let before = current.max_users;
+        let written = apply_wire(&mut current, &wire(&[("max_users", "many")]));
+
+        assert_eq!(current.max_users, before, "nothing was written");
+        assert!(written.is_empty(), "and nothing was claimed");
+    }
+
+    #[test]
+    fn a_secret_can_be_written_even_though_it_is_never_read_back() {
+        // `redact` withholds it, which is what makes an empty box mean
+        // "unchanged" at the far end. A secret that could not be *set* from the
+        // same screen would be a field that exists only to look editable.
+        let mut current = defaults(1);
+        let written = apply_wire(&mut current, &wire(&[("password", "hunter2")]));
+
+        assert_eq!(current.password, "hunter2");
+        assert_eq!(written, vec!["password".to_owned()]);
+        assert!(
+            !redact(&current).iter().any(|s| s.value == "hunter2"),
+            "and it still never comes back out"
+        );
+    }
+
+    #[test]
+    fn a_key_with_no_schema_row_is_settable_through_extra() {
+        // The other half of `a_setting_with_no_schema_is_offered_rather_than
+        // _dropped`: offering a field that cannot be saved is worse than not
+        // offering it.
+        let mut current = defaults(1);
+        let written = apply_wire(&mut current, &wire(&[("whiteboard_max_strokes", "500")]));
+
+        assert_eq!(
+            current
+                .extra
+                .get("whiteboard_max_strokes")
+                .map(String::as_str),
+            Some("500")
+        );
+        assert_eq!(written, vec!["whiteboard_max_strokes".to_owned()]);
+    }
+
+    #[test]
+    fn every_readable_setting_can_also_be_written() {
+        // A row whose `write` did not match its `read` would be a field that
+        // renders, accepts a value, and silently reverts on the next query.
+        for setting in redact(&defaults(1)) {
+            let mut current = defaults(1);
+            let sample = match setting.kind() {
+                Kind::Int => "7",
+                Kind::Bool => "true",
+                _ => "x",
+            };
+            assert_eq!(
+                apply_wire(&mut current, &wire(&[(&setting.key, sample)])),
+                vec![setting.key.clone()],
+                "{} is offered by the schema but not settable",
+                setting.key
+            );
+        }
+    }
 
     #[test]
     fn an_unknown_field_is_kept_in_extra_rather_than_dropped() {

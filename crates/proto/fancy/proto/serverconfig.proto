@@ -22,6 +22,12 @@ service ServerConfig {
   rpc SetLivery(SetLiveryRequest) returns (Livery);
   rpc WatchLivery(GetRequest) returns (stream Livery);
 
+  // Greeting: the conditional welcome graph. The same trio, for the same
+  // reason - it is a nested document, not a flat field.
+  rpc GetGreeting(GetRequest) returns (Greeting);
+  rpc SetGreeting(SetGreetingRequest) returns (Greeting);
+  rpc WatchGreeting(GetRequest) returns (stream Greeting);
+
   // Whether a bearer token is a short-lived operator ticket this service
   // minted, called by `operator-api` when its own configured authenticator
   // does not recognise a credential. `server-config` is the ticket authority
@@ -223,4 +229,227 @@ message Snapshot {
   // restriction, which is how an operator turns the rule off.
   string channel_name_regex = 41;
   string user_name_regex = 42;
+}
+
+// -- Greeting -----------------------------------------------------------------
+//
+// The conditional welcome message, as the operator drew it: a graph of
+// conditions about the arriving peer, combined through logic gates, ending at
+// the greeting they are shown.
+//
+// Its own trio beside Livery, and for the same reason `serverconfig.proto:17`
+// gives: `SetRequest.fields` is a flat list of names, and a nested document
+// under field-wise merge would need dotted paths the merge does not do.
+//
+// A graph rather than an ordered rule list because that is what the operator
+// authored. Flattening it here would throw away the layout the editor needs to
+// draw it back, and would make the server's answer to "why did this person see
+// that" untraceable to anything the operator recognises.
+
+message Greeting {
+  uint32 instance = 1;
+  // One per instance, bumped on every accepted SetGreeting, as Snapshot.version.
+  uint64 version = 2;
+  // Truncated SHA-256 over the canonical form. Server-filled, ignored as input.
+  bytes digest = 3;
+  // Off means no client is shown anything. Kept rather than deleting the graph,
+  // so an operator can turn it off without losing what they drew - the same
+  // reasoning as `Flow.enabled`.
+  bool enabled = 4;
+
+  repeated GreetingNode nodes = 10;
+  repeated GreetingEdge edges = 11;
+
+  // Server-filled; ignored as input.
+  string updated_by = 20;
+  uint64 updated_at_ms = 21;
+}
+
+// Which input a wire lands on. A condition has no inputs; a gate has A and B
+// (A alone for NOT); the greeting has WHEN for its condition and PLUS for the
+// reusable snippets appended to its body.
+enum GreetingPort {
+  GREETING_PORT_A = 0;
+  GREETING_PORT_B = 1;
+  GREETING_PORT_WHEN = 2;
+  GREETING_PORT_PLUS = 3;
+}
+
+message GreetingEdge {
+  string id = 1;
+  // Both are `GreetingNode.id`. A wire whose ends do not both resolve is
+  // dropped at validation rather than at evaluation: a dangling wire is a
+  // drawing mistake, and the operator is told at the moment they save.
+  string from = 2;
+  string to = 3;
+  GreetingPort port = 4;
+}
+
+message GreetingNode {
+  string id = 1;
+  // Where the operator put it. Carried because the editor has to redraw the
+  // graph exactly as it was left; the evaluator never reads either.
+  int32 x = 2;
+  int32 y = 3;
+
+  oneof body {
+    CountryIn country = 10;
+    Tenure tenure = 11;
+    ClientVersion client_version = 12;
+    AccountIs account = 13;
+    GroupIs group = 14;
+    OperatingSystem os = 15;
+    Gate gate = 16;
+    Snippet snippet = 17;
+    Greet greet = 18;
+    Filter filter = 19;
+  }
+
+  // ISO-3166-1 alpha-2, upper case. Matching needs a GeoIP database; where the
+  // server has none the condition is skipped, never treated as false - see the
+  // fail-open rule on `Greet`.
+  message CountryIn {
+    repeated string codes = 1;
+  }
+
+  // How long this account has existed, from `Account.created_at_ms`. A guest
+  // has no account and so no tenure, which is a skip rather than a zero.
+  message Tenure {
+    enum Op {
+      JOINED_LESS_THAN = 0;
+      JOINED_MORE_THAN = 1;
+    }
+    Op op = 1;
+    uint64 window_s = 2;
+  }
+
+  // Against `Version.version_v2` as the peer announced it. The editor encodes
+  // the operator's "1.5.0" into this; an operator never types the number,
+  // because a hand-written literal that forgets the patch shift decodes to
+  // something else entirely and the handshake completes either way.
+  message ClientVersion {
+    enum Op {
+      LT = 0;
+      LE = 1;
+      EQ = 2;
+      GE = 3;
+      GT = 4;
+    }
+    Op op = 1;
+    uint64 version = 2;
+  }
+
+  message AccountIs {
+    enum State {
+      // No registered account. Read from the identity, never from `id != 0`:
+      // the SuperUser is account 0, and that test calls them a guest.
+      GUEST = 0;
+      REGISTERED = 1;
+      // Certificate chains to a configured CA.
+      STRONG_CERT = 2;
+    }
+    State state = 1;
+  }
+
+  message GroupIs {
+    string group = 1;
+  }
+
+  // Normalised, never the raw `Version.os` string. The two clients spell it
+  // differently - the Fancy client sends `std::env::consts::OS` (lower case
+  // `windows`/`macos`/`linux`) and stock Mumble sends its own capitalisation,
+  // historically `X11` for Linux - so an operator matching on the raw string
+  // picks one client and silently misses the other.
+  message OperatingSystem {
+    enum Os {
+      WINDOWS = 0;
+      MACOS = 1;
+      LINUX = 2;
+      BSD = 3;
+      ANDROID = 4;
+      IOS = 5;
+    }
+    Os os = 1;
+  }
+
+  // Turns a maybe into a yes or a no.
+  //
+  // Every condition here has three answers, not two: a server with no
+  // geo-IP database cannot say which country somebody is in, and a guest
+  // has no account age to compare. That third answer travels through the
+  // gates, and a greeting fires only on a definite yes - which means an
+  // unanswerable condition quietly withholds the greeting, and the
+  // operator never sees why.
+  //
+  // This is where they say. It takes one input and always answers one of
+  // two things, so everything downstream of it is decided. Which way it
+  // resolves is the operator's call and it genuinely goes both ways:
+  // "I could not tell where they are from, so not the German greeting"
+  // is `UNKNOWN_IS_NO`, and "I could not tell whether their client is
+  // current, so warn them anyway" is `UNKNOWN_IS_YES`.
+  message Filter {
+    enum Unknown {
+      UNKNOWN_IS_NO = 0;
+      UNKNOWN_IS_YES = 1;
+    }
+    Unknown unknown_becomes = 1;
+  }
+
+  // A gate takes *settled* answers only.
+  //
+  // Every input has to come from a Filter or from another gate, which
+  // is checked when the graph is stored. A condition cannot be wired
+  // straight in, and that is the whole rule: combining a maybe with
+  // anything gives a maybe, so a single unanswerable condition would
+  // quietly take the whole expression with it and the greeting would
+  // go to nobody with nothing to show for it. Filters are where an
+  // operator says what a maybe means; gates are downstream of that
+  // decision, never upstream of it.
+  //
+  // The consequence worth stating: every gate's output is settled,
+  // because every input to it was. Undecidedness lives strictly
+  // between a condition and the first filter below it.
+  message Gate {
+    enum Kind {
+      AND = 0;
+      OR = 1;
+      XOR = 2;
+      // One input, on port A.
+      NOT = 3;
+      NAND = 4;
+      NOR = 5;
+      // Both or neither. Written XAND on some diagrams.
+      XNOR = 6;
+    }
+    Kind kind = 1;
+  }
+
+  // A named paragraph appended to a greeting's body. Reusable so an operator
+  // writing five greetings states the house rules once.
+  message Snippet {
+    string name = 1;
+    string html = 2;
+    string plain = 3;
+  }
+
+  // The terminal node: what the person actually reads.
+  //
+  // Both `html` and `plain` are carried, and this is not redundancy. A server
+  // with `allow_html` off hands a client tags it renders literally, which turns
+  // a greeting into what looks like a broken server - the same reason
+  // `listener_warning` and `outdated_epoch_warning` each hold two literals.
+  // One body with server-side tag stripping reproduces that bug class.
+  message Greet {
+    string html = 1;
+    string plain = 2;
+    // Shown once and then remembered per account. False shows it on every
+    // connect and stores nothing.
+    bool once = 3;
+  }
+}
+
+message SetGreetingRequest {
+  starling.common.v1.Scope scope = 1;
+  starling.common.v1.Actor actor = 2;
+  Greeting values = 3;
 }
