@@ -157,7 +157,7 @@ impl AppState {
     /// On creation, the room is inserted into the registry *before*
     /// seeding so the registry mutex isn't held across the
     /// file-server HTTP call.  Concurrent callers all observe the
-    /// same Arc<DocRoom>; the seed and any client edits are
+    /// same `Arc<DocRoom>`; the seed and any client edits are
     /// applied to the shared doc and commute via Yjs CRDT semantics,
     /// so it does not matter which happens first.
     pub async fn ensure_room(&self, key: DocKey) -> Arc<DocRoom> {
