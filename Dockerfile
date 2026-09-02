@@ -23,10 +23,16 @@ COPY . .
 # the cache mounts make a rebuild after a source change minutes instead. The
 # binary is copied out within the same layer, since a cache mount is not part of
 # the image.
+#
+# The plugins are a second `cargo build` rather than more `-p` flags on the
+# first: `--bin starling` is a target filter over every selected package, so
+# naming the plugins alongside it fails with "no bin target named `starling` in
+# `mumble-friends`". Two invocations share the same cache mount and cost
+# nothing extra.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked --bin starling \
-        -p mumble-friends -p mumble-live-doc \
+ && cargo build --release --locked -p mumble-friends -p mumble-live-doc \
  && cp /src/target/release/starling /usr/local/bin/starling \
  && mkdir -p /usr/local/lib/starling/plugins \
  && cp /src/target/release/libmumble_friends.so \
