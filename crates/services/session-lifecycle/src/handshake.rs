@@ -287,6 +287,9 @@ impl Handshake {
         let graph = self.greetings.get(instance);
         let facts = greeting::Facts {
             client_version: Some(pending.mumble_version),
+            // Zero and all: a peer that announced none is stock Mumble, which
+            // is what the node reads a zero as.
+            fancy_version: Some(pending.fancy_version),
             os: greeting::normalise_os(&pending.os),
             registered: Some(identity.account.is_some()),
             strong_cert: Some(pending.strong_cert),
@@ -2444,6 +2447,9 @@ mod tests {
                 id: id.into(),
                 x: 0,
                 y: 0,
+                // Layout is the editor's and no test here is about it.
+                w: 0,
+                h: 0,
                 body: Some(body),
             }
         }
@@ -2473,6 +2479,11 @@ mod tests {
                             html: "<b>Please update.</b>".to_owned(),
                             plain: "Please update.".to_owned(),
                             once: true,
+                            // Prose, not a screen: this fixture is about which
+                            // greeting is chosen, never about how one is drawn.
+                            sections: Vec::new(),
+                            legacy: false,
+                            design: None,
                         }),
                     ),
                 ],
@@ -2482,12 +2493,14 @@ mod tests {
                         from: "old".into(),
                         to: "f".into(),
                         port: i32::from(GreetingPort::A),
+                        input: String::new(),
                     },
                     GreetingEdge {
                         id: "e2".into(),
                         from: "f".into(),
                         to: "greet".into(),
                         port: i32::from(GreetingPort::When),
+                        input: String::new(),
                     },
                 ],
                 ..Greeting::default()

@@ -259,6 +259,10 @@ message Greeting {
 
   repeated GreetingNode nodes = 10;
   repeated GreetingEdge edges = 11;
+  // Notes an operator left on the canvas. Nothing evaluates them and no client
+  // is ever sent one; they are here so the *next* operator can read the
+  // drawing. See `GreetingAnnotation`.
+  repeated GreetingAnnotation annotations = 12;
 
   // Server-filled; ignored as input.
   string updated_by = 20;
@@ -273,6 +277,113 @@ enum GreetingPort {
   GREETING_PORT_B = 1;
   GREETING_PORT_WHEN = 2;
   GREETING_PORT_PLUS = 3;
+  // One of a design's declared inputs; `GreetingEdge.input` says which.
+  GREETING_PORT_INPUT = 4;
+}
+
+// A note on the canvas: a title over a region, a paragraph of explanation, a
+// one-line label, or a frame drawn behind a group of nodes.
+//
+// Deliberately outside `GreetingNode` rather than another arm of its `body`
+// oneof. An annotation has no ports, takes part in no wire, and is read by
+// nothing on the evaluation path - making it a node would put a thing with no
+// truth value into every walk that asks a node whether it is true, and each of
+// those walks would then need a case for "this one is furniture". It is a
+// second layer over the same canvas, and it is stored as one.
+//
+// Layout is all it has, which is why none of it reaches `canonical`: a graph
+// whose notes changed is the same rule, and a digest that moved with a note
+// would re-prompt every user on the server because somebody documented their
+// own canvas.
+message GreetingAnnotation {
+  string id = 1;
+  int32 x = 2;
+  int32 y = 3;
+  // Zero means the editor's default for this kind. A frame with no size is
+  // meaningless, so the editor gives one a size the moment it is drawn.
+  uint32 w = 4;
+  uint32 h = 5;
+  Kind kind = 6;
+  // Plain text, never markup. A note is read on the canvas by an operator, and
+  // a second markup surface here would be a second thing to sanitise for no
+  // reader who could not be served by a paragraph.
+  string text = 7;
+  // Which of the canvas's four marks it carries, so a region can be coloured
+  // to match what it is about.
+  Tone tone = 8;
+
+  enum Kind {
+    // A heading over a region: large text, no box around it.
+    TITLE = 0;
+    // A paragraph. What the group of nodes below it is for.
+    NOTE = 1;
+    // An outlined region drawn behind a group of nodes.
+    FRAME = 2;
+    // One line, for labelling a single wire or node.
+    LABEL = 3;
+  }
+
+  enum Tone {
+    TONE_MUTED = 0;
+    TONE_ACCENT = 1;
+    TONE_OK = 2;
+    TONE_WARN = 3;
+  }
+}
+
+// A greeting built from blocks, with a declared signature the graph fills.
+//
+// The server does three things with one: evaluates each condition input against
+// the arriving peer, substitutes each text slot from the snippet wired to it,
+// and concatenates the parts of whichever target that peer can render. There is
+// no layout engine here and no markup generated here - `compiled` is produced
+// by the editor, once, at save time.
+message GreetingDesign {
+  // What the block positions are relative to. Layout only; never evaluated.
+  uint32 sheet_w = 1;
+  // The signature. One port on the editor's node per entry.
+  repeated DesignInput slots = 2;
+  repeated DesignInput conditions = 3;
+  // The blocks and their per-target overrides, as the editor's own JSON.
+  //
+  // Opaque here on purpose: it is what the editor reopens, and nothing on the
+  // evaluation path reads it. Teaching the server to parse a layout would be a
+  // second implementation of the editor, kept in step by hope.
+  string tree = 4;
+  // What each target compiles to. One entry per target that has any parts.
+  repeated CompiledTarget compiled = 5;
+}
+
+message DesignInput {
+  // Stable. Wires bind to the *name*, so this is for the editor's own use.
+  string id = 1;
+  // What the port says, and what a slot or a gate refers to: `rules`.
+  string name = 2;
+}
+
+message CompiledTarget {
+  // `plain`, `rich`, `html` or `qt`. A string rather than an enum because the
+  // set is the *editor's* to grow, and a server that dropped a target it had
+  // never heard of would silently stop greeting the clients it was for.
+  string target = 1;
+  repeated DesignPart parts = 2;
+}
+
+// One piece of a compiled greeting.
+//
+// A list rather than one string, because two things are only known when
+// somebody actually connects: which gated blocks are on, and what is wired into
+// each slot. Splitting the output at every such boundary is the smallest thing
+// that lets the server assemble without rendering.
+message DesignPart {
+  oneof body {
+    // Markup or text, already generated.
+    string literal = 1;
+    // The name of a text input: substitute whatever is wired to it.
+    string slot = 2;
+  }
+  // The name of a condition input. Empty means the part is always sent.
+  string visible_if = 3;
 }
 
 message GreetingEdge {
@@ -283,14 +394,28 @@ message GreetingEdge {
   string from = 2;
   string to = 3;
   GreetingPort port = 4;
+  // Which design input this wire lands on, when `port` is INPUT.
+  //
+  // A name rather than an index: a design's ports are its declared inputs, and
+  // an index would silently re-point every wire the moment somebody reorders
+  // them.
+  string input = 5;
 }
 
 message GreetingNode {
   string id = 1;
-  // Where the operator put it. Carried because the editor has to redraw the
-  // graph exactly as it was left; the evaluator never reads either.
+  // Where the operator put it, and how big they made it. Carried because the
+  // editor has to redraw the graph exactly as it was left; the evaluator reads
+  // none of the four.
+  //
+  // Zero width or height means "whatever the editor's default for this kind
+  // is", which is what every node saved before this field existed has. A node
+  // is not given a nominal default here, because the default belongs to the
+  // editor that draws it and differs per kind.
   int32 x = 2;
   int32 y = 3;
+  uint32 w = 4;
+  uint32 h = 5;
 
   oneof body {
     CountryIn country = 10;
@@ -303,6 +428,7 @@ message GreetingNode {
     Snippet snippet = 17;
     Greet greet = 18;
     Filter filter = 19;
+    FancyVersion fancy_version = 20;
   }
 
   // ISO-3166-1 alpha-2, upper case. Matching needs a GeoIP database; where the
@@ -334,6 +460,41 @@ message GreetingNode {
       EQ = 2;
       GE = 3;
       GT = 4;
+    }
+    Op op = 1;
+    uint64 version = 2;
+  }
+
+  // Against `Version.fancy_version` - the fork's own version, which stock
+  // Mumble never sends and which moves independently of `version_v2`.
+  //
+  // A second node rather than another op on `ClientVersion`, because the two
+  // number different things: a Fancy build announces *both*, a Mumble
+  // compatibility version and its own, and 0.4.0 of the fork is not older than
+  // 1.5.0 of Mumble - the numbers are not on one line and comparing across
+  // them is meaningless. An operator addressing "everyone on the fork's own
+  // client, before the release that fixed X" has to be able to say which of
+  // the two versions they mean.
+  //
+  // A peer that announced no fancy version answers *no* here, to every op
+  // including `ANY` and including the `LT` ones. That is a definite answer and
+  // not a skip: the whole server already reads a missing `fancy_version` as
+  // "this is stock Mumble" - it is what gates every fork message - so this
+  // node reads it the same way. `ClientVersion` differs on purpose, because a
+  // zero there means the peer said nothing at all rather than that it said
+  // something the server understands.
+  message FancyVersion {
+    enum Op {
+      LT = 0;
+      LE = 1;
+      EQ = 2;
+      GE = 3;
+      GT = 4;
+      // Any version of the fork's client at all. `version` is ignored, and
+      // this is the op an operator reaches for: "is this one of ours" is the
+      // question the node mostly gets asked, and spelling it `GE 0.0.0` reads
+      // like a version comparison that happens to be vacuous.
+      ANY = 5;
     }
     Op op = 1;
     uint64 version = 2;
@@ -434,17 +595,147 @@ message GreetingNode {
 
   // The terminal node: what the person actually reads.
   //
-  // Both `html` and `plain` are carried, and this is not redundancy. A server
-  // with `allow_html` off hands a client tags it renders literally, which turns
-  // a greeting into what looks like a broken server - the same reason
-  // `listener_warning` and `outdated_epoch_warning` each hold two literals.
-  // One body with server-side tag stripping reproduces that bug class.
+  // Three representations of one greeting, and none of them is redundant -
+  // each is what some client can actually show:
+  //
+  // * `sections` is the welcome *screen*: a hero, prose, a call to action, a
+  //   row of links. A client that understands it draws these natively, with
+  //   its own type scale and its own buttons, so the greeting looks like part
+  //   of the application rather than like a web page pasted into it - and a
+  //   button can then be a button rather than an underlined word.
+  // * `html` is the same greeting as markup, for every client that renders
+  //   markup and knows nothing about sections. Generated by the editor from
+  //   the sections when there are any.
+  // * `plain` is the same greeting again as text. A server with `allow_html`
+  //   off hands a client tags it renders literally, which turns a greeting
+  //   into what looks like a broken server - the same reason
+  //   `listener_warning` and `outdated_epoch_warning` each hold two literals.
+  //   One body with server-side tag stripping reproduces that bug class.
+  //
+  // A client takes the richest form it understands. Unlike layout, all three
+  // are part of the document digest: changing what somebody reads is exactly
+  // what "show it again" is for.
   message Greet {
     string html = 1;
     string plain = 2;
     // Shown once and then remembered per account. False shows it on every
     // connect and stores nothing.
     bool once = 3;
+    repeated Section sections = 4;
+    // Whether `html` is written for Qt's rich-text subset rather than for a
+    // browser.
+    //
+    // Mumble 1.5 and older draw a greeting with `QTextDocument`, which renders
+    // a subset of HTML 4 and CSS 2.1: no flexbox, no grid, no border-radius,
+    // and layout done the way it was done in 2003 - with tables. Markup that
+    // reads as a card in a modern client collapses into a left-aligned column
+    // there, so an operator who cares about those clients writes a *second*
+    // greeting for them and wires it behind a version condition.
+    //
+    // Carried because the editor cannot tell the two apart by looking: both
+    // halves are markup, and one recompiled as the other on the next save
+    // would silently undo the whole point of having written it.
+    bool legacy = 5;
+    // A greeting laid out in the design editor, rather than typed as prose.
+    //
+    // Both halves above are still filled in, generated from this: `html` and
+    // `plain` are what a client that knows nothing about designs receives, and
+    // are what this server sends when it has no better option.
+    GreetingDesign design = 6;
+  }
+
+  // One band of a welcome screen, in the order they are drawn.
+  //
+  // A closed set rather than an arbitrary layout tree, and that is the whole
+  // design. A tree of rows, columns and styles is a second CSS: the operator
+  // gets to make an unreadable screen, every client has to implement a layout
+  // engine to draw one, and the two drift. Six bands each with a fixed shape
+  // means an operator picks *what this part is* and the client decides how
+  // that looks in its own type scale - so a welcome screen matches the client
+  // it is read in, on every platform, including ones written after it.
+  message Section {
+    Kind kind = 1;
+    // The heading, the button's label, the eyebrow. What it means depends on
+    // `kind`, and every kind that has one line uses this.
+    string title = 2;
+    // The second line: a hero's subtitle, a button's caption underneath.
+    string subtitle = 3;
+    // PROSE only: the paragraph, as markup.
+    string html = 4;
+    // Where an ACTION points. http(s) only; a client refuses anything else,
+    // as it does for every other link a server sends.
+    string url = 5;
+    // HERO only. One or two characters - an emoji, a letter - drawn in the
+    // badge above the title. Not an image: a picture here is paid for on
+    // every join and there is a livery icon already.
+    string glyph = 6;
+    // CARDS only.
+    repeated Card cards = 7;
+    // ACTION only: whether it is drawn as the screen's primary button.
+    bool primary = 8;
+    // How this band sits. Alignment is the one layout choice an operator
+    // genuinely has to make - a centred hero and a left-aligned paragraph are
+    // both right, and neither can be guessed from the kind.
+    Align align = 9;
+    // What this band is *for*, painted as its background. A title bar and a
+    // "registration is closed" notice are the same band with different tones,
+    // and giving an operator a colour picker instead would let them build one
+    // nobody can read on a theme they have never seen.
+    Tone tone = 10;
+    // IMAGE only: which of the server's own pictures to draw. Its livery,
+    // never bytes carried here - the artwork already exists, is already
+    // cached, and costs this document nothing.
+    Picture picture = 11;
+    // CARDS only: a centred list of links rather than a row of boxes.
+    bool compact = 12;
+
+    enum Align {
+      // Whatever the band's kind is normally drawn as.
+      ALIGN_DEFAULT = 0;
+      ALIGN_LEFT = 1;
+      ALIGN_CENTER = 2;
+    }
+
+    enum Tone {
+      // No background at all: the band sits on the screen's own surface.
+      TONE_NONE = 0;
+      TONE_ACCENT = 1;
+      TONE_MUTED = 2;
+      TONE_WARN = 3;
+      // For something that is actually wrong - registration closed, a service
+      // down - rather than for emphasis.
+      TONE_DANGER = 4;
+    }
+
+    enum Picture {
+      PICTURE_NONE = 0;
+      PICTURE_ICON = 1;
+      PICTURE_BANNER = 2;
+    }
+
+    enum Kind {
+      // A small strip across the top: the server's name, a version.
+      HEADER = 0;
+      // The badge, the big title, the line under it.
+      HERO = 1;
+      // A paragraph or several, as markup.
+      PROSE = 2;
+      // A button, with an optional line under it.
+      ACTION = 3;
+      // A row of small link cards.
+      CARDS = 4;
+      // A rule between bands.
+      DIVIDER = 5;
+      // The server's own artwork, from its livery.
+      IMAGE = 6;
+    }
+
+    message Card {
+      // The small caps line above the link: "BROWSE", "LIVE".
+      string eyebrow = 1;
+      string label = 2;
+      string url = 3;
+    }
   }
 }
 

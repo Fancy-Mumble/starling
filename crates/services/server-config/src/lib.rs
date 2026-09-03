@@ -1265,6 +1265,10 @@ fn describe_greeting_problems(problems: &[greeting_doc::Invalid]) -> String {
                 greeting_doc::Reason::Cycle => "the wires close a loop".to_owned(),
                 greeting_doc::Reason::Empty => "node carries nothing".to_owned(),
                 greeting_doc::Reason::BadCountry => "not a country code".to_owned(),
+                greeting_doc::Reason::BadUrl => "a link that is not http:// or https://".to_owned(),
+                greeting_doc::Reason::UnknownInput => {
+                    "a slot or a toggle naming an input the design does not declare".to_owned()
+                }
             };
             if problem.node.is_empty() {
                 what

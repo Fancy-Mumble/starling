@@ -20,7 +20,8 @@ use sha2::{Digest as _, Sha256};
 use starling_proto_fancy::common::Scope;
 use starling_proto_fancy::serverconfig::server_config_client::ServerConfigClient;
 use starling_proto_fancy::serverconfig::{
-    GetRequest, Greeting, GreetingEdge, GreetingNode, GreetingPort, greeting_node,
+    GetRequest, Greeting, GreetingAnnotation, GreetingDesign, GreetingEdge, GreetingNode,
+    GreetingPort, design_part, greeting_annotation, greeting_node,
 };
 
 use crate::channel::Resolver;
@@ -43,6 +44,174 @@ pub const MAX_BODY: usize = 4096;
 pub const MAX_NAME: usize = 48;
 /// Countries one condition may name.
 pub const MAX_COUNTRIES: usize = 32;
+/// Bands one welcome screen may have. Past this it is not a screen.
+pub const MAX_SECTIONS: usize = 24;
+/// Cards in one row. Past four they are unreadable on any client's width.
+pub const MAX_CARDS: usize = 6;
+/// Characters in one line of a section - a title, a label, an eyebrow.
+pub const MAX_LINE: usize = 160;
+/// Inputs one design may declare. Past this a node is not a node.
+pub const MAX_INPUTS: usize = 16;
+/// Parts one compiled target may hold. Bounds the assembly at handshake.
+pub const MAX_PARTS: usize = 128;
+/// Characters of the editor's own block tree.
+///
+/// Never parsed here - it is what the editor reopens - but it is stored, and a
+/// document nobody bounded is a document somebody eventually posts a megabyte
+/// of.
+pub const MAX_TREE: usize = 64_000;
+/// Notes one canvas may carry. Past this an operator is not annotating a graph.
+pub const MAX_ANNOTATIONS: usize = 64;
+/// Characters in one note.
+///
+/// Shorter than a greeting body on purpose: this is read on the canvas by the
+/// next operator, and it costs no join, so there is no reason for it to be
+/// generous and every reason for a note to stay a note.
+pub const MAX_ANNOTATION_TEXT: usize = 512;
+
+/// What is wrong with one greeting's body, if anything.
+///
+/// Its own function rather than another arm of [`validate`]'s match: a
+/// greeting carries three representations and a screen of bands, so checking
+/// one is a page of its own and inlining it buried the other nine node kinds.
+fn greet_problems(id: &str, greet: &greeting_node::Greet) -> Vec<Invalid> {
+    let mut problems = Vec::new();
+    let bad = |reason: Reason| Invalid {
+        node: id.to_owned(),
+        reason,
+    };
+
+    for body in [&greet.html, &greet.plain] {
+        if body.chars().count() > MAX_BODY {
+            problems.push(bad(Reason::TooLong(body.chars().count())));
+        }
+    }
+    if greet.sections.len() > MAX_SECTIONS {
+        problems.push(bad(Reason::TooLarge(greet.sections.len())));
+    }
+    for section in &greet.sections {
+        problems.extend(section_problems(id, section));
+    }
+    if let Some(design) = greet.design.as_ref() {
+        problems.extend(design_problems(id, design));
+    }
+    problems
+}
+
+/// What is wrong with one design.
+fn design_problems(id: &str, design: &GreetingDesign) -> Vec<Invalid> {
+    let mut problems = Vec::new();
+    let bad = |reason: Reason| Invalid {
+        node: id.to_owned(),
+        reason,
+    };
+
+    if design.slots.len() + design.conditions.len() > MAX_INPUTS {
+        problems.push(bad(Reason::TooLarge(
+            design.slots.len() + design.conditions.len(),
+        )));
+    }
+    if design.tree.chars().count() > MAX_TREE {
+        problems.push(bad(Reason::TooLong(design.tree.chars().count())));
+    }
+
+    // A name is what a slot and a gate refer to, so two inputs sharing one is a
+    // reference with two answers.
+    let mut names = HashSet::new();
+    for input in design.slots.iter().chain(design.conditions.iter()) {
+        if !names.insert(input.name.as_str()) {
+            problems.push(bad(Reason::DuplicateId));
+        }
+        if input.name.chars().count() > MAX_NAME {
+            problems.push(bad(Reason::TooLong(input.name.chars().count())));
+        }
+    }
+
+    for compiled in &design.compiled {
+        if compiled.parts.len() > MAX_PARTS {
+            problems.push(bad(Reason::TooLarge(compiled.parts.len())));
+        }
+        let total: usize = compiled
+            .parts
+            .iter()
+            .map(|part| match part.body.as_ref() {
+                Some(design_part::Body::Literal(text)) => text.chars().count(),
+                _ => 0,
+            })
+            .sum();
+        // The assembled greeting is what is paid for on every join, so the cap
+        // is on the sum rather than on any one part.
+        if total > MAX_BODY {
+            problems.push(bad(Reason::TooLong(total)));
+        }
+        for part in &compiled.parts {
+            // A part naming an input the design does not declare would be
+            // dropped or substituted with nothing, silently, on every join.
+            if !part.visible_if.is_empty() && !names.contains(part.visible_if.as_str()) {
+                problems.push(bad(Reason::UnknownInput));
+            }
+            if let Some(design_part::Body::Slot(name)) = part.body.as_ref()
+                && !names.contains(name.as_str())
+            {
+                problems.push(bad(Reason::UnknownInput));
+            }
+        }
+    }
+    problems
+}
+
+/// What is wrong with one band of a welcome screen.
+fn section_problems(id: &str, section: &greeting_node::Section) -> Vec<Invalid> {
+    let mut problems = Vec::new();
+    let bad = |reason: Reason| Invalid {
+        node: id.to_owned(),
+        reason,
+    };
+
+    if section.cards.len() > MAX_CARDS {
+        problems.push(bad(Reason::TooLarge(section.cards.len())));
+    }
+    if section.html.chars().count() > MAX_BODY {
+        problems.push(bad(Reason::TooLong(section.html.chars().count())));
+    }
+
+    let lines = [&section.title, &section.subtitle, &section.glyph]
+        .into_iter()
+        .chain(
+            section
+                .cards
+                .iter()
+                .flat_map(|card| [&card.eyebrow, &card.label]),
+        );
+    problems.extend(
+        lines
+            .filter(|line| line.chars().count() > MAX_LINE)
+            .map(|line| bad(Reason::TooLong(line.chars().count()))),
+    );
+
+    // Refused rather than stripped on the way out: a button pointing at
+    // `javascript:` is a thing an operator has to be told about, and a client
+    // that silently dropped it would leave a dead button on everybody's
+    // welcome screen.
+    problems.extend(
+        [&section.url]
+            .into_iter()
+            .chain(section.cards.iter().map(|card| &card.url))
+            .filter(|url| !url.is_empty() && !is_web_url(url))
+            .map(|_| bad(Reason::BadUrl)),
+    );
+    problems
+}
+
+/// Whether a link is one a client will follow.
+///
+/// http(s) and nothing else, checked at write time. Every other scheme a URL
+/// bar accepts - `javascript:`, `data:`, `file:` - is either an attack or a
+/// button that does nothing on the platform it is read on.
+fn is_web_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
 
 /// A refused greeting write, and what caused it.
 ///
@@ -78,6 +247,10 @@ pub enum Reason {
     Empty,
     /// A country code that is not two letters.
     BadCountry,
+    /// A link that is not `http://` or `https://`.
+    BadUrl,
+    /// A slot or a gate naming an input the design does not declare.
+    UnknownInput,
 }
 
 /// What the server knows about the peer being greeted.
@@ -90,6 +263,10 @@ pub enum Reason {
 pub struct Facts {
     /// `Version.version_v2` as the peer announced it.
     pub client_version: Option<u64>,
+    /// `Version.fancy_version` as the peer announced it. Zero is a stock
+    /// Mumble client, which is a fact rather than an absence - see
+    /// `GreetingNode.FancyVersion`.
+    pub fancy_version: Option<u64>,
     /// Normalised, never the raw `Version.os` string.
     pub os: Option<greeting_node::operating_system::Os>,
     /// Whether the peer holds a registered account.
@@ -281,6 +458,29 @@ fn condition(body: &greeting_node::Body, facts: &Facts) -> Truth {
                     greeting_node::client_version::Op::Eq => here == v.version,
                     greeting_node::client_version::Op::Ge => here >= v.version,
                     greeting_node::client_version::Op::Gt => here > v.version,
+                }),
+                Err(_) => Truth::Unknown,
+            },
+        },
+        Body::FancyVersion(v) => match facts.fancy_version {
+            None => Truth::Unknown,
+            // Zero is not a version here, it is *stock Mumble* - the same
+            // reading `pending.fancy_version != 0` gets everywhere else in the
+            // server. So it settles as a no, to every op: a client that is not
+            // the fork's is not an older one either, and answering Unknown
+            // would put every rule about the fork behind a filter that most
+            // operators would resolve the wrong way round.
+            Some(0) => Truth::No,
+            Some(here) => match greeting_node::fancy_version::Op::try_from(v.op) {
+                Ok(op) => Truth::of(match op {
+                    greeting_node::fancy_version::Op::Lt => here < v.version,
+                    greeting_node::fancy_version::Op::Le => here <= v.version,
+                    greeting_node::fancy_version::Op::Eq => here == v.version,
+                    greeting_node::fancy_version::Op::Ge => here >= v.version,
+                    greeting_node::fancy_version::Op::Gt => here > v.version,
+                    // Reached only past the zero above, so being here is
+                    // already the answer: this peer runs the fork.
+                    greeting_node::fancy_version::Op::Any => true,
                 }),
                 Err(_) => Truth::Unknown,
             },
@@ -535,13 +735,25 @@ pub fn validate(graph: &Greeting) -> Result<(), Vec<Invalid>> {
                 }
             }
             Some(greeting_node::Body::Greet(g)) => {
-                for body in [&g.html, &g.plain] {
-                    if body.chars().count() > MAX_BODY {
-                        problems.push(bad(&n.id, Reason::TooLong(body.chars().count())));
-                    }
-                }
+                problems.extend(greet_problems(&n.id, g));
             }
             Some(_) => {}
+        }
+    }
+
+    if graph.annotations.len() > MAX_ANNOTATIONS {
+        problems.push(bad("", Reason::TooLarge(graph.annotations.len())));
+    }
+    let mut annotation_ids = HashSet::new();
+    for note in &graph.annotations {
+        // The same id space as the nodes, because both are addressed by the
+        // editor and a note that shared an id with a node would be a note the
+        // canvas could delete by removing something else.
+        if !annotation_ids.insert(note.id.as_str()) || ids.contains(note.id.as_str()) {
+            problems.push(bad(&note.id, Reason::DuplicateId));
+        }
+        if note.text.chars().count() > MAX_ANNOTATION_TEXT {
+            problems.push(bad(&note.id, Reason::TooLong(note.text.chars().count())));
         }
     }
 
@@ -624,6 +836,9 @@ pub fn canonical(graph: &Greeting) -> String {
             Some(greeting_node::Body::ClientVersion(v)) => {
                 out.push_str(&format!("version={}:{}", v.op, v.version));
             }
+            Some(greeting_node::Body::FancyVersion(v)) => {
+                out.push_str(&format!("fancy={}:{}", v.op, v.version));
+            }
             Some(greeting_node::Body::Account(a)) => out.push_str(&format!("account={}", a.state)),
             Some(greeting_node::Body::Group(g)) => out.push_str(&format!("group={}", g.group)),
             Some(greeting_node::Body::Os(o)) => out.push_str(&format!("os={}", o.os)),
@@ -639,8 +854,16 @@ pub fn canonical(graph: &Greeting) -> String {
             }
             Some(greeting_node::Body::Greet(g)) => {
                 out.push_str(&format!(
-                    "greet={}\u{1f}{}\u{1f}{}",
-                    g.html, g.plain, g.once
+                    "greet={}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                    g.html,
+                    g.plain,
+                    g.once,
+                    g.legacy,
+                    format_args!(
+                        "{}{}",
+                        sections_form(&g.sections),
+                        design_form(g.design.as_ref())
+                    )
                 ));
             }
             None => out.push_str("empty"),
@@ -661,6 +884,72 @@ pub fn canonical(graph: &Greeting) -> String {
     out
 }
 
+/// A screen's bands as one line, for the two digests.
+///
+/// Part of what is hashed, unlike layout: the bands *are* what somebody reads,
+/// so a changed button is a changed greeting and "show it again" is exactly
+/// what should happen.
+fn sections_form(sections: &[greeting_node::Section]) -> String {
+    sections
+        .iter()
+        .map(|section| {
+            let cards = section
+                .cards
+                .iter()
+                .map(|card| format!("{}~{}~{}", card.eyebrow, card.label, card.url))
+                .collect::<Vec<_>>()
+                .join("|");
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{cards}",
+                section.kind,
+                section.title,
+                section.subtitle,
+                section.html,
+                section.url,
+                section.glyph,
+                section.primary,
+                section.align,
+                section.tone,
+                section.picture,
+                section.compact,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+/// A design as one line, for the two digests.
+///
+/// The *compiled* parts, not the block tree: what somebody reads is the parts,
+/// and a tree that moved a block two pixels without changing a word would
+/// otherwise re-prompt everybody who had already dismissed the greeting.
+fn design_form(design: Option<&GreetingDesign>) -> String {
+    let Some(design) = design else {
+        return String::new();
+    };
+    design
+        .compiled
+        .iter()
+        .map(|target| {
+            let parts = target
+                .parts
+                .iter()
+                .map(|part| {
+                    let body = match part.body.as_ref() {
+                        Some(design_part::Body::Literal(text)) => format!("L{text}"),
+                        Some(design_part::Body::Slot(name)) => format!("S{name}"),
+                        None => String::new(),
+                    };
+                    format!("{}~{body}", part.visible_if)
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            format!("{}:{parts}", target.target)
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1d}")
+}
+
 /// Truncated SHA-256 over [`canonical`].
 pub fn digest(graph: &Greeting) -> Vec<u8> {
     let hash = Sha256::digest(canonical(graph).as_bytes());
@@ -679,8 +968,16 @@ pub fn greet_digest(graph: &Greeting, greet: &GreetingNode) -> Vec<u8> {
     let mut form = String::new();
     if let Some(greeting_node::Body::Greet(body)) = greet.body.as_ref() {
         form.push_str(&format!(
-            "{}\u{1f}{}\u{1f}{}\n",
-            body.html, body.plain, body.once
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\n",
+            body.html,
+            body.plain,
+            body.once,
+            body.legacy,
+            format_args!(
+                "{}{}",
+                sections_form(&body.sections),
+                design_form(body.design.as_ref())
+            )
         ));
     }
     for snippet in snippets(graph, &greet.id) {
@@ -707,7 +1004,10 @@ pub fn greet_digest(graph: &Greeting, greet: &GreetingNode) -> Vec<u8> {
 ///   The markup half exists on the wire for servers with `allow_html` on, and
 ///   nothing authors it yet.
 mod json {
-    use super::{GreetingEdge, GreetingNode, GreetingPort, greeting_node};
+    use super::{
+        GreetingAnnotation, GreetingEdge, GreetingNode, GreetingPort, greeting_annotation,
+        greeting_node,
+    };
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]
@@ -718,6 +1018,8 @@ mod json {
         pub(super) nodes: Vec<Node>,
         #[serde(default)]
         pub(super) edges: Vec<Edge>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub(super) annotations: Vec<Annotation>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -727,8 +1029,106 @@ mod json {
         pub(super) x: i32,
         #[serde(default)]
         pub(super) y: i32,
+        /// Zero, and so absent, means the editor's default for the kind.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pub(super) w: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pub(super) h: u32,
         #[serde(flatten)]
         pub(super) body: Body,
+    }
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if hands the field by reference"
+    )]
+    fn is_zero(value: &u32) -> bool {
+        *value == 0
+    }
+
+    /// A note on the canvas, in the editor's own shape.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Annotation {
+        pub(super) id: String,
+        #[serde(default)]
+        pub(super) x: i32,
+        #[serde(default)]
+        pub(super) y: i32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pub(super) w: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pub(super) h: u32,
+        pub(super) kind: String,
+        #[serde(default)]
+        pub(super) text: String,
+        #[serde(default)]
+        pub(super) tone: String,
+    }
+
+    /// The four notes, as the editor spells them.
+    pub(super) fn annotation_kind(name: &str) -> greeting_annotation::Kind {
+        match name {
+            "note" => greeting_annotation::Kind::Note,
+            "frame" => greeting_annotation::Kind::Frame,
+            "label" => greeting_annotation::Kind::Label,
+            // A kind this build does not know becomes a title rather than
+            // being dropped: the text is the part somebody wrote, and losing
+            // it to keep the shape tidy is the wrong trade.
+            _ => greeting_annotation::Kind::Title,
+        }
+    }
+
+    pub(super) fn annotation_kind_name(kind: i32) -> &'static str {
+        match greeting_annotation::Kind::try_from(kind) {
+            Ok(greeting_annotation::Kind::Note) => "note",
+            Ok(greeting_annotation::Kind::Frame) => "frame",
+            Ok(greeting_annotation::Kind::Label) => "label",
+            _ => "title",
+        }
+    }
+
+    pub(super) fn tone(name: &str) -> greeting_annotation::Tone {
+        match name {
+            "accent" => greeting_annotation::Tone::Accent,
+            "ok" => greeting_annotation::Tone::Ok,
+            "warn" => greeting_annotation::Tone::Warn,
+            _ => greeting_annotation::Tone::Muted,
+        }
+    }
+
+    pub(super) fn tone_name(tone: i32) -> &'static str {
+        match greeting_annotation::Tone::try_from(tone) {
+            Ok(greeting_annotation::Tone::Accent) => "accent",
+            Ok(greeting_annotation::Tone::Ok) => "ok",
+            Ok(greeting_annotation::Tone::Warn) => "warn",
+            _ => "muted",
+        }
+    }
+
+    pub(super) fn from_annotation(note: &GreetingAnnotation) -> Annotation {
+        Annotation {
+            id: note.id.clone(),
+            x: note.x,
+            y: note.y,
+            w: note.w,
+            h: note.h,
+            kind: annotation_kind_name(note.kind).to_owned(),
+            text: note.text.clone(),
+            tone: tone_name(note.tone).to_owned(),
+        }
+    }
+
+    pub(super) fn into_annotation(note: Annotation) -> GreetingAnnotation {
+        GreetingAnnotation {
+            id: note.id,
+            x: note.x,
+            y: note.y,
+            w: note.w,
+            h: note.h,
+            kind: i32::from(annotation_kind(&note.kind)),
+            text: note.text,
+            tone: i32::from(tone(&note.tone)),
+        }
     }
 
     #[derive(Serialize, Deserialize)]
@@ -752,6 +1152,13 @@ mod json {
         },
         #[serde(rename = "clientVersion")]
         ClientVersion { op: String, version: String },
+        #[serde(rename = "fancyVersion")]
+        FancyVersion {
+            op: String,
+            /// Absent for `any`, which does not compare against anything.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            version: String,
+        },
         #[serde(rename = "account")]
         Account { state: String },
         #[serde(rename = "group")]
@@ -783,7 +1190,216 @@ mod json {
             once: bool,
             #[serde(default, skip_serializing_if = "String::is_empty")]
             html: String,
+            /// The welcome screen's bands, where the operator built one.
+            ///
+            /// Absent for a greeting written as prose, which is most of them,
+            /// so a document that has none reads exactly as it did before
+            /// screens existed.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            sections: Vec<Section>,
+            /// Whether the markup half is written for Qt's rich-text subset.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            legacy: bool,
         },
+    }
+
+    /// One band of a welcome screen, in the editor's own shape.
+    #[derive(Serialize, Deserialize, Default)]
+    pub(super) struct Section {
+        pub(super) kind: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) title: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) subtitle: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) html: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) url: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) glyph: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub(super) cards: Vec<Card>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub(super) primary: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) align: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) tone: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) picture: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub(super) compact: bool,
+    }
+
+    /// How a band sits, as both ends spell it.
+    fn align(name: &str) -> greeting_node::section::Align {
+        match name {
+            "left" => greeting_node::section::Align::Left,
+            "center" => greeting_node::section::Align::Center,
+            _ => greeting_node::section::Align::Default,
+        }
+    }
+
+    fn align_name(value: i32) -> &'static str {
+        match greeting_node::section::Align::try_from(value) {
+            Ok(greeting_node::section::Align::Left) => "left",
+            Ok(greeting_node::section::Align::Center) => "center",
+            _ => "",
+        }
+    }
+
+    fn band_tone(name: &str) -> greeting_node::section::Tone {
+        match name {
+            "accent" => greeting_node::section::Tone::Accent,
+            "muted" => greeting_node::section::Tone::Muted,
+            "warn" => greeting_node::section::Tone::Warn,
+            "danger" => greeting_node::section::Tone::Danger,
+            _ => greeting_node::section::Tone::None,
+        }
+    }
+
+    fn band_tone_name(value: i32) -> &'static str {
+        match greeting_node::section::Tone::try_from(value) {
+            Ok(greeting_node::section::Tone::Accent) => "accent",
+            Ok(greeting_node::section::Tone::Muted) => "muted",
+            Ok(greeting_node::section::Tone::Warn) => "warn",
+            Ok(greeting_node::section::Tone::Danger) => "danger",
+            _ => "",
+        }
+    }
+
+    fn picture(name: &str) -> greeting_node::section::Picture {
+        match name {
+            "icon" => greeting_node::section::Picture::Icon,
+            "banner" => greeting_node::section::Picture::Banner,
+            _ => greeting_node::section::Picture::None,
+        }
+    }
+
+    fn picture_name(value: i32) -> &'static str {
+        match greeting_node::section::Picture::try_from(value) {
+            Ok(greeting_node::section::Picture::Icon) => "icon",
+            Ok(greeting_node::section::Picture::Banner) => "banner",
+            _ => "",
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Default)]
+    pub(super) struct Card {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) eyebrow: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) label: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub(super) url: String,
+    }
+
+    /// The six bands, as both ends spell them.
+    fn section_kind(name: &str) -> greeting_node::section::Kind {
+        match name {
+            "hero" => greeting_node::section::Kind::Hero,
+            "image" => greeting_node::section::Kind::Image,
+            "prose" => greeting_node::section::Kind::Prose,
+            "action" => greeting_node::section::Kind::Action,
+            "cards" => greeting_node::section::Kind::Cards,
+            "divider" => greeting_node::section::Kind::Divider,
+            _ => greeting_node::section::Kind::Header,
+        }
+    }
+
+    fn section_kind_name(kind: i32) -> &'static str {
+        match greeting_node::section::Kind::try_from(kind) {
+            Ok(greeting_node::section::Kind::Hero) => "hero",
+            Ok(greeting_node::section::Kind::Image) => "image",
+            Ok(greeting_node::section::Kind::Prose) => "prose",
+            Ok(greeting_node::section::Kind::Action) => "action",
+            Ok(greeting_node::section::Kind::Cards) => "cards",
+            Ok(greeting_node::section::Kind::Divider) => "divider",
+            _ => "header",
+        }
+    }
+
+    pub(super) fn from_section(section: &greeting_node::Section) -> Section {
+        Section {
+            kind: section_kind_name(section.kind).to_owned(),
+            title: section.title.clone(),
+            subtitle: section.subtitle.clone(),
+            html: section.html.clone(),
+            url: section.url.clone(),
+            glyph: section.glyph.clone(),
+            cards: section
+                .cards
+                .iter()
+                .map(|card| Card {
+                    eyebrow: card.eyebrow.clone(),
+                    label: card.label.clone(),
+                    url: card.url.clone(),
+                })
+                .collect(),
+            primary: section.primary,
+            align: align_name(section.align).to_owned(),
+            tone: band_tone_name(section.tone).to_owned(),
+            picture: picture_name(section.picture).to_owned(),
+            compact: section.compact,
+        }
+    }
+
+    pub(super) fn into_section(section: Section) -> greeting_node::Section {
+        greeting_node::Section {
+            kind: i32::from(section_kind(&section.kind)),
+            title: section.title,
+            subtitle: section.subtitle,
+            html: section.html,
+            url: section.url,
+            glyph: section.glyph,
+            cards: section
+                .cards
+                .into_iter()
+                .map(|card| greeting_node::section::Card {
+                    eyebrow: card.eyebrow,
+                    label: card.label,
+                    url: card.url,
+                })
+                .collect(),
+            primary: section.primary,
+            align: i32::from(align(&section.align)),
+            tone: i32::from(band_tone(&section.tone)),
+            picture: i32::from(picture(&section.picture)),
+            compact: section.compact,
+        }
+    }
+
+    /// The fork's version condition, as the editor spells it.
+    ///
+    /// Its own function because of `any`: that is the one op that carries no
+    /// version, so this is the only condition here whose version field is
+    /// conditionally required, and inlining the two branches took `into_node`
+    /// past the length anybody reads in one go.
+    fn fancy_version(
+        id: &str,
+        op: &str,
+        version: &str,
+    ) -> Result<greeting_node::FancyVersion, String> {
+        use greeting_node::fancy_version::Op;
+        let op = match op {
+            "<=" => Op::Le,
+            "=" => Op::Eq,
+            ">=" => Op::Ge,
+            ">" => Op::Gt,
+            "any" => Op::Any,
+            _ => Op::Lt,
+        };
+        Ok(greeting_node::FancyVersion {
+            op: op as i32,
+            // A missing version is still refused for every other op, because a
+            // comparison against zero silently matches nobody.
+            version: if op == Op::Any {
+                0
+            } else {
+                encode_version(version)
+                    .ok_or_else(|| format!("{id}: {version} is not a version"))?
+            },
+        })
     }
 
     /// `major.minor.patch` in the packing `Version.version_v2` uses.
@@ -812,6 +1428,8 @@ mod json {
             Ok(GreetingPort::B) => "b",
             Ok(GreetingPort::When) => "when",
             Ok(GreetingPort::Plus) => "plus",
+            // Which input it is travels in `GreetingEdge.input`, beside this.
+            Ok(GreetingPort::Input) => "input",
             Err(_) => "a",
         }
     }
@@ -849,6 +1467,26 @@ mod json {
                 },
                 version: decode_version(v.version),
             },
+            P::FancyVersion(v) => {
+                let op = greeting_node::fancy_version::Op::try_from(v.op);
+                Body::FancyVersion {
+                    op: match op {
+                        Ok(greeting_node::fancy_version::Op::Le) => "<=".to_owned(),
+                        Ok(greeting_node::fancy_version::Op::Eq) => "=".to_owned(),
+                        Ok(greeting_node::fancy_version::Op::Ge) => ">=".to_owned(),
+                        Ok(greeting_node::fancy_version::Op::Gt) => ">".to_owned(),
+                        Ok(greeting_node::fancy_version::Op::Any) => "any".to_owned(),
+                        _ => "<".to_owned(),
+                    },
+                    // Left out rather than sent as "0.0.0": a number beside
+                    // `any` reads as one the node compares against, and the
+                    // next operator to open the canvas would believe it.
+                    version: match op {
+                        Ok(greeting_node::fancy_version::Op::Any) => String::new(),
+                        _ => decode_version(v.version),
+                    },
+                }
+            }
             P::Account(a) => Body::Account {
                 state: match greeting_node::account_is::State::try_from(a.state) {
                     Ok(greeting_node::account_is::State::Registered) => "registered".to_owned(),
@@ -897,12 +1535,16 @@ mod json {
                 body: g.plain.clone(),
                 once: g.once,
                 html: g.html.clone(),
+                sections: g.sections.iter().map(from_section).collect(),
+                legacy: g.legacy,
             },
         };
         Some(Node {
             id: node.id.clone(),
             x: node.x,
             y: node.y,
+            w: node.w,
+            h: node.h,
             body,
         })
     }
@@ -932,6 +1574,9 @@ mod json {
                 version: encode_version(&version)
                     .ok_or_else(|| format!("{}: {version} is not a version", node.id))?,
             }),
+            Body::FancyVersion { op, version } => {
+                p::Body::FancyVersion(fancy_version(&node.id, &op, &version)?)
+            }
             Body::Account { state } => p::Body::Account(p::AccountIs {
                 state: match state.as_str() {
                     "registered" => p::account_is::State::Registered as i32,
@@ -973,16 +1618,27 @@ mod json {
                 html,
                 plain: body,
             }),
-            Body::Greeting { body, once, html } => p::Body::Greet(p::Greet {
+            Body::Greeting {
+                body,
+                once,
+                html,
+                sections,
+                legacy,
+            } => p::Body::Greet(p::Greet {
                 html,
                 plain: body,
                 once,
+                sections: sections.into_iter().map(into_section).collect(),
+                legacy,
+                design: None,
             }),
         };
         Ok(GreetingNode {
             id: node.id,
             x: node.x,
             y: node.y,
+            w: node.w,
+            h: node.h,
             body: Some(body),
         })
     }
@@ -1004,6 +1660,7 @@ mod json {
             from: edge.from,
             to: edge.to,
             port: i32::from(port),
+            input: String::new(),
         })
     }
 }
@@ -1015,6 +1672,11 @@ pub fn to_json(graph: &Greeting) -> serde_json::Value {
         enabled: graph.enabled,
         nodes: graph.nodes.iter().filter_map(json::from_node).collect(),
         edges: graph.edges.iter().map(json::from_edge).collect(),
+        annotations: graph
+            .annotations
+            .iter()
+            .map(json::from_annotation)
+            .collect(),
     };
     serde_json::to_value(doc).unwrap_or(serde_json::Value::Null)
 }
@@ -1039,6 +1701,11 @@ pub fn from_json(value: &serde_json::Value) -> Result<Greeting, String> {
         enabled: doc.enabled,
         nodes,
         edges,
+        annotations: doc
+            .annotations
+            .into_iter()
+            .map(json::into_annotation)
+            .collect(),
         ..Default::default()
     })
 }
@@ -1177,8 +1844,8 @@ mod tests {
     use super::*;
     use starling_proto_fancy::serverconfig::GreetingEdge;
     use starling_proto_fancy::serverconfig::greeting_node::{
-        AccountIs, Body, ClientVersion, CountryIn, Filter, Gate, Greet, Snippet, Tenure,
-        account_is, client_version, filter, gate, tenure,
+        AccountIs, Body, ClientVersion, CountryIn, FancyVersion, Filter, Gate, Greet, Snippet,
+        Tenure, account_is, client_version, fancy_version, filter, gate, tenure,
     };
 
     /// A version in the wire's own packing.
@@ -1196,6 +1863,10 @@ mod tests {
             id: id.into(),
             x: 0,
             y: 0,
+            // Zero size: the layout is the editor's, and no test here is
+            // about it.
+            w: 0,
+            h: 0,
             body: Some(body),
         }
     }
@@ -1206,6 +1877,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             port: i32::from(port),
+            input: String::new(),
         }
     }
 
@@ -1260,12 +1932,54 @@ mod tests {
         ]
     }
 
+    /// A welcome screen with one of every band worth checking.
+    fn screen() -> Vec<greeting_node::Section> {
+        use greeting_node::section::{Card, Kind};
+        vec![
+            greeting_node::Section {
+                kind: i32::from(Kind::Hero),
+                title: "Welcome to Magical.Rocks".into(),
+                subtitle: "The home of Fancy Mumble".into(),
+                glyph: "\u{1f48e}".into(),
+                ..Default::default()
+            },
+            greeting_node::Section {
+                kind: i32::from(Kind::Action),
+                title: "Register your account".into(),
+                subtitle: "Takes about thirty seconds.".into(),
+                url: "https://magical.rocks/register".into(),
+                primary: true,
+                ..Default::default()
+            },
+            greeting_node::Section {
+                kind: i32::from(Kind::Cards),
+                cards: vec![Card {
+                    eyebrow: "BROWSE".into(),
+                    label: "Channel Viewer".into(),
+                    url: "https://magical.rocks/channels".into(),
+                }],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn with_screen(sections: &[greeting_node::Section]) -> Greeting {
+        let mut graph = mock();
+        for node in &mut graph.nodes {
+            if let Some(Body::Greet(greet)) = node.body.as_mut() {
+                greet.sections = sections.to_vec();
+            }
+        }
+        graph
+    }
+
     fn mock() -> Greeting {
         Greeting {
             instance: 0,
             version: 1,
             digest: Vec::new(),
             enabled: true,
+            annotations: Vec::new(),
             nodes: {
                 let mut nodes = conditions();
                 nodes.extend([
@@ -1301,6 +2015,9 @@ mod tests {
                             html: "<p>Willkommen!</p>".into(),
                             plain: "Willkommen!".into(),
                             once: true,
+                            sections: Vec::new(),
+                            legacy: false,
+                            design: None,
                         }),
                     ),
                 ]);
@@ -1419,6 +2136,113 @@ mod tests {
         }
     }
 
+    /// The fork's own version, which is not the Mumble one and does not
+    /// answer the same way when it is missing.
+    mod fancy_client {
+        use super::*;
+
+        /// A graph whose only rule is `fancy` wired straight into WHEN.
+        fn asking(op: fancy_version::Op, version: u64) -> Greeting {
+            Greeting {
+                nodes: vec![
+                    n(
+                        "fancy",
+                        Body::FancyVersion(FancyVersion {
+                            op: op as i32,
+                            version,
+                        }),
+                    ),
+                    n(
+                        "greet",
+                        Body::Greet(Greet {
+                            plain: "Welcome.".to_owned(),
+                            ..Greet::default()
+                        }),
+                    ),
+                ],
+                edges: vec![e("w", "fancy", "greet", GreetingPort::When)],
+                enabled: true,
+                ..Greeting::default()
+            }
+        }
+
+        fn on(fancy_version: u64) -> Facts {
+            Facts {
+                fancy_version: Some(fancy_version),
+                ..Facts::default()
+            }
+        }
+
+        #[test]
+        fn any_greets_every_build_of_the_fork_and_only_the_fork() {
+            let graph = asking(fancy_version::Op::Any, 0);
+            assert!(choose(&graph, &on(v(0, 2, 12))).is_some());
+            assert!(choose(&graph, &on(v(1, 0, 0))).is_some());
+            // Stock Mumble announced none.
+            assert!(choose(&graph, &on(0)).is_none());
+        }
+
+        #[test]
+        fn a_stock_mumble_client_is_a_definite_no_rather_than_a_maybe() {
+            // The distinction that matters: a no travels through a NOT and
+            // comes back as the greeting for everyone *not* on the fork,
+            // where a maybe would be swallowed and that greeting would go to
+            // nobody. Asked directly, and not through choose(), because
+            // choose() cannot tell the two apart - both withhold.
+            let graph = asking(fancy_version::Op::Any, 0);
+            let truth = |facts: &Facts| truth(&graph, "fancy", facts, &mut HashSet::new());
+            assert_eq!(truth(&on(0)), Truth::No);
+            assert_eq!(truth(&on(v(0, 4, 0))), Truth::Yes);
+            // Nothing gathered the fact at all. That is the maybe.
+            assert_eq!(truth(&Facts::default()), Truth::Unknown);
+        }
+
+        #[test]
+        fn an_older_build_is_the_one_told_to_update() {
+            let graph = asking(fancy_version::Op::Lt, v(0, 4, 0));
+            assert!(choose(&graph, &on(v(0, 2, 12))).is_some());
+            assert!(choose(&graph, &on(v(0, 4, 0))).is_none());
+            // And a stock client is not an old fork client: it is not one at
+            // all, so it must not be handed the fork's upgrade notice.
+            assert!(choose(&graph, &on(0)).is_none());
+        }
+
+        #[test]
+        fn it_is_numbered_apart_from_the_mumble_version() {
+            // 0.4.0 of the fork against 1.5.0 of Mumble: the same peer answers
+            // opposite ways depending on which node asked, which is the whole
+            // reason there are two.
+            let facts = Facts {
+                client_version: Some(v(1, 5, 0)),
+                fancy_version: Some(v(0, 4, 0)),
+                ..Facts::default()
+            };
+            assert!(choose(&asking(fancy_version::Op::Ge, v(1, 0, 0)), &facts).is_none());
+            assert!(choose(&asking(fancy_version::Op::Ge, v(0, 3, 0)), &facts).is_some());
+        }
+
+        #[test]
+        fn an_op_from_a_newer_server_goes_quiet() {
+            let mut graph = asking(fancy_version::Op::Any, 0);
+            graph.nodes[0].body = Some(Body::FancyVersion(FancyVersion {
+                op: 99,
+                version: v(0, 4, 0),
+            }));
+            assert!(choose(&graph, &on(v(0, 4, 0))).is_none());
+        }
+
+        #[test]
+        fn the_two_version_nodes_are_different_documents() {
+            let fancy = asking(fancy_version::Op::Lt, v(1, 5, 0));
+            let mut mumble = fancy.clone();
+            mumble.nodes[0].body = Some(Body::ClientVersion(ClientVersion {
+                op: client_version::Op::Lt as i32,
+                version: v(1, 5, 0),
+            }));
+            assert_ne!(canonical(&fancy), canonical(&mumble));
+        }
+    }
+
     #[test]
     fn a_stored_cycle_does_not_spin_the_login_path() {
         // validate() refuses this, so it can only arrive from storage - but the
@@ -1462,6 +2286,122 @@ mod tests {
         }
 
         #[test]
+        fn refuses_a_button_pointing_somewhere_a_client_will_not_go() {
+            // Refused rather than stripped later: a `javascript:` button is a
+            // thing an operator has to be told about, and one silently dropped
+            // leaves a dead button on everybody's welcome screen.
+            let mut graph = mock();
+            for node in &mut graph.nodes {
+                if let Some(Body::Greet(greet)) = node.body.as_mut() {
+                    greet.sections = vec![greeting_node::Section {
+                        kind: i32::from(greeting_node::section::Kind::Action),
+                        title: "Click".into(),
+                        url: "javascript:alert(1)".into(),
+                        ..Default::default()
+                    }];
+                }
+            }
+            let problems = validate(&graph).expect_err("a refused link");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.reason == Reason::BadUrl)
+            );
+        }
+
+        #[test]
+        fn a_changed_band_is_a_changed_greeting() {
+            // Unlike layout: what somebody reads is exactly what "show it
+            // again" is for, so the digests move with the bands.
+            let plain = mock();
+            let screened = with_screen(&screen());
+            assert_ne!(digest(&screened), digest(&plain));
+
+            let greet_of = |graph: &Greeting| {
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "greet")
+                    .map(|node| greet_digest(graph, node))
+            };
+            assert_ne!(greet_of(&screened), greet_of(&plain));
+        }
+
+        #[test]
+        fn refuses_more_bands_than_a_screen_may_have() {
+            let long: Vec<_> = (0..=MAX_SECTIONS)
+                .map(|_| greeting_node::Section {
+                    kind: i32::from(greeting_node::section::Kind::Divider),
+                    ..Default::default()
+                })
+                .collect();
+            assert!(validate(&with_screen(&long)).is_err());
+        }
+
+        #[test]
+        fn refuses_more_notes_than_a_canvas_may_carry() {
+            let mut graph = mock();
+            graph.annotations = (0..=MAX_ANNOTATIONS)
+                .map(|index| GreetingAnnotation {
+                    id: format!("note{index}"),
+                    text: "x".into(),
+                    ..Default::default()
+                })
+                .collect();
+            assert!(validate(&graph).is_err());
+        }
+
+        #[test]
+        fn refuses_a_note_longer_than_a_note() {
+            let mut graph = mock();
+            graph.annotations = vec![GreetingAnnotation {
+                id: "note1".into(),
+                text: "x".repeat(MAX_ANNOTATION_TEXT + 1),
+                ..Default::default()
+            }];
+            let problems = validate(&graph).expect_err("too long");
+            assert!(problems.iter().any(|problem| problem.node == "note1"));
+        }
+
+        #[test]
+        fn refuses_a_note_that_shares_an_id_with_a_node() {
+            // One id space, because the editor addresses both: a note sharing
+            // an id with a node is a note the canvas deletes by removing
+            // something else.
+            let mut graph = mock();
+            let taken = graph.nodes[0].id.clone();
+            graph.annotations = vec![GreetingAnnotation {
+                id: taken.clone(),
+                text: "clash".into(),
+                ..Default::default()
+            }];
+            let problems = validate(&graph).expect_err("duplicate");
+            assert!(problems.iter().any(|problem| problem.node == taken));
+        }
+
+        #[test]
+        fn a_note_is_not_part_of_what_the_digest_is_taken_over() {
+            // Same reason layout is not: documenting a canvas is not editing
+            // the rule, and a digest that moved with a note would re-prompt
+            // every user on the server because somebody wrote themselves a
+            // reminder.
+            let mut annotated = mock();
+            annotated.annotations = vec![GreetingAnnotation {
+                id: "note1".into(),
+                text: "why this is here".into(),
+                ..Default::default()
+            }];
+            assert_eq!(digest(&annotated), digest(&mock()));
+        }
+
+        #[test]
+        fn a_size_is_not_part_of_what_the_digest_is_taken_over() {
+            let mut resized = mock();
+            resized.nodes[0].w = 480;
+            assert_eq!(digest(&resized), digest(&mock()));
+        }
+
+        #[test]
         fn refuses_a_loop() {
             let mut graph = mock();
             graph.edges.push(e("loop", "xor", "and", GreetingPort::A));
@@ -1478,6 +2418,9 @@ mod tests {
                     html: "x".repeat(MAX_BODY + 1),
                     plain: String::new(),
                     once: true,
+                    sections: Vec::new(),
+                    legacy: false,
+                    design: None,
                 }),
             ));
             let problems = validate(&graph).expect_err("too long");
@@ -1527,6 +2470,9 @@ mod tests {
                     html: "<p>Hallo!</p>".into(),
                     plain: "Hallo!".into(),
                     once: true,
+                    sections: Vec::new(),
+                    legacy: false,
+                    design: None,
                 }),
             ));
             assert_ne!(digest(&graph), digest(&edited));
@@ -1772,6 +2718,156 @@ mod tests {
         }
 
         #[test]
+        fn a_welcome_screen_survives_the_round_trip() {
+            let before = with_screen(&screen());
+            let after = from_json(&to_json(&before)).expect("valid");
+
+            let Some(Body::Greet(greet)) = after
+                .nodes
+                .iter()
+                .find_map(|node| node.body.as_ref().filter(|_| node.id == "greet"))
+            else {
+                panic!("the greeting is still a greeting");
+            };
+            assert_eq!(greet.sections.len(), 3);
+            assert_eq!(greet.sections[0].title, "Welcome to Magical.Rocks");
+            assert_eq!(greet.sections[0].glyph, "\u{1f48e}");
+            assert!(greet.sections[1].primary);
+            assert_eq!(greet.sections[2].cards[0].label, "Channel Viewer");
+            // And the prose halves are untouched: a client that knows nothing
+            // about bands still reads the greeting.
+            assert!(!greet.html.is_empty());
+        }
+
+        #[test]
+        fn a_greeting_written_as_prose_carries_no_bands_at_all() {
+            // So a document that never used a screen reads exactly as it did
+            // before screens existed.
+            let json = to_json(&mock());
+            let greet = json["nodes"]
+                .as_array()
+                .expect("nodes")
+                .iter()
+                .find(|node| node["kind"] == "greeting")
+                .expect("a greeting");
+            assert!(greet.get("sections").is_none());
+        }
+
+        #[test]
+        fn a_band_this_build_does_not_know_is_read_as_a_header() {
+            let json = serde_json::json!({
+                "enabled": true,
+                "edges": [],
+                "nodes": [{
+                    "id": "g", "x": 0, "y": 0, "kind": "greeting",
+                    "body": "hi", "once": true,
+                    "sections": [{ "kind": "carousel", "title": "kept" }],
+                }],
+            });
+            let graph = from_json(&json).expect("valid");
+            let Some(Body::Greet(greet)) = graph.nodes[0].body.as_ref() else {
+                panic!("a greeting");
+            };
+            assert_eq!(greet.sections[0].title, "kept");
+            assert_eq!(
+                greet.sections[0].kind,
+                i32::from(greeting_node::section::Kind::Header)
+            );
+        }
+
+        #[test]
+        fn a_node_keeps_the_size_the_operator_gave_it() {
+            // The editor lets a node be resized, so the size travels with the
+            // position. Absent means "the editor's default for this kind",
+            // which is what every node stored before the field existed has.
+            let mut graph = mock();
+            graph.nodes[0].w = 420;
+            graph.nodes[0].h = 260;
+
+            let json = to_json(&graph);
+            assert_eq!(json["nodes"][0]["w"], 420);
+            let after = from_json(&json).expect("valid");
+            assert_eq!(after.nodes[0].w, 420);
+            assert_eq!(after.nodes[0].h, 260);
+
+            // A node nobody resized carries no size at all rather than a
+            // nominal one: the default belongs to the editor and differs per
+            // kind, so writing one down here would freeze somebody else's
+            // layout decision into the document.
+            assert!(json["nodes"][1].get("w").is_none());
+        }
+
+        #[test]
+        fn notes_on_the_canvas_survive_the_round_trip() {
+            let mut graph = mock();
+            graph.annotations = vec![
+                GreetingAnnotation {
+                    id: "note1".into(),
+                    x: 40,
+                    y: 12,
+                    w: 300,
+                    h: 120,
+                    kind: i32::from(greeting_annotation::Kind::Frame),
+                    text: "Everything in here decides the German greeting".into(),
+                    tone: i32::from(greeting_annotation::Tone::Warn),
+                },
+                GreetingAnnotation {
+                    id: "note2".into(),
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                    kind: i32::from(greeting_annotation::Kind::Title),
+                    text: "Conditions".into(),
+                    tone: i32::from(greeting_annotation::Tone::Muted),
+                },
+            ];
+
+            let after = from_json(&to_json(&graph)).expect("valid");
+            assert_eq!(after.annotations.len(), 2);
+            assert_eq!(after.annotations[0].text, graph.annotations[0].text);
+            assert_eq!(after.annotations[0].kind, graph.annotations[0].kind);
+            assert_eq!(after.annotations[0].tone, graph.annotations[0].tone);
+            assert_eq!(after.annotations[0].w, 300);
+            assert_eq!(after.annotations[1].kind, graph.annotations[1].kind);
+            validate(&after).expect("notes are not a reason to refuse a graph");
+        }
+
+        #[test]
+        fn a_graph_with_no_notes_sends_no_notes_field() {
+            // So a client too old to know about them reads exactly the
+            // document it read before.
+            let json = to_json(&mock());
+            assert!(json.get("annotations").is_none());
+        }
+
+        #[test]
+        fn a_note_of_an_unknown_kind_keeps_its_words() {
+            // From a newer editor. The text is the part somebody wrote, and
+            // losing it to keep the shape tidy is the wrong trade - unlike a
+            // *node*, which is dropped, because a condition drawn wrong is
+            // worse than one missing.
+            let json = serde_json::json!({
+                "enabled": true,
+                "nodes": [],
+                "edges": [],
+                "annotations": [
+                    { "id": "n1", "kind": "sticky", "text": "keep me", "tone": "chartreuse" }
+                ],
+            });
+            let graph = from_json(&json).expect("valid");
+            assert_eq!(graph.annotations[0].text, "keep me");
+            assert_eq!(
+                graph.annotations[0].kind,
+                i32::from(greeting_annotation::Kind::Title)
+            );
+            assert_eq!(
+                graph.annotations[0].tone,
+                i32::from(greeting_annotation::Tone::Muted)
+            );
+        }
+
+        #[test]
         fn a_version_reads_back_as_the_operator_typed_it() {
             // Packing is where a hand-written literal goes wrong - one that
             // forgets the patch shift decodes to a different version and the
@@ -1780,6 +2876,55 @@ mod tests {
             assert_eq!(packed, v(1, 5, 0));
             assert_eq!(json::decode_version(packed), "1.5.0");
             assert_eq!(json::encode_version("1.5.735"), Some(v(1, 5, 735)));
+        }
+
+        #[test]
+        fn the_fork_version_reads_back_as_the_operator_typed_it() {
+            let json = serde_json::json!({
+                "enabled": true,
+                "nodes": [{
+                    "id": "fv", "x": 0, "y": 0,
+                    "kind": "fancyVersion", "op": ">=", "version": "0.4.0"
+                }],
+                "edges": []
+            });
+            let graph = from_json(&json).expect("valid");
+            let Some(Body::FancyVersion(fancy)) = graph.nodes[0].body.as_ref() else {
+                panic!("a fancy version node");
+            };
+            assert_eq!(fancy.version, v(0, 4, 0));
+            assert_eq!(fancy.op, fancy_version::Op::Ge as i32);
+            assert_eq!(to_json(&graph)["nodes"][0]["version"], "0.4.0");
+        }
+
+        #[test]
+        fn any_carries_no_version_in_either_direction() {
+            // A number beside `any` is a number the node does not compare
+            // against, and an editor that drew one would be lying about the
+            // rule. It is also the one op that may arrive without one.
+            let json = serde_json::json!({
+                "enabled": true,
+                "nodes": [{ "id": "fv", "x": 0, "y": 0, "kind": "fancyVersion", "op": "any" }],
+                "edges": []
+            });
+            let graph = from_json(&json).expect("valid");
+            let out = to_json(&graph);
+            assert_eq!(out["nodes"][0]["op"], "any");
+            assert!(out["nodes"][0].get("version").is_none(), "{out}");
+        }
+
+        #[test]
+        fn a_fork_version_that_is_not_a_version_is_refused_by_name() {
+            let json = serde_json::json!({
+                "enabled": true,
+                "nodes": [{
+                    "id": "fv", "x": 0, "y": 0,
+                    "kind": "fancyVersion", "op": "<", "version": ""
+                }],
+                "edges": []
+            });
+            let error = from_json(&json).expect_err("refused");
+            assert!(error.contains("fv"), "{error}");
         }
 
         #[test]
