@@ -32,6 +32,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_plugin_host::{HostBridge, NewChannel, OutboundMessage};
 use starling_proto_fancy::common::{Actor, Internal, Scope, actor};
+use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::feature::{Opaque, PluginsEnvelope, plugins_envelope};
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::metadata::{AccessRequest, Channel, CreateRequest};
@@ -39,7 +40,7 @@ use starling_proto_fancy::permissions::SessionCheckRequest;
 use starling_proto_fancy::permissions::permissions_client::PermissionsClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::channel::Resolver;
-use starling_runtime::plane::{Fanout, to_sessions};
+use starling_runtime::plane::{Fanout, to_conns, to_sessions};
 use starling_runtime::roster::Roster;
 use starling_runtime::storage::{KvOp, KvStore};
 
@@ -123,6 +124,44 @@ impl StarlingBridge {
             })),
         })
     }
+
+    /// Address a plugin's frame at connections rather than sessions.
+    ///
+    /// Every write this bridge makes can be provoked by `on_client_connected`,
+    /// which fires from the `session-view` stream. session-lifecycle awaits that
+    /// announcement *before* it builds the `SessionUp` action the gateway binds
+    /// the session id from, so at that instant the id addresses nothing and the
+    /// gateway drops the frame in a `filter_map` with no log, no counter and no
+    /// way to tell it apart from a delivery. That is what made a loaded live-doc
+    /// plugin invisible to a client that was connected and working.
+    ///
+    /// A connection is bound from the accept, so addressing one is independent
+    /// of that ordering. Sessions the roster cannot place fall back to being
+    /// addressed as before: a cold roster knows nobody, while the gateway may
+    /// well know the session, and the old behaviour is the better guess there.
+    fn addressed(&self, sessions: Vec<u32>, type_id: u16, payload: Vec<u8>) -> Vec<ServerAction> {
+        let mut conns = Vec::with_capacity(sessions.len());
+        let mut unresolved = Vec::new();
+        for session in sessions {
+            match self.roster.conn_of(session) {
+                Some(conn) => conns.push(conn),
+                None => unresolved.push(session),
+            }
+        }
+        let mut actions = Vec::with_capacity(2);
+        if !conns.is_empty() {
+            actions.push(to_conns(conns, type_id, payload.clone()));
+        }
+        if !unresolved.is_empty() {
+            tracing::debug!(
+                sessions = ?unresolved,
+                type_id,
+                "the roster cannot place these sessions; addressing them by session id"
+            );
+            actions.push(to_sessions(unresolved, type_id, payload));
+        }
+        actions
+    }
 }
 
 impl HostBridge for StarlingBridge {
@@ -203,11 +242,9 @@ impl HostBridge for StarlingBridge {
             data: Some(data.to_vec()),
             data_id: Some(data_id.to_owned()),
         };
-        self.fanout.push(to_sessions(
-            vec![target_session],
-            PLUGIN_DATA,
-            message.encode_to_vec(),
-        ));
+        for action in self.addressed(vec![target_session], PLUGIN_DATA, message.encode_to_vec()) {
+            self.fanout.push(action);
+        }
         Ok(())
     }
 
@@ -238,11 +275,13 @@ impl HostBridge for StarlingBridge {
                 payload_type: message.payload_type.to_owned(),
             })),
         };
-        self.fanout.push(to_sessions(
+        for action in self.addressed(
             recipients,
             ServiceKind::Plugins.outer_type(),
             envelope.encode_to_vec(),
-        ));
+        ) {
+            self.fanout.push(action);
+        }
         Ok(())
     }
 

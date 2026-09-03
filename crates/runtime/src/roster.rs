@@ -82,6 +82,22 @@ pub struct Roster {
     /// for the copy a human reads, which otherwise costs a `session-view`
     /// round trip per message.
     names: Mutex<HashMap<u32, String>>,
+    /// Session id to the connection carrying it.
+    ///
+    /// Kept because a session id is not addressable until the gateway has bound
+    /// it, and the gateway learns that binding from `SessionUp`, which
+    /// session-lifecycle emits *after* it has already announced the arrival
+    /// here (`session-lifecycle/src/handshake.rs`: `announce_up` is awaited
+    /// before `welcome` builds the action). So every service that reacts to an
+    /// arrival by writing to the new session is addressing a number the gateway
+    /// cannot resolve yet, and `Send` resolution drops what it cannot resolve
+    /// without a word (`gateway/src/attach.rs`, `filter_map`). A connection id
+    /// is bound from the moment the socket is accepted, so addressing one is
+    /// ordering-independent.
+    ///
+    /// `session-view` has carried this all along (`Session.conn`); it was
+    /// simply never folded in.
+    conns: Mutex<HashMap<u32, u64>>,
     warm: AtomicBool,
 }
 
@@ -156,6 +172,12 @@ impl Roster {
                 .map(|session| (session.session, session.name.clone()))
                 .collect();
         }
+        if let Ok(mut held) = self.conns.lock() {
+            *held = sessions
+                .iter()
+                .map(|session| (session.session, session.conn))
+                .collect();
+        }
         if let Ok(mut held) = self.channels.lock() {
             *held = sessions
                 .into_iter()
@@ -182,6 +204,9 @@ impl Roster {
         if let Ok(mut held) = self.names.lock() {
             let _ = held.insert(session.session, session.name.clone());
         }
+        if let Ok(mut held) = self.conns.lock() {
+            let _ = held.insert(session.session, session.conn);
+        }
     }
 
     /// Forget one session.
@@ -201,6 +226,22 @@ impl Roster {
         if let Ok(mut held) = self.names.lock() {
             let _ = held.remove(&session);
         }
+        if let Ok(mut held) = self.conns.lock() {
+            let _ = held.remove(&session);
+        }
+    }
+
+    /// The connection carrying `session`, or `None` for an unknown session or a
+    /// cold roster.
+    ///
+    /// Prefer this over addressing a session directly whenever the write is
+    /// provoked by the session's own arrival: see the note on [`Self::conns`]
+    /// for why a session id is not yet addressable at that moment. For anything
+    /// later in a session's life the two are equivalent, and a session id is
+    /// the more natural address.
+    #[must_use]
+    pub fn conn_of(&self, session: u32) -> Option<u64> {
+        self.conns.lock().ok()?.get(&session).copied()
     }
 
     /// The certificate hash behind `session`, or `None` for a session that
@@ -473,6 +514,56 @@ mod tests {
         let roster = Roster::new();
         assert!(!roster.is_warm());
         assert!(roster.in_channel(4, 0).is_empty());
+    }
+
+    #[test]
+    fn an_arrival_is_addressable_by_connection_before_the_gateway_binds_it() {
+        // The regression this field exists for. A plugin answering
+        // `on_client_connected` writes to the arriving session, but the gateway
+        // has not bound that id yet -- session-lifecycle announces the arrival
+        // here before it emits `SessionUp` -- so a session-addressed frame is
+        // dropped without a trace. The connection is known from the accept, and
+        // `session-view` has been carrying it all along.
+        let roster = Roster::new();
+        let mut arriving = session(7, 4);
+        arriving.conn = 91;
+        let _ = roster.apply(ViewEvent {
+            event: Some(view_event::Event::Upsert(arriving)),
+        });
+
+        assert_eq!(roster.conn_of(7), Some(91));
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_connections_and_a_departure_forgets_one() {
+        // Session ids are recycled, so a stale conn is not a leak but a
+        // misdelivery: the next holder of the number would inherit it.
+        let roster = Roster::new();
+        let mut first = session(1, 4);
+        first.conn = 11;
+        let mut second = session(2, 4);
+        second.conn = 22;
+        let _ = roster.apply(snapshot(vec![first, second]));
+
+        assert_eq!(roster.conn_of(1), Some(11));
+        assert_eq!(roster.conn_of(2), Some(22));
+
+        let _ = roster.apply(ViewEvent {
+            event: Some(view_event::Event::Gone(Gone {
+                session: 1,
+                ..Gone::default()
+            })),
+        });
+        assert_eq!(roster.conn_of(1), None);
+        assert_eq!(roster.conn_of(2), Some(22));
+    }
+
+    #[test]
+    fn an_unknown_session_has_no_connection() {
+        // The caller's cue to fall back to session addressing rather than
+        // silently sending to nobody.
+        let roster = Roster::new();
+        assert_eq!(roster.conn_of(3), None);
     }
 
     #[test]

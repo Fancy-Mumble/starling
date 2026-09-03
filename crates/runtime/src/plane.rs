@@ -84,6 +84,29 @@ pub fn to_conn(conn: u64, type_id: u16, payload: Vec<u8>) -> ServerAction {
     }
 }
 
+/// Build a `Send` action addressed at several connections.
+///
+/// The many-recipient counterpart of [`to_conn`], and wanted for the same
+/// reason: a write provoked by a session's own arrival cannot address the
+/// session, because the gateway has not bound the id yet and drops what it
+/// cannot resolve. Connections are bound from the accept, so a fan-out that may
+/// include a just-arrived peer is addressed here.
+#[must_use]
+pub fn to_conns(conns: Vec<u64>, type_id: u16, payload: Vec<u8>) -> ServerAction {
+    ServerAction {
+        action: Some(server_action::Action::Send(
+            starling_proto_fancy::control::Send {
+                conns,
+                sessions: Vec::new(),
+                r#type: u32::from(type_id),
+                payload,
+                audio: false,
+                except: Vec::new(),
+            },
+        )),
+    }
+}
+
 /// Build a `Send` action for everyone except the speaker.
 #[must_use]
 pub fn broadcast_except(except: u32, type_id: u16, payload: Vec<u8>) -> ServerAction {
