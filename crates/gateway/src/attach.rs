@@ -548,16 +548,50 @@ fn deliver(send: &starling_proto_fancy::control::Send, ctx: &AttachContext) {
         Lane::Control
     };
 
+    // An address the registry cannot resolve is counted and said out loud.
+    //
+    // It used to be neither, and the silence cost three rounds of debugging: a
+    // frame addressed at a session the gateway had not bound yet was dropped
+    // here by the `filter_map`, indistinguishable in every log from one that was
+    // delivered. Any service that writes to a session on the strength of an
+    // arrival it learned from `session-view` can hit this, because the binding
+    // arrives separately, so it is a property of the plane rather than of the
+    // one service that tripped over it.
+    let resolve = |resolved: Vec<_>, asked: usize, addressed_by: &'static str| {
+        let missed = asked.saturating_sub(resolved.len());
+        if missed > 0 {
+            ctx.metrics
+                .counter("starling_gateway_unresolved_send_targets")
+                .add(missed as u64);
+            tracing::warn!(
+                type_id,
+                addressed_by,
+                missed,
+                asked,
+                "dropping a frame for targets the registry cannot resolve"
+            );
+        }
+        resolved
+    };
+
     let targets = if !send.conns.is_empty() {
-        send.conns
-            .iter()
-            .filter_map(|conn| ctx.registry.by_conn(*conn))
-            .collect()
+        resolve(
+            send.conns
+                .iter()
+                .filter_map(|conn| ctx.registry.by_conn(*conn))
+                .collect(),
+            send.conns.len(),
+            "conn",
+        )
     } else if !send.sessions.is_empty() {
-        send.sessions
-            .iter()
-            .filter_map(|session| ctx.registry.by_session(*session))
-            .collect()
+        resolve(
+            send.sessions
+                .iter()
+                .filter_map(|session| ctx.registry.by_session(*session))
+                .collect(),
+            send.sessions.len(),
+            "session",
+        )
     } else {
         ctx.registry.authenticated()
     };
