@@ -37,6 +37,8 @@ use starling_proto_fancy::permissions::{
 use starling_proto_fancy::sessionview::GetRequest as SessionGetRequest;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
+use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+use starling_proto_fancy::userdata::{LookupRequest, lookup_request};
 use starling_runtime::channel::Resolver;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::permit::permission_denied;
@@ -50,6 +52,8 @@ use tonic::{Request, Response, Status};
 const PERMISSION_QUERY: u16 = 20;
 /// Upstream `ACL`.
 const ACL: u16 = 13;
+/// Upstream `QueryUsers`.
+const QUERY_USERS: u16 = 14;
 
 /// How many invalidations a subscriber may fall behind before it must assume
 /// everything is stale. Falling behind on a *revocation* is the dangerous
@@ -833,11 +837,79 @@ impl PermissionsService {
         // round trip and, more usefully, shows the client what was actually
         // kept, inherited rows dropped, defaults filled in.
         let stored = self.acls.get(inbound.scope, channel);
-        vec![to_conn(
-            inbound.conn,
-            ACL,
-            evaluate::to_wire(&stored).encode_to_vec(),
-        )]
+        let wire = evaluate::to_wire(&stored);
+        let mut actions = vec![to_conn(inbound.conn, ACL, wire.encode_to_vec())];
+        actions.extend(self.names_in(inbound.scope, inbound.conn, &wire).await);
+        actions
+    }
+
+    /// Every account id an ACL table names: the `user_id` rows, and each
+    /// group's members, exclusions and inherited members.
+    fn accounts_named(wire: &starling_proto::proto::tcp::Acl) -> Vec<u32> {
+        let mut ids: Vec<u32> = wire.acls.iter().filter_map(|entry| entry.user_id).collect();
+        for group in &wire.groups {
+            ids.extend(group.add.iter().copied());
+            ids.extend(group.remove.iter().copied());
+            ids.extend(group.inherited_members.iter().copied());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// The names behind those ids, as an unsolicited `QueryUsers`.
+    ///
+    /// Murmur sends one alongside every ACL reply (`Messages.cpp`, right after
+    /// `sendMessage(uSource, msg)`) and the classic client depends on it: its
+    /// ACL editor seeds a name cache from the *connected* users only, and
+    /// never asks about an id, only about a name it is completing. Without
+    /// this frame every offline member of a group renders as `#1`, `#27`,
+    /// which is unusable for editing and reads as data loss.
+    ///
+    /// It follows the ACL frame rather than leading it, because the editor
+    /// that absorbs the names is constructed from the ACL frame: a
+    /// `QueryUsers` arriving first is handed to a dialog that does not exist
+    /// yet and is dropped.
+    async fn names_in(
+        &self,
+        scope: u32,
+        conn: u64,
+        wire: &starling_proto::proto::tcp::Acl,
+    ) -> Actions {
+        let ids = Self::accounts_named(wire);
+        if ids.is_empty() {
+            return Actions::new();
+        }
+        let Some(transport) = self
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.channel("userdata").ok())
+        else {
+            return Actions::new();
+        };
+        let mut userdata = UserDataClient::new(transport);
+
+        let mut reply = starling_proto::proto::tcp::QueryUsers::default();
+        for id in ids {
+            let found = userdata
+                .lookup(LookupRequest {
+                    scope: Some(Scope { instance: scope }),
+                    by: Some(lookup_request::By::Id(u64::from(id))),
+                })
+                .await;
+            // An id with no account behind it is left out rather than answered
+            // with a blank, exactly as murmur skips an empty name: a member row
+            // can outlive the account it names, and the editor treats a name it
+            // was not given as one still to be resolved.
+            if let Ok(account) = found {
+                reply.ids.push(id);
+                reply.names.push(account.into_inner().name);
+            }
+        }
+        if reply.ids.is_empty() {
+            return Actions::new();
+        }
+        vec![to_conn(conn, QUERY_USERS, reply.encode_to_vec())]
     }
 
     async fn on_acl_query(&self, inbound: &Inbound) -> Actions {
@@ -887,11 +959,10 @@ impl PermissionsService {
         }
 
         let set = self.acls.get(inbound.scope, query.channel_id);
-        vec![to_conn(
-            inbound.conn,
-            ACL,
-            evaluate::to_wire(&set).encode_to_vec(),
-        )]
+        let wire = evaluate::to_wire(&set);
+        let mut actions = vec![to_conn(inbound.conn, ACL, wire.encode_to_vec())];
+        actions.extend(self.names_in(inbound.scope, inbound.conn, &wire).await);
+        actions
     }
 }
 
@@ -1391,5 +1462,41 @@ mod tests {
             .try_recv()
             .expect("an invalidation was published");
         assert!(invalidation.everything);
+    }
+
+    #[test]
+    fn an_acl_table_names_every_account_it_mentions() {
+        // What the accompanying `QueryUsers` has to cover. Miss the group
+        // members and the classic editor shows them as `#27`; miss the ACL rows
+        // and the same happens one tab over.
+        let set = AclSet {
+            channel: 4,
+            inherit: true,
+            acls: vec![
+                AclEntry {
+                    apply_here: true,
+                    account: Some(9),
+                    ..AclEntry::default()
+                },
+                AclEntry {
+                    apply_here: true,
+                    group: Some("admin".to_owned()),
+                    ..AclEntry::default()
+                },
+            ],
+            groups: vec![Group {
+                name: "salz".to_owned(),
+                add: vec![3, 9],
+                remove: vec![4],
+                inherited_members: vec![7],
+                ..Group::default()
+            }],
+        };
+
+        let ids = PermissionsService::accounts_named(&evaluate::to_wire(&set));
+
+        // Sorted, deduplicated, and the group row that names no account
+        // contributes nothing.
+        assert_eq!(ids, vec![3, 4, 7, 9]);
     }
 }

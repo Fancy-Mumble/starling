@@ -3076,6 +3076,98 @@ async fn a_client_holding_write_can_save_an_acl_table_and_read_it_back() {
 }
 
 #[tokio::test]
+async fn an_acl_reply_carries_the_names_of_the_accounts_it_mentions() {
+    // What the classic client's ACL editor has no other way to learn. It seeds
+    // its name cache from the users that are *connected* and never asks about
+    // an id, so an offline group member rendered as `#27`: a members list of
+    // numbers, unreadable and uneditable. Murmur sends an unsolicited
+    // `QueryUsers`(14) after every `ACL`(13) reply; Starling sent only the ACL.
+    //
+    // Both halves of the table are asserted, group membership and an ACL row,
+    // because they are gathered from different fields and one without the other
+    // leaves the same symptom on the other tab.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::{AclEntry, AclSet, Group};
+
+    let data_dir = TempDir::new("acl-names");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let target = deployment.create_channel("Moderated").await;
+
+    // Registered and never connected, which is the case that was broken.
+    let zewi = register_with_password(&deployment, "zewi", "hunter2").await;
+    let sebi = register_with_password(&deployment, "sebi", "hunter2").await;
+
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    deployment
+        .set_acl(AclSet {
+            channel: target,
+            inherit: true,
+            acls: vec![AclEntry {
+                apply_here: true,
+                account: Some(sebi),
+                grant: Perm::MUTE_DEAFEN.bits(),
+                ..AclEntry::default()
+            }],
+            groups: vec![Group {
+                name: "salz".to_owned(),
+                add: vec![zewi],
+                ..Group::default()
+            }],
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+    alice
+        .send(
+            13,
+            &tcp::Acl {
+                channel_id: target,
+                query: Some(true),
+                ..tcp::Acl::default()
+            },
+        )
+        .await;
+
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(13))
+        .await
+        .expect("the read was never answered");
+    let table = tcp::Acl::decode(payload.as_slice()).expect("a well-formed ACL");
+    assert_eq!(table.groups[0].add, vec![zewi as u32]);
+
+    // After the ACL, never before it: the editor that absorbs these names is
+    // constructed from the ACL frame, and a `QueryUsers` that arrives first is
+    // handed to a dialog that does not exist yet.
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(14))
+        .await
+        .expect("the ACL reply carried no names");
+    let names = tcp::QueryUsers::decode(payload.as_slice()).expect("a well-formed QueryUsers");
+    let resolved: Vec<(u32, &str)> = names
+        .ids
+        .iter()
+        .zip(names.names.iter())
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect();
+    assert!(
+        resolved.contains(&(zewi as u32, "zewi")),
+        "the group member was left unnamed: {resolved:?}"
+    );
+    assert!(
+        resolved.contains(&(sebi as u32, "sebi")),
+        "the account named by an ACL row was left unnamed: {resolved:?}"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
 async fn a_channel_password_admits_whoever_presents_it_and_nobody_else() {
     // G2 and G3 together, which is how a user meets them: a channel password is
     // an `Enter` denied to `all` and granted back to `#token`, and it needs the
