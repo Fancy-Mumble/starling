@@ -235,7 +235,7 @@ impl Roster {
     /// cold roster.
     ///
     /// Prefer this over addressing a session directly whenever the write is
-    /// provoked by the session's own arrival: see the note on [`Self::conns`]
+    /// provoked by the session's own arrival: see the note on the `conns` map
     /// for why a session id is not yet addressable at that moment. For anything
     /// later in a session's life the two are equivalent, and a session id is
     /// the more natural address.

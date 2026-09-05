@@ -5,8 +5,8 @@
 //! Every other client is sent `ServerSync.welcome_text`, which is a string, and
 //! a string can only carry a picture as a `data:` URI. That costs a third more
 //! bytes than the picture does - base64 is four characters per three bytes -
-//! and it has to fit inside [`MAX_BODY`], which is four kilobytes spent on every
-//! single join. The practical effect is that a designed greeting can carry a
+//! and it has to fit the four kilobytes `welcome_text` is capped at - four
+//! kilobytes spent on every single join. The practical effect is that a designed greeting can carry a
 //! line icon and nothing else: a photograph is out of the question, and no
 //! amount of interface hides that.
 //!
