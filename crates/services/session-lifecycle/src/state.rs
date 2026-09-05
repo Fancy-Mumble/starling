@@ -67,6 +67,18 @@ pub struct PendingConnection {
     pub os: String,
     /// That operating system's version.
     pub os_version: String,
+    /// The greeting composed for this peer, held until it asks for it.
+    ///
+    /// A Fancy peer is offered the greeting's *hash* at sync and sends back a
+    /// want only when it does not recognise one - so the body has to survive
+    /// between the two. Held rather than recomposed because recomposing would
+    /// walk the graph a second time on the login path to produce, by
+    /// construction, the same bytes.
+    ///
+    /// Dropped with the connection, so an operator's edit reaches the next join
+    /// rather than this one, which is the same rule the string greeting
+    /// follows: what a peer is told is what was true when it arrived.
+    pub greeting: Option<starling_runtime::greeting_binary::Payload>,
     /// The access tokens the peer presented, in `Authenticate`.
     ///
     /// murmur's `ServerUser::qslAccessTokens`. These are what a `#name` ACL
@@ -276,6 +288,20 @@ pub struct Connections {
     sessions: Arc<Mutex<SessionAllocator>>,
 }
 
+/// A legacy `version_v1` in `version_v2`'s packing.
+///
+/// Mumble 1.4 and older announce only v1, which packs a version into 32 bits
+/// as `major << 16 | minor << 8 | patch` - one byte each for minor and patch.
+/// Everything downstream compares, republishes and gates on v2's packing,
+/// which gives each component its own 16 bits, so a v1 number stored raw is
+/// not a small version, it is a different number: it sorts below every real
+/// one, reaches administrators as a `version_v2` that decodes to nonsense, and
+/// answers a `ClientVersion` condition for a version nobody is running.
+fn widen_v1(v1: u32) -> u64 {
+    let v1 = u64::from(v1);
+    ((v1 >> 16) << 48) | (((v1 >> 8) & 0xFF) << 32) | ((v1 & 0xFF) << 16)
+}
+
 impl Connections {
     /// A registry with a session pool sized for `max_users`.
     #[must_use]
@@ -315,7 +341,7 @@ impl Connections {
         {
             pending.mumble_version = version
                 .version_v2
-                .or_else(|| version.version_v1.map(u64::from))
+                .or_else(|| version.version_v1.map(widen_v1))
                 .unwrap_or_default();
             pending.release = version.release.clone().unwrap_or_default();
             pending.os = version.os.clone().unwrap_or_default();
@@ -456,6 +482,22 @@ impl Connections {
     ///
     /// Only ever narrowed by the client's own `Hello`; nothing else may widen
     /// it, because every capability is something done *to* that connection.
+    /// Hold the greeting this peer was offered, for when it asks.
+    pub fn set_greeting(&self, conn: u64, greeting: starling_runtime::greeting_binary::Payload) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.get_mut(&conn)
+        {
+            pending.greeting = Some(greeting);
+        }
+    }
+
+    /// The greeting held for this peer, if it was offered one.
+    #[must_use]
+    pub fn greeting(&self, conn: u64) -> Option<starling_runtime::greeting_binary::Payload> {
+        self.inner.lock().ok()?.get(&conn)?.greeting.clone()
+    }
+
+    /// Record what this connection announced it can accept.
     pub fn set_capabilities(&self, conn: u64, capabilities: Capabilities) {
         if let Ok(mut inner) = self.inner.lock()
             && let Some(pending) = inner.get_mut(&conn)
@@ -1068,6 +1110,52 @@ mod tests {
         assert_eq!(pending.release, "Mumble 1.5.735");
         assert_eq!(pending.os, "Windows");
         assert_eq!(pending.os_version, "11");
+    }
+
+    #[test]
+    fn a_peer_that_announced_only_the_narrow_version_is_widened_to_the_wide_one() {
+        // Mumble 1.4 and older send `version_v1` alone. Everything that reads
+        // `mumble_version` - the listener warning, a `ClientVersion` greeting
+        // condition, the voice profile, and the `version_v2` an administrator
+        // is shown - compares v2's packing, so the narrow number has to become
+        // the wide one here or every one of them reads a version nobody runs.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.record_version(
+            1,
+            &tcp::Version {
+                // 1.4.287, as 1.4 puts it on the wire: one byte each for the
+                // minor and the patch. The patch does not survive a byte and
+                // upstream truncates it the same way.
+                version_v1: Some(0x0001_0400 | (287 & 0xFF)),
+                ..tcp::Version::default()
+            },
+        );
+        let pending = connections.get(1).expect("the connection");
+        assert_eq!(pending.mumble_version >> 48, 1, "major");
+        assert_eq!((pending.mumble_version >> 32) & 0xFFFF, 4, "minor");
+    }
+
+    #[test]
+    fn the_wide_version_is_taken_as_it_stands_when_a_peer_sends_both() {
+        // 1.5 announces both, and the wide one is the accurate half: it is the
+        // only one that can carry a patch above 255.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        connections.record_version(
+            1,
+            &tcp::Version {
+                version_v1: Some(0x0001_0500),
+                version_v2: Some((1 << 48) | (5 << 32) | (735 << 16)),
+                ..tcp::Version::default()
+            },
+        );
+        let pending = connections.get(1).expect("the connection");
+        assert_eq!(
+            (pending.mumble_version >> 16) & 0xFFFF,
+            735,
+            "the patch the narrow encoding could not have held"
+        );
     }
 
     #[test]

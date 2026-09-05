@@ -352,6 +352,34 @@ message GreetingDesign {
   string tree = 4;
   // What each target compiles to. One entry per target that has any parts.
   repeated CompiledTarget compiled = 5;
+  // The pictures this design draws, stored once each and referenced from the
+  // markup by id.
+  //
+  // Out here rather than inside a part because a picture is not per-target: the
+  // same photograph is drawn by every target that can draw one, and a copy per
+  // target would be the same bytes several times over in the one place bytes
+  // are most expensive.
+  repeated GreetingAsset assets = 6;
+}
+
+// A picture a design carries.
+//
+// Raw bytes, and that is the whole point of the message existing. A greeting
+// that has to travel inside a string can only carry a picture as a `data:` URI,
+// which is base64 - a third more bytes for nothing, on a payload paid at every
+// join - and it has to fit the 4096-character cap that string is held to. Sent
+// as bytes to the clients that can receive bytes, a picture costs what the
+// picture costs.
+message GreetingAsset {
+  // Referenced from the markup as `fm-a-<id>`. Stable across saves, so a design
+  // that is edited does not invalidate every reader's cache of its artwork.
+  string id = 1;
+  // `image/webp`, `image/jpeg`, `image/png`. The client renders by this rather
+  // than by sniffing, and refuses one it does not know.
+  string mime = 2;
+  // The picture. Never base64, never a URL: a URL would be fetched by every
+  // reader, which is the tracking vector `data:` was chosen to close.
+  bytes data = 3;
 }
 
 message DesignInput {

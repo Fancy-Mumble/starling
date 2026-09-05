@@ -564,6 +564,188 @@ pub fn compose(graph: &Greeting, greet: &GreetingNode, allow_html: bool) -> Stri
     parts.join(if allow_html { "" } else { " " })
 }
 
+/* -- Assembling a design --------------------------------------------------- */
+
+/// The first Mumble whose markup is not the Qt subset.
+///
+/// `(major << 48) | (minor << 32) | (patch << 16)`, which is `version_v2`'s own
+/// packing - the same one a `ClientVersion` condition compares in.
+const QT_UNTIL: u64 = (1 << 48) | (6 << 32);
+
+/// Which of a design's compiled targets this peer is sent.
+///
+/// The set of targets is the editor's; this is the only place the server picks
+/// between them, and every rule here is a limit of the *reader* rather than a
+/// preference:
+///
+/// * `plain` when the server forbids markup. A client with `allow_html` off
+///   renders tags literally, which turns a greeting into what looks like a
+///   broken server - the same reason [`compose`] has a plain half at all.
+/// * `rich` for the fork, whose sanitiser drops any `<img>` that is not a data
+///   URL, so a design's pictures cannot reach it as markup.
+/// * `qt` for stock Mumble 1.5 and older, which draws a subset of HTML 4.
+/// * `html` for anything newer.
+///
+/// A peer that announced no version is read as *old*, not as new: `qt` is the
+/// narrower markup and it still renders in a client that understands more,
+/// while the other way round leaves somebody reading tags.
+#[must_use]
+pub fn target_for(facts: &Facts, allow_html: bool) -> &'static str {
+    if !allow_html {
+        return "plain";
+    }
+    // Zero is stock Mumble rather than an absence, which is what it means
+    // everywhere else the fork's version is read.
+    if facts.fancy_version.is_some_and(|version| version != 0) {
+        return "rich";
+    }
+    if facts
+        .client_version
+        .is_none_or(|version| version < QT_UNTIL)
+    {
+        return "qt";
+    }
+    "html"
+}
+
+/// What separates one part from the next.
+///
+/// `JOIN` in the editor's `compile.ts`, which is what generated the parts:
+/// every markup part is a table row or a block that closes itself, so they need
+/// nothing between them, and text has nothing to close so its separation has to
+/// be real.
+fn separator(target: &str) -> &'static str {
+    if target == "plain" { "\n\n" } else { "" }
+}
+
+/// The node wired into `greet`'s design input named `name`.
+///
+/// By name rather than by position: a design's ports are its declared inputs,
+/// and an index would re-point every wire the moment somebody reordered them.
+fn wired<'a>(graph: &'a Greeting, greet: &str, name: &str) -> Option<&'a GreetingNode> {
+    let edge = graph
+        .edges
+        .iter()
+        .find(|e| e.to == greet && e.port == i32::from(GreetingPort::Input) && e.input == name)?;
+    node(graph, &edge.from)
+}
+
+/// Whether the condition wired to the input named `name` holds.
+fn input_truth(graph: &Greeting, greet: &str, name: &str, facts: &Facts) -> Truth {
+    wired(graph, greet, name).map_or(Truth::Unknown, |src| {
+        truth(graph, &src.id, facts, &mut HashSet::new())
+    })
+}
+
+/// The snippet wired into a slot, in the form that target reads.
+///
+/// A snippet carries markup and text and nothing target-specific, so `qt` is
+/// sent the markup: Qt keeps the words inside a tag it does not know, which is
+/// what the editor's own `qtSafe` does to the preview. Doing better would cost
+/// an HTML parser on the login path and a second copy of that sanitiser to keep
+/// in step with it, to end at the same words.
+///
+/// The plain half is the fallback in every target, exactly as it is in
+/// [`compose`]: a snippet written as text is still what the operator wants
+/// said.
+fn slot_body(graph: &Greeting, greet: &str, name: &str, target: &str) -> String {
+    let Some(source) = wired(graph, greet, name) else {
+        return String::new();
+    };
+    let Some(greeting_node::Body::Snippet(snippet)) = source.body.as_ref() else {
+        return String::new();
+    };
+    if target != "plain" && !snippet.html.is_empty() {
+        snippet.html.trim().to_owned()
+    } else {
+        snippet.plain.trim().to_owned()
+    }
+}
+
+/// The greeting `greet` reads as for this peer.
+///
+/// [`compose`] is the greeting a peer got before designs existed and remains
+/// the answer for every greeting that has no design; this is the walk over the
+/// parts the editor compiled, which is where a design becomes one string.
+///
+/// The walk is a loop over a list on purpose. All the layout happened in the
+/// editor at save time, and the only two things it could not know then are
+/// resolved here: which gated parts are on for *this* peer, and what is wired
+/// into each slot. Nothing here parses markup, and nothing here lays anything
+/// out - which is the whole reason the compiled form is a list of parts rather
+/// than a document.
+#[must_use]
+pub fn assemble(graph: &Greeting, greet: &GreetingNode, facts: &Facts, allow_html: bool) -> String {
+    let Some(greeting_node::Body::Greet(body)) = greet.body.as_ref() else {
+        return String::new();
+    };
+    let Some(design) = body.design.as_ref() else {
+        return compose(graph, greet, allow_html);
+    };
+    let target = target_for(facts, allow_html);
+    let Some(assembled) = assemble_target(graph, greet, facts, target) else {
+        // A design with nothing compiled for this target has nothing to say to
+        // this peer, and the greeting's own halves are what it said before the
+        // design was drawn. Falling back is what makes a half-migrated document
+        // safe to store.
+        return compose(graph, greet, allow_html);
+    };
+    let _ = design;
+    assembled
+}
+
+/// The same walk, for a target named outright rather than derived from a peer.
+///
+/// Split out because a Fancy client is sent a *different document* - markup
+/// naming pictures, which no string target can carry - and choosing it is not
+/// something [`target_for`] can do: that function answers "which string does
+/// this peer read", and this one is asked after something else has already
+/// decided the peer is getting bytes instead.
+///
+/// `None` where the design has nothing compiled under that name, which is what
+/// makes a half-migrated document safe to store: the caller falls back to what
+/// the greeting said before anybody drew a sheet.
+#[must_use]
+pub fn assemble_target(
+    graph: &Greeting,
+    greet: &GreetingNode,
+    facts: &Facts,
+    target: &str,
+) -> Option<String> {
+    let greeting_node::Body::Greet(body) = greet.body.as_ref()? else {
+        return None;
+    };
+    let design = body.design.as_ref()?;
+    let compiled = design.compiled.iter().find(|c| c.target == target)?;
+
+    let mut pieces = Vec::new();
+    // Bounded rather than trusted: [`validate`] refuses a longer list when it is
+    // written, but this walks a *stored* document - one saved before a cap
+    // existed, or by something other than this server - and it walks it on the
+    // login path.
+    for part in compiled.parts.iter().take(MAX_PARTS) {
+        // A part gated on a condition the server cannot settle is dropped.
+        // Validation already refuses an input fed by anything but a filter or a
+        // gate, so reaching Unknown here means a document that predates that
+        // rule - and a line shown for a reason nobody could establish is the
+        // one failure a gate exists to prevent.
+        if !part.visible_if.is_empty()
+            && input_truth(graph, &greet.id, &part.visible_if, facts) != Truth::Yes
+        {
+            continue;
+        }
+        let piece = match part.body.as_ref() {
+            Some(design_part::Body::Literal(text)) => text.clone(),
+            Some(design_part::Body::Slot(name)) => slot_body(graph, &greet.id, name, target),
+            None => String::new(),
+        };
+        if !piece.trim().is_empty() {
+            pieces.push(piece);
+        }
+    }
+    Some(pieces.join(separator(target)))
+}
+
 /// Whether this node's output can still be `Unknown`.
 ///
 /// A *static* property of the drawing, not of any one arrival: it asks
@@ -2532,6 +2714,280 @@ mod tests {
             assert_eq!(
                 compose(&graph, greet, true),
                 "<p>Willkommen!</p><p>House rules.</p>"
+            );
+        }
+    }
+
+    mod assembling {
+        use super::*;
+        use starling_proto_fancy::serverconfig::{
+            CompiledTarget, DesignInput, DesignPart, GreetingDesign, design_part,
+        };
+
+        fn input(name: &str) -> DesignInput {
+            DesignInput {
+                id: format!("in-{name}"),
+                name: name.into(),
+            }
+        }
+
+        fn literal(text: &str, gate: &str) -> DesignPart {
+            DesignPart {
+                body: Some(design_part::Body::Literal(text.into())),
+                visible_if: gate.into(),
+            }
+        }
+
+        fn slot(name: &str, gate: &str) -> DesignPart {
+            DesignPart {
+                body: Some(design_part::Body::Slot(name.into())),
+                visible_if: gate.into(),
+            }
+        }
+
+        /// A wire onto one of a design's declared inputs.
+        fn into_input(id: &str, from: &str, to: &str, name: &str) -> GreetingEdge {
+            GreetingEdge {
+                input: name.into(),
+                ..e(id, from, to, GreetingPort::Input)
+            }
+        }
+
+        /// One line everybody reads, one behind a condition, and a slot - in
+        /// three of the four targets. `rich` is left uncompiled on purpose:
+        /// that is the fallback this fixture also has to exercise.
+        fn design() -> GreetingDesign {
+            GreetingDesign {
+                sheet_w: 720,
+                slots: vec![input("rules")],
+                conditions: vec![input("closed")],
+                // Never read here - it is what the editor reopens.
+                tree: "{}".into(),
+                assets: Vec::new(),
+                compiled: vec![
+                    CompiledTarget {
+                        target: "html".into(),
+                        parts: vec![
+                            literal("<p>Welcome!</p>", ""),
+                            literal("<p>Registration is closed.</p>", "closed"),
+                            slot("rules", ""),
+                        ],
+                    },
+                    CompiledTarget {
+                        target: "qt".into(),
+                        parts: vec![literal("<b>Welcome!</b>", ""), slot("rules", "")],
+                    },
+                    CompiledTarget {
+                        target: "plain".into(),
+                        parts: vec![literal("Welcome!", ""), slot("rules", "")],
+                    },
+                ],
+            }
+        }
+
+        /// The design above, wired to a snippet and to a settled condition.
+        fn designed() -> Greeting {
+            Greeting {
+                enabled: true,
+                nodes: vec![
+                    n(
+                        "greet",
+                        Body::Greet(Greet {
+                            html: "<i>the old body</i>".into(),
+                            plain: "the old body".into(),
+                            design: Some(design()),
+                            ..Default::default()
+                        }),
+                    ),
+                    n(
+                        "rules",
+                        Body::Snippet(Snippet {
+                            name: "rules".into(),
+                            html: "<p>House rules.</p>".into(),
+                            plain: "House rules.".into(),
+                        }),
+                    ),
+                    n(
+                        "guest",
+                        Body::Account(AccountIs {
+                            state: account_is::State::Guest as i32,
+                        }),
+                    ),
+                    n(
+                        "fg",
+                        Body::Filter(Filter {
+                            unknown_becomes: filter::Unknown::IsNo as i32,
+                        }),
+                    ),
+                ],
+                edges: vec![
+                    e("w1", "guest", "fg", GreetingPort::A),
+                    into_input("w2", "fg", "greet", "closed"),
+                    into_input("w3", "rules", "greet", "rules"),
+                ],
+                ..Greeting::default()
+            }
+        }
+
+        fn greet_of(graph: &Greeting) -> &GreetingNode {
+            graph.nodes.iter().find(|node| node.id == "greet").unwrap()
+        }
+
+        /// A stock client of `version`, registered or not.
+        fn stock(version: u64, registered: bool) -> Facts {
+            Facts {
+                client_version: Some(version),
+                fancy_version: Some(0),
+                registered: Some(registered),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_server_that_forbids_markup_is_sent_the_plain_target() {
+            // Ahead of every other rule: a client that cannot render tags
+            // prints them, whatever it is.
+            assert_eq!(target_for(&stock(v(1, 6, 0), true), false), "plain");
+            let fork = Facts {
+                fancy_version: Some(42),
+                ..stock(v(1, 6, 0), true)
+            };
+            assert_eq!(target_for(&fork, false), "plain");
+        }
+
+        #[test]
+        fn the_fork_is_sent_the_rich_subset() {
+            let fork = Facts {
+                fancy_version: Some(42),
+                ..stock(v(1, 5, 0), true)
+            };
+            assert_eq!(target_for(&fork, true), "rich");
+        }
+
+        #[test]
+        fn mumble_1_5_and_older_are_sent_the_qt_subset() {
+            assert_eq!(target_for(&stock(v(1, 5, 735), true), true), "qt");
+            assert_eq!(target_for(&stock(v(1, 3, 0), true), true), "qt");
+            assert_eq!(target_for(&stock(v(1, 6, 0), true), true), "html");
+        }
+
+        #[test]
+        fn a_peer_that_announced_no_version_is_read_as_old() {
+            // Qt is the narrower markup and renders in a client that
+            // understands more; the other way round leaves somebody reading
+            // tags.
+            let quiet = Facts {
+                client_version: None,
+                ..stock(0, true)
+            };
+            assert_eq!(target_for(&quiet, true), "qt");
+            // 1.3, in the packing every version reaches here in - a client
+            // that announced only `version_v1` was widened into it as its
+            // `Version` was recorded, so there is no narrow number to handle.
+            assert_eq!(target_for(&stock((1 << 48) | (3 << 32), true), true), "qt");
+        }
+
+        #[test]
+        fn the_parts_of_the_chosen_target_are_joined() {
+            let graph = designed();
+            assert_eq!(
+                assemble(&graph, greet_of(&graph), &stock(v(1, 6, 0), true), true),
+                "<p>Welcome!</p><p>House rules.</p>"
+            );
+        }
+
+        #[test]
+        fn a_gated_part_is_sent_only_to_the_peers_its_condition_holds_for() {
+            let graph = designed();
+            let greet = greet_of(&graph);
+            let guest = assemble(&graph, greet, &stock(v(1, 6, 0), false), true);
+            let member = assemble(&graph, greet, &stock(v(1, 6, 0), true), true);
+            assert!(guest.contains("Registration is closed."));
+            assert!(!member.contains("Registration is closed."));
+        }
+
+        #[test]
+        fn a_gate_the_server_cannot_settle_hides_its_part() {
+            // The condition wired straight to the input, with no filter to
+            // settle it, and no fact to answer it. `validate` refuses that at
+            // write time; a document stored before the rule still has to be
+            // safe to walk, and hiding is the quiet failure.
+            let mut graph = designed();
+            graph.nodes.push(n(
+                "country",
+                Body::Country(CountryIn {
+                    codes: vec!["DE".into()],
+                }),
+            ));
+            graph.edges.retain(|edge| edge.id != "w2");
+            graph
+                .edges
+                .push(into_input("w4", "country", "greet", "closed"));
+            let facts = stock(v(1, 6, 0), false);
+            assert_eq!(
+                input_truth(&graph, "greet", "closed", &facts),
+                Truth::Unknown
+            );
+            assert!(!assemble(&graph, greet_of(&graph), &facts, true).contains("closed"));
+        }
+
+        #[test]
+        fn a_slot_is_substituted_with_the_snippet_wired_to_it() {
+            let graph = designed();
+            assert!(
+                assemble(&graph, greet_of(&graph), &stock(v(1, 5, 0), true), true)
+                    .contains("<p>House rules.</p>")
+            );
+        }
+
+        #[test]
+        fn an_unwired_slot_leaves_nothing_behind() {
+            // Not a hole in the markup and not the input's name: a slot with
+            // nothing in it is a part that is not sent.
+            let mut graph = designed();
+            graph.edges.retain(|edge| edge.id != "w3");
+            assert_eq!(
+                assemble(&graph, greet_of(&graph), &stock(v(1, 6, 0), true), true),
+                "<p>Welcome!</p>"
+            );
+        }
+
+        #[test]
+        fn plain_takes_the_snippets_text_half_and_separates_the_parts() {
+            let graph = designed();
+            let text = assemble(&graph, greet_of(&graph), &stock(v(1, 6, 0), true), false);
+            assert_eq!(text, "Welcome!\n\nHouse rules.");
+            assert!(!text.contains('<'));
+        }
+
+        #[test]
+        fn a_target_the_design_never_compiled_falls_back_to_the_greetings_own_halves() {
+            // `rich` has no compiled entry, and the fork is what asks for it.
+            // What it gets is what a client that knows nothing about designs
+            // gets, which is what those two halves are for.
+            let graph = designed();
+            let fork = Facts {
+                fancy_version: Some(42),
+                ..stock(v(1, 5, 0), true)
+            };
+            assert_eq!(
+                assemble(&graph, greet_of(&graph), &fork, true),
+                "<i>the old body</i>"
+            );
+        }
+
+        #[test]
+        fn a_greeting_with_no_design_composes_exactly_as_before() {
+            let graph = mock();
+            let greet = graph.nodes.iter().find(|node| node.id == "greet").unwrap();
+            let facts = stock(v(1, 6, 0), true);
+            assert_eq!(
+                assemble(&graph, greet, &facts, true),
+                compose(&graph, greet, true)
+            );
+            assert_eq!(
+                assemble(&graph, greet, &facts, false),
+                compose(&graph, greet, false)
             );
         }
     }

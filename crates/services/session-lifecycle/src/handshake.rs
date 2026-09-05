@@ -43,6 +43,7 @@ use starling_proto_fancy::voice::MintRequest;
 use starling_proto_fancy::voice::voice_client::VoiceClient;
 use starling_runtime::channel::Resolver;
 use starling_runtime::greeting::{self, Greetings};
+use starling_runtime::greeting_binary;
 use starling_runtime::log::{Category, LogEvent};
 use starling_runtime::plane::{
     Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn, to_sessions,
@@ -283,7 +284,7 @@ impl Handshake {
         identity: &Identity,
         config: &Snapshot,
         pending: &PendingConnection,
-    ) -> String {
+    ) -> (String, Option<greeting_binary::Payload>) {
         let graph = self.greetings.get(instance);
         let facts = greeting::Facts {
             client_version: Some(pending.mumble_version),
@@ -303,10 +304,17 @@ impl Handshake {
             groups: None,
             country: None,
         };
-        match greeting::choose(&graph, &facts) {
-            Some(greet) => greeting::compose(&graph, greet, config.allow_html),
-            None => config.welcome_text.clone(),
-        }
+        let Some(greet) = greeting::choose(&graph, &facts) else {
+            return (config.welcome_text.clone(), None);
+        };
+        // Both halves, because a peer gets both: the string is what
+        // `ServerSync` carries and what every client can read, and the payload
+        // is the same greeting as bytes for one that announced it can take
+        // them. A Fancy peer is *offered* the second and keeps the first, so
+        // that a client which declines - or whose cache reply never arrives -
+        // still has a welcome message.
+        let text = greeting::assemble(&graph, greet, &facts, config.allow_html);
+        (text, greeting_binary::compose(&graph, greet, &facts))
     }
 
     /// The whole handshake, from `Authenticate` to `SuggestConfig`.
@@ -343,21 +351,10 @@ impl Handshake {
         );
 
         let config = self.config(inbound.scope).await;
-        if !config.password.is_empty()
-            && request.password.as_deref().unwrap_or_default() != config.password
+        let identity = match self
+            .admit(inbound, &name, &request, &config, &pending)
+            .await
         {
-            return self.refuse(
-                inbound.conn,
-                &name,
-                tcp::reject::RejectType::WrongServerPw,
-                "wrong server password",
-            );
-        }
-
-        let outcome = self
-            .identify(inbound.scope, &name, &request, &pending)
-            .await;
-        let identity = match outcome {
             Ok(identity) => identity,
             Err(refusal) => return refusal,
         };
@@ -365,10 +362,6 @@ impl Handshake {
         // the stored profile hashes travel with it into `welcome`.
         let account = identity.account;
         let name = identity.name.as_str();
-
-        if let Some(refusal) = self.certificate_gate(&config, &pending, account, name) {
-            return refusal;
-        }
 
         // murmur never lets two live sessions share a name: refuse this one,
         // or kick the older one as a ghost (`Messages.cpp:418`). Doing neither
@@ -438,7 +431,15 @@ impl Handshake {
         }
 
         let mut actions = self
-            .welcome(inbound, session, &identity, &config, &pending, channel)
+            .welcome(
+                connections,
+                inbound,
+                session,
+                &identity,
+                &config,
+                &pending,
+                channel,
+            )
             .await;
 
         // After , which  has already queued: murmur is
@@ -463,6 +464,43 @@ impl Handshake {
             self.kick_ghost(&ghost);
         }
         actions
+    }
+
+    /// The three gates a login passes before it is given a session: the
+    /// server password, the identity behind the name, and the certificate the
+    /// operator may require of it.
+    ///
+    /// Split out of [`Self::authenticate`] because they share a shape - each
+    /// either refuses outright or hands the next one an identity - and because
+    /// none of them may touch the session, which does not exist until all
+    /// three have passed.
+    async fn admit(
+        &self,
+        inbound: &Inbound,
+        name: &str,
+        request: &tcp::Authenticate,
+        config: &Snapshot,
+        pending: &PendingConnection,
+    ) -> Result<Identity, Actions> {
+        if !config.password.is_empty()
+            && request.password.as_deref().unwrap_or_default() != config.password
+        {
+            return Err(self.refuse(
+                inbound.conn,
+                name,
+                tcp::reject::RejectType::WrongServerPw,
+                "wrong server password",
+            ));
+        }
+
+        let identity = self.identify(inbound.scope, name, request, pending).await?;
+
+        if let Some(refusal) =
+            self.certificate_gate(config, pending, identity.account, identity.name.as_str())
+        {
+            return Err(refusal);
+        }
+        Ok(identity)
     }
 
     /// Decode the message, and find the connection it arrived on.
@@ -535,9 +573,19 @@ impl Handshake {
     /// Disconnect the older session a reconnecting user left behind.
     ///
     /// Through the fan-out, because the ghost may be held by another gateway
-    /// pod and the pods without it ignore the frame. No `UserRemove` here: the
-    /// ordinary disconnect path broadcasts one, and a second removes the user
-    /// twice.
+    /// pod and the pods without it ignore the frame.
+    ///
+    /// The `UserRemove` is addressed at the ghost's own connection and nobody
+    /// else's: everyone *else* is told by the ordinary disconnect path, and a
+    /// second broadcast would remove the user twice. The ghost is the one peer
+    /// that path cannot reach, because it is gone from the registry by the
+    /// time the removal is built, so all it ever saw was its socket closing.
+    /// That is indistinguishable from a dropped link, which is what the client
+    /// then reported and, with auto-reconnect on, dialled straight back into -
+    /// evicting the device the user had just moved to. Naming our own session
+    /// in a `UserRemove` is how murmur says "you were kicked, here is why"
+    /// (`Messages.cpp:1055`), every client already understands it, and
+    /// `finish` flushes what is queued before the socket goes.
     fn kick_ghost(&self, ghost: &PendingConnection) {
         tracing::info!(
             conn = ghost.conn,
@@ -552,10 +600,16 @@ impl Handshake {
                 .with("name", ghost.name.clone())
                 .with("reason", "the same user connected from elsewhere"),
         );
-        self.fanout.push(disconnect(
-            ghost.conn,
-            "You connected to the server from another device",
-        ));
+        let removal = tcp::UserRemove {
+            session: ghost.session,
+            reason: Some(GHOST_REASON.to_owned()),
+            ..tcp::UserRemove::default()
+        };
+        // Ordered, and the order is the whole point: the frame has to be
+        // queued before the close, or `finish` drains an empty queue.
+        self.fanout
+            .push(to_conn(ghost.conn, USER_REMOVE, removal.encode_to_vec()));
+        self.fanout.push(disconnect(ghost.conn, GHOST_REASON));
     }
 
     /// Everything the client is sent once it is admitted, in murmur's order.
@@ -564,8 +618,15 @@ impl Handshake {
     /// questions: that one decides *whether* the peer may in, this one composes
     /// the world it is handed. The ordering constraints documented at the top of
     /// this module all live here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site, and every argument is a\
+        distinct part of the world the peer is handed - bundling them into a struct would\
+        name the same fields twice"
+    )]
     async fn welcome(
         &self,
+        connections: &Connections,
         inbound: &Inbound,
         session: u32,
         identity: &Identity,
@@ -576,7 +637,7 @@ impl Handshake {
         let account = identity.account;
         let name = identity.name.as_str();
 
-        let welcome = self.greeting_for(inbound.scope, identity, config, pending);
+        let (welcome, payload) = self.greeting_for(inbound.scope, identity, config, pending);
 
         let mut actions = Vec::new();
         actions.push(self.crypt_setup(inbound, session, pending).await);
@@ -594,6 +655,30 @@ impl Handshake {
             5,
             server_sync(session, config, &welcome).encode_to_vec(),
         ));
+        // The greeting's *hash*, not the greeting. A greeting changes when an
+        // operator edits it and a peer may join twenty times a day, so the
+        // first thing across is what identifies the document - and a client
+        // that recognises it says nothing and draws from its own cache.
+        //
+        // After the sync, because the string welcome in that message is what
+        // this peer falls back to: a client that declines the offer, or whose
+        // want never arrives, has already been given a greeting.
+        if let Some(payload) = payload {
+            actions.push(to_conn(
+                inbound.conn,
+                ServiceKind::SessionLifecycle.outer_type(),
+                SessionEnvelope {
+                    body: Some(session_envelope::Body::GreetingOffer(
+                        starling_proto_fancy::fancy::session::GreetingOffer {
+                            digest: payload.digest().to_vec(),
+                            bytes: u32::try_from(payload.weight()).unwrap_or(u32::MAX),
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+            ));
+            connections.set_greeting(inbound.conn, payload);
+        }
         actions.push(to_conn(
             inbound.conn,
             24,
@@ -1555,6 +1640,61 @@ impl Handshake {
         ]
     }
 
+    /// The greeting body, for a peer that did not recognise the hash.
+    ///
+    /// Answered from what was held at sync rather than recomposed. Recomposing
+    /// would walk the graph a second time on the login path to produce, by
+    /// construction, the same bytes - and would produce *different* bytes if an
+    /// operator edited the greeting in between, which is a body that does not
+    /// match the hash the client asked under.
+    ///
+    /// A want whose digest is not the one held is answered with nothing. It
+    /// means the offer it replies to is not the offer that was sent, which on
+    /// this path can only be a stale or invented message, and a greeting is not
+    /// worth guessing about.
+    fn on_greeting_want(
+        &self,
+        connections: &Connections,
+        inbound: &Inbound,
+        digest: &[u8],
+    ) -> Actions {
+        connections.touch(inbound.conn);
+        let Some(payload) = connections.greeting(inbound.conn) else {
+            return Actions::new();
+        };
+        if payload.digest().as_slice() != digest {
+            tracing::debug!(
+                conn = inbound.conn,
+                "greeting want for a digest we did not offer"
+            );
+            return Actions::new();
+        }
+        vec![to_conn(
+            inbound.conn,
+            ServiceKind::SessionLifecycle.outer_type(),
+            SessionEnvelope {
+                body: Some(session_envelope::Body::GreetingBody(
+                    starling_proto_fancy::fancy::session::GreetingBody {
+                        digest: digest.to_vec(),
+                        markup: payload.markup,
+                        assets: payload
+                            .assets
+                            .into_iter()
+                            .map(
+                                |asset| starling_proto_fancy::fancy::session::GreetingAsset {
+                                    id: asset.id,
+                                    mime: asset.mime,
+                                    data: asset.data,
+                                },
+                            )
+                            .collect(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        )]
+    }
+
     /// The Fancy extensions: hello, resume, lazy subscription.
     pub fn fancy(&self, connections: &Connections, inbound: &Inbound) -> Actions {
         let Ok(envelope) = SessionEnvelope::decode(inbound.payload.as_slice()) else {
@@ -1569,6 +1709,9 @@ impl Handshake {
             }
             Some(session_envelope::Body::Resume(resume)) => {
                 self.on_resume(connections, inbound, resume)
+            }
+            Some(session_envelope::Body::GreetingWant(want)) => {
+                self.on_greeting_want(connections, inbound, &want.digest)
             }
             _ => Actions::new(),
         }
@@ -1782,10 +1925,21 @@ fn codec_version() -> tcp::CodecVersion {
 /// Upstream `TextMessage`.
 const TEXT_MESSAGE: u16 = 11;
 
+/// Upstream `UserRemove`.
+const USER_REMOVE: u16 = 8;
+
+/// What a ghost is told before its socket closes.
+///
+/// Written for the person reading it, who is holding the device that just
+/// worked and wondering what happened to the one that stopped.
+const GHOST_REASON: &str = "You connected to the server from another device";
+
 /// The first Mumble release that understands channel listeners.
 ///
-/// Wire encoding is `major << 48 | minor << 32 | patch << 16`.
-const LISTENERS_SINCE: u64 = 0x0001_0004_0000;
+/// Wire encoding is `major << 48 | minor << 32 | patch << 16`, which is what
+/// `mumble_version` holds for every peer - a client that announced only the
+/// narrower `version_v1` is widened into it as it is recorded.
+const LISTENERS_SINCE: u64 = 0x0001_0004_0000_0000;
 
 /// Warn a client too old to know it can be listened to.
 ///
@@ -2379,6 +2533,31 @@ mod tests {
     }
 
     #[test]
+    fn the_listener_gate_is_read_in_the_packing_every_version_is_stored_in() {
+        // The regression: `LISTENERS_SINCE` was packed 16 bits short, so it sat
+        // below every real version and the gate only ever fired on the raw
+        // `version_v1` numbers that were themselves too small to mean anything
+        // - which warned 1.4, a release that renders a listener perfectly well,
+        // about being overheard without knowing it.
+        const fn v(major: u64, minor: u64) -> u64 {
+            (major << 48) | (minor << 32)
+        }
+        let with_listeners = Snapshot {
+            listeners_per_channel: 1,
+            listeners_per_user: 1,
+            ..Snapshot::default()
+        };
+        assert!(
+            listener_warning(1, v(1, 4), &with_listeners).is_empty(),
+            "1.4 knows what a listener is"
+        );
+        assert!(
+            only_warning(&listener_warning(1, v(1, 3), &with_listeners)).is_some(),
+            "1.3 does not, and its user cannot see who is hearing them"
+        );
+    }
+
+    #[test]
     fn a_client_too_old_for_listeners_is_warned_only_where_listeners_exist() {
         // Upstream gates this on both ceilings being non-zero: on a server that
         // permits no listeners at all there is nothing to be overheard by, and
@@ -2429,7 +2608,8 @@ mod tests {
             Body, ClientVersion, Filter, Greet, client_version, filter,
         };
         use starling_proto_fancy::serverconfig::{
-            Greeting, GreetingEdge, GreetingNode, GreetingPort,
+            CompiledTarget, DesignPart, Greeting, GreetingDesign, GreetingEdge, GreetingNode,
+            GreetingPort, design_part,
         };
 
         /// A version in the wire's own packing.
@@ -2556,6 +2736,42 @@ mod tests {
                 ..outdated_graph()
             };
             assert!(chosen(&graph, v(1, 4, 0), false).is_none());
+        }
+
+        #[test]
+        fn a_design_is_assembled_rather_than_composed() {
+            // The whole of what a design changes on this path: the greeting
+            // that has one no longer sends its html half, it sends the parts
+            // the editor compiled for the target this peer can read - `qt`
+            // here, 1.4.0 being older than the first Mumble that is not.
+            let mut graph = outdated_graph();
+            let greet = graph.nodes.iter_mut().find(|n| n.id == "greet").unwrap();
+            let Some(Body::Greet(body)) = greet.body.as_mut() else {
+                unreachable!("the fixture's greeting")
+            };
+            body.design = Some(GreetingDesign {
+                compiled: vec![CompiledTarget {
+                    target: "qt".into(),
+                    parts: vec![DesignPart {
+                        body: Some(design_part::Body::Literal(
+                            "<b>Please update.</b><p>It is quick.</p>".into(),
+                        )),
+                        visible_if: String::new(),
+                    }],
+                }],
+                ..GreetingDesign::default()
+            });
+
+            let facts = facts(v(1, 4, 0));
+            let greet = greeting::choose(&graph, &facts).unwrap();
+            let text = greeting::assemble(&graph, greet, &facts, true);
+            assert_eq!(text, "<b>Please update.</b><p>It is quick.</p>");
+            assert_eq!(
+                server_sync(7, &Snapshot::default(), &text)
+                    .welcome_text
+                    .as_deref(),
+                Some("<b>Please update.</b><p>It is quick.</p>")
+            );
         }
 
         #[test]

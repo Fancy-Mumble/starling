@@ -833,6 +833,39 @@ impl Client {
         }
     }
 
+    /// The `UserRemove` naming `session`, or `None` if the server hung up first.
+    ///
+    /// The tolerant sibling of [`Self::next_frame`], which asserts the socket
+    /// stays open: here the close is the *other* outcome under test, so
+    /// reaching it has to be an answer rather than a panic.
+    async fn next_removal_of(&mut self, session: u32, within: Duration) -> Option<tcp::UserRemove> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut scratch = [0_u8; 8 * 1024];
+        loop {
+            while let Some(frame) =
+                codec::decode_raw(&mut self.buffer).expect("the gateway sends well-formed frames")
+            {
+                if frame.type_id != 8 {
+                    continue;
+                }
+                let removal = tcp::UserRemove::decode(frame.payload.as_ref())
+                    .expect("a well-formed UserRemove");
+                if removal.session == session {
+                    return Some(removal);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match timeout(remaining, self.stream.read(&mut scratch)).await {
+                // EOF or the TLS session ending: hung up without saying why.
+                Ok(Ok(0) | Err(_)) | Err(_) => return None,
+                Ok(Ok(read)) => self.buffer.extend_from_slice(&scratch[..read]),
+            }
+        }
+    }
+
     /// This connection's half of the voice cipher.
     ///
     /// OCB2, because this client announces no Fancy version, the same cipher
@@ -3568,6 +3601,49 @@ async fn the_same_name_twice_replaces_the_first_rather_than_joining_it() {
     assert!(
         ended.is_ok(),
         "the first session must be disconnected when the same user reconnects"
+    );
+
+    deployment.stop();
+}
+
+#[tokio::test]
+async fn the_ghost_is_told_why_its_connection_ended() {
+    // The other half of the eviction above, and the half the user actually
+    // sees. The ghost is gone from the registry before the ordinary disconnect
+    // path builds its `UserRemove`, so it was the one peer never told anything:
+    // its socket simply closed, which is what a flaky network looks like too.
+    // The client reported a lost link and, with auto-reconnect on, dialled
+    // back in - evicting the device the user had just moved to, which evicted
+    // this one, indefinitely. A `UserRemove` naming the ghost's own session is
+    // how every Mumble client is told "you were kicked, and here is why".
+    let data_dir = TempDir::new("ghost-reason");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut first = Client::connect(deployment.port).await;
+    let first_session = handshake(&mut first, "alice").await;
+
+    let mut second = Client::connect(deployment.port).await;
+    let second_session = handshake(&mut second, "alice").await;
+    assert_ne!(first_session, second_session);
+
+    let removal = timeout(
+        FRAME_TIMEOUT,
+        first.next_removal_of(first_session, FRAME_TIMEOUT),
+    )
+    .await
+    .expect("the ghost was still waiting when the test gave up");
+    let removal = removal.expect("the ghost was hung up on without being told why");
+    let reason = removal.reason.unwrap_or_default();
+    assert!(
+        reason.contains("another device"),
+        "the ghost has to be told it was replaced, not left to guess; got {reason:?}"
+    );
+
+    // And then the socket actually goes: the frame explains the disconnect, it
+    // does not replace it.
+    assert!(
+        first.closed_by_server(FRAME_TIMEOUT).await,
+        "the ghost's connection must still end after it is told why"
     );
 
     deployment.stop();
