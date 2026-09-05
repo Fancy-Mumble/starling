@@ -20,6 +20,9 @@ it calls: [`docs/SERVICES.md`](docs/SERVICES.md). Wire compatibility:
 [`docs/OPERATOR-API.md`](docs/OPERATOR-API.md). Diagrams:
 [`docs/diagrams/`](docs/diagrams/).
 
+What threatens years of uptime, and the staged plan to close it:
+[`docs/RELIABILITY.md`](docs/RELIABILITY.md).
+
 How far the port has got, measured against two different targets:
 [`docs/GAP-ANALYSIS.md`](docs/GAP-ANALYSIS.md) against upstream murmur, and
 [`docs/FANCY-PARITY.md`](docs/FANCY-PARITY.md) against the Fancy fork. A feature
