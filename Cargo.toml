@@ -384,6 +384,22 @@ iter_over_hash_type = "warn"
 redundant_clone = "warn"
 unused_async = "deny"
 
+# Release-shaped code with the checks a long run needs.
+#
+# **Deliberately not `overflow-checks` on `[profile.release]`.** With
+# `panic = "abort"` that turns every overflow, including a benign one inside a
+# dependency, into a hard production abort -- which is worse for a
+# years-of-uptime goal than a wrong number. This profile is for the nightly soak
+# and the weekly chaos run, where hours of load is what surfaces an overflow
+# that needs 2^32 frames to appear, and where an abort is a report rather than
+# an outage.
+[profile.soak]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+debug = 1
+strip = "none"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
