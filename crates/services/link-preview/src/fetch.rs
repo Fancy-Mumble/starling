@@ -273,6 +273,12 @@ impl Fetcher {
         // first, a preview service that works or panics according to the
         // deployment's start-up order is not a service.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        #[expect(
+            clippy::unreachable,
+            reason = "AUDIT: the provider is `ring`, named on the line above, which \
+                      supports both default protocol versions; the arm is unreachable \
+                      for any provider this call site can be given"
+        )]
         let tls = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_or_else(

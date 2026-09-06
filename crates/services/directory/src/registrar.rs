@@ -156,19 +156,52 @@ impl PublicList {
     }
 }
 
+/// How long any one hop of the registration may take.
+///
+/// Generous, because this runs on a timer and nothing waits on it: the point is
+/// that it finishes, not that it finishes quickly.
+const HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most of the public list's reply that is kept.
+///
+/// murmur logs whatever the list says and does not parse it, so this is only
+/// ever read by a human in a log line.
+const MAX_REPLY_BYTES: usize = 4096;
+
+/// Bound one hop, naming it if it runs out of time.
+async fn deadline<F: std::future::Future>(
+    future: F,
+    what: &'static str,
+) -> Result<F::Output, RegisterError> {
+    tokio::time::timeout(HOP_TIMEOUT, future)
+        .await
+        .map_err(|_| RegisterError::Endpoint(format!("{what} timed out")))
+}
+
 impl Registrar for PublicList {
     async fn submit(&self, body: String) -> Result<(), RegisterError> {
         let (host, path) = Self::split(&self.endpoint)?;
         let name = ServerName::try_from(host.to_owned())
             .map_err(|_| RegisterError::Endpoint(format!("{host:?} is not a server name")))?;
 
-        let stream = TcpStream::connect((host, 443)).await?;
-        let tls = TlsConnector::from(Arc::clone(&self.tls))
-            .connect(name, stream)
-            .await?;
+        // Every hop is bounded. This is the one outbound path in the tree that
+        // had no timeout anywhere: `link-preview` and `push/fcm` both get it
+        // right. A public list that accepts the connection and then stops
+        // reading held this task, its socket and its TLS state for the life of
+        // the process, and the registration runs on a timer, so one unreachable
+        // list leaked a task per interval forever.
+        let stream = deadline(TcpStream::connect((host, 443)), "connecting").await??;
+        let tls = deadline(
+            TlsConnector::from(Arc::clone(&self.tls)).connect(name, stream),
+            "the TLS handshake",
+        )
+        .await??;
 
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
+        let (mut sender, connection) = deadline(
+            hyper::client::conn::http1::handshake(TokioIo::new(tls)),
+            "the HTTP handshake",
+        )
+        .await??;
         // The connection has to be driven for the request to make progress, and
         // it ends on its own when the response is done.
         drop(tokio::spawn(async move {
@@ -188,10 +221,16 @@ impl Registrar for PublicList {
             )
             .body(Full::new(Bytes::from(body)))?;
 
-        let response = sender.send_request(request).await?;
+        let response = deadline(sender.send_request(request), "the response").await??;
         let status = response.status();
-        let body = response.into_body().collect().await?.to_bytes();
-        let body = String::from_utf8_lossy(&body).trim().to_owned();
+        // Capped as well as bounded in time: `collect()` on a third-party body
+        // reads whatever the far end sends, and the reply this expects is a
+        // line of text.
+        let body = deadline(response.into_body().collect(), "the response body").await??;
+        let body = body.to_bytes();
+        let body = String::from_utf8_lossy(body.get(..MAX_REPLY_BYTES).unwrap_or(&body))
+            .trim()
+            .to_owned();
 
         if !status.is_success() {
             return Err(RegisterError::Refused { status, body });

@@ -65,9 +65,18 @@ pub fn shrink(bytes: &[u8], edge: u32, max_pixels: u32) -> Option<Thumbnail> {
         return None;
     }
 
-    let decoded = ImageReader::with_format(Cursor::new(bytes), format)
-        .decode()
-        .ok()?;
+    // A second ceiling, inside the decoder. The dimension gate above trusts the
+    // header, and a header is written by the same stranger as the pixels: a
+    // malformed or hostile file can describe one size and decode into another.
+    // `Limits` is enforced by the decoder itself as it allocates, so it holds
+    // even when the header lied.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_pixels);
+    limits.max_image_height = Some(max_pixels);
+    limits.max_alloc = Some(u64::from(max_pixels) * 4);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?;
     // Only ever down. A 60x60 favicon blown up to the box would be a blurry
     // version of a picture that was already the right size.
     let shrunk = if width > edge || height > edge {
