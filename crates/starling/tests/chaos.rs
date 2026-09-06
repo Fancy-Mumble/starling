@@ -136,6 +136,29 @@ async fn a_restarted_session_view_still_routes_a_message() {
     );
 }
 
+/// Tell the server both clients are still there.
+///
+/// `session-lifecycle` disconnects a connection it has heard nothing from for
+/// thirty seconds, and a chat message is not heard from: `TextMessage` is
+/// routed to `text`, so the frame never reaches the service holding the
+/// deadline. A test that keeps a client past thirty seconds must therefore ping
+/// even while it is talking, which `soak/drive.rs` documents and does for the
+/// same reason.
+///
+/// This is not incidental to the sweep, it is what makes it honest. Restarting
+/// `session-lifecycle` empties the map the reaper reads, so the *unpinged*
+/// version of this test survived by being forgotten -- the clients lived
+/// because the service that would have reaped them no longer knew they existed.
+/// Pinging is what lets the sweep hold `session-lifecycle` out, keep a working
+/// reaper, and still run for a minute.
+///
+/// Exempt from the rate limiter, so it costs the relay's allowance nothing.
+async fn keepalive(clients: [&mut Client; 2]) {
+    for client in clients {
+        client.send(3, &tcp::Ping::default()).await;
+    }
+}
+
 /// [`relayed`], retried until it works or [`REPAIR`] runs out.
 ///
 /// A service that comes back empty is repaired on `session-lifecycle`'s sweep,
@@ -219,6 +242,7 @@ async fn a_restarted_session_lifecycle_can_still_repair_a_restarted_view() {
     );
 
     deployment.restart("session-view").await;
+    keepalive([&mut alice, &mut bob]).await;
     let after = relayed_within(&mut alice, alice_session, &mut bob, "after-view").await;
 
     deployment.stop().await;
@@ -304,13 +328,13 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
+        keepalive([&mut alice, &mut bob]).await;
+
         // The real assertion. A message from one client reaching the other goes
         // through the gateway, `session-view`'s roster, `permissions`, `text`
         // and the fan-out, so it covers both halves at once: that neither
         // client was hung up on, and that the server still knows how to route
         // between two it never disconnected.
-        //
-        eprintln!("PROGRESS restarted {name}");
         let needle = format!("after-{round}-{name}");
         if !relayed_within(&mut alice, alice_session, &mut bob, &needle).await {
             lost_the_relay.push(*name);
