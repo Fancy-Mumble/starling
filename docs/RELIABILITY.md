@@ -33,42 +33,49 @@ in four places:
 Every item was read in the source and confirmed. Ordered by threat to uptime.
 Update this table as each defect closes.
 
+**Status.** Stages 0 and 2b are done: defects 2, 3, 4, 7, 8, 10, 18 and 22 are
+closed with regression tests, 6 is closed for visibility, and 16 and 19 are
+partly closed. Defect 7 turned out to have a second half the register missed --
+`serve::run` discarded a panicking background task's `JoinError` before
+`Deployment::stop` ever saw it, so fixing the harness alone would not have made
+a service panic fail a test.
+
 ### P0 — will take the server down, or degrade it badly at scale
 
 | # | Defect | Evidence |
 |---|---|---|
-| 1 | **`str0m` parses unauthenticated UDP inside an abort-on-panic process.** `route_udp_packet(source, &udp_buf[..len])` hands raw datagrams from any source to a third-party WebRTC stack. A panic anywhere in its STUN/DTLS/SRTP parsing aborts the whole server. Largest unowned attack surface in the tree. | `crates/sfu/src/session/runtime.rs:95`; `str0m = "0.21"` in `crates/sfu/Cargo.toml:11` |
-| 2 | **No TLS handshake timeout.** `acceptor.accept(stream).await` is not wrapped in any `timeout`. A peer that completes TCP then trickles one byte holds a task, an fd and a rustls buffer forever. The 30 s idle reaper only sees connections registered *after* the handshake returns. No per-IP cap, no accept cap; `max_users` is checked only after TLS **and** auth. | `crates/gateway/src/listener.rs:526`; reaper `crates/services/session-lifecycle/src/lib.rs:1795`; `ServerFull` `handshake.rs:386` |
-| 3 | **Resume ring is O(N^2) per broadcast.** `stamp()` takes a process-global `Mutex` and runs a full `retain` sweep over every session — called once *per recipient* inside the fan-out loop, for legacy clients too. One broadcast to 1 000 clients is ~10^6 `Instant` subtractions under one lock. | `crates/gateway/src/resume.rs:147`, `evict_expired` `:210`, call site `crates/gateway/src/attach.rs:632` |
-| 4 | **`gateway.resume.ttl` and `.enabled` are dead config.** `ResumeStore::new()` hardcodes `DEFAULT_TTL = 600s`; the config default is 120 s and is never passed (only `with_limits`, marked "for tests", takes it). `enabled = false` sets a health warning and nothing else, so an operator cannot turn off defect 3. | `resume.rs:49`, `:118`, `:132`; `listener.rs:154`, `:285`; default `crates/runtime/src/config/gateway.rs:215` |
+| 1 | **`str0m` parses unauthenticated UDP inside an abort-on-panic process.** `route_udp_packet(source, &udp_buf[..len])` hands raw datagrams from any source to a third-party WebRTC stack. A panic anywhere in its STUN/DTLS/SRTP parsing aborts the whole server. Largest unowned attack surface in the tree. Fuzzing (Stage 1) finds these; it cannot prove their absence in code we do not own, and with `panic = "abort"` there is no `catch_unwind`. The SFU runs inside the `screenshare` unit, so per-service deployment already contains the blast radius to one pod; `--all-in-one` does not. Stage 2b records the decision. | `crates/sfu/src/session/runtime.rs:95`; `str0m = "0.21"` in `crates/sfu/Cargo.toml:11`; host `crates/services/screenshare/Cargo.toml:15` |
+| 2 | **CLOSED.** *(handshake deadline, plus a server-wide and per-address ceiling on handshakes in flight; `crates/gateway/src/admission.rs`)* **No TLS handshake timeout.** `acceptor.accept(stream).await` is not wrapped in any `timeout`. A peer that completes TCP then trickles one byte holds a task, an fd and a rustls buffer forever. The 30 s idle reaper only sees connections registered *after* the handshake returns. No per-IP cap, no accept cap; `max_users` is checked only after TLS **and** auth. | `crates/gateway/src/listener.rs:526`; reaper `crates/services/session-lifecycle/src/lib.rs:1795`; `ServerFull` `handshake.rs:386` |
+| 3 | **CLOSED.** *(the sweep is rate-limited to once per `ttl / 4`, and expiry is checked on the ring rather than left to the schedule)* **Resume ring is O(N^2) per broadcast.** `stamp()` takes a process-global `Mutex` and runs a full `retain` sweep over every session — called once *per recipient* inside the fan-out loop, for legacy clients too. One broadcast to 1 000 clients is ~10^6 `Instant` subtractions under one lock. | `crates/gateway/src/resume.rs:147`, `evict_expired` `:210`, call site `crates/gateway/src/attach.rs:632` |
+| 4 | **CLOSED.** *(`ResumeStore::from_config`; `enabled = false` now keeps nothing and stops the gateway announcing sequencing)* **`gateway.resume.ttl` and `.enabled` are dead config.** `ResumeStore::new()` hardcodes `DEFAULT_TTL = 600s`; the config default is 120 s and is never passed (only `with_limits`, marked "for tests", takes it). `enabled = false` sets a health warning and nothing else, so an operator cannot turn off defect 3. | `resume.rs:49`, `:118`, `:132`; `listener.rs:154`, `:285`; default `crates/runtime/src/config/gateway.rs:215` |
 | 5 | **Health gates are one-way, so nothing detects a wedge.** `Readiness::Warming` is written only by `gate()` at build time; nothing moves a gate backwards. A service whose background task died keeps reporting `Ready` while serving a frozen cache. The Kubernetes `livenessProbe` is `tcpSocket`, which a process with every task dead still passes. | `crates/runtime/src/health.rs:48`, `:60`; `crates/runtime/src/serve.rs:288`; `deploy/helm/starling/templates/all-in-one.yaml:103` |
-| 6 | **All-in-one awaits only the gateway.** A service task that dies at t=0 is unnoticed until shutdown, where it yields a "did not stop cleanly" warning. No restart, no alert, no exit. | `crates/starling/src/compose.rs:159` vs `:168` |
-| 7 | **`Deployment::stop()` discards panics.** It calls `handle.abort()` on every service without awaiting or inspecting the result, so all 66 whole-server tests silently swallow a service panic — it surfaces as an unrelated client timeout. | `crates/starling/src/e2e.rs:437` |
+| 6 | **CLOSED for visibility** *(every service handle is watched alongside the gateway and a service ending early is an error record naming it; supervision is still Stage 8)* **All-in-one awaits only the gateway.** A service task that dies at t=0 is unnoticed until shutdown, where it yields a "did not stop cleanly" warning. No restart, no alert, no exit. | `crates/starling/src/compose.rs:159` vs `:168` |
+| 7 | **CLOSED.** *(drains and joins, reporting panics, service errors, stalled drains and unexpected error records; plus `serve::run`, which discarded the background task's panic upstream of it)* **`Deployment::stop()` discards panics.** It calls `handle.abort()` on every service without awaiting or inspecting the result, so all 66 whole-server tests silently swallow a service panic — it surfaces as an unrelated client timeout. | `crates/starling/src/e2e.rs:437` |
 
 ### P1 — unbounded growth, or an unowned parser
 
 | # | Defect | Evidence |
 |---|---|---|
-| 8 | **`social` never cleans up on disconnect.** The one client-facing service that does not implement `ClientService::closed` (pchat, screenshare, voice and session-lifecycle all do). Its `watches` map is keyed by a **client-supplied** 64-byte string and only shrinks on an explicit `End`, so a client can mint unlimited entries that outlive it. | `crates/services/social/src/lib.rs:163`, `:365`, `:412`; the four impls at `pchat:595`, `screenshare:846`, `voice/service.rs:719`, `session-lifecycle:218` |
+| 8 | **CLOSED.** *(`ClientService::closed`, with the owning connection recorded per watch)* **`social` never cleans up on disconnect.** The one client-facing service that does not implement `ClientService::closed` (pchat, screenshare, voice and session-lifecycle all do). Its `watches` map is keyed by a **client-supplied** 64-byte string and only shrinks on an explicit `End`, so a client can mint unlimited entries that outlive it. | `crates/services/social/src/lib.rs:163`, `:365`, `:412`; the four impls at `pchat:595`, `screenshare:846`, `voice/service.rs:719`, `session-lifecycle:218` |
 | 9 | **SFU viewers are never individually removed.** `outbound: BTreeMap<u32, Rtc>` is inserted on every viewer offer; the only removal is the whole session. Departed viewers' DTLS/SRTP state stays resident, is fed `Input::Timeout` each tick, and is linearly scanned per inbound packet. Its two `unbounded_channel`s are the only unbounded ones on a client-driven path, and the runtime `std::thread` is never joined. | `crates/sfu/src/session/broadcast.rs:31`, `:78`, `:129`, `:159`; sole removal `runtime.rs:226`; `mod.rs:143-144` |
-| 10 | **Expired bans are never deleted, and the whole table is scanned on every accept.** Expiry is a read-time filter; the only `DELETE FROM ban` is an explicit unban. `check_ban` `SELECT`s the entire history into a `Vec` per connection attempt — free amplification for whoever is being banned. | `crates/services/moderation/src/lib.rs:122`, `:144`, `:217`; delete `:321` |
+| 10 | **CLOSED.** *(expiry filtered in SQL, and a five-minute sweep deletes)* **Expired bans are never deleted, and the whole table is scanned on every accept.** Expiry is a read-time filter; the only `DELETE FROM ban` is an explicit unban. `check_ban` `SELECT`s the entire history into a `Vec` per connection attempt — free amplification for whoever is being banned. | `crates/services/moderation/src/lib.rs:122`, `:144`, `:217`; delete `:321` |
 | 11 | **Every TLS accept parses an arbitrary DER chain.** `AcceptAnyClientCertificate` is wired by design, so `PeerCertificate::from_chain` runs on unauthenticated input on every connection. | `crates/gateway/src/listener.rs:485`; `crates/crypto/src/peer_cert.rs:83`, `:124` |
 | 12 | **link-preview decodes remote images with the `image` crate** — jpeg/png/gif/webp decoders on bytes from a URL a *user* chose. Third-party, remotely triggerable. | `crates/services/link-preview/src/thumbnail.rs`; `image.workspace = true` |
 | 13 | **Outbound directory registration has no timeout at any hop and no response cap.** TCP connect, TLS connect, request and `collect()` of a third-party body are all unbounded. `link-preview` and `push/fcm` both get this right; this is the one path that does not. | `crates/services/directory/src/registrar.rs:165-193` |
-| 14 | **Blocking file I/O on the reactor, append-only forever.** `AuditLog::record` is a sync fn doing `std::fs` writes under a `std::sync::Mutex`, called from async handlers. No rotation, unlike the runtime log sink which rotates. | `crates/operator-api/src/audit.rs:52`; callers `routes.rs:186`, `webtransport.rs:175` |
+| 14 | **OPEN.** **Blocking file I/O on the reactor, append-only forever.** `AuditLog::record` is a sync fn doing `std::fs` writes under a `std::sync::Mutex`, called from async handlers. No rotation, unlike the runtime log sink which rotates. | `crates/operator-api/src/audit.rs:52`; callers `routes.rs:186`, `webtransport.rs:175` |
 | 15 | **WASM plugins have no resource ceiling.** No `consume_fuel`, no `epoch_interruption`, no `StoreLimits`, no call timeout, no memory cap. Hooks are synchronous by contract, so a guest that loops forever wedges the calling thread permanently. | `crates/plugin-host/host/src/wasm.rs:81`, store `:435` |
 
 ### P2 — latent, or a hazard rather than a live bug
 
 | # | Defect | Evidence |
 |---|---|---|
-| 16 | **SQLite runs with no WAL, no `busy_timeout`, no `VACUUM`.** The only pragma set anywhere is `foreign_keys = ON`. Rollback-journal with `busy_timeout = 0` means a concurrent write fails *immediately* with `SQLITE_BUSY` across a pool of 8. The audit and pchat sweeps delete rows into a freelist that is never reclaimed. | `crates/runtime/src/storage/backend.rs:83-95`, `dialect/sqlite.rs:55`; zero hits for `journal_mode`/`busy_timeout`/`VACUUM` in the tree |
+| 16 | **CLOSED for WAL and `busy_timeout`** *(both in the `after_connect` hook, on every pooled connection; reclaiming the freelist is still open)* **SQLite runs with no WAL, no `busy_timeout`, no `VACUUM`.** The only pragma set anywhere is `foreign_keys = ON`. Rollback-journal with `busy_timeout = 0` means a concurrent write fails *immediately* with `SQLITE_BUSY` across a pool of 8. The audit and pchat sweeps delete rows into a freelist that is never reclaimed. | `crates/runtime/src/storage/backend.rs:83-95`, `dialect/sqlite.rs:55`; zero hits for `journal_mode`/`busy_timeout`/`VACUUM` in the tree |
 | 17 | **Postgres and MySQL ship completely untested.** Three dialect implementations exist; CI exercises one. This is a "the server does not start for an operator" bug waiting to happen. | `crates/runtime/src/storage/dialect/{sqlite,postgres,mysql}.rs`; `.github/workflows/ci.yml` |
-| 18 | **Session-id pool is eagerly allocated from unvalidated config.** `(1..max_users.saturating_mul(2)).collect()` at boot; a fat-fingered `max_users` is a multi-GB allocation. `release()` also pushes with no membership check, so a double-release would hand out a duplicate id. | `crates/services/session-lifecycle/src/session/pool.rs:26`, `:37` |
-| 19 | **The lint set does not match the documented one.** `docs/DESIGN.md:108` claims "`unwrap`/`expect`/indexing that can fail are denied by lint". `expect_used` is `warn` and **indexing is not linted at all**. Also absent: `clippy::panic`, `clippy::unreachable`, `integer_division`, `modulo_arithmetic`, `arithmetic_side_effects`, `cast_possible_truncation`. | `Cargo.toml:294`, `:300`, `:356-361`; `.clippy.toml` |
+| 18 | **CLOSED.** *(ids are handed out on demand, and `release` refuses an id nobody holds)* **Session-id pool is eagerly allocated from unvalidated config.** `(1..max_users.saturating_mul(2)).collect()` at boot; a fat-fingered `max_users` is a multi-GB allocation. `release()` also pushes with no membership check, so a double-release would hand out a duplicate id. | `crates/services/session-lifecycle/src/session/pool.rs:26`, `:37` |
+| 19 | **PARTLY CLOSED** *(`DESIGN.md` and `.clippy.toml` now describe the lints that exist; landing the missing ones is Stage 3)* **The lint set does not match the documented one.** `docs/DESIGN.md:108` claims "`unwrap`/`expect`/indexing that can fail are denied by lint". `expect_used` is `warn` and **indexing is not linted at all**. Also absent: `clippy::panic`, `clippy::unreachable`, `integer_division`, `modulo_arithmetic`, `arithmetic_side_effects`, `cast_possible_truncation`. | `Cargo.toml:294`, `:300`, `:356-361`; `.clippy.toml` |
 | 20 | **Six `plugin-host` crates do not inherit the workspace lints**, each hand-copying a subset; `api-wasm` has the thinnest table. `host` sets `unsafe_code = "allow"` — it is the crate that `dlopen`s third-party `.so`. A lint added to the workspace table silently misses all six. | `crates/plugin-host/{api,api-derive,host,api-wasm}/Cargo.toml` plus the two plugin crates |
 | 21 | **No process limits in packaging.** `packaging/starling.service` sets no `LimitNOFILE`, `MemoryMax` or watchdog. Helm ships `resources: {}`. The compose healthcheck **latches on first success**, so it stops tracking liveness after start. | `packaging/starling.service`; `deploy/helm/starling/values.yaml:189`; `docker-compose.yml` |
-| 22 | **Accept loop hot-spins on `EMFILE`** — logged and `continue`d with no backoff. **Per-connection read buffer never shrinks**: one 8 MiB frame keeps 8 MiB resident for that connection's life. | `crates/gateway/src/listener.rs:322-330`, `:586`, `:615` |
+| 22 | **CLOSED.** *(backoff on `EMFILE`/`ENFILE`, and the read buffer is returned to 8 KiB once drained)* **Accept loop hot-spins on `EMFILE`** — logged and `continue`d with no backoff. **Per-connection read buffer never shrinks**: one 8 MiB frame keeps 8 MiB resident for that connection's life. | `crates/gateway/src/listener.rs:322-330`, `:586`, `:615` |
 
 ### What the audit found to be clean
 
@@ -103,11 +110,14 @@ through it.
   is empty. Also scan `records()` for `Severity::Error` outside a per-test
   allow-list. Add a `Drop` impl flagging a `Deployment` dropped without `stop()`,
   guarded by `std::thread::panicking()` so it never masks the real failure.
-* **Make a dead service observable in `compose.rs`** (defect 6): `select!` over
-  the gateway *and* every service handle. Stage 8 decides what to *do* about it;
-  Stage 0 only needs it visible.
-* **Correct `docs/DESIGN.md:108`** (defect 19), which claims a lint that does not
-  exist.
+* **Make a dead service observable in `compose.rs`** (defect 6): poll the
+  service handles in a `JoinSet` alongside the gateway and write a
+  `Severity::Error` record naming the service the moment one finishes. Not a
+  `select!`: that returns on the *first* completion, which would turn a finished
+  service into a process exit, and whether to exit is Stage 8's decision. Stage 0
+  only needs it visible.
+* **Correct `docs/DESIGN.md:108` and the `.clippy.toml` header comment**
+  (defect 19); both claim `panic!()` is denied by a lint that does not exist.
 
 **Done when:** inserting `panic!()` into one service's `run()` fails a named e2e
 test with that panic's message.
@@ -207,6 +217,55 @@ assertions rather than timings.
 
 Several of these will fail on first write. That is the point.
 
+### Stage 2b — close the register (~5 days)
+
+Stage 2 writes tests that fail. This is where they start passing. One PR per
+defect, each landing with its Stage 2 test. Not repeated here: defects 6 and 7
+close in Stage 0, defects 19 and 20 in Stage 3, defect 17 in Stage 7's dialect
+matrix, and defects 5 and 21 in Stage 8. Defect 11 stays open by design —
+accepting any client certificate is the Mumble model, so its answer is the
+`peer_cert` fuzz target, not a code change.
+
+* **Defect 1** — a decision, not a patch. In per-service deployment a `str0m`
+  panic already loses only `screenshare`. Under `--all-in-one` the only real
+  defence is running `screenshare` as a child process over the existing local
+  transport, which needs the Stage 8 supervisor to restart it. Record it now as
+  a known limitation beside the native-plugin `abort()` case, and schedule the
+  child-process split after Stage 8 rather than pretending fuzzing closes it.
+* **Defect 2** — `timeout(handshake, acceptor.accept(stream))`, a `Semaphore`
+  cap on connections mid-handshake, and a per-IP counter in the accept loop,
+  all under `gateway.limits` with `check-config` validation.
+* **Defect 3** — sweep at most once per `ttl / 4` from a `last_sweep: Instant`
+  held beside the map, so a stamp is a lookup again.
+* **Defect 4** — `ResumeStore::new(&config.gateway.resume)` takes the TTL;
+  `enabled = false` builds a store that neither allocates a ring nor stamps.
+* **Defect 8** — implement `ClientService::closed` in `social`, recording the
+  owning connection on each watch so a disconnect removes everything it minted.
+* **Defect 9** — an `SfuCommand::RemoveViewer` when a viewer leaves, removing
+  its `Rtc` from `outbound`; bound the two channels; join the runtime thread on
+  drop.
+* **Defect 10** — delete expired rows in the existing sweep cadence, and make
+  `check_ban` filter in SQL on the address and certificate hash instead of
+  loading the table.
+* **Defect 12** — cap the fetched byte count before decoding and set
+  `image::Limits` (dimensions and allocation) on the reader.
+* **Defect 13** — `timeout` on connect, TLS, request and body, and a body cap,
+  copied from what `link-preview` already does.
+* **Defect 14** — a dedicated writer task behind a bounded channel, with
+  size-based rotation like the runtime log sink.
+* **Defect 15** — `consume_fuel` plus `epoch_interruption` with a per-call
+  deadline, and `StoreLimits` for memory.
+* **Defect 16** — `journal_mode = WAL` and `busy_timeout` in the `after_connect`
+  hook next to `foreign_keys`, and a periodic `wal_checkpoint(TRUNCATE)` in the
+  sweeps that delete.
+* **Defect 18** — a ceiling on `max_users` in `check-config`; a lazy allocator
+  (a `next` counter plus a free list) with a membership check in `release`.
+* **Defect 22** — sleep-then-retry on `EMFILE`; shrink the read buffer back to
+  8 KiB once it is empty after a large frame.
+
+**Done when:** every Stage 2 test passes and the external e2e suite is still
+green against a release build.
+
 ### Stage 3 — static proof the remaining panic set is empty (~4 days)
 
 Cheaper than it looks: `.clippy.toml` already sets `allow-unwrap-in-tests`,
@@ -216,8 +275,9 @@ only production code is in scope. Land each lint as its own PR.
 1. **`clippy::panic` and `clippy::unreachable` = deny.** Fallout: exactly the
    five audited crypto sites. Half a day. This is what makes the audit *stick* —
    every future explicit panic must be argued for at the site.
-2. **`clippy::expect_used` warn -> deny.** Fallout: **one** site
-   (`plugin-host/api/src/info_macros.rs`). One hour.
+2. **`clippy::expect_used` warn -> deny.** Fallout: none. The only `.expect(`
+   outside tests is inside a `//!` doc comment in
+   `plugin-host/api/src/info_macros.rs`. One hour.
 3. **`clippy::indexing_slicing` = deny**, with `allow-indexing-slicing-in-tests`
    in `.clippy.toml` so the count drops to the ~40 real production sites. Two to
    three days. Expect two or three genuine out-of-range possibilities in the
@@ -320,21 +380,22 @@ trust); `crates/runtime/src/inflight.rs` (the RAII counter, same class); and
 `crates/gateway/src/limits.rs` `Limits` (per-field `swap` against concurrent
 `load`, where a torn combination disconnects a client). Do **not** loom the
 `Mutex<BTreeMap>` registries — that just verifies `std`. Do **not** reach for
-shuttle, turmoil or madsim: retrofitting a deterministic runtime across 24
-services with real sockets, sqlx pools and a `std::thread` SFU runtime is a
+shuttle, turmoil or madsim: retrofitting a deterministic runtime across 23
+units with real sockets, sqlx pools and a `std::thread` SFU runtime is a
 multi-month project with a worse payoff than Stage 7.
 
 ### Stage 5 — expose the state the soak needs (~3 days; prerequisite for Stage 6)
 
 You cannot assert on state you cannot read, and the plumbing is 80 % built.
-**Do not build 24 per-service `/metrics` listeners.**
+**Do not build 23 per-unit `/metrics` listeners.**
 
 `crates/runtime/src/serve.rs:246` constructs a fresh `Metrics` and `Pressure`
-*per service*, so under all-in-one there are 24 unshared registries and
+*per service*, so under all-in-one there are 23 unshared registries (the 22
+services plus the gateway, per `units.rs`) and
 `Metrics::render()` is genuinely dead code. But `Pressure` is already exported:
 `health_rpc` wires a `HealthReporter` into every service's routes
 (`serve.rs:317`), `ServiceHealth` already carries `repeated Load`, the `health`
-service polls all 24 every 5 s keeping 720 samples, and operator-api serves the
+service polls all 23 every 5 s keeping 720 samples, and operator-api serves the
 aggregate at `/v1/health`. Collector, transport, aggregation and HTTP surface all
 exist. What is missing is one field.
 
@@ -347,7 +408,7 @@ exist. What is missing is one field.
    Fill it in `HealthReporter::snapshot()` and pass `&ctx.metrics` at
    `serve.rs:317`: **one call site for the whole tree.**
 2. **`/metrics` on operator-api**, rendered from the collector's `Overview`
-   rather than the local registry, so one scrape covers all 24 services in both
+   rather than the local registry, so one scrape covers all 23 units in both
    topologies. **Critical:** `Pressure::sample()` *clears the peak* and permits
    exactly one reader, which is the `health` collector. `/metrics` must read the
    collector's last snapshot and never call `sample()` itself, or a Prometheus
@@ -368,17 +429,22 @@ exist. What is missing is one field.
    a diff rather than an oversight.
 
 **Done when:** `curl /metrics` on an all-in-one lists every counter and gauge
-from all 24 services, the canon-gauges test passes, and `Deployment` gains an
+from all 23 units, the canon-gauges test passes, and `Deployment` gains an
 `async fn overview()` helper going through the existing `self.resolver`.
 
-### Stage 6 — the soak and longevity harness (~7 days; the centrepiece)
+### Stage 6 — the soak and longevity harness (~8 days; the centrepiece)
 
 **Extract the harness first.** `Deployment`, `Client`, `TempDir`, the handshake
 helpers and `TrustAnyCertificate` are all private inside `#[cfg(test)] mod e2e`
 in a *binary* crate (`crates/starling/src/main.rs:31`), so nothing else can use
 them and a second copy would drift. Move them to a new `crates/harness`; `e2e.rs`
-becomes an importer and sheds roughly 1 200 lines. One day, its own PR, a **pure
-move** so the 66 tests are the proof. `ONE_AT_A_TIME` stays for e2e; the soak
+becomes an importer and sheds roughly 1 200 lines. Not a pure move:
+`Deployment` calls `crate::units::spawn`, `crate::units::names` and
+`crate::compose::enabled` (`e2e.rs:173-197`), which are `pub(crate)` in the
+binary, and `TestPeer` is a private `mod testing` in `voice`. Either `starling`
+grows a `lib.rs` exposing `units` and `compose`, or those two move with the
+harness. About two days, its own PR, no behaviour change so the 66 tests are the
+proof. `ONE_AT_A_TIME` stays for e2e; the soak
 gets its own target so it never contends.
 
 **Two harnesses, not one.** In-process (`crates/starling/tests/soak.rs`,
@@ -453,7 +519,8 @@ startup** so a failure reproduces, emit `soak-report.json` every run, and add
 ### Stage 7 — fault and chaos injection (~5 days)
 
 **In-process** — 20x cheaper to run and debug, folded into the soak and run
-nightly. `Deployment::restart(name)` looping over all 22 service names, one per
+nightly. `Deployment::restart(name)` looping over all 22 service names from
+`units.rs` (every unit but the gateway, which owns the client sockets), one per
 minute under churn: clients stay connected, gates go `Warming -> Ready`, no
 unexpected disconnects. **This is the test that forces defect 6's fix, because
 you cannot restart a service the runtime does not supervise.** Plus a background
@@ -480,7 +547,7 @@ by truncating a `.db` and flipping WAL bytes;
 `docker compose kill -s SIGKILL voice` under load; a `tc netem` or `iptables`
 partition between gateway and one service, asserting `crates/runtime/src/breaker.rs`
 opens; `libfaketime` for a system-wide clock step; `mem_limit: 256m` on one
-service, asserting the other 23 keep serving; and **the three-dialect matrix**
+service, asserting the rest keep serving; and **the three-dialect matrix**
 (defect 17), running the existing test suite against Postgres and MySQL. That
 last one is cheap and covers three shipping code paths CI has never executed;
 **promote it to nightly.**
@@ -496,7 +563,7 @@ No test suite proves years; the server must notice its own wedge.
   on each accept-loop `select!` wakeup **including the timer arm**, so an idle
   server does not false-positive. Expose `/livez` (heartbeats) distinct from
   `/readyz` (warm-up gates), on operator-api *and* on a minimal always-on probe
-  port for the 24-pod topology where operator-api is not deployed. Switch the
+  port for the per-service topology where operator-api is not deployed. Switch the
   Helm `livenessProbe` from `tcpSocket` to `httpGet /livez` and `readinessProbe`
   to `/readyz`, and add a `startupProbe` so slow cold starts are not killed.
 * **Supervise rather than log** (defect 6). In `serve.rs:288`, a background task
@@ -547,7 +614,7 @@ beats catching it six weeks later.
 accumulating cached corpus); `soak-short` (45 min, `--profile soak`);
 `chaos-inproc`; `loom` on the three modules; `dialects` (Postgres and MySQL);
 `sanitizers` (ASan then TSan on `runtime`, `gateway`, `sfu` and `voice` only —
-TSan across 24 services and sqlx is noise); and `proptest-deep`.
+TSan across 23 units and sqlx is noise); and `proptest-deep`.
 
 **Weekly:** `soak-long` (6 h, 200 clients, needing a self-hosted runner or a
 scheduled VM); `fuzz-deep` (`-fork=4` plus MSan on three targets);
@@ -574,17 +641,21 @@ has a stable reference rather than drifting against yesterday. This mirrors the
 | 0 Teardown and supervisor visibility | ~1 d | **Immediately** — 66 tests stop swallowing panics |
 | 1 Fuzz Tier 1 | ~3 d | **Days** — str0m and the hand-rolled varint are the likely two |
 | 2 Regression tests for the register | ~2 d | Confirms known bugs; several fail on first write |
+| 2b Close the register | ~5 d | Nothing new — turns Stage 2 from red to green |
 | 1 Fuzz Tier 2 and 3, `arbitrary`, allocation cap | ~2 d | Days |
 | 3 Lints, in order | ~4 d | Weeks — the ~40 indexing sites hold two or three real ones |
 | 4 proptest and loom | ~4 d | ACL evaluation is the likeliest |
 | 5 Counters, `/metrics`, per-map gauges | ~3 d | Nothing directly; unblocks Stage 6 |
-| 6 Soak harness | ~7 d | Weeks — but the only thing that finds a *leak* |
+| 6 Soak harness | ~8 d | Weeks — but the only thing that finds a *leak* |
 | 7 Chaos | ~5 d | The restart-under-load loop finds defect 6's consequences fast |
 | 8 Production detection | ~4 d | Nothing in test; it is the year-three insurance |
 | 9 CI wiring | ~1 d | — |
 
-About 36 engineer-days total. **Stages 0 to 2 are roughly 6 days and deliver most
-of the crash-finding**; the rest is the machinery that keeps it true.
+About 42 engineer-days total. **Stages 0 to 2b are roughly 11 days and deliver
+most of the crash-finding and every fix in the register**; the rest is the
+machinery that keeps it true. Stages 5 to 7 wait for 2b: the soak's headline
+assertions (quiesce, per-map gauges) are written to fail on today's code, and
+fifteen days of red proving what the register already says is not a finding.
 
 ## Verification
 
@@ -593,7 +664,7 @@ of the crash-finding**; the rest is the machinery that keeps it true.
 * **Stage 1:** `cargo fuzz run <t> -- -runs=0` green for every target from the
   committed corpus, and 30 min of search clean per target.
 * **Stage 2:** the slowloris and DB-locked tests **fail on today's `main`** and
-  pass after the Stage 3 and 8 fixes. That is the proof they test something.
+  pass after Stage 2b. That is the proof they test something.
 * **Stage 3:** `cargo clippy --workspace --all-targets -- -D warnings` green;
   `scripts/check-panic-audit.sh` and the layering check pass.
 * **Stage 4:** proptests run in the per-PR job under 60 s; `--cfg loom` green on
@@ -611,7 +682,10 @@ of the crash-finding**; the rest is the machinery that keeps it true.
 * **Stages 5 and 6 are coupled**: the soak assertions need the gauges and
   `/metrics` from Stage 5. Do the gauge work once.
 * **The native-plugin `abort()` case is not solvable in-process** and should be
-  documented as a known limitation rather than papered over.
+  documented as a known limitation rather than papered over. **A `str0m` panic
+  under `--all-in-one` is the same class**: per-service deployment contains it to
+  `screenshare`; all-in-one does not until that unit runs as a child process
+  (Stage 2b, after the Stage 8 supervisor exists).
 * **Disk.** The `soak`, ASan, TSan and fuzz builds are each a separate target
   directory. Budget around 40 GB on a self-hosted runner, and add a weekly
   `cargo clean` of the sanitizer trees.
