@@ -305,11 +305,18 @@ impl ClientHandle {
     /// keeps [`Self::send`]'s budget a measure of what is *queued* rather than
     /// of everything ever sent.
     pub fn control_sent(&self, len: usize) {
-        let _ = self
-            .queued_control
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
-                Some(queued.saturating_sub(len))
-            });
+        // The loop `fetch_update` would run, written out. See the same note in
+        // `starling_runtime::pressure`: nightly is deprecating that name, and
+        // the fuzz build treats its warnings as errors.
+        let mut queued = self.queued_control.load(Ordering::Relaxed);
+        while let Err(actual) = self.queued_control.compare_exchange_weak(
+            queued,
+            queued.saturating_sub(len),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            queued = actual;
+        }
     }
 
     /// Bytes waiting in this client's control queue, for tests and metrics.

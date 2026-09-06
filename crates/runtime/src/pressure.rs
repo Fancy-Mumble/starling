@@ -112,12 +112,19 @@ impl Gauge {
     /// that should read as an empty queue, not as one holding 18 quintillion
     /// items, a wrapped gauge discredits every other number beside it.
     pub fn release(&self, n: u64) {
-        let _ = self
-            .0
-            .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                Some(used.saturating_sub(n))
-            });
+        // The loop `fetch_update` would run, written out. Nightly has begun
+        // deprecating that name in favour of `try_update`, and the fuzz build
+        // compiles with `-D warnings` on nightly, so a call that is perfectly
+        // well on stable is a hard error there.
+        let mut used = self.0.used.load(Ordering::Relaxed);
+        while let Err(actual) = self.0.used.compare_exchange_weak(
+            used,
+            used.saturating_sub(n),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            used = actual;
+        }
     }
 
     /// Record a reading of something whose current value lives elsewhere.
