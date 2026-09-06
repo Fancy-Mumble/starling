@@ -11,7 +11,7 @@ use std::sync::Arc;
 use starling_runtime::config::Config;
 use starling_runtime::inproc::Broker;
 use starling_runtime::live::ConfigCell;
-use starling_runtime::log::{Category, LogEvent, LogHandles, LogRuntime, Logger};
+use starling_runtime::log::{Category, LogEvent, LogHandles, LogRuntime, Logger, Severity};
 use starling_runtime::serve::{ServiceError, context};
 use starling_runtime::shutdown::Shutdown;
 use starling_runtime::telemetry;
@@ -29,6 +29,9 @@ pub(crate) fn one(name: &str, arguments: &[String]) -> Result<(), ServiceError> 
             .with("version", env!("CARGO_PKG_VERSION")),
     );
     let logger = log.logger().clone();
+    // Before anything can panic. In a release build a panic aborts, so this is
+    // the only chance to write down why.
+    install_panic_hook(logger.clone());
     let handles = log.handles();
     let source = source_path(arguments);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -38,6 +41,7 @@ pub(crate) fn one(name: &str, arguments: &[String]) -> Result<(), ServiceError> 
         shutdown.install_signal_handler();
         let config = Arc::new(config);
         let cell = cell_for(&config, source, &logger, handles);
+
         let ctx = context(name, config, Broker::new(), shutdown, logger).following(cell);
         let Some(handle) = units::spawn(name, ctx) else {
             return Err(ServiceError::service(format!("no service named {name:?}")));
@@ -80,6 +84,10 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
             .with("data_dir", config.runtime.data_dir.display().to_string()),
     );
     let logger = log.logger().clone();
+    // Before anything can panic. In a release build a panic aborts, taking the
+    // whole all-in-one process with it, so this is the only chance to write
+    // down which task it was and where.
+    install_panic_hook(logger.clone());
     let handles = log.handles();
     // After the first-start write above, so a fresh deployment reloads the file
     // it just created rather than reporting that it has none.
@@ -95,6 +103,12 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
         // file and one consistent view of it across all twenty-two units. A
         // cell each would mean twenty-two reads racing an operator's editor.
         let cell = cell_for(&config, source, &logger, handles);
+
+        // One for the whole process, because every service below shares it and
+        // a restart is a process-wide event: a dead sweep in `voice` is this
+        // process's problem however healthy `pchat` is.
+        // See `ServiceContext::sharing_health`.
+        let health = starling_runtime::health::Health::new();
 
         // Before the services rather than during them. `userdata` creates the
         // administrator on its way up and announces the password there, which
@@ -123,7 +137,8 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
                 shutdown.clone(),
                 logger.clone(),
             )
-            .following(cell.clone());
+            .following(cell.clone())
+            .sharing_health(health.clone());
             if let Some(handle) = units::spawn(name, ctx) {
                 handles.push((*name, handle));
             }
@@ -146,33 +161,43 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
             shutdown.clone(),
             logger.clone(),
         )
-        .following(cell.clone());
+        .following(cell.clone())
+        .sharing_health(health.clone());
         let Some(gateway) = units::spawn("gateway", gateway_ctx) else {
             return Err(ServiceError::service("the gateway could not be started"));
         };
 
-        tracing::info!(services = handles.len(), "all-in-one");
+        // Watched while the gateway runs, not only after it stops. A service
+        // task that ended at t=0 used to be noticed at shutdown, as a "did not
+        // stop cleanly" warning however many hours later, with everything that
+        // depended on it failing in between and nothing saying why.
+        //
+        // Watched, deliberately, rather than supervised: nothing here restarts
+        // a service or brings the process down. Which of those is right is a
+        // per-service decision and this is not where it is made. What this does
+        // is stop the event being invisible.
+        let mut watch = ServiceWatch::new();
+        for (name, handle) in handles {
+            let _ = watch.spawn(async move { (name, handle.await) });
+        }
+
+        tracing::info!(services = watch.len(), "all-in-one");
         logger.log(
-            LogEvent::info(Category::Server, "all services started")
-                .with("services", handles.len()),
+            LogEvent::info(Category::Server, "all services started").with("services", watch.len()),
         );
-        let result = match gateway.await {
-            Ok(result) => result,
-            Err(error) => Err(ServiceError::service(format!("gateway stopped: {error}"))),
-        };
+
+        let watchdog = start_watchdog(&health, &shutdown);
+        let result = run_until_gateway_stops(gateway, &mut watch, &logger).await;
+        if let Some(watchdog) = watchdog {
+            watchdog.abort();
+        }
 
         // Draining the gateway drains everything: a service outliving the
         // socket that feeds it is a process that will not exit.
         logger.log(LogEvent::info(Category::Server, "draining"));
         shutdown.drain();
-        for (name, handle) in handles {
-            if let Err(error) = handle.await {
-                logger.log(
-                    LogEvent::warning(Category::Server, "service did not stop cleanly")
-                        .with("service", name)
-                        .with("error", error.to_string()),
-                );
-            }
+        while let Some(Ok((name, outcome))) = watch.join_next().await {
+            note_service_end(&logger, true, name, outcome);
         }
         result
     });
@@ -183,8 +208,145 @@ pub(crate) fn all_in_one(arguments: &[String]) -> Result<(), ServiceError> {
     result
 }
 
+/// Write a record for a panic before the process aborts on it.
+///
+/// Release builds set `panic = "abort"`, so a panic ends the process without
+/// unwinding: `log.finish()` never runs and the operator log's tail -- the part
+/// describing what led to the crash -- is lost in whatever buffer held it. The
+/// hook writes the panic itself and flushes, so the last line in the file is
+/// the reason there are no more.
+///
+/// Installed once, from the process entry point rather than per service: there
+/// is one process and one hook.
+pub(crate) fn install_panic_hook(logger: Logger) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map_or_else(String::new, |at| format!("{}:{}", at.file(), at.line()));
+        logger.log(
+            LogEvent::new(Severity::Critical, Category::Server, "panic")
+                .with("message", info.to_string())
+                .with("location", location)
+                .with(
+                    "thread",
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_owned(),
+                ),
+        );
+        // Waited on, not merely requested: `request_flush` returns before the
+        // write lands, and the next instruction after this hook is the abort.
+        // Bounded, so a writer already wedged on a full disk turns a panic into
+        // a lost record rather than a hang.
+        let _ = logger.flush_blocking(std::time::Duration::from_secs(2));
+        // The default hook still runs, so the backtrace reaches stderr the way
+        // a developer expects.
+        previous(info);
+    }));
+}
+
+/// Tell systemd the server is up, and keep telling it while it works.
+///
+/// Called once every service has started and the gateway is accepting. Before
+/// this, the unit was `Type=exec`, so systemd considered it started as soon as
+/// the process existed and `systemctl start` returned while nothing could yet
+/// answer a login.
+///
+/// The returned handle pings for as long as the process is live. `None` when
+/// there is no systemd to tell, which is every deployment that is not a
+/// `Type=notify` unit.
+fn start_watchdog(
+    health: &starling_runtime::health::Health,
+    shutdown: &Shutdown,
+) -> Option<tokio::task::JoinHandle<()>> {
+    starling_runtime::notify::ready();
+    let interval = starling_runtime::notify::interval_from_env()?;
+    Some(tokio::spawn(starling_runtime::notify::watchdog(
+        health.clone(),
+        shutdown.clone(),
+        interval,
+    )))
+}
+
+/// Serve until the gateway stops, reporting any service that stops first.
+///
+/// The gateway is the one whose result is the process's, so it is what the
+/// wait is *for*; the services are watched alongside it only so that one dying
+/// early is a record at the time rather than a puzzle at shutdown.
+async fn run_until_gateway_stops(
+    gateway: tokio::task::JoinHandle<Result<(), ServiceError>>,
+    watch: &mut ServiceWatch,
+    logger: &Logger,
+) -> Result<(), ServiceError> {
+    let mut gateway = gateway;
+    loop {
+        tokio::select! {
+            // Biased so that when the gateway and a service end together,
+            // which is what a drain looks like, the gateway's own result is
+            // reported rather than whichever of the two the runtime polled
+            // first.
+            biased;
+            joined = &mut gateway => {
+                return match joined {
+                    Ok(result) => result,
+                    Err(error) => Err(ServiceError::service(format!("gateway stopped: {error}"))),
+                };
+            }
+            Some(Ok((name, outcome))) = watch.join_next() => {
+                note_service_end(logger, false, name, outcome);
+            }
+        }
+    }
+}
+
+/// Every service task, named, so one ending can be reported as itself.
+type ServiceWatch = tokio::task::JoinSet<(
+    &'static str,
+    Result<Result<(), ServiceError>, tokio::task::JoinError>,
+)>;
+
+/// Record how one service task ended, and whether that was asked for.
+///
+/// Before the drain, a service returning *at all* is the event: nothing asked
+/// it to stop, and everything depending on it is about to start failing. After
+/// the drain, returning is exactly what was asked for and only a failure is
+/// worth a record.
+fn note_service_end(
+    logger: &Logger,
+    draining: bool,
+    name: &str,
+    outcome: Result<Result<(), ServiceError>, tokio::task::JoinError>,
+) {
+    let (severity, message, detail) = match outcome {
+        Ok(Ok(())) if draining => return,
+        Ok(Ok(())) => (
+            Severity::Error,
+            "service stopped early",
+            "it returned before anything asked it to drain".to_owned(),
+        ),
+        Ok(Err(error)) => (Severity::Error, "service failed", error.to_string()),
+        // `JoinError` renders the panic payload, so the record carries the
+        // message the panic itself was written with.
+        Err(error) if error.is_panic() => {
+            (Severity::Critical, "service panicked", error.to_string())
+        }
+        Err(error) => (
+            Severity::Warning,
+            "service did not stop cleanly",
+            error.to_string(),
+        ),
+    };
+    logger.log(
+        LogEvent::new(severity, Category::Server, message)
+            .with("service", name.to_owned())
+            .with("error", detail),
+    );
+}
+
 /// Whether a service should run in this process.
-pub(crate) fn enabled(config: &Config, name: &str) -> bool {
+pub fn enabled(config: &Config, name: &str) -> bool {
     config
         .services
         .get(name)

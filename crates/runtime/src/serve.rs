@@ -21,7 +21,7 @@ use crate::health::Health;
 use crate::inproc::Broker;
 use crate::listen::{ListenError, serve_routes};
 use crate::live::ConfigCell;
-use crate::log::{Category, LogEvent, Logger};
+use crate::log::{Category, LogEvent, Logger, Severity};
 use crate::metrics::Metrics;
 use crate::pressure::Pressure;
 use crate::shutdown::Shutdown;
@@ -98,6 +98,19 @@ impl ServiceContext {
         // every reader of the channel tree asks it for them.
         self.resolver = self.resolver.clone().following(cell.clone());
         self.live = cell;
+        self
+    }
+
+    /// Share one process-wide [`Health`] rather than this context's own.
+    ///
+    /// Under `--all-in-one` every service is in one process, so "should this be
+    /// restarted" has one answer for all of them: a dead sweep in `voice` is
+    /// this process's problem however healthy `pchat` is. Per-service health is
+    /// still right when each runs on its own, which is why this is a choice the
+    /// composition makes rather than a default.
+    #[must_use]
+    pub fn sharing_health(mut self, health: Health) -> Self {
+        self.health = health;
         self
     }
 
@@ -262,8 +275,10 @@ pub fn context(
 /// # Errors
 ///
 /// [`ServiceError`] if construction or serving fails. A background task
-/// failing is logged and ends that task; it does not take the process down,
-/// because a service whose sweep failed is still worth answering queries.
+/// returning `Err` is logged and ends that task; it does not take the process
+/// down, because a service whose sweep failed is still worth answering
+/// queries. A background task that *panicked* is reported as this service
+/// failing, because a release build would already have aborted on it.
 pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     let service = match S::build(ctx.clone()).await {
         Ok(service) => service,
@@ -281,20 +296,17 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     ctx.logger
         .log(LogEvent::info(Category::Server, "service started").with("service", ctx.name.clone()));
 
+    // Supervised, not merely spawned. A `run` that returned `Err` used to end
+    // there: the task was gone for the life of the process, everything
+    // depending on it failed, and the only trace was one log line at start-up.
+    // Now it is restarted with backoff, and a service that cannot stay up stops
+    // claiming to be live, which is what makes systemd or Kubernetes act.
+    ctx.health
+        .heartbeat(BACKGROUND_HEARTBEAT, background_max_age::<S>());
     let mut background = {
         let service = Arc::clone(&service);
         let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let result = service.run(ctx.clone()).await;
-            if let Err(error) = &result {
-                ctx.logger.log(
-                    LogEvent::error(Category::Server, "background task stopped")
-                        .with("service", ctx.name.clone())
-                        .with("error", error.to_string()),
-                );
-            }
-            result
-        })
+        tokio::spawn(async move { supervise(service, ctx).await })
     };
 
     if !S::SERVES_GRPC {
@@ -318,7 +330,17 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
         // rather than by each service's `routes()`, a health surface a
         // service can forget to implement is one the least-instrumented
         // service lacks, which is the service most worth asking about.
-        crate::health_rpc::with_health(service.routes(), &ctx.name, &ctx.health, &ctx.pressure),
+        // One call site for the whole tree: every service's counters and
+        // gauges reach the collector from here, so a service cannot forget to
+        // export them and the least-instrumented service is not the one most
+        // worth asking about.
+        crate::health_rpc::with_health(
+            service.routes(),
+            &ctx.name,
+            &ctx.health,
+            &ctx.pressure,
+            &ctx.metrics,
+        ),
         // Counts requests this service has not finished. Same argument as
         // above and the same place to make it: measured for everyone, opted
         // into by no one.
@@ -340,13 +362,154 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     // Bounded, and only while draining: a `run` that ended by itself has
     // already returned, and one that is still working through an ordinary
     // request has no reason to be waited on at all.
-    if ctx.shutdown.is_draining() {
-        let _ = tokio::time::timeout(LETTING_GO, &mut background).await;
+    //
+    // The join result is inspected rather than discarded. A panicking task is
+    // not the same event as one that returned `Err`: in a release build
+    // `panic = "abort"` takes the whole process down at the panic, so there is
+    // no "the sweep failed but queries are still worth answering" to preserve.
+    // Under `cargo test` the same panic unwinds into a `JoinError` here, and
+    // dropping it was what let a service die mid-suite and surface only as
+    // some later test timing out on a client this service should have
+    // answered. Reported as this service failing, which is what the abort
+    // would have made it.
+    let mut panicked = None;
+    if ctx.shutdown.is_draining()
+        && let Ok(Err(joined)) = tokio::time::timeout(LETTING_GO, &mut background).await
+        && joined.is_panic()
+    {
+        panicked = Some(panic_message(joined));
     }
     background.abort();
+    if let Some(message) = panicked {
+        ctx.logger.log(
+            LogEvent::new(
+                Severity::Critical,
+                Category::Server,
+                "background task panicked",
+            )
+            .with("service", ctx.name.clone())
+            .with("panic", message.clone()),
+        );
+        return Err(ServiceError::service(format!(
+            "{}'s background task panicked: {message}",
+            ctx.name
+        )));
+    }
     ctx.logger
         .log(LogEvent::info(Category::Server, "service stopped").with("service", ctx.name.clone()));
     result.map_err(ServiceError::from)
+}
+
+/// The message a panicking task carried.
+///
+/// A payload is `Box<dyn Any>`; the two shapes `panic!` produces are a
+/// `&'static str` for a literal and a `String` for a format.
+fn panic_message(error: tokio::task::JoinError) -> String {
+    let payload = error.into_panic();
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a payload that is not a string".to_owned())
+}
+
+/// The heartbeat a supervised background task keeps fresh.
+///
+/// One name, not one per service, because a process holds one service's
+/// background task and the liveness answer is about the process.
+const BACKGROUND_HEARTBEAT: &str = "background";
+
+/// How long a background task may go without beating before this process is
+/// not live.
+///
+/// A service whose `run` is a sweep on a five-minute timer is not late at four
+/// minutes, so this is deliberately generous: it exists to catch a task that is
+/// *gone*, and a tighter bound would restart a healthy server on a busy
+/// machine. The supervisor beats it on every restart as well as through the
+/// task, so a service restarting in a loop stays live until it exceeds
+/// `MAX_RESTARTS`, where a *count* rather than a clock is the right signal.
+fn background_max_age<S: Serve>() -> std::time::Duration {
+    let _ = std::marker::PhantomData::<S>;
+    std::time::Duration::from_secs(600)
+}
+
+/// How many times a background task is restarted before the process gives up.
+///
+/// Not unlimited: a task that fails immediately every time would otherwise spin
+/// forever, reporting itself live, doing nothing. After this the heartbeat is
+/// left to go stale, `/livez` fails, and the supervisor above this process --
+/// systemd or Kubernetes -- restarts the whole thing, which is the one thing
+/// that can clear state this process cannot.
+const MAX_RESTARTS: u32 = 5;
+
+/// The delay before the first restart. Doubles, to a ceiling.
+const RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The longest the supervisor waits between restarts.
+const RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a service's background task, restarting it if it fails.
+///
+/// Returns when the task returns `Ok`, when the process is draining, or when
+/// the task has failed [`MAX_RESTARTS`] times. A panic is not caught here: with
+/// `panic = "abort"` there is nothing to catch in a release build, and under
+/// test the join in `run` above reports it.
+async fn supervise<S: Serve>(service: Arc<S>, ctx: ServiceContext) -> Result<(), ServiceError> {
+    let mut backoff = RESTART_BACKOFF;
+    for attempt in 0..=MAX_RESTARTS {
+        ctx.health.beat(BACKGROUND_HEARTBEAT);
+        let result = Arc::clone(&service).run(ctx.clone()).await;
+
+        let Err(error) = result else {
+            // Returned on purpose, which for every service here means the
+            // drain. Nothing left to keep alive.
+            ctx.health.forget_heartbeat(BACKGROUND_HEARTBEAT);
+            return Ok(());
+        };
+
+        // A drain that surfaced as an error is still a drain.
+        if ctx.shutdown.is_draining() {
+            ctx.health.forget_heartbeat(BACKGROUND_HEARTBEAT);
+            return Ok(());
+        }
+
+        ctx.logger.log(
+            LogEvent::error(Category::Server, "background task stopped")
+                .with("service", ctx.name.clone())
+                .with("error", error.to_string())
+                .with("attempt", u64::from(attempt)),
+        );
+
+        if attempt == MAX_RESTARTS {
+            // Left to go stale deliberately: this process cannot fix itself,
+            // and the next thing that can is whatever restarts processes.
+            ctx.logger.log(
+                LogEvent::new(
+                    Severity::Critical,
+                    Category::Server,
+                    "background task will not stay up; this process is no longer live",
+                )
+                .with("service", ctx.name.clone())
+                .with("restarts", u64::from(MAX_RESTARTS)),
+            );
+            return Err(error);
+        }
+
+        tokio::select! {
+            () = ctx.shutdown.wait() => {
+                ctx.health.forget_heartbeat(BACKGROUND_HEARTBEAT);
+                return Ok(());
+            }
+            () = tokio::time::sleep(backoff) => {}
+        }
+        // Counted here, not above: this is the point at which a restart
+        // actually happens, so the counter means restarts rather than
+        // failures. The two differ by one on the give-up path, which is
+        // exactly the case an alert on this rate is about.
+        ctx.metrics.counter("starling_service_restarts").inc();
+        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+    }
+    Ok(())
 }
 
 /// How long a drained service's background task has to let go of what it holds.
@@ -441,6 +604,137 @@ fn load_config() -> Result<(Config, Option<std::path::PathBuf>), ConfigError> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A service whose background task fails a fixed number of times.
+    struct Flaky {
+        /// Failures remaining before `run` starts succeeding.
+        failures: std::sync::atomic::AtomicU32,
+        /// How many times `run` has been entered.
+        runs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Serve for Flaky {
+        const NAME: &'static str = "flaky";
+
+        async fn build(_ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
+            Ok(Arc::new(Self {
+                failures: std::sync::atomic::AtomicU32::new(0),
+                runs: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            }))
+        }
+
+        fn routes(self: Arc<Self>) -> Routes {
+            Routes::default()
+        }
+
+        async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+            let _ = self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let left = self.failures.load(std::sync::atomic::Ordering::Relaxed);
+            if left > 0 {
+                self.failures
+                    .store(left - 1, std::sync::atomic::Ordering::Relaxed);
+                return Err(ServiceError::service("the sweep fell over"));
+            }
+            ctx.shutdown.wait().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_task_that_fails_is_restarted_rather_than_lost() {
+        // It used to end there: gone for the life of the process, with one log
+        // line at start-up and everything depending on it failing since.
+        let ctx = ctx("flaky");
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let service = Arc::new(Flaky {
+            failures: std::sync::atomic::AtomicU32::new(2),
+            runs: Arc::clone(&runs),
+        });
+
+        ctx.health
+            .heartbeat(BACKGROUND_HEARTBEAT, std::time::Duration::from_secs(600));
+        let supervised = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { supervise(service, ctx).await }
+        });
+
+        // Two failures, two backoffs, then it stays up.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "two failures must be followed by a third attempt that stays up"
+        );
+        assert_eq!(
+            ctx.metrics.counter("starling_service_restarts").get(),
+            2,
+            "each restart must be counted, so an operator can alert on the rate"
+        );
+        assert!(ctx.health.is_live(), "a service that recovered is live");
+
+        ctx.shutdown.drain();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervised).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_that_will_not_stay_up_stops_claiming_to_be_live() {
+        // The point of the ceiling: a task failing instantly forever would
+        // otherwise spin, reporting itself healthy, doing nothing. Failing
+        // liveness is what gets the process restarted by something that can
+        // clear state it cannot.
+        let ctx = ctx("hopeless");
+        let service = Arc::new(Flaky {
+            failures: std::sync::atomic::AtomicU32::new(u32::MAX),
+            runs: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+
+        // A zero max-age, so "still registered" is observable the instant the
+        // supervisor returns. `Health` measures with `std::time::Instant`,
+        // which a paused tokio clock does not move, and the staleness rule
+        // itself is tested in `crate::health`.
+        ctx.health
+            .heartbeat(BACKGROUND_HEARTBEAT, std::time::Duration::ZERO);
+        let result = supervise(service, ctx.clone()).await;
+
+        assert!(result.is_err(), "the supervisor must give up and say so");
+        assert_eq!(
+            ctx.metrics.counter("starling_service_restarts").get(),
+            u64::from(MAX_RESTARTS),
+            "one count per restart actually made, not per failure seen"
+        );
+        // Left to go stale, not forgotten: forgetting it would make a process
+        // that gave up look healthy, which is the whole failure being closed.
+        assert!(
+            !ctx.health.is_live(),
+            "a process that cannot keep its own task up must not pass liveness"
+        );
+        assert_eq!(
+            ctx.health.stale().first().map(|(name, _)| name.as_str()),
+            Some(BACKGROUND_HEARTBEAT),
+            "and must name what stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_is_not_a_failure() {
+        // Otherwise every service reports itself dead on the way out, and a
+        // clean shutdown looks like a crash in every dashboard.
+        let ctx = ctx("draining");
+        let service = Arc::new(Flaky {
+            failures: std::sync::atomic::AtomicU32::new(0),
+            runs: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+        ctx.health
+            .heartbeat(BACKGROUND_HEARTBEAT, std::time::Duration::from_millis(1));
+
+        ctx.shutdown.drain();
+        assert!(supervise(service, ctx.clone()).await.is_ok());
+        assert_eq!(ctx.metrics.counter("starling_service_restarts").get(), 0);
+        assert!(
+            ctx.health.is_live(),
+            "the heartbeat must be forgotten, not left to go stale"
+        );
+    }
 
     fn ctx(name: &str) -> ServiceContext {
         let config = Config::with_defaults(Path::new("/run/starling"));
