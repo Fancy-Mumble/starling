@@ -130,7 +130,18 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The lint denies the panicking macros; this asserts that the exemptions
+      # left behind are argued ones. Without it the deny is one `#[allow]` away
+      # from meaning nothing, and nobody would notice.
+      - name: Panic audit
+        if: runner.os == 'Linux'
+        run: python3 scripts/check-panic-audit.py
+
       - name: Tests
+        # Proptest's own default today, set here so a future change to it is a
+        # change to this line rather than a silent loss of coverage.
+        env:
+          PROPTEST_CASES: 256
         run: cargo test --workspace --all-targets
 
       # `cargo test --all-targets` skips doctests; the lint config denies
@@ -272,11 +283,17 @@ jobs:
         run: cargo +nightly miri test -p starling-proto-fancy --lib
 
   # ----------------------------------------------------------------
-  # Fuzz the frame decoder. It is the first thing an unauthenticated peer
-  # reaches, so it gets a short run on every PR and must never panic.
+  # Fuzz the surfaces an unauthenticated peer reaches.
+  #
+  # Replay first, search second. The committed corpus in `fuzz/corpus/` is what
+  # makes this a regression test: an input that crashed once fails again in
+  # seconds, rather than waiting for the fuzzer to rediscover it inside a
+  # timebox. The search that follows is a bounded top-up on the four surfaces
+  # reachable before authentication, not an attempt to find something new in a
+  # minute.
   # ----------------------------------------------------------------
   fuzz:
-    name: Fuzz (frame decoder)
+    name: Fuzz (replay, then search)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -286,6 +303,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: fuzz
+          workspaces: fuzz
 
       - name: Install protoc
         run: |
@@ -297,9 +315,49 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Fuzz decode
-        # Pin the gnu host target. cargo-fuzz otherwise selects
-        # x86_64-unknown-linux-musl here, whose static libc is incompatible
-        # with AddressSanitizer and whose std the runner does not have.
-        run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -max_total_time=60
-        working-directory: crates/proto/classic
+      # Pin the gnu host target here and below. cargo-fuzz otherwise selects
+      # x86_64-unknown-linux-musl, whose static libc is incompatible with
+      # AddressSanitizer and whose std the runner does not have.
+      - name: Build every target
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+        working-directory: fuzz
+
+      - name: Replay the committed corpus
+        # `-runs=0` executes the corpus and stops. Every target, about a minute
+        # for all ten, and the only step that can fail on a PR that added no
+        # fuzzing of its own.
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::replay $target"
+            cargo +nightly fuzz run "$target" \
+              --target x86_64-unknown-linux-gnu -- -runs=0
+            echo "::endgroup::"
+          done
+        working-directory: fuzz
+
+      - name: Search the pre-authentication surfaces
+        # Twenty seconds each. Long enough to explore what the diff changed,
+        # short enough that the job stays under the ten-minute PR budget; the
+        # real search is the nightly's six minutes a target.
+        run: |
+          search() {
+            echo "::group::search $1"
+            cargo +nightly fuzz run "$1" --target x86_64-unknown-linux-gnu \
+              -- "${@:2}" -max_total_time=20
+            echo "::endgroup::"
+          }
+          search decode -dict=dictionaries/mumble.dict
+          search voice_packet -dict=dictionaries/voice.dict
+          search voice_varint -dict=dictionaries/voice.dict
+          search peer_cert
+        working-directory: fuzz
+
+      - name: Keep the crashing input
+        # Without this the run reports a crash and throws away the bytes that
+        # caused it, which costs a whole rediscovery to reproduce.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
