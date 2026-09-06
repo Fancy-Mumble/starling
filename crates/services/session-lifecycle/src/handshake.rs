@@ -2747,7 +2747,7 @@ mod tests {
             let mut graph = outdated_graph();
             let greet = graph.nodes.iter_mut().find(|n| n.id == "greet").unwrap();
             let Some(Body::Greet(body)) = greet.body.as_mut() else {
-                unreachable!("the fixture's greeting")
+                panic!("the fixture's greeting")
             };
             body.design = Some(GreetingDesign {
                 compiled: vec![CompiledTarget {

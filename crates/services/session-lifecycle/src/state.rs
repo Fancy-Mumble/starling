@@ -286,6 +286,13 @@ pub struct ReportedStats {
 pub struct Connections {
     inner: Arc<Mutex<HashMap<u64, PendingConnection>>>,
     sessions: Arc<Mutex<SessionAllocator>>,
+    /// Session ids in use, against the pool's own size.
+    ///
+    /// The one gauge here with a real denominator: `max_users * 2` is what an
+    /// exhausted pool refuses at, so this reads as a percentage of a limit an
+    /// operator set rather than as a bare count.
+    /// See `scripts/canon-gauges.json`.
+    in_use: starling_runtime::pressure::Gauge,
 }
 
 /// A legacy `version_v1` in `version_v2`'s packing.
@@ -306,9 +313,20 @@ impl Connections {
     /// A registry with a session pool sized for `max_users`.
     #[must_use]
     pub fn new(max_users: u32) -> Self {
+        Self::with_pressure(max_users, &starling_runtime::pressure::Pressure::new())
+    }
+
+    /// The same, reporting into `pressure`.
+    ///
+    /// Separate constructor rather than a parameter on the one above, because
+    /// most callers are tests that do not care and the service is the one that
+    /// does.
+    #[must_use]
+    pub fn with_pressure(max_users: u32, pressure: &starling_runtime::pressure::Pressure) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(SessionAllocator::new(max_users))),
+            in_use: pressure.gauge("sessions.in_use", u64::from(max_users).saturating_mul(2)),
         }
     }
 
@@ -416,7 +434,15 @@ impl Connections {
     pub fn allocate(&self, conn: u64, identity: &Identity) -> Option<u32> {
         let session = {
             let mut sessions = self.sessions.lock().ok()?;
-            sessions.allocate()?.0
+            let Some(session) = sessions.allocate() else {
+                // The pool is empty, which is a full server refusing a login.
+                // Counted so an operator sees `max_users` being reached rather
+                // than a client reporting that it cannot connect.
+                self.in_use.reject();
+                return None;
+            };
+            self.in_use.observe(sessions.in_use() as u64);
+            session.0
         };
         let mut inner = self.inner.lock().ok()?;
         let pending = inner.get_mut(&conn)?;
@@ -736,6 +762,7 @@ impl Connections {
         if pending.session != 0 {
             if let Ok(mut sessions) = self.sessions.lock() {
                 sessions.release(SessionId(pending.session));
+                self.in_use.observe(sessions.in_use() as u64);
             }
             return Some(pending.session);
         }

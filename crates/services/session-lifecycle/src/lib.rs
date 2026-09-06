@@ -1767,7 +1767,7 @@ impl Serve for SessionLifecycleService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let fanout = Fanout::default();
         Ok(Arc::new(Self {
-            connections: Connections::new(max_users(&ctx)),
+            connections: Connections::with_pressure(max_users(&ctx), &ctx.pressure),
             handshake: Handshake::new(Resolver::clone(&ctx.resolver), fanout.clone(), ctx.clone()),
             fanout,
             permit: Permit::new(ctx.resolver.clone()),

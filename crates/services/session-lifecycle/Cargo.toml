@@ -20,6 +20,8 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Property tests: see docs/RELIABILITY.md Stage 4.
+proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
