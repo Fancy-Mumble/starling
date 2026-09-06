@@ -1,6 +1,13 @@
 /target
 **/*.rs.bk
 
+# cargo-fuzz's build tree (2.5 GB). The corpora and dictionaries beside it are
+# committed on purpose - see docs/RELIABILITY.md Stage 1.
+/fuzz/target/
+
+# Where `cargo test --test soak` writes its samples and report.
+/crates/starling/target/
+
 # Auto-generated on first boot when no cert is configured.
 /starling-data/
 *.pem
