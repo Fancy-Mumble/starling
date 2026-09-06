@@ -27,32 +27,6 @@ thiserror.workspace = true
 # implementations that cannot be expressed safely. This crate and the host are
 # the only two places in the tree where unsafe is needed, so the workspace-level
 # `unsafe_code = "deny"` is relaxed here.
-[lints.rust]
-unsafe_code = "allow"
-missing_docs = "deny"
-unused_crate_dependencies = "warn"
-unused_results = "deny"
-missing_debug_implementations = "deny"
-# `#[sabi_trait]` expands to qualified paths in supertrait bounds whose spans
-# point back to the user-written `Send + Sync + 'static` clause, producing
-# false-positive `unused_qualifications` warnings. Disabled here rather than
-# papering over the macro emissions.
-unused_qualifications = "allow"
-# Same root cause for non-local impls: the macro generates trait impls inside an
-# anonymous const item. A known upstream pattern.
-non_local_definitions = "allow"
-unreachable_pub = "warn"
 
-[lints.rustdoc]
-broken_intra_doc_links = "deny"
-
-[lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "warn", priority = -1 }
-style = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-excessive_nesting = "deny"
-too_many_lines = "deny"
-allow_attributes_without_reason = "deny"
-expect_used = "warn"
+[lints]
+workspace = true

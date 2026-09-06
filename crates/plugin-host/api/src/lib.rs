@@ -20,6 +20,28 @@
 //! connected clients as `fancy-plugin-info` plugin-data.  Payloads are
 //! hard-capped at [`PLUGIN_INFO_MAX_BYTES`] uncompressed.
 
+#![allow(
+    unsafe_code,
+    reason = "`abi_stable`'s `#[sabi_trait]` generates unsafe impls for the \
+              ABI-stable trait objects this crate exists to define"
+)]
+#![allow(
+    unused_qualifications,
+    reason = "`#[sabi_trait]` expands to qualified paths in supertrait bounds \
+              whose spans point back at the user-written clause, so the \
+              warning names code nobody wrote"
+)]
+#![allow(
+    clippy::mem_forget,
+    reason = "`#[sabi_trait]` forgets the values it has moved across the ABI \
+              boundary, which is how ownership transfers to the other side of \
+              a `cdylib` edge"
+)]
+#![allow(
+    non_local_definitions,
+    reason = "`#[sabi_trait]` generates trait impls inside an anonymous const \
+              item, a known upstream pattern"
+)]
 #![warn(missing_docs)]
 
 use abi_stable::{

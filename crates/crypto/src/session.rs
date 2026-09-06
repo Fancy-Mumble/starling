@@ -113,6 +113,10 @@ impl VoiceSession {
         let mut directional = [0_u8; MASTER_KEY_LEN];
         let hkdf = Hkdf::<Sha256>::new(Some(salt), master);
         // Infallible for a 32-byte output; HKDF only fails past 255 hash lengths.
+        #[expect(
+            clippy::unreachable,
+            reason = "AUDIT: HKDF-Expand fails only past 255 hash lengths; MASTER_KEY_LEN is 32"
+        )]
         hkdf.expand(direction.label(), &mut directional)
             .unwrap_or_else(|_| unreachable!("32 bytes is within HKDF's output limit"));
 

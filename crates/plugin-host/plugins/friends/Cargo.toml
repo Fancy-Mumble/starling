@@ -28,18 +28,5 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "deny"
-unused_crate_dependencies = "warn"
-unused_results = "deny"
-missing_debug_implementations = "deny"
-
-[lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "warn", priority = -1 }
-style = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "warn"
-allow_attributes_without_reason = "deny"
+[lints]
+workspace = true

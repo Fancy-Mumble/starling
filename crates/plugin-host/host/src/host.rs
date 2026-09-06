@@ -488,7 +488,9 @@ impl Host {
         )?;
 
         let bridge = Arc::clone(&self.bridge);
-        let entry = &mut self.plugins[idx];
+        let Some(entry) = self.plugins.get_mut(idx) else {
+            return Err(format!("plugin '{name}' went away while being toggled"));
+        };
         if enabled == entry.loaded {
             return Ok(());
         }
@@ -607,11 +609,14 @@ impl Host {
     /// The plugin is unknown, ships with the server, or its file cannot be
     /// deleted.
     pub fn uninstall_plugin(&mut self, name: &str) -> Result<(), String> {
-        if let Some(idx) = self.plugins.iter().position(|entry| entry.name == name) {
-            if self.plugins[idx].builtin {
+        if let Some(entry) = self.plugins.iter().find(|entry| entry.name == name) {
+            if entry.builtin {
                 return Err(format!("plugin '{name}' ships with the server"));
             }
-            let path = self.plugins[idx].plugin.path.clone();
+            let path = entry.plugin.path.clone();
+            let Some(idx) = self.plugins.iter().position(|entry| entry.name == name) else {
+                return Err(format!("plugin '{name}' went away while being removed"));
+            };
             let _ = self.plugins.swap_remove(idx);
             remove_binary(&path)?;
             self.bridge
@@ -624,7 +629,11 @@ impl Host {
             .iter()
             .position(|failed| failed.name == name)
         {
-            if self.failed_plugins[idx].builtin {
+            if self
+                .failed_plugins
+                .get(idx)
+                .is_some_and(|failed| failed.builtin)
+            {
                 return Err(format!("plugin '{name}' ships with the server"));
             }
             let path = self.failed_plugins.swap_remove(idx).path;

@@ -159,7 +159,7 @@ async fn run_session(
     let (personal_tx, personal_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Push the initial sync-step-1 so the client knows our state vector.
-    let initial = room.initial_sync_frame().await;
+    let initial = room.initial_sync_frame();
     if sender
         .send(WsMessage::Binary(initial.into()))
         .await
@@ -201,7 +201,7 @@ async fn run_session(
         Ok(m) => m.clone(),
         Err(p) => p.into_inner().clone(),
     };
-    room.broadcast_awareness_removal(&removals).await;
+    room.broadcast_awareness_removal(&removals);
 
     state.unregister_session(&key, session).await;
     let _ = room;
@@ -258,7 +258,7 @@ async fn run_send_loop(
                     // many-editor sessions correct under load.
                     Err(RecvError::Lagged(skipped)) => {
                         tracing::debug!(connection_id, skipped, "live-doc subscriber lagged; re-syncing");
-                        let resync = room.initial_sync_frame().await;
+                        let resync = room.initial_sync_frame();
                         if sender
                             .send(WsMessage::Binary(resync.into()))
                             .await

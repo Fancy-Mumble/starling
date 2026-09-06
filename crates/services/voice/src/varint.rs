@@ -82,14 +82,23 @@ impl<'a> Reader<'a> {
                 available,
             });
         }
-        let slice = &self.bytes[self.at..self.at + n];
-        self.at += n;
+        // `get`, not an index. The length check above already proves the
+        // range, but `self.at + n` is the shape that overflows and this reader
+        // takes both its offset and its length from the wire.
+        let slice =
+            self.bytes
+                .get(self.at..self.at.saturating_add(n))
+                .ok_or(VarintError::Truncated {
+                    needed: n,
+                    available,
+                })?;
+        self.at = self.at.saturating_add(n);
         Ok(slice)
     }
 
     /// Take everything that remains.
     pub fn take_rest(&mut self) -> &'a [u8] {
-        let slice = &self.bytes[self.at..];
+        let slice = self.bytes.get(self.at..).unwrap_or_default();
         self.at = self.bytes.len();
         slice
     }
@@ -100,7 +109,13 @@ impl<'a> Reader<'a> {
     ///
     /// [`VarintError::Truncated`] at the end of the buffer.
     pub fn u8(&mut self) -> Result<u8, VarintError> {
-        Ok(self.take(1)?[0])
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(VarintError::Truncated {
+                needed: 1,
+                available: 0,
+            })
     }
 
     /// Read a little-endian `f32`.
@@ -121,6 +136,16 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// [`VarintError::Truncated`] if the encoding runs past the end.
+    ///
+    /// # On the signedness
+    ///
+    /// `i64`, matching murmur's format, while [`Writer::varint`] takes `u64`.
+    /// The two agree on every value the audio path produces -- a session, a
+    /// target, a sequence -- and on the bits for all the rest: a value at or
+    /// above `2^63` written as unsigned reads back as the same bits with the
+    /// opposite sign. Use `cast_unsigned` to recover it. Nothing in this
+    /// protocol carries a number that large, so this is a documented property
+    /// rather than a conversion any caller has to make.
     pub fn varint(&mut self) -> Result<i64, VarintError> {
         let lead = self.u8()?;
 
@@ -362,5 +387,70 @@ mod tests {
         let mut reader = Reader::new(&[1, 2, 3]);
         assert!(reader.take(9).is_err());
         assert_eq!(reader.remaining(), 3);
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// What the writer produces, the reader reads back.
+        ///
+        /// The encoding is hand-rolled and both halves are, so a disagreement
+        /// between them is not caught by any type. Every audio packet's target,
+        /// session and sequence go through this.
+        #[test]
+        fn a_written_varint_reads_back_as_itself(value: u64) {
+            let mut writer = Writer::new();
+            writer.varint(value);
+            let bytes = writer.finish();
+
+            let mut reader = Reader::new(&bytes);
+            let read = reader.varint().expect("what this writer just wrote");
+            // Compared as bits, not as a number. `Writer::varint` takes `u64`
+            // and `Reader::varint` returns `i64` -- murmur's format is a signed
+            // 64-bit value and the writer only ever produces non-negative ones
+            // -- so a value at or above 2^63 round-trips to the same bits with
+            // the opposite sign. This property found that; the reader's own
+            // documentation now says it.
+            prop_assert_eq!(read.cast_unsigned(), value, "encoded as {:02x?}", bytes);
+            prop_assert_eq!(reader.remaining(), 0, "the encoding must be exact");
+        }
+
+        /// A reader never reads past the slice it was given.
+        ///
+        /// The property behind the whole module: `take` bounds itself, so an
+        /// attacker-chosen length is a `Truncated` error rather than a panic.
+        #[test]
+        fn reading_arbitrary_bytes_never_reads_past_the_end(bytes: Vec<u8>) {
+            let mut reader = Reader::new(&bytes);
+            // Enough attempts to run off the end of anything proptest builds.
+            for _ in 0..32 {
+                let before = reader.remaining();
+                match reader.varint() {
+                    Ok(_) => prop_assert!(reader.remaining() <= before),
+                    Err(VarintError::Truncated { .. }) => break,
+                }
+                prop_assert!(reader.remaining() <= bytes.len());
+            }
+        }
+
+        /// `take(n)` yields exactly `n` bytes or refuses.
+        #[test]
+        fn take_is_exact_or_refuses(bytes: Vec<u8>, n in 0_usize..512) {
+            let mut reader = Reader::new(&bytes);
+            match reader.take(n) {
+                Ok(slice) => {
+                    prop_assert_eq!(slice.len(), n);
+                    prop_assert!(n <= bytes.len());
+                }
+                Err(VarintError::Truncated { needed, available }) => {
+                    prop_assert_eq!(needed, n);
+                    prop_assert!(available < n);
+                }
+            }
+        }
     }
 }

@@ -236,16 +236,17 @@ pub fn parse_hex(value: &str) -> Option<[u8; 3]> {
     if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let bytes = digits.as_bytes();
-    // Indexed as bytes rather than sliced as a string: every byte here is an
-    // ASCII hex digit, checked above, but a string slice would still be a panic
-    // waiting for the day that check is loosened.
-    let channel = |at: usize| {
-        let pair = [bytes[at], bytes[at + 1]];
-        let text = std::str::from_utf8(&pair).ok()?;
-        u8::from_str_radix(text, 16).ok()
-    };
-    Some([channel(0)?, channel(2)?, channel(4)?])
+    // Taken in pairs rather than indexed. Every byte here is an ASCII hex
+    // digit, checked above, so a pair of indices could not panic -- but
+    // `chunks_exact` says the same thing in a form the compiler enforces, and
+    // this parses a value an operator pasted in.
+    let mut channels = [0_u8; 3];
+    let mut pairs = digits.as_bytes().chunks_exact(2);
+    for (channel, pair) in channels.iter_mut().zip(&mut pairs) {
+        let text = std::str::from_utf8(pair).ok()?;
+        *channel = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(channels)
 }
 
 /// The form the digest is taken over: sorted keys, empty fields omitted.
@@ -374,7 +375,10 @@ pub fn digest(livery: &Livery) -> Vec<u8> {
     if canonical == "{}" {
         return Vec::new();
     }
-    Sha256::digest(canonical.as_bytes())[..DIGEST_BYTES].to_vec()
+    Sha256::digest(canonical.as_bytes())
+        .into_iter()
+        .take(DIGEST_BYTES)
+        .collect()
 }
 
 /// Everything an operator may read back, as JSON.

@@ -58,6 +58,27 @@
 //! to a component with `wasm-tools component new` (see the sample plugin's
 //! README), then drop the resulting `*.wasm` into a Mumble plugin directory.
 
+#![allow(
+    unsafe_code,
+    reason = "the guest side of the component ABI: `wit-bindgen`'s generated \
+              exports are unsafe by construction"
+)]
+// The rest of this crate *is* the `wit_bindgen::generate!` expansion below: the
+// modules, their documentation and their `mem::forget` calls are component ABI
+// glue emitted from `../wit`, not code written here. An attribute on the macro
+// invocation does not reach the items it emits, so these are crate-level. Every
+// hand-written line in this file is a `pub use` or a doc comment.
+#![allow(
+    missing_docs,
+    reason = "the generated bindings document themselves from the WIT, which \
+              is where their documentation belongs"
+)]
+#![allow(
+    clippy::mem_forget,
+    reason = "the generated resource glue forgets handles it has passed to the \
+              host, which is how the component ABI transfers ownership"
+)]
+
 /// ABI version this binding crate targets. The host rejects a component whose
 /// `abi-version` export does not equal its own `PLUGIN_ABI_VERSION`; return
 /// this value from [`Guest::abi_version`].

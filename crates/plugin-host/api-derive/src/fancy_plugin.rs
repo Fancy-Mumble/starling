@@ -221,6 +221,13 @@ const LIFECYCLE_METHOD_NAMES: &[&str] = &[
     "on_plugin_message",
 ];
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one `match` arm per hook in the plugin ABI, each a few lines. \
+              Splitting it would put half the hooks in another function with \
+              no boundary between them, which is harder to check against the \
+              trait than the long match is"
+)]
 fn walk_impl(input: &mut ItemImpl) -> syn::Result<Walked> {
     let mut plugin_info_tokens: Option<TokenStream> = None;
     let mut commands: Vec<Command> = Vec::new();
@@ -884,6 +891,13 @@ fn build_auto_slash_commands_fn(commands: &[Command]) -> TokenStream {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one `quote!` template, emitted as a single unit. The generated \
+              dispatcher has to read as the code it becomes, and splitting the \
+              template would interleave Rust and generated Rust with no \
+              boundary a reader could follow"
+)]
 fn build_dispatch_fn(
     commands: &[Command],
     components: &[ComponentHandler],

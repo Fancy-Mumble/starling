@@ -39,6 +39,12 @@ impl Block {
     /// deliberately partial: the length is folded into the tag separately, so a
     /// short block is not ambiguous.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "AUDIT: `take` is `min(BLOCK_LEN)` on the line above, so both \
+                  slices are in range for a BLOCK_LEN array and a caller's slice \
+                  of at least that length"
+    )]
     pub fn from_padded(bytes: &[u8]) -> Self {
         let mut block = [0; BLOCK_LEN];
         let take = bytes.len().min(BLOCK_LEN);
@@ -61,6 +67,12 @@ impl Block {
     /// A left shift of the whole block as a big-endian integer, then a XOR of
     /// the reduction polynomial when a one was shifted out of the top.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "AUDIT: every index is a constant into a [u8; BLOCK_LEN], and \
+                  `pair` is a `windows(2)` slice, so both of its indices exist by \
+                  the window's own definition"
+    )]
     pub fn times2(self) -> Self {
         let carry = self.0[0] >> 7;
         let mut out = [0; BLOCK_LEN];
@@ -123,6 +135,10 @@ impl Block {
 
     /// The first `len` bytes.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "AUDIT: the bound is `min(BLOCK_LEN)` in the expression itself"
+    )]
     pub fn prefix(&self, len: usize) -> &[u8] {
         &self.0[..len.min(BLOCK_LEN)]
     }

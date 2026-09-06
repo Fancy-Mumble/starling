@@ -55,30 +55,5 @@ wasmtime-wasi = { workspace = true, optional = true }
 # cdylib is rejected before its .init_array can run and take the process down.
 goblin.workspace = true
 
-[lints.rust]
-# The only place besides `mumble-plugin-api` that needs unsafe: `abi_stable`'s
-# raw library loading and the layout-independent ABI probe both take it. Every
-# unsafe block carries a SAFETY comment.
-unsafe_code = "allow"
-missing_docs = "deny"
-unused_crate_dependencies = "warn"
-unused_results = "deny"
-missing_debug_implementations = "deny"
-unused_qualifications = "warn"
-unreachable_pub = "warn"
-
-[lints.rustdoc]
-broken_intra_doc_links = "deny"
-
-[lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "warn", priority = -1 }
-style = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "warn"
-too_many_lines = "deny"
-excessive_nesting = "deny"
-uninlined_format_args = "warn"
-doc_markdown = "warn"
-allow_attributes_without_reason = "deny"
+[lints]
+workspace = true

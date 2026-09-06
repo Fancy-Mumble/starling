@@ -1054,7 +1054,7 @@ fn sniff(bytes: &[u8]) -> &'static str {
         "image/png"
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         "image/jpeg"
-    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
         "image/webp"
     } else {
         "application/octet-stream"
@@ -1065,11 +1065,11 @@ fn unhex(value: &str) -> Option<Vec<u8>> {
     if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let bytes = value.as_bytes();
-    (0..bytes.len())
-        .step_by(2)
-        .map(|at| {
-            std::str::from_utf8(&bytes[at..at + 2])
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
                 .ok()
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
         })

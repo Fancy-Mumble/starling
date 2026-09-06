@@ -212,7 +212,7 @@ pub(crate) fn open(
         let mut filled = 0;
         while filled < cap {
             let read = reader
-                .read(&mut buffer[filled..])
+                .read(buffer.get_mut(filled..).unwrap_or_default())
                 .map_err(|_| CryptoError::Io)?;
             if read == 0 {
                 break;

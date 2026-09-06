@@ -373,6 +373,13 @@ pub fn send_interaction_response_to_channel(
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "AUDIT: a plugin is a cdylib inside the server with no handle on \
+              its logger, so stderr is the only channel it has. The host \
+              inherits it, which is how a guest's diagnostics reach the \
+              server log"
+)]
 fn log_warn(msg: &str) {
     // The api crate has no logging dep; print to stderr so misbehaving
     // commands still leave a trace.  Real plugins typically embed a

@@ -307,7 +307,7 @@ impl DocRoom {
     /// Broadcast an awareness removal for the given set of Yjs clients.
     /// Each entry maps a Yjs clientID to the last clock seen for that
     /// client; the removal uses `clock + 1` so peers accept it.
-    pub async fn broadcast_awareness_removal(&self, removals: &HashMap<u64, u32>) {
+    pub fn broadcast_awareness_removal(&self, removals: &HashMap<u64, u32>) {
         if removals.is_empty() {
             return;
         }
@@ -394,7 +394,7 @@ impl DocRoom {
     /// Build the initial sync-step-1 frame the server pushes to a
     /// newly connected client.  Together with the client's reply
     /// this brings the client to a state-vector match.
-    pub async fn initial_sync_frame(&self) -> Vec<u8> {
+    pub fn initial_sync_frame(&self) -> Vec<u8> {
         let sv = self.doc.transact().state_vector();
         let mut enc = EncoderV1::new();
         Message::Sync(SyncMessage::SyncStep1(sv)).encode(&mut enc);
@@ -408,7 +408,7 @@ impl DocRoom {
 
     /// Encode the current doc state as a Yjs v1 update suitable for
     /// persisting and re-seeding.
-    pub async fn encode_snapshot(&self) -> Vec<u8> {
+    pub fn encode_snapshot(&self) -> Vec<u8> {
         self.doc
             .transact()
             .encode_state_as_update_v1(&StateVector::default())
@@ -454,7 +454,7 @@ mod tests {
             txt.push(&mut txn, "Hello, Mumble!");
         }
 
-        let snapshot = room.encode_snapshot().await;
+        let snapshot = room.encode_snapshot();
         assert!(!snapshot.is_empty(), "snapshot must contain bytes");
 
         // New room hydrated from snapshot must observe the same text.

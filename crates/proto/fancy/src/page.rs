@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(cut_off.next_before_id, "id-50");
 
         // Exactly limit rows: the store had no more to give.
-        let exact = PageInfo::after(50, 50, || unreachable!("not computed when complete"));
+        let exact = PageInfo::after(50, 50, || panic!("not computed when complete"));
         assert!(!exact.more);
         assert!(exact.next_before_id.is_empty());
     }

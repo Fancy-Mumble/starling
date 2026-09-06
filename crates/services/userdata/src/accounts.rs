@@ -37,8 +37,15 @@ const PASSWORD_ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVW
 fn generated_password() -> String {
     use rand::RngExt as _;
     let mut rng = rand::rng();
+    // `get`, not an index: the range is derived from the alphabet's own
+    // length, so the fallback cannot be taken. It is here so that a future
+    // edit to either line cannot turn a password generator into a panic.
     (0..GENERATED_PASSWORD_LEN)
-        .map(|_| char::from(PASSWORD_ALPHABET[rng.random_range(0..PASSWORD_ALPHABET.len())]))
+        .filter_map(|_| {
+            PASSWORD_ALPHABET
+                .get(rng.random_range(0..PASSWORD_ALPHABET.len()))
+                .map(|byte| char::from(*byte))
+        })
         .collect()
 }
 

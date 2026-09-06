@@ -207,6 +207,11 @@ impl RecvNonce {
             _ => return Err(NonceError::OutOfRange),
         };
 
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "AUDIT: `seen` is a 256-entry table indexed by a u8 widened \
+                      with `usize::from`, and `nonce.0` is a fixed-size array"
+        )]
         if self.seen[usize::from(wire)] == Some(nonce.0[1]) {
             return Err(NonceError::Replay);
         }
@@ -224,6 +229,11 @@ impl RecvNonce {
     /// counter. Upstream does this by saving and restoring the IV around the
     /// attempt; not mutating in the first place is the same guarantee without
     /// the window in which the state is wrong.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "AUDIT: `seen` is a 256-entry table indexed by a u8 widened with \
+                  `usize::from`, and `nonce.0` is a fixed-size array"
+    )]
     pub(super) fn accept(&mut self, candidate: &Candidate) {
         self.seen[usize::from(candidate.nonce.0[0])] = Some(candidate.nonce.0[1]);
         // A late packet must not drag the expectation backwards, or the packets

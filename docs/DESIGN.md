@@ -105,7 +105,9 @@ the one way this differs from the pure `fn(..) -> Effects` originally planned.
 Everything that decodes bytes comes from an unauthenticated peer:
 
 * bound before you allocate;
-* never panic, `unwrap`/`expect`/indexing that can fail are denied by lint;
+* never panic. `unwrap` is denied by lint; `expect` warns and indexing is not
+  linted yet, so those two are a review rule until `docs/RELIABILITY.md`
+  Stage 3 lands them;
 * a protocol error closes **that** connection and nothing else.
 
 ## 7. Quality gates

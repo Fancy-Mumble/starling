@@ -74,6 +74,12 @@ pub(super) fn encrypt(cipher: &BlockCipher, nonce: Block, plain: &[u8]) -> (Vec<
     // The checksum absorbs the tail padded with the *pad's* own tail, not with
     // zeros. Getting this wrong produces a tag that only ever matches itself.
     let mut padded = pad;
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "AUDIT: `tail` is the final partial block, so its length is below \
+                  BLOCK_LEN by construction: it comes from `chunks_exact`'s \
+                  remainder"
+    )]
     padded.0[..tail.len()].copy_from_slice(tail);
     checksum = checksum.xor(padded);
     out.extend_from_slice(pad.xor(padded).prefix(tail.len()));

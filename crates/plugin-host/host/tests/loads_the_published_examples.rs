@@ -74,6 +74,14 @@
 //! `cargo test` red for somebody who has never heard of the examples -- but it
 //! does mean a green run alone is not evidence. Read the skip line.
 
+#![allow(
+    clippy::print_stderr,
+    reason = "an integration test is its own crate, so clippy's in-test \
+              exemptions do not reach it. These print the reason a test \
+              skipped itself, which is the only way a skip is visible in \
+              `cargo test` output"
+)]
+
 use abi_stable as _;
 use mumble_plugin_api as _;
 use serde as _;

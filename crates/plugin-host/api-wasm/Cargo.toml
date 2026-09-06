@@ -31,6 +31,6 @@ mumble-plugin-api.workspace = true
 # its surface is `wit-bindgen` output, which carries no documentation and would
 # trip `missing_docs`, and the generated component glue is `unsafe extern "C"`.
 # The hand-written wrappers in `src/lib.rs` are documented.
-[lints.rust]
-unsafe_code = "allow"
-unused_crate_dependencies = "warn"
+
+[lints]
+workspace = true

@@ -20,6 +20,13 @@
 //! [`mumble_plugin_api`] is unchanged and must stay that way: a plugin binary
 //! built against either tree has to load in either server.
 
+#![allow(
+    unsafe_code,
+    reason = "the only place besides `mumble-plugin-api` that needs it: \
+              `abi_stable`'s raw library loading and the layout-independent \
+              ABI probe. Every unsafe block carries a SAFETY comment"
+)]
+
 mod bridge;
 mod context;
 mod host;

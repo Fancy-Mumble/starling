@@ -309,6 +309,12 @@ fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; 48] {
         // As in `hmac_sha256`: HMAC accepts every key length, so this arm is
         // unreachable and exists to keep the `unwrap_used` rule without
         // inventing an error path nobody can hit.
+        #[expect(
+            clippy::panic,
+            reason = "AUDIT: HMAC accepts a key of any length, so `new_from_slice` \
+                      cannot fail; this arm exists only to avoid inventing an error \
+                      path no caller can reach"
+        )]
         <Hmac<Sha384> as KeyInit>::new_from_slice(&[0_u8; 48])
             .unwrap_or_else(|_| panic!("HMAC-SHA384 rejected a 48-byte key"))
     });
@@ -355,6 +361,12 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+#[expect(
+    clippy::panic,
+    reason = "AUDIT: HMAC accepts a key of any length, so `new_from_slice` cannot \
+              fail; this arm exists only to avoid inventing an error path no caller \
+              can reach"
+)]
 fn unreachable_mac() -> Hmac<Sha256> {
     // Reached only if HMAC rejects a 32-byte key, which it cannot.
     panic!("HMAC-SHA256 rejected a 32-byte key")
@@ -413,12 +425,18 @@ pub fn base32(bytes: &[u8]) -> String {
         while bits >= 5 {
             bits -= 5;
             let index = ((buffer >> bits) & 0x1f) as usize;
-            out.push(char::from(ALPHABET[index]));
+            // `& 0x1f` is 0..=31 and the alphabet is 32 long, so the fallback
+            // is unreachable; `get` keeps it that way if either changes.
+            if let Some(symbol) = ALPHABET.get(index) {
+                out.push(char::from(*symbol));
+            }
         }
     }
     if bits > 0 {
         let index = ((buffer << (5 - bits)) & 0x1f) as usize;
-        out.push(char::from(ALPHABET[index]));
+        if let Some(symbol) = ALPHABET.get(index) {
+            out.push(char::from(*symbol));
+        }
     }
     out
 }

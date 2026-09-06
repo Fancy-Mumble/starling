@@ -1050,8 +1050,7 @@ fn forget_links_to(state: &mut TreeState, gone: &[u32]) {
 fn descendants(state: &TreeState, root: u32) -> Vec<u32> {
     let mut found = vec![root];
     let mut index = 0;
-    while index < found.len() {
-        let parent = found[index];
+    while let Some(&parent) = found.get(index) {
         index += 1;
         let mut children: Vec<u32> = state
             .channels

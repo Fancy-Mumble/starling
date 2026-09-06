@@ -254,7 +254,7 @@ fn collide(listeners: &[(String, String)], protocol: &str, findings: &mut Vec<Fi
         let Some((host, port)) = split_host_port(address) else {
             continue;
         };
-        for (other_key, other) in &listeners[index + 1..] {
+        for (other_key, other) in listeners.get(index + 1..).unwrap_or_default() {
             let Some((other_host, other_port)) = split_host_port(other) else {
                 continue;
             };

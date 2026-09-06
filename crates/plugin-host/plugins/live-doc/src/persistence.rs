@@ -175,7 +175,7 @@ pub async fn persist_room(cfg: &LiveDocConfig, client: &reqwest::Client, room: &
         );
         return;
     }
-    let snapshot = room.encode_snapshot().await;
+    let snapshot = room.encode_snapshot();
     let meta = room.meta().await;
     tracing::trace!(
         ?filename,
@@ -279,10 +279,14 @@ fn extract_meta(body: &str) -> Option<DocMeta> {
 }
 
 fn extract_marker<'a>(body: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
-    let start = body.find(prefix)? + prefix.len();
-    let rest = &body[start..];
+    // `get`, not a slice. The offsets come from `find`, so they are on char
+    // boundaries and could not panic -- but this parses a document body from
+    // storage, and byte offsets into a `str` are exactly where hostile UTF-8
+    // turns a parser into a crash.
+    let start = body.find(prefix)?.checked_add(prefix.len())?;
+    let rest = body.get(start..)?;
     let end = rest.find(suffix)?;
-    Some(rest[..end].trim())
+    Some(rest.get(..end)?.trim())
 }
 
 async fn fetch_shared_with(
@@ -554,7 +558,7 @@ mod tests {
             bound_channel: None,
             visibility: Visibility::Private,
         };
-        let snapshot = test_room("seed-src").encode_snapshot().await;
+        let snapshot = test_room("seed-src").encode_snapshot();
         let stored = render_document(&snapshot, &meta);
 
         let (base, mock) = start_mock(GetMode::Body(stored)).await;

@@ -12,6 +12,14 @@
 //! crate's cdylib -- the test says so and passes rather than failing for a
 //! reason that is about the build and not the code.
 
+#![allow(
+    clippy::print_stderr,
+    reason = "an integration test is its own crate, so clippy's in-test \
+              exemptions do not reach it. These print the reason a test \
+              skipped itself, which is the only way a skip is visible in \
+              `cargo test` output"
+)]
+
 // An integration test sees the library's dependencies as its own, and uses none
 // of them directly: everything it needs is re-exported through the crate under
 // test. Named here so `unused_crate_dependencies` stays on for the library,

@@ -438,7 +438,9 @@ impl<'a> Audience<'a> {
                 });
             }
             Some(at) => {
-                let existing = &mut self.order[at];
+                let Some(existing) = self.order.get_mut(at) else {
+                    return;
+                };
                 existing.context = existing.context.min(context);
                 // `None` is unity, and unity beats any attenuation.
                 existing.gain = match (existing.gain, gain) {

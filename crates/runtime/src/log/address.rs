@@ -49,8 +49,12 @@ static SALT: LazyLock<[u8; 16]> = LazyLock::new(|| {
     hasher.update(std::process::id().to_be_bytes());
     hasher.update(crate::ids::now_ms().to_be_bytes());
     let digest = hasher.finalize();
+    // Zipped rather than sliced: SHA-256 is 32 bytes and this takes 16, so a
+    // slice could not panic, but the zip cannot even be written wrongly.
     let mut salt = [0_u8; 16];
-    salt.copy_from_slice(&digest[..16]);
+    for (slot, byte) in salt.iter_mut().zip(digest) {
+        *slot = byte;
+    }
     salt
 });
 

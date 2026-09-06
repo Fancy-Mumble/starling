@@ -350,7 +350,8 @@ impl AudioCodec for LegacyCodec {
         } else {
             length
         });
-        writer.bytes(&packet.opus[..usize::try_from(length).unwrap_or(0)]);
+        let length = usize::try_from(length).unwrap_or(0);
+        writer.bytes(packet.opus.get(..length).unwrap_or(&packet.opus));
 
         if let Some(position) = packet.positional {
             for axis in position {

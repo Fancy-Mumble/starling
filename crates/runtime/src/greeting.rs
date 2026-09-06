@@ -1134,8 +1134,10 @@ fn design_form(design: Option<&GreetingDesign>) -> String {
 
 /// Truncated SHA-256 over [`canonical`].
 pub fn digest(graph: &Greeting) -> Vec<u8> {
-    let hash = Sha256::digest(canonical(graph).as_bytes());
-    hash[..DIGEST_BYTES].to_vec()
+    Sha256::digest(canonical(graph).as_bytes())
+        .into_iter()
+        .take(DIGEST_BYTES)
+        .collect()
 }
 
 /// What a *single greeting* is dismissed against.
@@ -1165,7 +1167,10 @@ pub fn greet_digest(graph: &Greeting, greet: &GreetingNode) -> Vec<u8> {
     for snippet in snippets(graph, &greet.id) {
         form.push_str(&format!("{}\u{1f}{}\n", snippet.html, snippet.plain));
     }
-    Sha256::digest(form.as_bytes())[..DIGEST_BYTES].to_vec()
+    Sha256::digest(form.as_bytes())
+        .into_iter()
+        .take(DIGEST_BYTES)
+        .collect()
 }
 
 /* -- JSON ------------------------------------------------------------------ */

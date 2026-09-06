@@ -307,7 +307,25 @@ too_many_lines = "deny"
 allow_attributes_without_reason = "deny"
 branches_sharing_code = "deny"
 collapsible_else_if = "deny"
-expect_used = "warn"
+expect_used = "deny"
+# `panic!`/`unreachable!` are denied so that every remaining explicit panic in
+# production code has to be argued for at the site. `.clippy.toml` exempts test
+# bodies, where a failed assertion SHOULD panic. This is what makes the audit in
+# `docs/RELIABILITY.md` stick: a new panic cannot be added quietly.
+panic = "deny"
+unreachable = "deny"
+# Indexing that can fail is a panic the type system will not catch. Denied in
+# production code, exempt in tests via `.clippy.toml`; the exemptions that
+# remain are argued at the site and checked by `scripts/check-panic-audit.py`.
+indexing_slicing = "deny"
+# Division by a runtime zero is a panic no other lint catches -- but clippy
+# cannot tell a runtime divisor from a constant one, and every division in this
+# tree today is by a constant (`BLOCK_LEN`, `MILLIS`). Denied, these would be
+# four exemptions that argue nothing plus a new one for every future
+# `x / 1000`, which makes the audited exemptions harder to read rather than
+# easier. Kept at `warn` so a new division is still visible in review.
+integer_division = "warn"
+modulo_arithmetic = "warn"
 
 # -- Bugs that are silent when they happen ----------------------------------
 # Each of these was measured to fire zero times when it was added, so they cost
@@ -358,7 +376,10 @@ unwrap_in_result = "warn"
 checked_conversions = "warn"
 unnested_or_patterns = "warn"
 needless_continue = "warn"
-string_slice = "warn"
+# Byte-slicing a `str` panics on a char boundary, and `crates/migrate/src/ini.rs`
+# and `crates/services/text/src/filter.rs` are where hostile UTF-8 meets byte
+# offsets.
+string_slice = "deny"
 iter_over_hash_type = "warn"
 redundant_clone = "warn"
 unused_async = "deny"

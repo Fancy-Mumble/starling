@@ -1,11 +1,17 @@
 excessive-nesting-threshold = 5
 
-# unwrap()/expect()/panic!() are denied in production code (see the
-# [workspace.lints.clippy] table in Cargo.toml) but are idiomatic in tests,
-# where a failed assertion SHOULD panic with a clear message.
+# unwrap() is denied in production code and expect() warns (see the
+# [workspace.lints.clippy] table in Cargo.toml); panic!() is not linted yet,
+# which docs/RELIABILITY.md Stage 3 closes. All three are idiomatic in tests,
+# where a failed assertion SHOULD panic with a clear message, so these three
+# settings exempt test bodies rather than production code.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+# Indexing is denied in production code for the same reason: `xs[i]` on a
+# length the wire chose is a panic, and with `panic = "abort"` a panic is an
+# outage. In a test an index is an assertion about a fixture the test wrote.
+allow-indexing-slicing-in-tests = true
 
 # Domain/product names that read fine unbackticked in prose. `..` keeps
 # clippy's built-in defaults (OpenGL, WebGL, ...).

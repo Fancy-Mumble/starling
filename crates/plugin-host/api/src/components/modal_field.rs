@@ -80,10 +80,12 @@ impl ModalFieldValue {
         match self {
             Self::String { value } => Some(value.clone()),
             Self::Bool { value } => Some(value.to_string()),
-            Self::Strings { values } if values.len() == 1 => Some(values[0].clone()),
-            Self::Users { values } if values.len() == 1 => Some(values[0].to_string()),
-            Self::Channels { values } if values.len() == 1 => Some(values[0].to_string()),
-            Self::Roles { values } if values.len() == 1 => Some(values[0].clone()),
+            Self::Strings { values } if values.len() == 1 => values.first().cloned(),
+            Self::Users { values } if values.len() == 1 => values.first().map(ToString::to_string),
+            Self::Channels { values } if values.len() == 1 => {
+                values.first().map(ToString::to_string)
+            }
+            Self::Roles { values } if values.len() == 1 => values.first().cloned(),
             _ => None,
         }
     }

@@ -144,24 +144,40 @@ impl VoiceCipher for Ocb2 {
         let (header, ciphertext) = packet
             .split_at_checked(OVERHEAD)
             .ok_or(VoiceError::Truncated { len: packet.len() })?;
+        // Destructured rather than indexed. `split_at_checked` has already
+        // proved the length, so `header[0]` could not panic -- but saying so in
+        // a comment is weaker than a binding the compiler checks, and this is
+        // the function an unauthenticated datagram reaches first.
+        let (&sequence_byte, tag) = header
+            .split_first()
+            .ok_or(VoiceError::Truncated { len: packet.len() })?;
 
         // Only eight bits of counter reach the wire, so the sequence in the
         // error is the byte, not a reconstructed 64-bit number. Reporting the
         // byte is honest; inventing the high bits would put a guess in a log.
-        let candidate = self.recv.place(header[0]).map_err(|error| match error {
-            NonceError::Replay => Rejected::Replay {
-                sequence: u64::from(header[0]),
-            },
-            NonceError::OutOfRange => Rejected::TooOld {
-                sequence: u64::from(header[0]),
-            },
-        })?;
+        let candidate = self
+            .recv
+            .place(sequence_byte)
+            .map_err(|error| match error {
+                NonceError::Replay => Rejected::Replay {
+                    sequence: u64::from(sequence_byte),
+                },
+                NonceError::OutOfRange => Rejected::TooOld {
+                    sequence: u64::from(sequence_byte),
+                },
+            })?;
 
         let opened = core::decrypt(&self.cipher, candidate.nonce, ciphertext);
 
         // Constant time: a timing signal here leaks how much of a forged tag was
         // right, which turns 2^24 guesses into three lots of 2^8.
-        if opened.tag.0[..TAG_LEN].ct_eq(&header[1..]).unwrap_u8() != 1 {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "AUDIT: `tag.0` is a fixed-size Block and TAG_LEN is a \
+                      constant below its length; `tag` on the right is the \
+                      `split_first` remainder, not an index"
+        )]
+        if opened.tag.0[..TAG_LEN].ct_eq(tag).unwrap_u8() != 1 {
             return Err(VoiceError::NotAuthentic);
         }
 
