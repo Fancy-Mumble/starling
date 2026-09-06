@@ -30,6 +30,17 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi))
         .route("/healthz", get(|| async { "ok\n" }))
+        // Liveness and readiness, deliberately separate.
+        //
+        // `/livez` asks "is this process worth keeping": it fails when a
+        // background task has died and will not come back, which restarting
+        // fixes. `/readyz` asks "may traffic arrive": it fails while a cache is
+        // still warming, which restarting makes *worse*. A `tcpSocket` probe
+        // answers neither, and a process with every task dead passes it.
+        .route("/livez", get(get_livez))
+        .route("/readyz", get(get_readyz))
+        // Prometheus text, for every service at once. See `get_metrics`.
+        .route("/metrics", get(get_metrics))
         .route("/v1/accounts", get(list_accounts).post(create_account))
         // Setting the SuperUser password is `PUT /v1/accounts/0`: the
         // administrator is an account, so it takes the account route.
@@ -183,7 +194,7 @@ async fn admit(
         action: action.to_owned(),
         outcome: "accepted".to_owned(),
     };
-    if let Err(error) = api.record(&record) {
+    if let Err(error) = api.record(&record).await {
         return Err(refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("the action was not recorded and so did not happen: {error}"),
@@ -1158,8 +1169,13 @@ async fn session_permissions(
         // The mask test done here, not by a second RPC: one evaluation,
         // so the boolean cannot disagree with the bitset beside it.
         let allowed = permission != 0 && granted.granted & permission == permission;
-        answer["permission"] = serde_json::json!(permission);
-        answer["allowed"] = serde_json::json!(allowed);
+        // `as_object_mut`, not `answer[..] =`: `IndexMut` on a `Value` panics
+        // when the value is not an object. It is one, three lines up, but the
+        // panic would be on the admin plane and the insert reads no worse.
+        if let Some(fields) = answer.as_object_mut() {
+            let _ = fields.insert("permission".to_owned(), serde_json::json!(permission));
+            let _ = fields.insert("allowed".to_owned(), serde_json::json!(allowed));
+        }
     }
     Ok(Json(answer))
 }
@@ -1269,6 +1285,187 @@ async fn list_bans(
 ///
 /// Unreadable without a credential like every other route here. Readiness
 /// names internal services and the caches they are waiting on, which is a map
+/// Whether this process's background tasks are still running.
+///
+/// The wedge signature is `/livez` failing while `/healthz` passes: the socket
+/// accepts, the process is scheduling, and the work is gone. That pair is the
+/// highest-severity alert in `deploy/prometheus-rules.yaml` for exactly that
+/// reason.
+///
+/// Unauthenticated, like `/healthz`: a probe that needs a credential is a probe
+/// an operator turns off.
+async fn get_livez(State(api): State<Arc<OperatorApi>>) -> (StatusCode, String) {
+    let stale = api.health().stale();
+    if stale.is_empty() {
+        return (StatusCode::OK, "live\n".to_owned());
+    }
+    // Named and timed, because "not live" is not actionable and "voice's sweep
+    // has not beaten in 4m12s" is.
+    let mut body = String::from("not live\n");
+    for (name, age) in stale {
+        body.push_str(&format!("{name}: no heartbeat for {}s\n", age.as_secs()));
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, body)
+}
+
+/// Whether this process has finished warming up.
+async fn get_readyz(State(api): State<Arc<OperatorApi>>) -> (StatusCode, String) {
+    let health = api.health();
+    if health.is_ready() {
+        return (StatusCode::OK, "ready\n".to_owned());
+    }
+    let mut body = String::from("warming\n");
+    for gate in health.pending() {
+        body.push_str(&format!("{gate}\n"));
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, body)
+}
+
+/// Every counter and gauge in the deployment, in Prometheus text format.
+///
+/// # Why this reads the collector rather than this process's registry
+///
+/// `serve.rs` builds a fresh `Metrics` and `Pressure` per service, so under
+/// `--all-in-one` there are twenty-three unshared registries and this process's
+/// own holds only the admin plane's. Reading the collector's `Overview` gives
+/// every service in both topologies from one scrape, which is also the only
+/// thing that works when the services are twenty-three pods.
+///
+/// # The rule that must not be broken here
+///
+/// **This must never call `Pressure::sample` itself.** That call *clears the
+/// peak*, so exactly one reader may make it, and that reader is the `health`
+/// collector's five-second poll. A scrape that sampled directly would silently
+/// take intervals from the dashboard and vice versa, and neither would look
+/// wrong. Counters are cumulative and have no such problem; the gauges below
+/// are the collector's last snapshot, read and not taken.
+///
+/// Unauthenticated, like `/healthz`: a scrape target that needs a bearer token
+/// is one an operator disables. Bind the admin plane where only the scraper can
+/// reach it, which is what its `listen` is for.
+async fn get_metrics(
+    State(api): State<Arc<OperatorApi>>,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::health::OverviewRequest;
+    use starling_proto_fancy::health::health_overview_client::HealthOverviewClient;
+
+    let channel = api
+        .resolver()
+        .channel("health")
+        .map_err(|error| refuse(StatusCode::BAD_GATEWAY, &error.to_string()))?;
+    let overview = HealthOverviewClient::new(channel)
+        .get(OverviewRequest {
+            scope: Some(Scope { instance: 1 }),
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, &status.to_string()))?
+        .into_inner();
+
+    // This process's own memory, descriptors and threads, which no service
+    // counts for itself: they are properties of the process and only the kernel
+    // knows them. Under `--all-in-one` that is the whole server; under one pod
+    // per service it is this pod, which is what a per-pod memory alert wants.
+    Ok(render_prometheus(&overview)
+        + &starling_runtime::process::render()
+        + &render_log_counts(api.logger()))
+}
+
+/// Records written, by severity.
+///
+/// The one thing a log can tell an alert that reading the log cannot: a *rate*.
+/// Exported from the counters the logger keeps rather than from a log pipeline,
+/// so an error-rate alert works on a deployment that ships its logs nowhere.
+fn render_log_counts(logger: &starling_runtime::log::Logger) -> String {
+    use std::fmt::Write as _;
+
+    const NAMES: [&str; starling_runtime::log::SEVERITIES] =
+        ["debug", "info", "notice", "warning", "error", "critical"];
+
+    let mut out = String::from(
+        "# HELP starling_log_records Records written, by severity.\n         # TYPE starling_log_records counter\n",
+    );
+    for (severity, count) in NAMES.iter().zip(logger.counts()) {
+        let _ = writeln!(
+            out,
+            "starling_log_records{{severity=\"{severity}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP starling_log_records_dropped Records lost to a full queue.\n         # TYPE starling_log_records_dropped counter\n         starling_log_records_dropped {}",
+        logger.dropped()
+    );
+    out
+}
+
+/// The `Overview` as Prometheus text.
+///
+/// Every series carries a `service` label, because the same counter name exists
+/// in twenty-three services and summing them without one would report a total
+/// nobody can act on.
+fn render_prometheus(overview: &starling_proto_fancy::health::Overview) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let mut typed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Sorted, so two scrapes of an unchanged server produce identical text.
+    let mut services: Vec<&starling_proto_fancy::health::ServiceHealth> =
+        overview.services.iter().collect();
+    services.sort_by(|a, b| a.service.cmp(&b.service));
+
+    for service in &services {
+        let label = escape(&service.service);
+        for counter in &service.counters {
+            if typed.insert(counter.name.clone()) {
+                let _ = writeln!(out, "# TYPE {} counter", counter.name);
+            }
+            let _ = writeln!(
+                out,
+                "{}{{service=\"{label}\"}} {}",
+                counter.name, counter.value
+            );
+        }
+        for load in &service.load {
+            // One gauge per field rather than one with a `field` label: a
+            // dashboard plots used against capacity, and a label would make
+            // that a join.
+            let base = format!("starling_load_{}", sanitise(&load.name));
+            // `rejected` is cumulative and the other three are instantaneous,
+            // which is the difference between a counter and a gauge to
+            // Prometheus and decides how a dashboard may aggregate them.
+            for (suffix, kind, value) in [
+                ("used", "gauge", load.used),
+                ("peak", "gauge", load.peak),
+                ("capacity", "gauge", load.capacity),
+                ("rejected", "counter", load.rejected),
+            ] {
+                let name = format!("{base}_{suffix}");
+                if typed.insert(name.clone()) {
+                    let _ = writeln!(out, "# TYPE {name} {kind}");
+                }
+                let _ = writeln!(out, "{name}{{service=\"{label}\"}} {value}");
+            }
+        }
+    }
+    out
+}
+
+/// A gauge name as a Prometheus metric name.
+fn sanitise(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// A label value, with the three characters Prometheus escapes.
+fn escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 /// of the deployment and not something to serve anonymously.
 async fn get_health(
     State(api): State<Arc<OperatorApi>>,
@@ -2186,7 +2383,7 @@ fn sniff(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         return Some("image/jpeg");
     }
-    if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
         return Some("image/webp");
     }
     None
@@ -2565,5 +2762,81 @@ mod tests {
             };
             assert_eq!(status, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use starling_proto_fancy::health::{CounterSample, Load, Overview, ServiceHealth};
+
+    use super::render_prometheus;
+
+    fn service(name: &str) -> ServiceHealth {
+        ServiceHealth {
+            service: name.to_owned(),
+            counters: vec![CounterSample {
+                name: "starling_frames_routed".to_owned(),
+                value: 12,
+            }],
+            load: vec![Load {
+                name: "control queue".to_owned(),
+                used: 3,
+                peak: 9,
+                capacity: 4096,
+                rejected: 1,
+            }],
+            ..ServiceHealth::default()
+        }
+    }
+
+    #[test]
+    fn every_series_names_the_service_it_came_from() {
+        // The same counter name exists in twenty-three services. Without the
+        // label a scrape reports one total nobody can act on.
+        let rendered = render_prometheus(&Overview {
+            services: vec![service("gateway"), service("voice")],
+            ..Overview::default()
+        });
+
+        assert!(rendered.contains(r#"starling_frames_routed{service="gateway"} 12"#));
+        assert!(rendered.contains(r#"starling_frames_routed{service="voice"} 12"#));
+        assert_eq!(
+            rendered
+                .matches("# TYPE starling_frames_routed counter")
+                .count(),
+            1,
+            "a TYPE line is per metric name, not per series"
+        );
+    }
+
+    #[test]
+    fn a_gauge_becomes_its_four_fields() {
+        let rendered = render_prometheus(&Overview {
+            services: vec![service("gateway")],
+            ..Overview::default()
+        });
+
+        for (suffix, value) in [
+            ("used", 3),
+            ("peak", 9),
+            ("capacity", 4096),
+            ("rejected", 1),
+        ] {
+            let line =
+                format!(r#"starling_load_control_queue_{suffix}{{service="gateway"}} {value}"#);
+            assert!(rendered.contains(&line), "missing {line} in:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn two_scrapes_of_one_overview_are_byte_identical() {
+        // Read, not taken. The collector owns the only `Pressure::sample` call;
+        // if this ever consumed anything, a scrape and the dashboard would
+        // steal intervals from each other and neither would look wrong.
+        let overview = Overview {
+            services: vec![service("voice"), service("gateway"), service("pchat")],
+            ..Overview::default()
+        };
+        assert_eq!(render_prometheus(&overview), render_prometheus(&overview));
     }
 }

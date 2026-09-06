@@ -179,6 +179,10 @@ pub struct OperatorAudit {
     pub path: PathBuf,
     /// A request that cannot be recorded is refused.
     pub fail_closed: bool,
+    /// Rotate once the file passes this. `0` never rotates.
+    pub max_bytes: u64,
+    /// How many rotated generations to keep.
+    pub keep: usize,
 }
 
 impl Default for OperatorAudit {
@@ -186,6 +190,12 @@ impl Default for OperatorAudit {
         Self {
             path: PathBuf::from("/var/log/starling/operator-audit.log"),
             fail_closed: true,
+            // Rotated, unlike before, where this file was the one thing in the
+            // tree that grew forever: the runtime's own log sink rotates and
+            // this did not. 64 MiB of one-line JSON records is a long history
+            // of operator actions.
+            max_bytes: 64 * 1024 * 1024,
+            keep: 5,
         }
     }
 }

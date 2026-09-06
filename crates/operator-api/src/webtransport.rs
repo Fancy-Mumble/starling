@@ -172,11 +172,14 @@ async fn session(
 
     // Recorded before the session is established, as every other action is.
     // A live channel is a read of everything, so it is not exempt.
-    if let Err(error) = api.record(&crate::AuditRecord {
-        subject: subject.clone(),
-        action: format!("CONNECT {PATH} (webtransport)"),
-        outcome: "accepted".to_owned(),
-    }) {
+    if let Err(error) = api
+        .record(&crate::AuditRecord {
+            subject: subject.clone(),
+            action: format!("CONNECT {PATH} (webtransport)"),
+            outcome: "accepted".to_owned(),
+        })
+        .await
+    {
         tracing::error!(%error, "a WebTransport session was refused: not recorded");
         return Ok(());
     }
@@ -250,7 +253,10 @@ async fn pump(
                         pending.extend_from_slice(&bytes);
                         while let Some(at) = pending.iter().position(|byte| *byte == b'\n') {
                             let line: Vec<u8> = pending.drain(..=at).collect();
-                            let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                            let text = String::from_utf8_lossy(
+                            line.split_last().map_or(&[][..], |(_, rest)| rest),
+                        )
+                        .into_owned();
                             if let Some(reply) =
                                 crate::live::run_command(api, &text, &mut registered).await
                             {

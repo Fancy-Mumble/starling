@@ -64,9 +64,28 @@ pub struct OperatorApi {
     listen: String,
     resolver: starling_runtime::channel::Resolver,
     events: EventHub,
+    /// This process's log, for the record counts `/metrics` exports.
+    logger: Logger,
+    /// This process's own liveness and readiness, for `/livez` and `/readyz`.
+    ///
+    /// Under `--all-in-one` that is every service, because they share a process
+    /// and therefore share the answer to "should this be restarted".
+    health: starling_runtime::health::Health,
 }
 
 impl OperatorApi {
+    /// This process's log, for the record counts.
+    #[must_use]
+    pub const fn logger(&self) -> &Logger {
+        &self.logger
+    }
+
+    /// This process's health, for the probes.
+    #[must_use]
+    pub const fn health(&self) -> &starling_runtime::health::Health {
+        &self.health
+    }
+
     /// Who is asking, from an `Authorization` header.
     ///
     /// Tried against the configured strategy first -- `token`, `mtls`, `oidc`
@@ -169,8 +188,8 @@ impl OperatorApi {
     /// whole contract: an action that cannot be recorded does not happen. With
     /// it unset the write still failed and is logged at error, but the request
     /// is allowed to proceed, an operator's decision to take.
-    pub fn record(&self, record: &AuditRecord) -> std::io::Result<()> {
-        match self.audit.record(record) {
+    pub async fn record(&self, record: &AuditRecord) -> std::io::Result<()> {
+        match self.audit.record(record).await {
             Ok(()) => Ok(()),
             Err(error) if self.audit.fail_closed() => Err(error),
             Err(error) => {
@@ -292,6 +311,8 @@ impl Serve for OperatorApi {
                 .unwrap_or_else(|| "127.0.0.1:8081".to_owned()),
             resolver: ctx.resolver,
             events: EventHub::new(),
+            logger: ctx.logger.clone(),
+            health: ctx.health.clone(),
         }))
     }
 
@@ -344,6 +365,7 @@ mod tests {
             audit: AuditLog::new(OperatorAudit {
                 path: std::path::PathBuf::from("/"),
                 fail_closed,
+                ..OperatorAudit::default()
             }),
             listen: "127.0.0.1:0".to_owned(),
             resolver: starling_runtime::channel::Resolver::new(
@@ -351,6 +373,8 @@ mod tests {
                 starling_runtime::inproc::Broker::new(),
             ),
             events: EventHub::new(),
+            logger: starling_runtime::log::Logger::null(),
+            health: starling_runtime::health::Health::new(),
         }
     }
 
@@ -362,12 +386,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fail_closed_refuses_an_action_that_could_not_be_recorded() {
+    #[tokio::test]
+    async fn fail_closed_refuses_an_action_that_could_not_be_recorded() {
         let api = api_with_unwritable_audit(true);
         assert!(api.audit_fail_closed());
         assert!(
-            api.record(&record()).is_err(),
+            api.record(&record()).await.is_err(),
             "the default must refuse: an action that cannot be recorded does not happen"
         );
     }
@@ -386,14 +410,14 @@ mod tests {
         assert_eq!(refusal, Refusal::Rejected);
     }
 
-    #[test]
-    fn fail_closed_unset_lets_the_action_proceed() {
+    #[tokio::test]
+    async fn fail_closed_unset_lets_the_action_proceed() {
         // The bug this prevents: the key was read by nobody, so an operator who
         // turned it off still got a 503 the moment the log filled up.
         let api = api_with_unwritable_audit(false);
         assert!(!api.audit_fail_closed());
         assert!(
-            api.record(&record()).is_ok(),
+            api.record(&record()).await.is_ok(),
             "with fail_closed unset the write still failed, but the request proceeds"
         );
     }
