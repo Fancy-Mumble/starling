@@ -40,10 +40,14 @@ pub mod livery;
 pub mod log;
 pub mod metrics;
 pub mod names;
+/// Telling systemd what this process is doing.
+pub mod notify;
 pub mod operator_scope;
 pub mod permit;
 pub mod plane;
 pub mod pressure;
+/// This process's own memory, descriptors and threads.
+pub mod process;
 pub mod ratelimit;
 pub mod roster;
 pub mod serve;

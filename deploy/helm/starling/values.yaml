@@ -186,7 +186,17 @@ persistence:
 # ---------------------------------------------------------------------------
 defaults:
   replicas: 1
-  resources: {}
+  # Empty means unlimited, which is what this was: a leak ends with the OOM
+# killer choosing a victim on the node rather than this pod restarting, and a
+# CPU-hungry neighbour can starve the voice path. Set both, even generously.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    # No CPU limit on purpose: throttling the voice path produces jitter every
+    # listener hears, and the request above is what the scheduler honours.
+    memory: 2Gi
   nodeSelector: {}
   tolerations: []
   affinity: {}

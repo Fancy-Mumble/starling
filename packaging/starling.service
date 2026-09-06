@@ -32,7 +32,6 @@ StartLimitBurst=5
 StartLimitIntervalSec=60
 
 [Service]
-Type=exec
 ExecStart=/usr/bin/starling --all-in-one
 
 # No user to create and none left behind: systemd allocates one for the
@@ -52,6 +51,33 @@ Environment=XDG_DATA_HOME=/var/lib/starling/data
 
 Restart=on-failure
 RestartSec=5s
+
+# Process limits. Absent before, which meant the defaults: 1024 descriptors on
+# many distributions, which a server holding one socket per client reaches at
+# around a thousand users and then reports as "accept failed" in a loop.
+#
+# LimitNOFILE counts sockets, the databases and the log; MemoryMax is a ceiling
+# the kernel enforces rather than a hint, so a leak ends as a restart with a
+# journal entry instead of the OOM killer choosing a victim; TasksMax bounds a
+# runaway spawn.
+LimitNOFILE=65536
+MemoryAccounting=yes
+MemoryMax=2G
+TasksMax=4096
+
+# The watchdog, and the reason it is gated on liveness rather than on a timer.
+#
+# A plain periodic ping proves only that the runtime is still scheduling, which
+# a wedged server also does: every background task can be dead while the accept
+# loop still answers and the timer still fires. Starling pings only while
+# `Health::is_live()` holds -- every registered heartbeat still fresh -- so this
+# restarts exactly the failure that has no other symptom.
+#
+# Type=notify with READY=1 sent after warm-up, so `systemctl start` returns when
+# the server can actually answer rather than when the process exists.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 
 # This process terminates TLS for unauthenticated peers on a public port, so it
 # gets no more of the system than it needs. Every one of these was checked

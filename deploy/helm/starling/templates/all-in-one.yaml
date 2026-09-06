@@ -88,11 +88,57 @@ spec:
               containerPort: {{ .Values.operatorApi.port }}
               protocol: TCP
             {{- end }}
-          # There is no gRPC port to probe here - every call is in-process - so
-          # the client port is the only listener to ask about. That makes this
-          # the one probe that is an unfinished TLS handshake, which the
-          # gateway records as a security event, so it runs rarely rather than
-          # every few seconds.
+          # `/livez` and `/readyz` are served by the operator API, so real
+          # probes need it enabled. With it off, the only listener to ask about
+          # is the client port, and a TLS socket that accepts proves the process
+          # exists and nothing more: a server whose background tasks have all
+          # died still completes the handshake. That is the wedge these probes
+          # exist to catch, and the `tcpSocket` fallback below cannot. It also
+          # leaves an unfinished handshake in the log as a security event, which
+          # is why it runs rarely rather than every few seconds.
+          #
+          # Enable `operatorApi` for a deployment that should be restarted when
+          # it stops working rather than when it stops existing.
+          {{- if .Values.operatorApi.enabled }}
+          # `httpGet`, not `tcpSocket`. A socket that accepts proves the
+          # process exists and nothing else: a server whose background tasks
+          # have all died still completes the handshake, which is the wedge
+          # these probes existed to catch and could not.
+          #
+          # `/readyz` gates traffic on warm-up, `/livez` on the background tasks
+          # still running, and the two must not be swapped: restarting a warming
+          # server makes it warm more slowly, while restarting a wedged one is
+          # the only thing that fixes it.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: rest
+            periodSeconds: 5
+            # Five minutes to warm up, which a cold start with large channel
+            # artwork can take. Generous, because failing this kills the pod
+            # before it has ever served, and the loop that produces is a
+            # deployment that never comes up with no explanation.
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: rest
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: rest
+            # No initial delay: `startupProbe` above holds this off until the
+            # server is warm, which is what that probe is for.
+            periodSeconds: 30
+            timeoutSeconds: 3
+            # Three misses, so one slow scrape on a busy node is not a restart.
+            failureThreshold: 3
+          {{- else }}
+          # No operator API, so no `/livez`. This says the socket accepts and
+          # nothing else; see the note above.
           readinessProbe:
             tcpSocket:
               port: mumble-tcp
@@ -107,6 +153,7 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 3
             failureThreshold: 3
+          {{- end }}
           resources:
             {{- toYaml $d.resources | nindent 12 }}
           volumeMounts:
