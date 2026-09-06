@@ -119,13 +119,22 @@ impl ModerationService {
     }
 
     /// Every ban in `scope`, expired ones dropped.
+    ///
+    /// Expiry is applied in the statement, not only afterwards. This is called
+    /// once per connection *attempt*, and reading the whole ban history to
+    /// discard most of it made a long-banned peer's reconnect loop into free
+    /// amplification against the server that banned them. The row filter still
+    /// runs below, because `duration_s` arithmetic in SQL and in Rust agreeing
+    /// is not something to assume across three dialects.
     async fn bans(&self, scope: u32) -> Vec<Ban> {
         use sqlx::Row as _;
         let rows = sqlx::query(
             "SELECT id, address, prefix_len, name, cert_hash, reason, start_ms, duration_s \
-             FROM ban WHERE server_id = ?",
+             FROM ban WHERE server_id = ? \
+             AND (duration_s = 0 OR start_ms + duration_s * 1000 > ?)",
         )
         .bind(i64::from(scope))
+        .bind(now_ms() as i64)
         .fetch_all(self.store.pool())
         .await
         .unwrap_or_default();
@@ -145,6 +154,13 @@ impl ModerationService {
             .collect()
     }
 }
+
+/// How often expired bans are deleted.
+///
+/// Expiry was a read-time filter only: the sole `DELETE FROM ban` is an
+/// explicit unban, so a server that had banned a thousand transient peers for
+/// an hour each kept all thousand rows for the life of the deployment.
+const BAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A `PermissionDenied` saying the target is the administrator.
 fn deny_superuser(inbound: &Inbound) -> starling_proto_fancy::control::ServerAction {
@@ -644,6 +660,39 @@ impl Serve for ModerationService {
         tonic::service::Routes::default()
             .add_service(ModerationServer::new(ModerationRpc(Arc::clone(&self))))
             .add_service(plane)
+    }
+
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let mut tick = tokio::time::interval(BAN_SWEEP_INTERVAL);
+        // Ticks missed while the sweep ran are dropped rather than fired back
+        // to back; this is housekeeping, and catching up on it has no value.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ctx.shutdown.wait() => return Ok(()),
+                _ = tick.tick() => {
+                    let swept = self.sweep_expired().await;
+                    if swept > 0 {
+                        tracing::debug!(bans = swept, "expired bans deleted");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ModerationService {
+    /// Delete every ban whose duration has run out. Returns how many went.
+    ///
+    /// Timed bans only: `duration_s = 0` is permanent and is lifted by an
+    /// operator, never by the clock.
+    async fn sweep_expired(&self) -> u64 {
+        sqlx::query("DELETE FROM ban WHERE duration_s <> 0 AND start_ms + duration_s * 1000 <= ?")
+            .bind(now_ms() as i64)
+            .execute(self.store.pool())
+            .await
+            .map(|done| done.rows_affected())
+            .unwrap_or_default()
     }
 }
 

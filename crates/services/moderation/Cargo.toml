@@ -12,6 +12,8 @@ starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
 sqlx.workspace = true
+# The expired-ban sweep: an interval, and a select against the drain.
+tokio.workspace = true
 
 prost.workspace = true
 tonic.workspace = true
