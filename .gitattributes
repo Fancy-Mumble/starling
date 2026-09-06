@@ -13,3 +13,9 @@
 # Binary, and diffing or converting them corrupts them.
 *.pem binary
 *.png binary
+
+# Fuzz corpora: arbitrary bytes, chosen for the shape they have. `text=auto`
+# classifies the entries without a NUL byte as text and would rewrite their
+# line endings, changing the input the target replays.
+fuzz/corpus/** binary
+fuzz/artifacts/** binary

@@ -1,0 +1,43 @@
+# Wire tokens for the frame decoder and the envelope targets.
+#
+# A dictionary is not a corpus: it gives the fuzzer byte sequences worth trying
+# at a mutation site, which is how it gets past a length or tag check it would
+# otherwise have to guess a byte at a time.
+#
+# libFuzzer's parser takes `name="value"` or a bare `"value"`, and `#` only at
+# the start of a line -- a trailing comment is a parse error, so the labels are
+# entry names.
+
+# Frame type ids, big-endian, from the classic protocol.
+type_version="\x00\x00"
+type_udptunnel="\x00\x01"
+type_authenticate="\x00\x02"
+type_ping="\x00\x03"
+type_reject="\x00\x04"
+type_serversync="\x00\x05"
+type_channelstate="\x00\x07"
+type_userstate="\x00\x09"
+type_textmessage="\x00\x0b"
+type_cryptsetup="\x00\x0f"
+
+# Payload lengths that sit on a boundary: zero, the 8 MiB cap, one past it, and
+# the largest a u32 can say.
+len_zero="\x00\x00\x00\x00"
+len_cap="\x00\x80\x00\x00"
+len_over_cap="\x00\x80\x00\x01"
+len_max="\xff\xff\xff\xff"
+
+# Protobuf field headers: (field number << 3) | wire type, for the first few
+# fields in each of the wire types a message actually uses.
+pb_f1_varint="\x08"
+pb_f2_varint="\x10"
+pb_f2_bytes="\x12"
+pb_f3_varint="\x18"
+pb_f3_bytes="\x1a"
+pb_f4_bytes="\x22"
+pb_f5_bytes="\x2a"
+pb_f6_bytes="\x32"
+
+# Varint continuations, which is how a length field is grown.
+varint_u32_max="\xff\xff\xff\xff\x0f"
+varint_overlong="\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01"

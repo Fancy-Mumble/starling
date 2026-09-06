@@ -1,0 +1,33 @@
+# The audio format's own tokens.
+#
+# The legacy header packs a type in the top three bits and a target in the
+# bottom five, so a fuzzer that does not know that spends its budget finding
+# the handful of headers a packet can start with.
+#
+# `name="value"` because libFuzzer's parser reads a trailing `#` as part of the
+# entry, not as a comment.
+
+# Legacy headers: type 0..5 with target 0. Type 5 is unassigned and must be
+# refused rather than guessed at.
+hdr_celt_alpha="\x00"
+hdr_ping="\x20"
+hdr_speex="\x40"
+hdr_celt_beta="\x60"
+hdr_opus="\x80"
+hdr_unassigned="\xa0"
+
+# Opus with each of the four whisper targets.
+opus_whisper_1="\x81"
+opus_whisper_2="\x82"
+opus_whisper_3="\x83"
+opus_whisper_4="\x84"
+
+# Varint prefixes, one per length class the encoding defines.
+varint_1byte="\x7f"
+varint_2byte="\x80"
+varint_3byte="\xc0"
+varint_4byte="\xe0"
+varint_5byte="\xf0"
+varint_negative="\xf4"
+varint_inverted="\xf8"
+varint_byte_inverted="\xfc"

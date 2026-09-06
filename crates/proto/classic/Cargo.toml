@@ -15,5 +15,9 @@ thiserror.workspace = true
 [build-dependencies]
 prost-build.workspace = true
 
+[dev-dependencies]
+# Property tests: see docs/RELIABILITY.md Stage 4.
+proptest.workspace = true
+
 [lints]
 workspace = true

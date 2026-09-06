@@ -23,6 +23,13 @@
 //! not regenerate the fixture to make it pass without establishing which: the
 //! whole value here is that a drifting codec cannot quietly re-baseline itself.
 
+#![allow(
+    clippy::panic,
+    reason = "an integration test is its own crate, so clippy's \
+              `allow-panic-in-tests` does not reach it; a failed fixture check \
+              SHOULD panic with the message naming the fixture"
+)]
+
 use prost::Message as _;
 use starling_proto_fancy::fancy::files::{FilesEnvelope, Visibility, files_envelope};
 use starling_proto_fancy::fancy::pchat::{PchatEnvelope, pchat_envelope};

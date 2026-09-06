@@ -1,0 +1,119 @@
+# Every fuzz target in the tree, in one crate.
+#
+# Its own workspace (the empty `[workspace]` table at the bottom) so
+# `cargo-fuzz`'s nightly-only `-Z` flags and sanitizer settings do not leak into
+# the main build, and so `cargo build` at the repo root ignores it.
+#
+# One crate rather than one per target. There were fifteen surfaces worth
+# fuzzing and a crate each would mean fifteen manifests, fifteen lockfiles and
+# fifteen CI steps to keep in step; the targets share almost all of their
+# dependencies, so they share a crate.
+#
+# Corpora live in `fuzz/corpus/<target>/`, committed and minimised. A committed
+# corpus is what turns a timed fuzz run into a *replay*, which is the right
+# per-PR semantic: a crash that was fixed once fails in seconds if it comes
+# back, rather than depending on the fuzzer rediscovering it.
+[package]
+name = "starling-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+# The configuration parser is one of the surfaces being fuzzed.
+toml = "1"
+rustls = { version = "0.23", features = ["ring"] }
+prost = "0.14"
+
+starling-proto = { path = "../crates/proto/classic" }
+starling-proto-fancy = { path = "../crates/proto/fancy" }
+starling-crypto = { path = "../crates/crypto" }
+starling-runtime = { path = "../crates/runtime" }
+starling-voice = { path = "../crates/services/voice" }
+starling-gateway = { path = "../crates/gateway" }
+starling-link-preview = { path = "../crates/services/link-preview" }
+starling-permissions = { path = "../crates/services/permissions" }
+
+# --- Tier 1: what an unauthenticated peer reaches --------------------------
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_packet"
+path = "fuzz_targets/voice_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_varint"
+path = "fuzz_targets/voice_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_cert"
+path = "fuzz_targets/peer_cert.rs"
+test = false
+doc = false
+bench = false
+
+# --- Tier 2: after the handshake, before any privilege ---------------------
+
+[[bin]]
+name = "fancy_envelope"
+path = "fuzz_targets/fancy_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unbatch"
+path = "fuzz_targets/unbatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocb2"
+path = "fuzz_targets/ocb2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thumbnail"
+path = "fuzz_targets/thumbnail.rs"
+test = false
+doc = false
+bench = false
+
+# --- Tier 3: operator-controlled, still process-fatal ----------------------
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acl_eval"
+path = "fuzz_targets/acl_eval.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
