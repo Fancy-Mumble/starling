@@ -33,9 +33,13 @@ in four places:
 Every item was read in the source and confirmed. Ordered by threat to uptime.
 Update this table as each defect closes.
 
-**Status.** Stages 0 and 2b are done: defects 2, 3, 4, 7, 8, 10, 18 and 22 are
+**Status.** Stages 0 to 6 and 8 are done. Stage 7 has its in-process restart
+half and Stage 9 its per-PR jobs. Defects 2, 3, 4, 7, 8, 10, 18 and 22 are
 closed with regression tests, 6 is closed for visibility, and 16 and 19 are
-partly closed. Defect 7 turned out to have a second half the register missed --
+partly closed. Restarting one service at a time then found two the audit had
+not looked for, 23 and 24, both below.
+
+Defect 7 turned out to have a second half the register missed --
 `serve::run` discarded a panicking background task's `JoinError` before
 `Deployment::stop` ever saw it, so fixing the harness alone would not have made
 a service panic fail a test.
@@ -76,6 +80,19 @@ a service panic fail a test.
 | 20 | **Six `plugin-host` crates do not inherit the workspace lints**, each hand-copying a subset; `api-wasm` has the thinnest table. `host` sets `unsafe_code = "allow"` — it is the crate that `dlopen`s third-party `.so`. A lint added to the workspace table silently misses all six. | `crates/plugin-host/{api,api-derive,host,api-wasm}/Cargo.toml` plus the two plugin crates |
 | 21 | **No process limits in packaging.** `packaging/starling.service` sets no `LimitNOFILE`, `MemoryMax` or watchdog. Helm ships `resources: {}`. The compose healthcheck **latches on first success**, so it stops tracking liveness after start. | `packaging/starling.service`; `deploy/helm/starling/values.yaml:189`; `docker-compose.yml` |
 | 22 | **CLOSED.** *(backoff on `EMFILE`/`ENFILE`, and the read buffer is returned to 8 KiB once drained)* **Accept loop hot-spins on `EMFILE`** — logged and `continue`d with no backoff. **Per-connection read buffer never shrinks**: one 8 MiB frame keeps 8 MiB resident for that connection's life. | `crates/gateway/src/listener.rs:322-330`, `:586`, `:615` |
+
+### Found by Stage 7, not by the original audit
+
+A restart is a fault the audit never injected, so nothing here was visible until
+`crates/starling/tests/chaos.rs` stopped one service at a time. Both have a
+named `#[ignore]`d reproduction in that file, and both pass the day the fix
+lands.
+
+| # | Defect | Evidence |
+|---|---|---|
+| 23 | **A drained service is still held by its callers' connections, so it can never be restarted.** `serve_routes` waits `DRAIN_GRACE` for its connections and returns anyway, but the per-connection tasks belong to hyper, spawned by `serve_with_incoming_shutdown` and detached; each holds the `Routes`, and so an `Arc` to the service. They end only when the caller closes the stream, and the caller is not the thing being restarted. `voice` is where it is fatal: its UDP port is still bound, the replacement fails to build with `Address already in use`, and `serve::run` does not retry a failed construction, so it never comes back. The quieter half is that every restart leaks the instance before it, database pool included, until the process exits. | `crates/runtime/src/listen.rs:84`, `:96`; `crates/services/voice/src/service.rs:894`; `serve::run` `crates/runtime/src/serve.rs:283`; repro `chaos.rs::voice_can_be_restarted` |
+| 24 | **A restarted `session-view` forgets who is connected, and nothing refills it.** It holds the roster in memory and starts empty; `session-lifecycle` publishes a session when it is created and never re-publishes to a subscriber it has not seen before. Two clients who never disconnected can no longer hear each other twelve seconds later. A service that comes back without the deployment's state is not restartable in the sense a supervisor needs. | `crates/services/session-view/src/lib.rs`; repro `chaos.rs::a_restarted_session_view_still_routes_a_message` |
+
 
 ### What the audit found to be clean
 
