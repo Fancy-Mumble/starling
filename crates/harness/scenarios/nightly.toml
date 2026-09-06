@@ -1,0 +1,19 @@
+# Forty-five minutes at a hundred clients, on a hosted runner.
+#
+# Enough for the map, descriptor, task and quiesce assertions, all of which are
+# population-independent. Not enough for the RSS slope, which needs hours; that
+# is `long.toml`'s job and the reason the two exist separately rather than as
+# one scenario with a flag.
+name = "nightly"
+population = 100
+duration_s = 2700
+warmup_s = 120
+quiesce_s = 300
+sample_every_s = 30
+channels = 64
+join_every_s = 90
+chat_every_s = 60
+large_chat_percent = 3
+speaking_percent = 15
+reconnect_percent = 4
+cycles = 2

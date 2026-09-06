@@ -20,19 +20,25 @@
 //! makes the `.deb`, the `.AppImage`, the `.dmg` and the `.exe` in `docs/
 //! RELEASING.md` something a person can double-click.
 
+// The e2e suite in `tests/` is what uses `starling-harness`, `rustls` and the
+// rest of the dev-dependencies; this target sees them and cannot see it.
+#![cfg_attr(
+    test,
+    allow(
+        unused_crate_dependencies,
+        reason = "the dev-dependencies belong to tests/e2e.rs"
+    )
+)]
+
 mod check;
-mod compose;
+pub mod compose;
 mod firstrun;
 mod migrate_db;
 mod paths;
 mod superuser;
-mod units;
-
-#[cfg(test)]
-mod e2e;
+pub mod units;
 
 use std::io::{self, Write as _};
-use std::process::ExitCode;
 
 /// Write `text` to stdout, reporting a failed write instead of dying on it.
 ///
@@ -47,21 +53,12 @@ pub(crate) fn out(text: &str) -> Result<(), String> {
         .map_err(|error| format!("writing to stdout: {error}"))
 }
 
-fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match run(&arguments) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            // Ignored rather than reported: this *is* the reporting path, and
-            // there is nowhere left to report a stderr that will not take it.
-            let _ = writeln!(io::stderr().lock(), "starling: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 /// Dispatch on the first argument.
-fn run(arguments: &[String]) -> Result<(), String> {
+///
+/// # Errors
+///
+/// The message the binary prints to stderr before exiting non-zero.
+pub fn run(arguments: &[String]) -> Result<(), String> {
     let first = arguments.first().map(String::as_str);
     match first {
         None | Some("--help" | "-h") => out(&format!("{}\n", usage())),
@@ -109,7 +106,8 @@ fn run(arguments: &[String]) -> Result<(), String> {
 }
 
 /// What this binary accepts.
-fn usage() -> String {
+#[must_use]
+pub fn usage() -> String {
     let mut lines = String::from(
         "usage: starling <component> [--config <file>]\n\
          \x20      starling --all-in-one [--config <file>]\n\

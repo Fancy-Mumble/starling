@@ -50,6 +50,11 @@ members = [
     "crates/migrate",
     "crates/starling",
 
+    # Test scaffolding: starts a deployment and speaks its wire. A crate rather
+    # than a `#[cfg(test)] mod` inside the binary, because the e2e suite, the
+    # soak and the chaos runs all need it and a second copy would drift.
+    "crates/harness",
+
     # The plugin host and the contract plugins are built against. Lifted from
     # the C++ server's `3rdparty/mumble-plugin-host`; the api crates keep their
     # published names and ABI so a plugin binary loads in either server.
@@ -105,6 +110,7 @@ starling-context-actions = { path = "crates/services/context-actions" }
 starling-directory = { path = "crates/services/directory" }
 starling-operator-api = { path = "crates/operator-api" }
 starling-migrate = { path = "crates/migrate" }
+starling-harness = { path = "crates/harness" }
 starling-plugin-host = { path = "crates/plugin-host/host" }
 mumble-plugin-api = { path = "crates/plugin-host/api" }
 mumble-plugin-api-wasm = { path = "crates/plugin-host/api-wasm" }

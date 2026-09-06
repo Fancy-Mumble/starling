@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "starling"
+path = "src/lib.rs"
+
 [[bin]]
 name = "starling"
 path = "src/main.rs"
@@ -104,7 +108,16 @@ tracing.workspace = true
 # discarded rather than printed.
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "soak"
+path = "tests/soak.rs"
+# Its own target so it never contends with the e2e suite's `ONE_AT_A_TIME`.
+harness = true
+
 [dev-dependencies]
+# The deployment and the client the e2e suite drives. Its own crate so the soak
+# and the chaos runs share one copy; see `crates/harness`.
+starling-harness.workspace = true
 starling-proto.workspace = true
 # The version encoding, so the handshake test names a feature gate by its parts
 # rather than re-deriving the shifts the wire actually carries.

@@ -1,0 +1,39 @@
+[package]
+name = "starling-harness"
+description = "Starts a whole deployment and speaks its wire; for e2e, soak and chaos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Test scaffolding. It links every service and a TLS verifier that trusts
+# anything, neither of which belongs in a published artifact.
+publish = false
+
+[dependencies]
+# The entrypoint's own `units::spawn` and `compose::enabled`, so the harness
+# starts services the way the binary does rather than keeping a second list.
+starling = { path = "../starling" }
+starling-runtime.workspace = true
+starling-proto.workspace = true
+starling-proto-fancy.workspace = true
+# The server's own identity loader and the client half of the voice cipher, so
+# a datagram this harness sends is one the server would genuinely accept.
+starling-crypto.workspace = true
+bytes.workspace = true
+prost.workspace = true
+rustls.workspace = true
+# The soak report: a `Budget` a scenario can override, and one JSON object per
+# sample so a killed run still leaves a readable artifact.
+serde.workspace = true
+serde_json.workspace = true
+# A scenario is a file, not a function, so a nightly and a per-PR smoke test
+# differ by config rather than by a second driver.
+toml.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+# A deployment's own logs, when `RUST_LOG` asks for them. Without a subscriber
+# installed the tracing a failing run needs goes nowhere.
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

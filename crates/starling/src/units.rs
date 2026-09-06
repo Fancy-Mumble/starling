@@ -15,7 +15,7 @@ use starling_proto_fancy as _;
 ///
 /// Returns `None` when nothing answers to that name, so the caller can print
 /// the list rather than guess.
-pub(crate) fn spawn(
+pub fn spawn(
     name: &str,
     ctx: ServiceContext,
 ) -> Option<tokio::task::JoinHandle<Result<(), ServiceError>>> {
@@ -50,7 +50,7 @@ pub(crate) fn spawn(
 
 /// Every service this binary can be, in tier order.
 #[must_use]
-pub(crate) fn names() -> &'static [&'static str] {
+pub fn names() -> &'static [&'static str] {
     &[
         "session-lifecycle",
         "session-view",

@@ -106,6 +106,30 @@ for service in "${SERVICES[@]}"; do
     forbid "$service" "service" "$others"
 done
 
+# 5. Every workspace member inherits the workspace lint table.
+#
+# Six plugin-host crates each hand-copied a subset of it, so a lint added to the
+# workspace silently missed all six -- and the crate with the thinnest table was
+# the one that `dlopen`s third-party `.so` files. A crate that genuinely needs
+# an exception states it in its own source with a reason, where the code that
+# needs it is, rather than by opting out of the table wholesale.
+#
+# `[lints] workspace = true` and a per-crate override cannot coexist: cargo
+# refuses the manifest. That is what makes this check a straight yes or no.
+while IFS= read -r manifest; do
+    # A member of *this* workspace: a manifest declaring its own `[workspace]`
+    # (the fuzz crate does, so `cargo fuzz` can pick its own profile) inherits
+    # from itself and is checked by its own build.
+    grep -q '^\[package\]' "$manifest" || continue
+    grep -q '^\[workspace\]' "$manifest" && continue
+    if ! grep -qE '^\s*workspace\s*=\s*true' <(sed -n '/^\[lints\]/,/^\[/p' "$manifest"); then
+        echo >&2 "$manifest does not inherit the workspace lints"
+        echo >&2 "  add:  [lints]"
+        echo >&2 "        workspace = true"
+        status=1
+    fi
+done < <(find crates -name Cargo.toml -not -path '*/target/*' | sort)
+
 if [[ $status -ne 0 ]]; then
     echo >&2
     echo "See docs/ARCHITECTURE.md. Services reach each other over gRPC, the gateway" >&2

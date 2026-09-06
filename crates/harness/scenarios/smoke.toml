@@ -1,0 +1,22 @@
+# The per-PR smoke test: ninety seconds, and viable only because the quiesce
+# assertion is a level rather than a slope.
+#
+# It cannot see an RSS trend and does not try to. What it does see is every
+# population-independent check: a gauge that does not drain, a descriptor that
+# is not closed, a task that outlives its connection. Those are the ones that
+# catch a leak on the pull request that introduces it.
+# Two cycles, not one. The check that needs no tuned constant is the second
+# idle sample against the first, and one cycle cannot make it.
+name = "smoke"
+population = 12
+duration_s = 80
+warmup_s = 10
+quiesce_s = 30
+sample_every_s = 10
+cycles = 2
+channels = 4
+join_every_s = 20
+chat_every_s = 10
+large_chat_percent = 3
+speaking_percent = 15
+reconnect_percent = 0

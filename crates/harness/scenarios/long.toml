@@ -1,0 +1,19 @@
+# Six hours at two hundred clients, weekly.
+#
+# The only run that meaningfully tests the resident-memory slope and latency
+# drift. Everything else here is also asserted by `nightly.toml` in a
+# forty-fifth of the time, so a failure that appears only in this file is a
+# failure about *duration*, which is the point.
+name = "long"
+population = 200
+duration_s = 21600
+warmup_s = 300
+quiesce_s = 300
+sample_every_s = 30
+channels = 64
+join_every_s = 90
+chat_every_s = 60
+large_chat_percent = 3
+speaking_percent = 15
+reconnect_percent = 4
+cycles = 2
