@@ -17,7 +17,7 @@ use starling_crypto::peer_cert::{AcceptAnyClientCertificate, PeerCertificate};
 use starling_proto::codec;
 use starling_proto_fancy::control::{ClientEvent, Frame, Opened, client_event};
 use starling_proto_fancy::types::ServiceKind;
-use starling_runtime::config::Config;
+use starling_runtime::config::{Config, GatewayConfig};
 use starling_runtime::health::Health;
 use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use crate::admission::Admission;
 use crate::attach::{AttachContext, Attachments};
 use crate::certs::{self, CertResolver};
 use crate::compress;
@@ -89,6 +90,10 @@ pub struct Gateway {
     registry: Registry,
     attachments: Attachments,
     resume: ResumeStore,
+    /// The ceiling on unauthenticated handshakes. See [`crate::admission`].
+    admission: Admission,
+    /// What this gateway is holding, for the soak and the dashboard.
+    gauges: GatewayGauges,
     metrics: Metrics,
     /// Queue occupancy, handed to every connection.
     ///
@@ -131,6 +136,68 @@ pub struct Gateway {
     message_limit: Arc<MessageLimit>,
 }
 
+/// The gateway's own occupancy gauges.
+///
+/// Held rather than looked up per accept: `Pressure::gauge` takes a lock and
+/// allocates the name on a miss, and this runs once per connection.
+#[derive(Debug, Clone)]
+struct GatewayGauges {
+    connections: Gauge,
+    resume_sessions: Gauge,
+    resume_bytes: Gauge,
+    pending_handshakes: Gauge,
+    /// The per-client control lane, shared by every connection.
+    ///
+    /// Held here as well as by each `ClientHandle` so that a *departure* can
+    /// republish it. Every enqueue writes it; nothing else did, so an idle
+    /// gateway reported the queue of whichever client last had something to
+    /// send, long after that client had gone.
+    control_queue: Gauge,
+}
+
+impl GatewayGauges {
+    fn new(pressure: &Pressure, config: &GatewayConfig) -> Self {
+        Self {
+            // No declared ceiling: how many clients a server holds is
+            // `max_users`, which lives in the server settings rather than here,
+            // and inventing a denominator would turn an unknown into a
+            // reassuring percentage.
+            connections: pressure.gauge("connections", 0),
+            resume_sessions: pressure.gauge("resume.sessions", 0),
+            resume_bytes: pressure.gauge("resume.bytes", 0),
+            pending_handshakes: pressure
+                .gauge("handshakes.pending", config.max_pending_handshakes as u64),
+            control_queue: pressure.gauge(connection::CONTROL_QUEUE_GAUGE, 0),
+        }
+    }
+}
+
+/// The per-connection read buffer, and the size it is returned to.
+///
+/// Frames are small: the ceiling is 8 MiB but the median is a few hundred
+/// bytes, so sizing for the common case and growing for the rare one is right.
+/// What was missing was giving the growth back.
+const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+/// How long the accept loop pauses when the process is out of descriptors.
+///
+/// Short enough that recovery is immediate once a descriptor frees, long
+/// enough that the loop is not spinning: at `EMFILE` the listening socket stays
+/// readable, so the failed accept returns instantly and a bare `continue`
+/// re-enters it at scheduler speed.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether an accept failure is the process running out of descriptors.
+///
+/// `EMFILE` is this process's limit and `ENFILE` is the system's; both clear on
+/// their own once something closes, and neither is a reason to stop serving.
+fn accept_is_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == 24 || code == 23
+    )
+}
+
 impl Gateway {
     /// Build a gateway over `config`.
     ///
@@ -151,7 +218,8 @@ impl Gateway {
             return Err(GatewayError::NoRoutes);
         }
         let router = Arc::new(LiveRouter::new(router));
-        let resume = ResumeStore::new(config.gateway.resume.ring);
+        let resume = ResumeStore::from_config(&config.gateway.resume);
+        let admission = Admission::from_config(&config.gateway);
         let limits = Arc::new(Limits::from_config(&config.gateway));
         let buckets = Arc::new(LiveBuckets::new(&config.gateway.limits));
         // Loaded here so a broken pair fails the build rather than the first
@@ -165,7 +233,9 @@ impl Gateway {
             router,
             registry: Registry::new(),
             attachments: Attachments::new(),
+            gauges: GatewayGauges::new(&pressure, &config.gateway),
             resume,
+            admission,
             metrics,
             control_pressure: pressure.gauge(
                 connection::CONTROL_QUEUE_GAUGE,
@@ -234,7 +304,7 @@ impl Gateway {
     }
 
     /// Adopt changed `[gateway]` breaker numbers.
-    pub fn retune_breakers(&self, gateway: &starling_runtime::config::GatewayConfig) {
+    pub fn retune_breakers(&self, gateway: &GatewayConfig) {
         self.attachments.retune_breakers(
             gateway.breaker_failures,
             gateway
@@ -326,6 +396,15 @@ impl Gateway {
                                     LogEvent::warning(Category::Server, "accept failed")
                                         .with("error", error.to_string()),
                                 );
+                                // Backed off, because the socket stays readable
+                                // while the process is out of descriptors: a
+                                // bare `continue` spins this loop at the speed
+                                // of the scheduler, burning the CPU that the
+                                // connections already open need in order to
+                                // finish and give a descriptor back.
+                                if accept_is_exhaustion(&error) {
+                                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                                }
                                 continue;
                             }
                         };
@@ -342,10 +421,22 @@ impl Gateway {
                             // slower, and murmur ignores the same failure.
                             tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
                         }
+                        // Reported before the decision, so a refusal is
+                        // visible as a full gauge rather than only as a counter
+                        // after the fact.
+                        self.observe_admission();
+                        // Before the spawn, so a peer that is refused costs a
+                        // closed socket rather than a task and a rustls buffer.
+                        let Some(ticket) = self.admit(peer) else {
+                            drop(stream);
+                            continue;
+                        };
                         let gateway = Arc::clone(&self);
                         let acceptor = acceptor.clone();
                         drop(tokio::spawn(async move {
-                            if let Err(error) = gateway.serve_client(stream, acceptor, peer).await {
+                            if let Err(error) =
+                                gateway.serve_client(stream, acceptor, peer, ticket).await
+                            {
                                 tracing::debug!(%peer, %error, "client ended");
                             }
                         }));
@@ -516,16 +607,95 @@ impl Gateway {
         self.logger.log(connected);
     }
 
-    /// One client, from TLS handshake to disconnect.
-    async fn serve_client(
-        self: Arc<Self>,
+    /// Publish the map sizes this gateway is holding.
+    ///
+    /// Called on **both** the accept and the disconnect path rather than from a
+    /// timer: between them they are every point at which these four numbers
+    /// change, and a sweep task would be a second thing to own.
+    ///
+    /// It was the accept path alone, which made every one of these a
+    /// last-accept reading rather than a current one: after the final client
+    /// left, `connections` kept whatever it said when the last peer arrived,
+    /// forever. On a quiet server that is an operator looking at a dashboard
+    /// showing eleven connections and nobody online, and an alert on
+    /// `resume.bytes` firing on a figure hours out of date. The soak's quiesce
+    /// assertion is what surfaced it: a gauge that does not return to its
+    /// baseline when nothing is connected.
+    ///
+    /// See `scripts/canon-gauges.json`.
+    fn observe_admission(&self) {
+        self.gauges.connections.observe(self.registry.len() as u64);
+        self.gauges
+            .resume_sessions
+            .observe(self.resume.len() as u64);
+        self.gauges
+            .resume_bytes
+            .observe(self.resume.bytes_total() as u64);
+        self.gauges
+            .pending_handshakes
+            .observe(self.admission.in_flight() as u64);
+        // Written by every enqueue as well, but never by a *departure*: the
+        // "worst client" was whoever last had something queued, alive or not.
+        self.gauges
+            .control_queue
+            .observe(self.registry.worst_control_queue() as u64);
+    }
+
+    /// Take an admission slot for `peer`, recording a refusal.
+    ///
+    /// `None` means the connection is to be closed without a task: refusing
+    /// after a spawn would already have paid most of what the ceiling exists to
+    /// avoid.
+    fn admit(&self, peer: std::net::SocketAddr) -> Option<crate::admission::Ticket> {
+        match self.admission.admit(peer.ip()) {
+            Ok(ticket) => Some(ticket),
+            Err(refusal) => {
+                self.logger.log(
+                    LogEvent::notice(Category::Security, "connection refused")
+                        .with("peer", peer.to_string())
+                        .with("reason", refusal.as_str()),
+                );
+                self.metrics
+                    .counter("starling_gateway_admission_refused")
+                    .inc();
+                None
+            }
+        }
+    }
+
+    /// Complete the TLS handshake, within the admission deadline.
+    ///
+    /// # Errors
+    ///
+    /// The handshake failure, or [`std::io::ErrorKind::TimedOut`]. Unbounded, a
+    /// peer that completed TCP and then sent one byte held its task, its
+    /// descriptor and a rustls buffer for the life of the process: the 30 s
+    /// idle reaper only ever sees connections that registered, which happens
+    /// after this returns.
+    async fn handshake(
+        &self,
         stream: tokio::net::TcpStream,
         acceptor: TlsAcceptor,
         peer: std::net::SocketAddr,
-    ) -> Result<(), std::io::Error> {
-        let tls = match acceptor.accept(stream).await {
-            Ok(tls) => tls,
-            Err(error) => {
+    ) -> Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error> {
+        let attempt =
+            tokio::time::timeout(self.admission.handshake_timeout(), acceptor.accept(stream));
+        match attempt.await {
+            Ok(Ok(tls)) => Ok(tls),
+            Err(_elapsed) => {
+                self.logger.log(
+                    LogEvent::notice(Category::Security, "tls handshake timed out")
+                        .with("peer", peer.to_string()),
+                );
+                self.metrics
+                    .counter("starling_gateway_tls_handshake_timeouts")
+                    .inc();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the TLS handshake did not complete in time",
+                ))
+            }
+            Ok(Err(error)) => {
                 // A failed TLS handshake is the single most common "the client
                 // cannot connect and the server says nothing" report: an expired
                 // certificate, a client pinned to TLS 1.0, a plaintext probe.
@@ -536,9 +706,29 @@ impl Gateway {
                         .with("error", error.to_string()),
                 );
                 self.metrics.counter("starling_gateway_tls_failures").inc();
-                return Err(error);
+                Err(error)
             }
-        };
+        }
+    }
+
+    /// One client, from TLS handshake to disconnect.
+    async fn serve_client(
+        self: Arc<Self>,
+        stream: tokio::net::TcpStream,
+        acceptor: TlsAcceptor,
+        peer: std::net::SocketAddr,
+        ticket: crate::admission::Ticket,
+    ) -> Result<(), std::io::Error> {
+        // Bounded. Unbounded, a peer that completed TCP and then sent one byte
+        // held this task, its descriptor and a rustls buffer for the life of
+        // the process: the 30 s idle reaper only ever sees connections that
+        // registered, which happens after this returns.
+        let tls = self.handshake(stream, acceptor, peer).await?;
+        // The handshake is over, so the slot goes back. Holding it for the
+        // life of the connection would make this a connection limit, which is
+        // `max_users`' job and is answered with a `Reject` the client can read.
+        drop(ticket);
+
         // Read before the stream is split: the chain lives on the rustls
         // connection, and after `tokio::io::split` there is no handle left that
         // can be asked for it.
@@ -583,8 +773,8 @@ impl Gateway {
         let writer_task = tokio::spawn(pump_writer(writer, outbound, Arc::clone(&handle)));
 
         let mut limiter = Limiter::live(&self.buckets, now_ms(), Arc::clone(&self.message_limit));
-        let mut buffer = BytesMut::with_capacity(8 * 1024);
-        let mut scratch = vec![0_u8; 8 * 1024];
+        let mut buffer = BytesMut::with_capacity(READ_BUFFER_BYTES);
+        let mut scratch = vec![0_u8; READ_BUFFER_BYTES];
 
         let reason = loop {
             let read = tokio::select! {
@@ -612,7 +802,12 @@ impl Gateway {
             if read == 0 {
                 break "peer closed";
             }
-            buffer.extend_from_slice(&scratch[..read]);
+            // `get`, not an index: `read` comes from the TLS layer, and this
+            // is the loop every unauthenticated peer's bytes arrive in.
+            let Some(fresh) = scratch.get(..read) else {
+                break "read past the buffer";
+            };
+            buffer.extend_from_slice(fresh);
 
             match self.drain_frames(&handle, &mut buffer, &mut limiter) {
                 Ok(()) => {}
@@ -623,6 +818,17 @@ impl Gateway {
                     self.finish(conn, "protocol error", writer_task).await;
                     return Ok(());
                 }
+            }
+
+            // Given back once the frames are out of it. `BytesMut` grows to the
+            // largest frame a connection ever carried and never shrinks, so one
+            // 8 MiB avatar left 8 MiB resident for the rest of that client's
+            // session -- and with a thousand clients, for the rest of the
+            // server's. Only when empty, so this never copies a partial frame,
+            // and only when it has actually grown, so the ordinary case is a
+            // comparison.
+            if buffer.is_empty() && buffer.capacity() > READ_BUFFER_BYTES {
+                buffer = BytesMut::with_capacity(READ_BUFFER_BYTES);
             }
         };
 
@@ -832,6 +1038,9 @@ impl Gateway {
         self.registry.remove(conn);
         self.attachments.broadcast_closed(conn, reason);
         self.metrics.counter("starling_gateway_disconnects").inc();
+        // After the removal, so the reading is what the gateway holds now and
+        // not what it held a moment ago.
+        self.observe_admission();
 
         let mut event = LogEvent::info(Category::Session, "client disconnected")
             .with("conn", conn)
@@ -1068,6 +1277,97 @@ mod tests {
         )
         .expect_err("an empty table must be refused");
         assert!(matches!(err, GatewayError::NoRoutes));
+    }
+
+    /// A gateway wired over the shipped defaults, for a gauge assertion.
+    fn shipped_gateway(pressure: &Pressure) -> Gateway {
+        Gateway::new(
+            Arc::new(Config::with_defaults(Path::new("/run/starling"))),
+            Metrics::new(),
+            pressure,
+            Health::new(),
+            Logger::null(),
+        )
+        .expect("the defaults must be servable")
+    }
+
+    #[tokio::test]
+    async fn the_connection_gauges_come_back_down_when_the_last_client_leaves() {
+        // These were published on the accept path alone, so every reading was
+        // "what this gateway held when the last peer arrived". After the final
+        // client left, `connections` kept saying whatever it said then, for as
+        // long as the process ran: a dashboard showing eleven connections on an
+        // empty server, and an alert on `resume.bytes` firing on an hours-old
+        // figure.
+        //
+        // Asserted here rather than only by the soak's quiesce check, because
+        // this is the deterministic half: a stale gauge does not need load or
+        // time to reproduce, only an arrival followed by a departure.
+        let pressure = Pressure::new();
+        let gateway = shipped_gateway(&pressure);
+        let limits = Arc::new(Limits::from_config(
+            &Config::with_defaults(Path::new("/run/starling")).gateway,
+        ));
+
+        let (handle, _rx) = connection::channel(
+            1,
+            String::new(),
+            limits,
+            pressure.gauge("control queue (worst client)", 0),
+        );
+        // Something queued, so the control gauge is genuinely non-zero before
+        // the departure. Without this the assertion after it would pass against
+        // a gauge nothing had ever written.
+        handle
+            .send(
+                Lane::Control,
+                Outbound::whole(bytes::Bytes::from_static(&[0_u8; 128])),
+            )
+            .expect("the queue is empty");
+        gateway.registry.insert(handle);
+        gateway.observe_admission();
+        assert_eq!(
+            gauge_used(&pressure, "connections"),
+            1,
+            "an arrival must be visible"
+        );
+        assert_eq!(
+            gauge_used(&pressure, connection::CONTROL_QUEUE_GAUGE),
+            128,
+            "and so must what it has queued"
+        );
+
+        // Through the real teardown, not by calling the observer directly: the
+        // defect was never that `observe_admission` computed the wrong number,
+        // it was that nothing called it when a client left.
+        gateway
+            .finish(1, "connection reset", tokio::spawn(async {}))
+            .await;
+        assert_eq!(
+            gauge_used(&pressure, "connections"),
+            0,
+            "and so must the departure; a gauge that only counts up is a \
+             dashboard that lies about an idle server"
+        );
+        assert_eq!(
+            gauge_used(&pressure, connection::CONTROL_QUEUE_GAUGE),
+            0,
+            "with nobody connected there is no worst client, and reporting the \
+             queue of one that has gone is worse than reporting nothing"
+        );
+    }
+
+    /// One gauge's current reading, without disturbing its peak.
+    ///
+    /// Through `sample` rather than by holding the `Gauge`, because that is how
+    /// the collector reads it, and a test that reads it another way would not
+    /// notice the collector seeing something different.
+    fn gauge_used(pressure: &Pressure, name: &str) -> u64 {
+        pressure
+            .sample()
+            .into_iter()
+            .find(|load| load.name == name)
+            .map_or(u64::MAX, |load| load.used)
     }
 
     #[test]

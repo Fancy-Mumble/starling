@@ -504,6 +504,30 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// The most control bytes any one client has queued.
+    ///
+    /// The gauge is budgeted **per client**, so the figure worth publishing is
+    /// the client closest to its own bound, not a sum across clients that has
+    /// no ceiling to be a fraction of.
+    ///
+    /// Zero when nobody is connected. That case is the reason this exists: the
+    /// gauge was only ever written by [`ClientHandle::send`], so after the last
+    /// client left it kept whatever the last enqueue said, and an idle gateway
+    /// reported a worst client that no longer existed.
+    #[must_use]
+    pub fn worst_control_queue(&self) -> usize {
+        self.conns
+            .lock()
+            .map(|conns| {
+                conns
+                    .values()
+                    .map(|handle| handle.queued_control_bytes())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
     /// How many connections are held.
     #[must_use]
     pub fn len(&self) -> usize {

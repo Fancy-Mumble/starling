@@ -172,6 +172,13 @@ pub const TABLE: &[(&str, Reload)] = &[
     // full of clients a restart would disconnect.
     ("gateway.limits.*.rate", Reload::Live),
     ("gateway.limits.*.burst", Reload::Live),
+    // Admission control, all three read per accepted connection from the
+    // listener's own copy, so a change reaches the next peer to connect. The
+    // semaphore is sized once, which is what keeps `max_pending_handshakes` a
+    // restart.
+    ("gateway.handshake_timeout", Reload::NextConnection),
+    ("gateway.max_pending_handshakes", Reload::Restart),
+    ("gateway.max_pending_per_address", Reload::Restart),
     ("gateway.resume.enabled", Reload::Restart),
     ("gateway.resume.ring", Reload::Restart),
     ("gateway.resume.ttl", Reload::Restart),
@@ -245,6 +252,11 @@ pub const TABLE: &[(&str, Reload)] = &[
     ("services.*.auth.token.tokens.*.scopes.*", Reload::Live),
     ("services.*.audit.path", Reload::Restart),
     ("services.*.audit.fail_closed", Reload::Restart),
+    // The rotation, read when a generation rolls rather than held by the open
+    // file, so a change reaches the next roll. Restart with the two above
+    // because the whole block is read once when the log is first opened.
+    ("services.*.audit.max_bytes", Reload::Restart),
+    ("services.*.audit.keep", Reload::Restart),
     ("services.*.webtransport.enabled", Reload::Restart),
     ("services.*.webtransport.listen", Reload::Restart),
     ("services.*.webtransport.cert", Reload::Restart),

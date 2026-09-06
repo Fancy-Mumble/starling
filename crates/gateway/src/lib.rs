@@ -27,6 +27,8 @@
 //! socket, so one hop can seal for every listener), audio routing (clients send
 //! UDP straight to voice) and any service's schema.
 
+/// Admission control in front of the TLS handshake.
+pub mod admission;
 pub mod attach;
 pub mod certs;
 /// Compressing the control stream for peers that asked for it.

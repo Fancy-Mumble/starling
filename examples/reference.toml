@@ -173,6 +173,20 @@ default_deadline = "5s"
 # before probing again. Deadlines alone fail slowly.
 breaker_failures = 5
 breaker_cooldown = "10s"
+# How long a peer has to finish its TLS handshake. Everything up to that point
+# is unauthenticated, and without a deadline a peer that completes TCP and then
+# sends one byte holds a task and a descriptor indefinitely: the idle reaper
+# only sees connections that finished the handshake.
+handshake_timeout = "10s"
+# TLS handshakes in flight at once, server-wide, and how many of those one
+# address may hold. Reaching either closes the next connection immediately
+# rather than queueing it. The per-address ceiling is what stops one peer
+# filling the server-wide one and locking everybody else out. Handshakes take
+# milliseconds, so 64 in flight from one address means thousands of logins a
+# second from it: an office reconnecting through one NAT address arrives over
+# seconds and never comes close.
+max_pending_handshakes = 1024
+max_pending_per_address = 64
 
 [gateway.tls]
 # Certificate chain and private key, PEM. Omit both and a self-signed pair is
@@ -495,6 +509,12 @@ path = "/var/log/starling/operator-audit.log"
 # A request that cannot be recorded is refused. Set false and it proceeds, with
 # the failed write logged at error.
 fail_closed = true
+# Rotate once the file passes this, keeping that many old generations, the same
+# way the runtime log does. 0 never rotates, which is what this file used to do
+# unconditionally: an append-only record of every operator action fills a disk
+# eventually, and the disk it fills is the one the databases are on.
+max_bytes = 67108864
+keep = 5
 
 # The live channel is a WebSocket at GET /v1/events and needs no configuration.
 # The same channel over WebTransport does, because a reverse proxy generally

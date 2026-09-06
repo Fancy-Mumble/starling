@@ -54,6 +54,28 @@ pub struct GatewayConfig {
 
     /// The replay ring that makes RESUME possible.
     pub resume: ResumeConfig,
+
+    /// How long a peer has to finish its TLS handshake.
+    ///
+    /// Everything before this point is unauthenticated. Without a deadline a
+    /// peer that completes TCP and then trickles one byte holds a task, a file
+    /// descriptor and a rustls buffer for as long as it likes: the idle reaper
+    /// only sees connections registered *after* the handshake returns.
+    pub handshake_timeout: HumanDuration,
+
+    /// How many TLS handshakes may be in flight at once, server-wide.
+    ///
+    /// Reached means the next connection is closed immediately rather than
+    /// queued. Well above what a genuine login storm needs, because a
+    /// reconnect after a restart is every client at once.
+    pub max_pending_handshakes: usize,
+
+    /// How many of those one address may hold.
+    ///
+    /// What stops a single peer filling `max_pending_handshakes` and locking
+    /// everybody else out. Several, not one: a household or an office behind
+    /// one NAT address is normal.
+    pub max_pending_per_address: u32,
 }
 
 impl Default for GatewayConfig {
@@ -72,6 +94,24 @@ impl Default for GatewayConfig {
             tls: TlsConfig::default(),
             limits: default_limits(),
             resume: ResumeConfig::default(),
+            // Ten seconds: a TLS 1.3 handshake over a bad mobile link is well
+            // under one second, and murmur's own client gives up long before
+            // this. Slow enough to never cut off a real client, short enough
+            // that a held slot is measured in seconds.
+            handshake_timeout: HumanDuration::secs(10),
+            // 1 024 concurrent handshakes is far more than a full server's
+            // reconnect storm, and bounds what an unauthenticated peer can
+            // make the process hold.
+            max_pending_handshakes: 1024,
+            // Concurrency is rate times duration, which is what makes this
+            // number defensible rather than a guess: a handshake takes single
+            // -digit milliseconds, so 64 in flight from one address is
+            // thousands of logins a second from it. A whole office reconnecting
+            // through one NAT address after a restart never reaches that --
+            // they arrive over seconds, not all within one handshake -- while a
+            // peer holding slots open to the deadline is stopped at 64 rather
+            // than at the server-wide ceiling.
+            max_pending_per_address: 64,
         }
     }
 }
