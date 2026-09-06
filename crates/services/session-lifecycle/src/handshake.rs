@@ -1293,7 +1293,7 @@ impl Handshake {
     /// Re-announce every session `session-view` is not holding.
     ///
     /// The view is a composed cache with no store behind it: it learns a
-    /// session from [`Self::announce_up`] and keeps it in memory. An instance
+    /// session from `announce_up` and keeps it in memory. An instance
     /// that has just started therefore holds nothing, and nothing was ever
     /// going to tell it otherwise, because every announcement describes a
     /// *change* and the sessions it is missing are the ones not changing. The

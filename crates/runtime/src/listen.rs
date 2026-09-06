@@ -85,8 +85,8 @@ type Served = InFlight<Routes>;
 ///
 /// So the connections are ours. A [`JoinSet`] is the whole of the difference:
 /// each one still shuts down gracefully when the drain starts, and if they are
-/// not all finished by [`DRAIN_GRACE`] they are aborted rather than merely
-/// stopped being waited for.
+/// not all finished by the three-second `DRAIN_GRACE` they are aborted rather
+/// than merely stopped being waited for.
 ///
 /// # Errors
 ///
