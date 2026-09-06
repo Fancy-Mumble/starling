@@ -186,10 +186,19 @@ impl ClientService for SessionLifecycleService {
     }
 
     async fn frame(&self, inbound: Inbound) -> Actions {
-        // Anything at all counts as being alive, not just `Ping`. A client that
-        // is talking is plainly still there, and reaping it because its pings
-        // happened to be the frames that were lost would be a self-inflicted
-        // disconnect.
+        // Anything reaching *this service* counts as being alive, not just
+        // `Ping`: reaping a client because its pings happened to be the frames
+        // that were lost would be a self-inflicted disconnect.
+        //
+        // Which is narrower than "a client that is talking is plainly still
+        // there", and was written here as though it were not. The gateway
+        // routes on type, so a `TextMessage` goes to `text` and never arrives
+        // here at all; a client that chats and does not ping is reaped on
+        // schedule. Measured, not reasoned: a harness client relaying every
+        // three seconds is disconnected at thirty. Stock clients ping every
+        // five seconds so no user is affected, but a test that holds a client
+        // longer than the timeout has to ping -- see `chaos.rs::keepalive` and
+        // the same note in `soak/drive.rs`.
         self.connections.touch(inbound.conn);
         match inbound.type_id {
             VERSION => self.on_version(&inbound),
