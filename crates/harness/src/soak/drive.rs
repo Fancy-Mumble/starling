@@ -208,21 +208,19 @@ pub async fn run(deployment: &Deployment, scenario: &Scenario, seed: u64) -> Rep
             // client. Splitting it this way rather than sharing one generator
             // keeps the run reproducible under a different task schedule.
             //
-            // **Not mixed with the cycle**, which it used to be, on the
-            // reasoning that a repeated cycle would test the caches rather than
-            // the server. It measured worse than it read: with the work varying
-            // per cycle, a cycle can be the first to take some path, and a
-            // first-use cost then lands in the middle of the run looking
-            // exactly like a leak. It did -- two descriptors and four tasks
-            // appearing at the third cycle of six and never again, which turned
-            // out to be one service's first dial of `server-config` over the
-            // in-process transport, pooled from then on.
+            // Mixed with the cycle as well, so the second cycle is not a replay
+            // of the first, which would test the caches rather than the server.
             //
-            // The cycle check compares an idle server against an idle server,
-            // and that comparison is only worth making when the load between
-            // them was the same load. Variety comes from the twelve clients and
-            // the steady window; the cycle's job is to repeat.
-            let rng = Rng::new(seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            // This was briefly the suspect for the two descriptors and four
+            // tasks that appear once, mid-run: vary the work per cycle and a
+            // cycle can be the first to take some path, whose one-time cost
+            // then looks exactly like a leak. Measured, it was not the cause --
+            // the step survived making every cycle identical. It is
+            // `directory`'s first announcement, on a 60-180s timer from boot,
+            // and `crates/starling/tests/soak.rs` excludes that service.
+            let rng = Rng::new(
+                seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ cycle.wrapping_mul(0x1234_5678),
+            );
             clients.push(tokio::spawn(live_one(
                 deployment.port,
                 cycle * scenario.population + id,

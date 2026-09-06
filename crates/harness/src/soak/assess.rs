@@ -205,11 +205,6 @@ fn quiesced(samples: &[Sample]) -> Option<&Sample> {
     samples.iter().rev().find(|s| s.phase == Phase::Quiesced)
 }
 
-/// The settled sample after the *first* load cycle.
-fn first_quiesced(samples: &[Sample]) -> Option<&Sample> {
-    samples.iter().find(|s| s.phase == Phase::Quiesced)
-}
-
 fn steady(samples: &[Sample]) -> Vec<&Sample> {
     samples
         .iter()
@@ -296,64 +291,78 @@ fn quiesce(samples: &[Sample], budget: Budget) -> Vec<Failure> {
 /// of one entry per connection fails this at any population; a pool that warmed
 /// once passes it at every population.
 ///
-/// This rests on the cycles running the *same* load, which is why
-/// [`drive::run`](super::drive::run) seeds each client from the run and the
-/// client and not from the cycle. Vary the work per cycle and a later cycle can
-/// be the first to take some path, whose one-time cost then arrives mid-run and
-/// is indistinguishable here from a leak.
+/// Compared between *consecutive* cycles rather than first against last, which
+/// costs nothing in strength -- any growth anywhere still fails -- and names the
+/// cycle it appeared at. That mattered: the first version of this check reported
+/// "227 descriptors after cycle 6 against 225 after cycle 1", which is true of a
+/// leak and equally true of one connection opened once, and telling those apart
+/// took two runs and a photograph of `/proc/<pid>/fd`. "Between cycles 2 and 3"
+/// would have said which it was on the first run.
+///
+/// A one-time cost inside the run is the one thing this cannot judge, so the
+/// answer is to keep them out of the run: see the service
+/// `crates/starling/tests/soak.rs` excludes, and why.
 fn cycles(samples: &[Sample]) -> Vec<Failure> {
-    let (Some(first), Some(last)) = (first_quiesced(samples), quiesced(samples)) else {
-        return Vec::new();
-    };
-    if first.cycle == last.cycle {
-        // One cycle. Not a failure -- a smoke run is deliberately one -- but
-        // nothing here was measured, and the checks against the baseline are
-        // what stand in for it.
-        return Vec::new();
-    }
+    let idle: Vec<&Sample> = samples
+        .iter()
+        .filter(|sample| sample.phase == Phase::Quiesced)
+        .collect();
+    // One cycle. Not a failure -- a smoke run may deliberately be one -- but
+    // nothing here was measured, and the checks against the baseline are what
+    // stand in for it.
     let mut failures = Vec::new();
+    for (a, b) in idle.iter().zip(idle.iter().skip(1)) {
+        failures.extend(between(a, b));
+    }
+    failures
+}
 
-    if let (Some(a), Some(b)) = (first.process, last.process) {
-        if b.open_fds > a.open_fds {
+/// What grew between two settled samples one cycle apart.
+fn between(a: &Sample, b: &Sample) -> Vec<Failure> {
+    let mut failures = Vec::new();
+    let (cycle, was) = (b.cycle, a.cycle);
+
+    if let (Some(before), Some(after)) = (a.process, b.process) {
+        if after.open_fds > before.open_fds {
             failures.push(Failure::new(
                 "cycle.descriptors",
                 format!(
-                    "{} descriptors idle after cycle {}, against {} after cycle {}; \
-                     a cost paid once does not grow between two identical cycles",
-                    b.open_fds, last.cycle, a.open_fds, first.cycle,
+                    "{} descriptors idle after cycle {cycle}, against {} after cycle {was}; \
+                     a cost paid once does not grow between two cycles",
+                    after.open_fds, before.open_fds,
                 ),
             ));
         }
-        if b.threads > a.threads {
+        if after.threads > before.threads {
             failures.push(Failure::new(
                 "cycle.threads",
                 format!(
-                    "{} threads idle after cycle {}, against {} after cycle {}",
-                    b.threads, last.cycle, a.threads, first.cycle,
+                    "{} threads idle after cycle {cycle}, against {} after cycle {was}",
+                    after.threads, before.threads,
                 ),
             ));
         }
     }
-    if last.tasks > first.tasks {
+    if b.tasks > a.tasks {
         failures.push(Failure::new(
             "cycle.tasks",
             format!(
-                "{} tasks alive after cycle {}, against {} after cycle {}",
-                last.tasks, last.cycle, first.tasks, first.cycle,
+                "{} tasks alive after cycle {cycle}, against {} after cycle {was}",
+                b.tasks, a.tasks,
             ),
         ));
     }
-    for (name, gauge) in &last.gauges {
+    for (name, gauge) in &b.gauges {
         if RETAINED.iter().any(|retained| retained.gauge == name) {
             continue;
         }
-        let was = first.gauges.get(name).map_or(0, |g| g.used);
-        if gauge.used > was {
+        let held = a.gauges.get(name).map_or(0, |g| g.used);
+        if gauge.used > held {
             failures.push(Failure::new(
                 "cycle.gauges",
                 format!(
-                    "{name} holds {} idle after cycle {}, against {was} after cycle {}",
-                    gauge.used, last.cycle, first.cycle,
+                    "{name} holds {} idle after cycle {cycle}, against {held} after cycle {was}",
+                    gauge.used,
                 ),
             ));
         }

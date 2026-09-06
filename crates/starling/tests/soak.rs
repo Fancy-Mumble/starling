@@ -109,7 +109,24 @@ async fn a_deployment_under_load_comes_back_to_where_it_started() {
     let seed = seed();
 
     let data_dir = TempDir::new("soak");
-    let deployment = Deployment::start(data_dir.path()).await;
+    // Everything but `directory`, which announces this server to a public list
+    // 60 to 180 seconds after boot, jittered. Two reasons it does not belong in
+    // a soak. It is an outbound call to the internet from a run that is
+    // measuring this process, and its first attempt dials `server-config`,
+    // which opens one pooled connection over the local transport: two
+    // descriptors and four tasks, once, at a random point inside the run.
+    //
+    // That is a real and bounded cost, not a leak, but it lands between two
+    // idle samples and there is no way to tell it from a leak from the outside
+    // -- it cost two runs to identify. Excluding it is what lets the cycle
+    // check below stay at an allowance of zero; the e2e suite is where
+    // `directory` is covered.
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        if let Some(directory) = config.services.get_mut("directory") {
+            directory.enabled = false;
+        }
+    })
+    .await;
 
     let report = run(&deployment, &scenario, seed).await;
 
