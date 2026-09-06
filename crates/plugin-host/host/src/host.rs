@@ -16,7 +16,7 @@
 //! async runtime must not call these from a runtime worker; see
 //! `starling-plugins`, which puts the whole host behind a blocking pool.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -310,7 +310,7 @@ impl Host {
 
     /// Tell every loaded plugin a client arrived, then ship each one's
     /// `fancy-plugin-info` envelope to that session.
-    pub fn on_client_connected(&self, info: ClientInfo) {
+    pub fn on_client_connected(&self, info: &ClientInfo) {
         if let Ok(mut sessions) = self.sessions.lock() {
             let _ = sessions.insert((info.server_id, info.session_id), info.clone());
         }
@@ -323,7 +323,7 @@ impl Host {
             {
                 tracing::warn!(plugin = %entry.name, error = %e, "on_client_connected failed");
             }
-            self.deliver_info(entry, &info);
+            self.deliver_info(entry, info);
         }
     }
 
@@ -669,10 +669,14 @@ impl Host {
         } else {
             PAYLOAD_TYPE_PLUGIN_DEACTIVATED
         };
-        let mut by_server: HashMap<ServerId, Vec<SessionId>> = HashMap::new();
+        let mut by_server: BTreeMap<ServerId, Vec<SessionId>> = BTreeMap::new();
         let Ok(sessions) = self.sessions.lock() else {
             return;
         };
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "this only fills a map; the order entries go in does not reach the result"
+        )]
         for (server_id, session) in sessions.keys() {
             by_server.entry(*server_id).or_default().push(*session);
         }

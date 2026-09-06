@@ -22,6 +22,13 @@
               exemptions do not reach it. A contract this test cannot read is a \
               test that must fail loudly, naming the file"
 )]
+// This test reads two files and compares strings; the crate's twenty other
+// dependencies belong to the library, and `unused_crate_dependencies` is
+// per-target, so it cannot see that.
+#![allow(
+    unused_crate_dependencies,
+    reason = "the manifest's dependencies belong to the lib target"
+)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

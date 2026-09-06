@@ -39,7 +39,7 @@ mod modal;
 ///
 #[proc_macro_attribute]
 pub fn command(args: TokenStream, item: TokenStream) -> TokenStream {
-    command::expand(args.into(), item.into())
+    command::expand(args.into(), &item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -74,7 +74,7 @@ pub fn command(args: TokenStream, item: TokenStream) -> TokenStream {
 /// wiring.
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, item: TokenStream) -> TokenStream {
-    component::expand(args.into(), item.into())
+    component::expand(args.into(), &item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -107,7 +107,7 @@ pub fn component(args: TokenStream, item: TokenStream) -> TokenStream {
 /// `ShowModal` response.
 #[proc_macro_attribute]
 pub fn modal(args: TokenStream, item: TokenStream) -> TokenStream {
-    modal::modal_expand(args.into(), item.into())
+    modal::modal_expand(args.into(), &item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -117,7 +117,7 @@ pub fn modal(args: TokenStream, item: TokenStream) -> TokenStream {
 /// code on its own; consumed by [`macro@fancy_plugin`]'s walker.
 #[proc_macro_attribute]
 pub fn field(args: TokenStream, item: TokenStream) -> TokenStream {
-    modal::field_expand(args.into(), item.into())
+    modal::field_expand(&args.into(), item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

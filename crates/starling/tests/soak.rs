@@ -25,6 +25,9 @@
     unused_crate_dependencies,
     reason = "the manifest's dependencies are shared across targets"
 )]
+// A soak run reports as it goes: `--nocapture` is how a two-hour run is
+// watched, and its first line has to be the thing that reproduces it.
+#![allow(clippy::print_stdout, reason = "the run's own progress report")]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,

@@ -273,7 +273,7 @@ impl<'a> Host<'a> {
         self.ctx
             .get_config(RStr::from_str(key))
             .into_option()
-            .map(|s| s.into_string())
+            .map(abi_stable::std_types::RString::into_string)
     }
 
     // ---- Raw plugin data / message --------------------------------
@@ -346,7 +346,7 @@ impl<'a> Host<'a> {
 
     /// Send a serialised payload back to the sender of `msg`.
     ///
-    /// Equivalent to `send_to_sessions(msg.server_id, &[msg.sender_session], ...).
+    /// Equivalent to `send_to_sessions(msg.server_id, &[msg.sender_session], ...)`.
     pub fn reply_to(
         &self,
         msg: &PluginMessageIn,

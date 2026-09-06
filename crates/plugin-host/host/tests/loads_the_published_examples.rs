@@ -555,7 +555,7 @@ fn a_client_arriving_reaches_all_of_them() {
         return;
     };
 
-    staged.host.on_client_connected(ClientInfo {
+    staged.host.on_client_connected(&ClientInfo {
         server_id: 1,
         session_id: 77,
         username: "ada".into(),

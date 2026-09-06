@@ -4,6 +4,8 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
+    clippy::print_stdout,
+    clippy::excessive_nesting,
     reason = "scratch"
 )]
 

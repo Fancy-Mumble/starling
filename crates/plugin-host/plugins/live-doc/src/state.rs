@@ -208,6 +208,10 @@ impl AppState {
         if room.meta().await.owner_cert_hash.is_empty() {
             room.set_meta(cached.meta).await;
         }
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "every member is added; the set does not depend on the order they arrive"
+        )]
         for cert in cached.shared_with {
             room.add_member(cert).await;
         }
@@ -269,6 +273,10 @@ impl AppState {
             .remove(&(server_id, session));
         let mut to_teardown: Vec<DocKey> = Vec::new();
         let mut rooms = self.inner.rooms.lock().await;
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "each room is torn down independently of the others"
+        )]
         for (key, entry) in rooms.iter_mut() {
             if key.server_id != server_id {
                 continue;

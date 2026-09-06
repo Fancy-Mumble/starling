@@ -12,7 +12,7 @@
 //!
 //! ```ignore
 //! let host = Host::new(Arc::new(my_bridge));
-//! host.on_client_connected(info);
+//! host.on_client_connected(&info);
 //! ```
 //!
 //! Lifted from the C++ server's `3rdparty/mumble-plugin-host`, whose C ABI is

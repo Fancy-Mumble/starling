@@ -235,7 +235,10 @@ impl WasmPlugin {
         ctx: &PluginContext_TO<RArc<()>>,
         f: impl FnOnce(&Self, &mut Store<HostState>) -> wasmtime::Result<Result<(), WitError>>,
     ) -> PluginResult<()> {
-        let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Per call, not per store: the deadline is consumed when it fires, and
         // a store whose deadline has passed would trap every later call. Each
         // hook gets the whole budget.

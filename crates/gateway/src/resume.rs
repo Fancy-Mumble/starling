@@ -640,7 +640,10 @@ mod properties {
     /// is what bounds memory, the floor is what makes a replay honest, and a
     /// store that satisfied one while breaking another would still be wrong.
     fn assert_invariants(store: &ResumeStore, token: &str) -> Result<(), TestCaseError> {
-        let sessions = store.sessions.lock().expect("not poisoned");
+        let sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| TestCaseError::fail("the session lock is poisoned"))?;
         let Some(ring) = sessions.rings.get(token) else {
             return Ok(());
         };

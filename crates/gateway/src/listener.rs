@@ -233,7 +233,7 @@ impl Gateway {
             router,
             registry: Registry::new(),
             attachments: Attachments::new(),
-            gauges: GatewayGauges::new(&pressure, &config.gateway),
+            gauges: GatewayGauges::new(pressure, &config.gateway),
             resume,
             admission,
             metrics,

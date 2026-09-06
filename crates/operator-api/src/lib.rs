@@ -312,7 +312,7 @@ impl Serve for OperatorApi {
             resolver: ctx.resolver,
             events: EventHub::new(),
             logger: ctx.logger.clone(),
-            health: ctx.health.clone(),
+            health: ctx.health,
         }))
     }
 
@@ -373,7 +373,7 @@ mod tests {
                 starling_runtime::inproc::Broker::new(),
             ),
             events: EventHub::new(),
-            logger: starling_runtime::log::Logger::null(),
+            logger: Logger::null(),
             health: starling_runtime::health::Health::new(),
         }
     }

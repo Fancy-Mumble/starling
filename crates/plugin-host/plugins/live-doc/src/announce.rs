@@ -54,7 +54,7 @@ pub fn sanitize_slug(raw: &str) -> Option<String> {
             break;
         }
     }
-    let trimmed = out.trim_matches('-').to_string();
+    let trimmed = out.trim_matches('-').to_owned();
     if trimmed.is_empty() {
         None
     } else {

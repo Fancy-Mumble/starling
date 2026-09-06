@@ -85,7 +85,7 @@ impl LiveDocConfig {
         let host: IpAddr = match ctx.get_config("host").as_deref() {
             Some(v) => v.parse().map_err(|_| ConfigError::Parse {
                 key: "host",
-                value: v.to_string(),
+                value: v.to_owned(),
             })?,
             None => IpAddr::from([0u8, 0, 0, 0]),
         };
@@ -143,7 +143,7 @@ fn parse_optional<T: std::str::FromStr>(
         .map(Some)
         .map_err(|_| ConfigError::Parse {
             key,
-            value: value.to_string(),
+            value: value.to_owned(),
         })
 }
 

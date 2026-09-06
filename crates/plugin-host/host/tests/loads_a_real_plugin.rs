@@ -246,7 +246,7 @@ fn an_enabled_plugin_loads_registers_and_hears_about_a_client() {
 
     // A client arriving reaches the plugin, and the plugin's info envelope is
     // shipped to that session. This is the whole connect path.
-    host.on_client_connected(ClientInfo {
+    host.on_client_connected(&ClientInfo {
         server_id: 1,
         session_id: 42,
         username: "ada".into(),
@@ -327,7 +327,7 @@ fn a_plugin_can_be_switched_off_and_on_at_runtime() {
 
     // Somebody is already connected when the toggle happens, which is the case
     // the re-announce exists for.
-    host.on_client_connected(ClientInfo {
+    host.on_client_connected(&ClientInfo {
         server_id: 1,
         session_id: 5,
         username: "grace".into(),

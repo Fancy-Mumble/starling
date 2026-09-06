@@ -10,7 +10,7 @@ use proc_macro2::TokenStream;
 use quote::ToTokens;
 use syn::{FnArg, ImplItemFn, ItemFn, parse2};
 
-pub(crate) fn expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
+pub(crate) fn expand(args: TokenStream, item: &TokenStream) -> syn::Result<TokenStream> {
     // Validate args; discard the parsed values - `#[fancy_plugin]`
     // reparses them when it walks the impl block.
     let _ = CommandArgs::parse(args)?;
@@ -34,7 +34,7 @@ pub(crate) fn expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenS
         return Ok(f.into_token_stream());
     }
     Err(syn::Error::new_spanned(
-        &item,
+        item,
         "#[command] must be applied to a function or method",
     ))
 }

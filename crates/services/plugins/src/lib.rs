@@ -218,7 +218,7 @@ impl PluginsService {
             Presence::Arrived(info) => {
                 let _ = self
                     .host
-                    .with(move |host| host.on_client_connected(info))
+                    .with(move |host| host.on_client_connected(&info))
                     .await;
             }
             Presence::Left { server_id, session } => {

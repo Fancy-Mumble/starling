@@ -284,6 +284,10 @@ impl DocRoom {
                     }
                 }
                 Message::Awareness(update) => {
+                    #[expect(
+                        clippy::iter_over_hash_type,
+                        reason = "each entry updates its own slot to a max; no order changes the result"
+                    )]
                     for (&cid, entry) in &update.clients {
                         let slot = awareness_seen.entry(cid.get()).or_insert(0);
                         *slot = (*slot).max(entry.clock);
@@ -319,7 +323,7 @@ impl DocRoom {
                         yrs::ClientID::new(cid),
                         AwarenessUpdateEntry {
                             clock: clock.saturating_add(1),
-                            json: "null".to_string().into(),
+                            json: "null".to_owned().into(),
                         },
                     )
                 })

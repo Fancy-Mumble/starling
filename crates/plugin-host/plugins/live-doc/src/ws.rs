@@ -331,6 +331,10 @@ async fn apply_client_frame(ctx: &RecvLoop, bytes: &[u8]) -> Flow {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "each entry updates its own slot to a max; no order changes the result"
+    )]
     for (cid, clock) in awareness {
         let slot = map.entry(cid).or_insert(0);
         *slot = (*slot).max(clock);

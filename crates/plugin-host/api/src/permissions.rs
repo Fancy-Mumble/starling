@@ -6,7 +6,7 @@
 //! # ABI note
 //!
 //! The `#[sabi_trait]`-decorated [`crate::PluginContext::has_permission`]
-//! still takes a raw `u32` so the abi_stable trait object remains
+//! still takes a raw `u32` so the `abi_stable` trait object remains
 //! ABI-stable across plugin versions.  Plugins should construct the
 //! permission set with [`Permissions`] and pass `.bits()` at the call:
 //!

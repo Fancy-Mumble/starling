@@ -171,12 +171,8 @@ impl VoiceCipher for Ocb2 {
 
         // Constant time: a timing signal here leaks how much of a forged tag was
         // right, which turns 2^24 guesses into three lots of 2^8.
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "AUDIT: `tag.0` is a fixed-size Block and TAG_LEN is a \
-                      constant below its length; `tag` on the right is the \
-                      `split_first` remainder, not an index"
-        )]
+        // `tag.0` is a fixed-size Block and TAG_LEN a constant below its
+        // length, so the slice is in range by construction and the lint agrees.
         if opened.tag.0[..TAG_LEN].ct_eq(tag).unwrap_u8() != 1 {
             return Err(VoiceError::NotAuthentic);
         }

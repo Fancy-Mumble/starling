@@ -319,13 +319,14 @@ unreachable = "deny"
 # remain are argued at the site and checked by `scripts/check-panic-audit.py`.
 indexing_slicing = "deny"
 # Division by a runtime zero is a panic no other lint catches -- but clippy
-# cannot tell a runtime divisor from a constant one, and every division in this
-# tree today is by a constant (`BLOCK_LEN`, `MILLIS`). Denied, these would be
-# four exemptions that argue nothing plus a new one for every future
-# `x / 1000`, which makes the audited exemptions harder to read rather than
-# easier. Kept at `warn` so a new division is still visible in review.
-integer_division = "warn"
-modulo_arithmetic = "warn"
+# cannot tell a runtime divisor from a constant one, and the ~60 divisions in
+# this tree are all by a constant (`BLOCK_LEN`, `MILLIS`, `1000`). `warn` is not
+# a middle ground here: CI runs `clippy -- -D warnings`, so a warning is a
+# failure, and denying these would be sixty exemptions that argue nothing plus a
+# new one for every future `x / 1000` -- which makes the audited exemptions in
+# `docs/RELIABILITY.md` harder to read rather than easier.
+integer_division = "allow"
+modulo_arithmetic = "allow"
 
 # -- Bugs that are silent when they happen ----------------------------------
 # Each of these was measured to fire zero times when it was added, so they cost

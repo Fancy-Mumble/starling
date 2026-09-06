@@ -70,7 +70,7 @@ impl Live {
 ///
 /// Returns rather than panicking. See the module note: a lost client is a
 /// number in the report, not the end of the run.
-async fn live_one(port: u16, id: u64, channels: Arc<Vec<u32>>, mut rng: Rng, live: Arc<Live>) {
+async fn live_one(port: u16, id: u64, channels: Arc<[u32]>, mut rng: Rng, live: Arc<Live>) {
     // Arrivals spread over the warm-up rather than all at once: a thundering
     // herd measures admission control, which is a different test.
     tokio::time::sleep(rng.delay(Duration::from_millis(200 * (id % 64 + 1)))).await;
@@ -167,6 +167,13 @@ async fn live_one(port: u16, id: u64, channels: Arc<Vec<u32>>, mut rng: Rng, liv
 ///
 /// If `scenario.check()` fails. A scenario whose steady window holds no samples
 /// asserts nothing, and running it to green would be worse than refusing it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one run of the soak, start to report: warm-up, the steady window, \
+              the drain and the assessment. Splitting it would put the phases in \
+              separate functions threading the same eight locals between them, \
+              which is harder to read against the scenario than the sequence is"
+)]
 pub async fn run(deployment: &Deployment, scenario: &Scenario, seed: u64) -> Report {
     scenario.check().unwrap_or_else(|error| panic!("{error}"));
 
@@ -188,7 +195,7 @@ pub async fn run(deployment: &Deployment, scenario: &Scenario, seed: u64) -> Rep
     for i in 0..scenario.channels {
         channels.push(deployment.create_channel(&format!("soak-{i}")).await);
     }
-    let channels = Arc::new(channels);
+    let channels: Arc<[u32]> = channels.into();
 
     let interval = Duration::from_secs(scenario.sample_every_s);
     let mut why: Vec<String> = Vec::new();
@@ -197,14 +204,25 @@ pub async fn run(deployment: &Deployment, scenario: &Scenario, seed: u64) -> Rep
         let live = Arc::new(Live::default());
         let mut clients = Vec::new();
         for id in 0..scenario.population {
-            // One stream per client, derived from the run's seed and the cycle.
-            // Splitting it this way rather than sharing one generator is what
-            // keeps the run reproducible under a different task schedule, and
-            // mixing in the cycle keeps the second one from being a replay of
-            // the first, which would test the caches rather than the server.
-            let rng = Rng::new(
-                seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ cycle.wrapping_mul(0x1234_5678),
-            );
+            // One stream per client, derived from the run's seed and the
+            // client. Splitting it this way rather than sharing one generator
+            // keeps the run reproducible under a different task schedule.
+            //
+            // **Not mixed with the cycle**, which it used to be, on the
+            // reasoning that a repeated cycle would test the caches rather than
+            // the server. It measured worse than it read: with the work varying
+            // per cycle, a cycle can be the first to take some path, and a
+            // first-use cost then lands in the middle of the run looking
+            // exactly like a leak. It did -- two descriptors and four tasks
+            // appearing at the third cycle of six and never again, which turned
+            // out to be one service's first dial of `server-config` over the
+            // in-process transport, pooled from then on.
+            //
+            // The cycle check compares an idle server against an idle server,
+            // and that comparison is only worth making when the load between
+            // them was the same load. Variety comes from the twelve clients and
+            // the steady window; the cycle's job is to repeat.
+            let rng = Rng::new(seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             clients.push(tokio::spawn(live_one(
                 deployment.port,
                 cycle * scenario.population + id,

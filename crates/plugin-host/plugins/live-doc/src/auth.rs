@@ -46,7 +46,7 @@ pub fn issue_handshake_jwt(
     let claims = HandshakeClaims {
         server_id,
         session_id,
-        doc_slug: doc_slug.to_string(),
+        doc_slug: doc_slug.to_owned(),
         exp: now + ttl_secs,
         iat: now,
     };

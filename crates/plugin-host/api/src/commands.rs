@@ -109,7 +109,7 @@ impl FromOption for u32 {
                         actual: "non-numeric String",
                     })
             }
-            OptionValue::Integer(n) if *n >= 0 && *n <= i64::from(u32::MAX) =>
+            OptionValue::Integer(n) if u32::try_from(*n).is_ok() =>
             {
                 #[allow(
                     clippy::cast_sign_loss,
@@ -261,6 +261,12 @@ pub fn parse_interaction(msg: &PluginMessageIn) -> Option<Interaction> {
 /// Wrap an [`InteractionResponse`] into a `PluginMessage` envelope and
 /// ship it back to the originating session via
 /// [`PluginContext::send_plugin_message`](crate::PluginContext::send_plugin_message).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the caller builds the response for this call and has no use \
+              for it afterwards; taking a reference would only move the \
+              borrow into every plugin that sends one"
+)]
 pub fn send_interaction_response(
     ctx: &PluginContext_TO<RArc<()>>,
     msg: &PluginMessageIn,
@@ -305,6 +311,12 @@ pub fn send_interaction_response(
 ///
 /// [`ResponseKind::ChatMessage`]: crate::ResponseKind::ChatMessage
 /// [`ResponseKind::UpdateMessage`]: crate::ResponseKind::UpdateMessage
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the caller builds the response for this call and has no use \
+              for it afterwards; taking a reference would only move the \
+              borrow into every plugin that sends one"
+)]
 pub fn send_interaction_response_to_sessions(
     ctx: &PluginContext_TO<RArc<()>>,
     server_id: crate::ServerId,
@@ -344,6 +356,12 @@ pub fn send_interaction_response_to_sessions(
 /// fan it out to every current member of `channel_id`.  Membership is
 /// resolved by the host at delivery time, so users who join the
 /// channel after this call do **not** receive a copy.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the caller builds the response for this call and has no use \
+              for it afterwards; taking a reference would only move the \
+              borrow into every plugin that sends one"
+)]
 pub fn send_interaction_response_to_channel(
     ctx: &PluginContext_TO<RArc<()>>,
     server_id: crate::ServerId,

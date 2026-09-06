@@ -30,6 +30,10 @@
     clippy::indexing_slicing,
     reason = "a failed assumption is the test result"
 )]
+// The soak driver reports as it runs: a nightly that fails after two hours has
+// to say on its first line what reproduces it, and nothing reads its stdout but
+// a person.
+#![allow(clippy::print_stdout, reason = "the soak run's own progress report")]
 
 pub mod soak;
 
@@ -1291,7 +1295,10 @@ pub async fn handshake_as(
     );
     let greeting =
         tcp::Version::decode(greeting_payload.as_slice()).expect("a well-formed Version");
-    assert!(greeting.version_v2.is_some());
+    assert!(
+        greeting.version_v2.is_some(),
+        "the greeting must carry the v2 version field"
+    );
 
     client
         .send(

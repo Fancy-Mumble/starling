@@ -11,7 +11,7 @@ use proc_macro2::TokenStream;
 use quote::ToTokens;
 use syn::{FnArg, ImplItemFn, ItemFn, parse2};
 
-pub(crate) fn modal_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
+pub(crate) fn modal_expand(args: TokenStream, item: &TokenStream) -> syn::Result<TokenStream> {
     let _ = ModalArgs::parse(args)?;
     if let Ok(mut f) = parse2::<ImplItemFn>(item.clone()) {
         strip_field_attrs(&mut f.sig.inputs);
@@ -22,7 +22,7 @@ pub(crate) fn modal_expand(args: TokenStream, item: TokenStream) -> syn::Result<
         return Ok(f.into_token_stream());
     }
     Err(syn::Error::new_spanned(
-        &item,
+        item,
         "#[modal] must be applied to a function or method",
     ))
 }
@@ -33,12 +33,9 @@ pub(crate) fn modal_expand(args: TokenStream, item: TokenStream) -> syn::Result<
 /// can write `#[field] message: String` without rustc rejecting it
 /// as an unknown attribute when the surrounding `#[fancy_plugin]`
 /// hasn't been added yet.
-pub(crate) fn field_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
+pub(crate) fn field_expand(args: &TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     if !args.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &args,
-            "#[field] takes no arguments",
-        ));
+        return Err(syn::Error::new_spanned(args, "#[field] takes no arguments"));
     }
     Ok(item)
 }

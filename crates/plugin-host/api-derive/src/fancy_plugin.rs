@@ -423,7 +423,7 @@ struct CommandParam {
     description: String,
     type_kind: OptionTypeKind,
     is_optional: bool,
-    /// Original syn type tokens, for the dispatch shim's extract_option turbofish.
+    /// Original syn type tokens, for the dispatch shim's `extract_option` turbofish.
     extract_ty: TokenStream,
 }
 
@@ -1399,7 +1399,7 @@ fn extract_self_ty_ident(ty: &Type) -> syn::Result<Ident> {
 
 /// Replace placeholder auto-ids on components and modals with the
 /// resolved `"<TypeName>::<method>"` literal.  Also rejects duplicate
-/// custom_ids within each kind (commands are deduped in `walk_impl`).
+/// `custom_ids` within each kind (commands are deduped in `walk_impl`).
 fn finalize_auto_ids(
     components: &mut [ComponentHandler],
     modals: &mut [ModalHandler],
