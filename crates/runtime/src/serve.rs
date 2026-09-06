@@ -303,16 +303,16 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     // claiming to be live, which is what makes systemd or Kubernetes act.
     ctx.health
         .heartbeat(BACKGROUND_HEARTBEAT, background_max_age::<S>());
-    let mut background = {
+    let mut background = Background(tokio::spawn({
         let service = Arc::clone(&service);
         let ctx = ctx.clone();
-        tokio::spawn(async move { supervise(service, ctx).await })
-    };
+        async move { supervise(service, ctx).await }
+    }));
 
     if !S::SERVES_GRPC {
         // Nothing to serve: the unit *is* its background task, so its exit is
         // the exit of the whole thing rather than something to abort.
-        return match background.await {
+        return match (&mut background.0).await {
             Ok(result) => result,
             Err(error) => Err(ServiceError::service(format!(
                 "{} stopped: {error}",
@@ -374,12 +374,12 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     // would have made it.
     let mut panicked = None;
     if ctx.shutdown.is_draining()
-        && let Ok(Err(joined)) = tokio::time::timeout(LETTING_GO, &mut background).await
+        && let Ok(Err(joined)) = tokio::time::timeout(LETTING_GO, &mut background.0).await
         && joined.is_panic()
     {
         panicked = Some(panic_message(joined));
     }
-    background.abort();
+    background.0.abort();
     if let Some(message) = panicked {
         ctx.logger.log(
             LogEvent::new(
@@ -510,6 +510,26 @@ async fn supervise<S: Serve>(service: Arc<S>, ctx: ServiceContext) -> Result<(),
         backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
     }
     Ok(())
+}
+
+/// A service's background task, aborted if the task that owns it is cancelled.
+///
+/// `tokio::spawn` detaches: drop the `JoinHandle` and the task runs on. Every
+/// exit [`run`] takes deliberately aborts it, so the leak is invisible until
+/// something cancels `run` *itself*, and then the background half outlives the
+/// service, still holding its sockets and its subscriptions on other services.
+///
+/// It stayed invisible because nothing cancelled a service until Stage 7's
+/// restart test did. Killing `voice` and starting it again left the old UDP
+/// loop bound to the audio port, so the replacement could not listen: a service
+/// that was restarted but never came back, reported as a bind timeout with
+/// nothing in the log to say why.
+struct Background(tokio::task::JoinHandle<Result<(), ServiceError>>);
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// How long a drained service's background task has to let go of what it holds.
@@ -733,6 +753,69 @@ mod tests {
         assert!(
             ctx.health.is_live(),
             "the heartbeat must be forgotten, not left to go stale"
+        );
+    }
+
+    /// Ticks kept by [`Clingy`], read after its service has been aborted.
+    ///
+    /// A static rather than a field, because `build` constructs the service and
+    /// the test never holds it.
+    static CLINGY_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A service whose background task would happily outlive it.
+    struct Clingy;
+
+    impl Serve for Clingy {
+        const NAME: &'static str = "clingy";
+        const SERVES_GRPC: bool = false;
+
+        async fn build(_ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
+            Ok(Arc::new(Self))
+        }
+
+        fn routes(self: Arc<Self>) -> Routes {
+            Routes::default()
+        }
+
+        async fn run(self: Arc<Self>, _ctx: ServiceContext) -> Result<(), ServiceError> {
+            loop {
+                let _ = CLINGY_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_a_service_stops_the_task_it_spawned() {
+        // `tokio::spawn` detaches, so this used to leave the background half
+        // running with the service gone: still holding its sockets, still
+        // subscribed to other services, and unreachable. What found it was a
+        // restart -- the replacement `voice` could not bind the audio port,
+        // because the one that had been killed was still listening on it.
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let handle = spawn::<Clingy>(ctx("clingy"));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while CLINGY_TICKS.load(Relaxed) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the background task never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+
+        // Read after the abort has been observed, then again after twenty of
+        // the task's own periods. A number that is still moving is a task that
+        // is still running.
+        let when_aborted = CLINGY_TICKS.load(Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            CLINGY_TICKS.load(Relaxed),
+            when_aborted,
+            "the background task kept running after its service was aborted"
         );
     }
 
