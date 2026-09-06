@@ -48,11 +48,26 @@ impl SqlDialect for Sqlite {
         format!(" ON CONFLICT ({conflict}) DO UPDATE SET {sets}")
     }
 
-    fn foreign_key_pragma(&self) -> Option<&'static str> {
-        // SQLite parses foreign keys and then ignores them unless this is set,
-        // per connection. Without it every `ON DELETE CASCADE` in the schema is
-        // decoration, and orphaned rows accumulate silently.
-        Some("PRAGMA foreign_keys = ON")
+    fn connect_pragmas(&self) -> &'static [&'static str] {
+        &[
+            // SQLite parses foreign keys and then ignores them unless this is
+            // set, per connection. Without it every `ON DELETE CASCADE` in the
+            // schema is decoration, and orphaned rows accumulate silently.
+            "PRAGMA foreign_keys = ON",
+            // The default rollback journal takes a database-wide write lock, so
+            // one writer blocks every reader. A voice server writes on paths a
+            // client is waiting on -- a ban check, a comment, an audit record --
+            // while background sweeps write too. WAL lets readers carry on
+            // through a write, which is the difference between a busy server
+            // and a stalled one.
+            "PRAGMA journal_mode = WAL",
+            // Without this, `busy_timeout` is zero: a connection that finds the
+            // database locked fails *immediately* with SQLITE_BUSY rather than
+            // waiting. Across a pool of eight that is a contended write turning
+            // into an error a user sees, for a lock that would have cleared in
+            // microseconds.
+            "PRAGMA busy_timeout = 5000",
+        ]
     }
 }
 
@@ -76,7 +91,7 @@ mod tests {
     #[test]
     fn foreign_keys_must_be_asked_for() {
         assert_eq!(
-            Sqlite.foreign_key_pragma(),
+            Sqlite.connect_pragmas().first().copied(),
             Some("PRAGMA foreign_keys = ON")
         );
     }

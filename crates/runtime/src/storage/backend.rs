@@ -80,19 +80,19 @@ impl Backend {
         install_default_drivers();
 
         let dialect = Dialect::from_url(url)?;
-        let pragma = dialect.foreign_key_pragma();
+        let pragmas = dialect.connect_pragmas();
 
         let pool = AnyPoolOptions::new()
             .max_connections(pool_size(url, max_connections))
             .acquire_timeout(CONNECT_TIMEOUT)
             // Every connection, not just the first. A pragma run once arms one
             // pooled connection and leaves the others ignoring the schema's
-            // foreign keys, so whether a delete cascades would depend on which
-            // connection the pool handed out.
+            // foreign keys, or waiting zero milliseconds for a lock, so which
+            // connection the pool handed out would decide the behaviour.
             .after_connect(move |connection, _meta| {
                 Box::pin(async move {
-                    if let Some(pragma) = pragma {
-                        let _ = sqlx::query(pragma).execute(&mut *connection).await?;
+                    for pragma in pragmas {
+                        let _ = sqlx::query(*pragma).execute(&mut *connection).await?;
                     }
                     Ok(())
                 })
@@ -244,6 +244,54 @@ mod tests {
                 .expect("read pragma");
             assert_eq!(enabled, 1, "a pooled connection had foreign keys disabled");
         }
+    }
+
+    /// Defect 16: the only pragma set anywhere was `foreign_keys`.
+    ///
+    /// A file-backed database, because `journal_mode` on an in-memory one
+    /// reports `memory` however it is asked -- the mode this is about only
+    /// exists for a database with a file behind it, which is every deployed
+    /// one.
+    #[tokio::test]
+    async fn a_file_database_waits_for_a_lock_instead_of_failing_on_it() {
+        let dir = std::env::temp_dir().join(format!("starling-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("pragmas.db");
+        let backend = Backend::connect(
+            &format!("sqlite:{}?mode=rwc", path.display()),
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
+
+        // Every pooled connection, for the same reason foreign keys are checked
+        // that way above: a setting armed on one of eight is a behaviour that
+        // depends on which one the pool hands out.
+        for _ in 0..DEFAULT_MAX_CONNECTIONS + 2 {
+            let (mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
+                .fetch_one(backend.pool())
+                .await
+                .expect("read journal_mode");
+            assert_eq!(
+                mode.to_lowercase(),
+                "wal",
+                "a pooled connection was on the rollback journal, where one \
+                 writer blocks every reader"
+            );
+
+            let (busy,): (i64,) = sqlx::query_as("PRAGMA busy_timeout")
+                .fetch_one(backend.pool())
+                .await
+                .expect("read busy_timeout");
+            assert!(
+                busy > 0,
+                "a pooled connection would fail a contended write immediately \
+                 rather than wait for the lock"
+            );
+        }
+
+        drop(backend);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

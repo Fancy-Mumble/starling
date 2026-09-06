@@ -85,6 +85,6 @@ mod tests {
 
     #[test]
     fn foreign_keys_need_no_asking() {
-        assert!(Postgres.foreign_key_pragma().is_none());
+        assert!(Postgres.connect_pragmas().is_empty());
     }
 }

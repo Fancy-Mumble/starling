@@ -76,13 +76,16 @@ pub trait SqlDialect: std::fmt::Debug + Send + Sync {
         format!("\"{identifier}\"")
     }
 
-    /// A statement that must run per connection before foreign keys are
-    /// enforced, if this backend needs one.
+    /// Statements every connection must run before it is used, in order.
     ///
-    /// SQLite parses foreign keys and then ignores them by default, which is the
-    /// worst of both. The other two enforce them always and return `None`.
-    fn foreign_key_pragma(&self) -> Option<&'static str> {
-        None
+    /// Per connection rather than per database: a pragma run once arms one
+    /// pooled connection and leaves the rest on the defaults, so which
+    /// connection the pool handed out would decide whether foreign keys are
+    /// enforced or how long a write waits for a lock.
+    ///
+    /// Empty for the server backends, which need no such setting.
+    fn connect_pragmas(&self) -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -183,8 +186,8 @@ impl SqlDialect for Dialect {
         self.behaviour().quote(identifier)
     }
 
-    fn foreign_key_pragma(&self) -> Option<&'static str> {
-        self.behaviour().foreign_key_pragma()
+    fn connect_pragmas(&self) -> &'static [&'static str] {
+        self.behaviour().connect_pragmas()
     }
 }
 
@@ -268,9 +271,9 @@ mod tests {
     fn only_sqlite_needs_asking_about_foreign_keys() {
         // The others enforce them always. SQLite parses them and then ignores
         // them unless told otherwise, which is the worst of both.
-        assert!(Dialect::Sqlite(Sqlite).foreign_key_pragma().is_some());
-        assert!(Dialect::MySql(MySql).foreign_key_pragma().is_none());
-        assert!(Dialect::Postgres(Postgres).foreign_key_pragma().is_none());
+        assert!(!Dialect::Sqlite(Sqlite).connect_pragmas().is_empty());
+        assert!(Dialect::MySql(MySql).connect_pragmas().is_empty());
+        assert!(Dialect::Postgres(Postgres).connect_pragmas().is_empty());
     }
 
     #[test]

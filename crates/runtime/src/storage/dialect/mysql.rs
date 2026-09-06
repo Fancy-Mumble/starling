@@ -86,6 +86,6 @@ mod tests {
 
     #[test]
     fn foreign_keys_need_no_asking() {
-        assert!(MySql.foreign_key_pragma().is_none());
+        assert!(MySql.connect_pragmas().is_empty());
     }
 }
