@@ -161,9 +161,24 @@ async fn accept(
     connections: mpsc::Sender<std::io::Result<NamedPipeServer>>,
 ) {
     loop {
-        if let Err(error) = server.connect().await {
-            let _ = connections.send(Err(error)).await;
-            return;
+        tokio::select! {
+            // Selected against the connect rather than checked after it. The
+            // send below already lets the pipe go once nothing is serving it,
+            // but that line is only reached when a client dials: a service
+            // drained while nothing is dialling would otherwise sit parked in
+            // `connect` holding the name indefinitely. On Windows that is not
+            // a leak but a wall -- `bind` asks for `first_pipe_instance`, so
+            // the replacement's create fails with `Access is denied` while
+            // this instance lives, and the service can never be restarted.
+            // Defect 23 in `docs/RELIABILITY.md` in a different costume: a
+            // detached task holding what the service had bound.
+            () = connections.closed() => return,
+            result = server.connect() => {
+                if let Err(error) = result {
+                    let _ = connections.send(Err(error)).await;
+                    return;
+                }
+            }
         }
         let next = match ServerOptions::new().create(&path) {
             Ok(next) => next,
@@ -276,5 +291,37 @@ mod tests {
         let _second = ClientOptions::new().open(pipe.path()).expect("second dial");
         let served = incoming.next().await.expect("the second arrives");
         assert!(served.is_ok(), "{:?}", served.err());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_transport_lets_the_name_go_without_being_dialled() {
+        // The other half of `two_deployments_cannot_share_one_name`: because
+        // the name is exclusive, a restart can only bind if the instance
+        // before it actually let go. The accept task holds one, and it used to
+        // learn that nothing was serving it only from a failed send -- which
+        // is reached only after a client dials. A service drained while idle
+        // therefore kept the name for the life of the process and its
+        // replacement was refused with `Access is denied`, which is what made
+        // every `chaos.rs` restart test unrunnable on Windows.
+        let broker = Broker::new();
+        let pipe = Pipe::new(unique("released-while-idle"));
+
+        // Bound and dropped without ever being dialled, which is the case that
+        // used to hang on to the name.
+        drop(pipe.bind(&broker).await.expect("the first bind succeeds"));
+
+        // Given a few turns rather than asked once: the accept task learns of
+        // the drop when the runtime next polls it, not when `drop` returns.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if pipe.bind(&broker).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pipe name was never released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
