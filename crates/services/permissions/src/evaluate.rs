@@ -1414,3 +1414,174 @@ mod tests {
         assert!(acls.ancestry(1, 1).len() <= 65);
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A random channel tree, as parent links.
+    ///
+    /// Built by giving each channel a parent strictly above it, which makes a
+    /// tree by construction: a cycle would make `ancestry` a question about
+    /// termination rather than about permissions, and cycles are the tree
+    /// service's invariant to keep, not this one's.
+    fn tree(count: usize) -> impl Strategy<Value = Vec<u32>> {
+        prop::collection::vec(0_usize..count.max(1), count).prop_map(|raw| {
+            raw.iter()
+                .enumerate()
+                .map(|(child, parent)| u32::try_from(parent % child.max(1)).unwrap_or(0))
+                .collect()
+        })
+    }
+
+    /// Wire `parents` into an `Acls`, where index 0 is the root.
+    fn wire(parents: &[u32]) -> Acls {
+        let acls = Acls::new();
+        for (child, parent) in parents.iter().enumerate().skip(1) {
+            let child = u32::try_from(child).unwrap_or(0);
+            acls.set_parent(1, child, *parent);
+        }
+        acls
+    }
+
+    fn entry(group: &str, grant: Perm, deny: Perm, here: bool, subs: bool) -> AclEntry {
+        AclEntry {
+            apply_here: here,
+            apply_subs: subs,
+            group: Some(group.to_owned()),
+            grant: grant.bits(),
+            deny: deny.bits(),
+            ..AclEntry::default()
+        }
+    }
+
+    proptest! {
+        /// Evaluation is a function: the same inputs give the same answer.
+        ///
+        /// Not trivial. The walk reads `HashMap`s and resolves groups through
+        /// more of them, and an answer that depended on iteration order would
+        /// be a permission that differs between two runs of one server -- and
+        /// between two servers behind one address.
+        #[test]
+        fn evaluation_is_deterministic(
+            parents in tree(8),
+            channel in 0_u32..8,
+            grant in 0_u32..64,
+        ) {
+            let acls = wire(&parents);
+            acls.set(1, AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![entry(
+                    "all",
+                    Perm::from_bits_truncate(grant),
+                    Perm::empty(),
+                    true,
+                    true,
+                )],
+                groups: Vec::new(),
+            });
+            let subject = Subject::default();
+
+            let first = evaluate(&acls, 1, &subject, channel);
+            for _ in 0..8 {
+                prop_assert_eq!(evaluate(&acls, 1, &subject, channel), first);
+            }
+        }
+
+        /// A deny on the target channel is never undone by an inherited allow.
+        ///
+        /// The direction that matters: an allow lost to a deny is an
+        /// inconvenience, while a deny lost to an allow is somebody speaking in
+        /// a room an operator shut them out of.
+        #[test]
+        fn a_deny_on_the_target_is_not_overridden_from_above(
+            parents in tree(6),
+            channel in 1_u32..6,
+        ) {
+            let acls = wire(&parents);
+            // The root grants SPEAK to everyone, everywhere below it.
+            acls.set(1, AclSet {
+                channel: 0,
+                inherit: true,
+                acls: vec![entry("all", Perm::SPEAK, Perm::empty(), true, true)],
+                groups: Vec::new(),
+            });
+            // The target denies it.
+            acls.set(1, AclSet {
+                channel,
+                inherit: true,
+                acls: vec![entry("all", Perm::empty(), Perm::SPEAK, true, true)],
+                groups: Vec::new(),
+            });
+
+            let granted = Perm::from_bits_truncate(
+                evaluate(&acls, 1, &Subject::default(), channel),
+            );
+            prop_assert!(
+                !granted.contains(Perm::SPEAK),
+                "an inherited allow overrode a deny written on the channel itself"
+            );
+        }
+
+        /// An ACL on an unrelated channel never changes a verdict.
+        ///
+        /// What makes an ACL table something an operator can reason about one
+        /// room at a time.
+        #[test]
+        fn an_unrelated_channel_cannot_change_the_answer(
+            parents in tree(8),
+            channel in 0_u32..8,
+            unrelated in 0_u32..8,
+        ) {
+            let acls = wire(&parents);
+            let before = evaluate(&acls, 1, &Subject::default(), channel);
+
+            // Only meaningful when the other channel is not an ancestor: an
+            // ancestor is *related*, and its entries are supposed to reach here.
+            let ancestry = acls.ancestry(1, channel);
+            prop_assume!(!ancestry.contains(&unrelated));
+
+            acls.set(1, AclSet {
+                channel: unrelated,
+                inherit: true,
+                acls: vec![entry("all", Perm::SPEAK, Perm::MUTE_DEAFEN, true, true)],
+                groups: Vec::new(),
+            });
+            prop_assert_eq!(
+                evaluate(&acls, 1, &Subject::default(), channel),
+                before,
+                "an entry on channel {} changed the verdict for {}",
+                unrelated,
+                channel
+            );
+        }
+
+        /// The superuser is granted everything, whatever the table says.
+        ///
+        /// The property that keeps a server repairable: an ACL table that has
+        /// locked its own administrator out is one nobody can fix.
+        #[test]
+        fn the_superuser_is_never_locked_out(parents in tree(6), channel in 0_u32..6) {
+            let acls = wire(&parents);
+            for id in 0..6_u32 {
+                acls.set(1, AclSet {
+                    channel: id,
+                    inherit: false,
+                    acls: vec![entry("all", Perm::empty(), Perm::all(), true, true)],
+                    groups: Vec::new(),
+                });
+            }
+            let superuser = Subject {
+                registered: true,
+                account: 0,
+                ..Subject::default()
+            };
+            prop_assert_eq!(
+                evaluate(&acls, 1, &superuser, channel),
+                Perm::SUPERUSER.bits()
+            );
+        }
+    }
+}

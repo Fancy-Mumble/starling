@@ -247,6 +247,10 @@ jsonwebtoken = { version = "9", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 # Drives the WebSocket end of live-doc's own tests.
 tokio-tungstenite = "0.30"
+# Property tests. `proptest` rather than `quickcheck`: it shrinks failures to a
+# minimal case, which is the difference between "this seed fails" and "here is
+# the input".
+proptest = { version = "1", default-features = false, features = ["std"] }
 # Proc-macros for plugin authors, used only by `mumble-plugin-api-derive`.
 proc-macro2 = "1"
 quote = "1"

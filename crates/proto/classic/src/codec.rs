@@ -429,3 +429,82 @@ mod tests {
         assert!(buf.is_empty());
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The decoder either consumes a whole frame, asks for more, or refuses.
+        ///
+        /// The property that matters for a server reading from a socket: there
+        /// is no fourth outcome, and in particular no panic. This is the first
+        /// code an unauthenticated peer's bytes reach.
+        #[test]
+        fn decoding_arbitrary_bytes_never_panics(bytes: Vec<u8>) {
+            let mut buf = BytesMut::from(&bytes[..]);
+            let before = buf.len();
+            match decode(&mut buf) {
+                // A frame came out, so the buffer moved forward by exactly it.
+                Ok(Some(_)) => prop_assert!(buf.len() < before),
+                // Not yet a frame: nothing may be consumed, or the bytes
+                // already read would be lost before the rest arrives.
+                Ok(None) => prop_assert_eq!(buf.len(), before),
+                Err(_) => {}
+            }
+        }
+
+        /// An encoded frame is its header plus its payload, always.
+        ///
+        /// The invariant the length field on the wire depends on: a mismatch
+        /// here desynchronises every following frame on that connection.
+        #[test]
+        fn an_encoded_frame_is_six_bytes_plus_its_payload(payload: Vec<u8>) {
+            prop_assume!(payload.len() <= MAX_PAYLOAD_SIZE as usize);
+            let encoded = encode(&ControlMessage::UdpTunnel(Bytes::from(payload.clone())));
+            prop_assert_eq!(encoded.len(), HEADER_SIZE + payload.len());
+        }
+
+        /// Encode then decode returns what went in.
+        #[test]
+        fn a_tunnelled_packet_survives_a_round_trip(payload: Vec<u8>) {
+            prop_assume!(payload.len() <= MAX_PAYLOAD_SIZE as usize);
+            let original = Bytes::from(payload);
+            let mut buf = BytesMut::from(&encode(&ControlMessage::UdpTunnel(original.clone()))[..]);
+
+            let decoded = decode(&mut buf).expect("a frame this encoder produced");
+            match decoded {
+                Some(ControlMessage::UdpTunnel(round_tripped)) => {
+                    prop_assert_eq!(round_tripped, original);
+                }
+                other => prop_assert!(false, "expected a tunnel frame, got {:?}", other),
+            }
+            prop_assert!(buf.is_empty(), "the frame must be fully consumed");
+        }
+
+        /// A frame arriving in pieces decodes once, and only once it is whole.
+        ///
+        /// How every frame actually arrives: TCP gives no message boundaries,
+        /// so a decoder that reads a partial header as a real one produces a
+        /// frame nobody sent.
+        #[test]
+        fn a_frame_split_across_reads_decodes_exactly_once(
+            payload: Vec<u8>,
+            split in 0_usize..64,
+        ) {
+            prop_assume!(payload.len() <= 4096);
+            let whole = encode(&ControlMessage::UdpTunnel(Bytes::from(payload.clone())));
+            let split = split.min(whole.len());
+
+            let mut buf = BytesMut::from(&whole[..split]);
+            // Nothing may come out of a prefix, however the split fell.
+            if split < HEADER_SIZE + payload.len() {
+                prop_assert!(matches!(decode(&mut buf), Ok(None)));
+            }
+            buf.extend_from_slice(&whole[split..]);
+            prop_assert!(matches!(decode(&mut buf), Ok(Some(_))));
+            prop_assert!(buf.is_empty());
+        }
+    }
+}
