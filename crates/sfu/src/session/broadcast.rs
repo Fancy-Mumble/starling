@@ -50,6 +50,19 @@ impl BroadcastSession {
         }
     }
 
+    /// Drop one viewer's peer. Returns whether there was one.
+    ///
+    /// Dropping the `Rtc` is the whole of it: its DTLS and SRTP state, its
+    /// buffers and its place in the per-packet scan all go with it.
+    pub(super) fn remove_viewer(&mut self, viewer_session: u32) -> bool {
+        self.outbound.remove(&viewer_session).is_some()
+    }
+
+    /// How many viewers this broadcast is serving.
+    pub(super) fn viewers(&self) -> usize {
+        self.outbound.len()
+    }
+
     pub(super) fn accept_broadcaster_offer(
         &mut self,
         config: &SfuConfig,

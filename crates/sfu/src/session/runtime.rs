@@ -72,8 +72,8 @@ impl SfuRuntime {
 
     pub(super) async fn run(
         &mut self,
-        mut cmd_rx: mpsc::UnboundedReceiver<SfuCommand>,
-        event_tx: mpsc::UnboundedSender<SfuEvent>,
+        mut cmd_rx: mpsc::Receiver<SfuCommand>,
+        event_tx: mpsc::Sender<SfuEvent>,
     ) {
         let mut udp_buf = vec![0u8; UDP_BUF_SIZE];
         let mut tick_interval = tokio::time::interval(TICK_INTERVAL);
@@ -95,7 +95,15 @@ impl SfuRuntime {
                 result = self.socket.recv_from(&mut udp_buf) => {
                     match result {
                         Ok((len, source)) => {
-                            self.route_udp_packet(source, &udp_buf[..len]);
+                            // `get`, not an index. The kernel cannot report more
+                            // bytes than the buffer holds, so this could not
+                            // panic -- but this is the exact line that hands an
+                            // unauthenticated datagram to a third-party WebRTC
+                            // stack inside an abort-on-panic process, and it is
+                            // worth not having to argue about.
+                            if let Some(datagram) = udp_buf.get(..len) {
+                                self.route_udp_packet(source, datagram);
+                            }
                             self.batch_drain_udp(&mut udp_buf);
                         }
                         Err(e) => warn!("SFU UDP recv error: {e}"),
@@ -132,7 +140,11 @@ impl SfuRuntime {
     fn batch_drain_udp(&mut self, udp_buf: &mut [u8]) {
         for _ in 0..MAX_BATCH_DRAIN {
             match self.socket.try_recv_from(udp_buf) {
-                Ok((len, source)) => self.route_udp_packet(source, &udp_buf[..len]),
+                Ok((len, source)) => {
+                    if let Some(datagram) = udp_buf.get(..len) {
+                        self.route_udp_packet(source, datagram);
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -151,7 +163,7 @@ impl SfuRuntime {
         }
     }
 
-    fn handle_command(&mut self, cmd: SfuCommand, event_tx: &mpsc::UnboundedSender<SfuEvent>) {
+    fn handle_command(&mut self, cmd: SfuCommand, event_tx: &mpsc::Sender<SfuEvent>) {
         match cmd {
             SfuCommand::CreateSession {
                 broadcaster_session,
@@ -181,7 +193,7 @@ impl SfuRuntime {
                             "SFU: broadcaster {broadcaster_session} SDP\n\
                              --- OFFER ---\n{sdp}\n--- ANSWER ---\n{answer_sdp}\n---",
                         );
-                        let _r = event_tx.send(SfuEvent::SdpAnswer {
+                        let _r = event_tx.try_send(SfuEvent::SdpAnswer {
                             target_session: broadcaster_session,
                             broadcaster_session,
                             sdp: answer_sdp,
@@ -205,7 +217,7 @@ impl SfuRuntime {
                         info!(
                             "SFU: viewer {viewer_session} connected to broadcaster {broadcaster_session}"
                         );
-                        let _r = event_tx.send(SfuEvent::SdpAnswer {
+                        let _r = event_tx.try_send(SfuEvent::SdpAnswer {
                             target_session: viewer_session,
                             broadcaster_session,
                             sdp: answer_sdp,
@@ -219,12 +231,26 @@ impl SfuRuntime {
             SfuCommand::AddIceCandidate { client_session, .. } => {
                 trace!("SFU: ICE candidate from session {client_session} (handled via UDP)");
             }
+            SfuCommand::RemoveViewer {
+                broadcaster_session,
+                viewer_session,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&broadcaster_session)
+                    && session.remove_viewer(viewer_session)
+                {
+                    debug!(
+                        "SFU: viewer {viewer_session} left broadcast \
+                         {broadcaster_session}, {} still watching",
+                        session.viewers()
+                    );
+                }
+            }
             SfuCommand::DestroySession {
                 broadcaster_session,
             } => {
                 info!("SFU: destroying session for broadcaster {broadcaster_session}");
                 let _ = self.sessions.remove(&broadcaster_session);
-                let _r = event_tx.send(SfuEvent::SessionEnded {
+                let _r = event_tx.try_send(SfuEvent::SessionEnded {
                     broadcaster_session,
                 });
             }

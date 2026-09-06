@@ -100,9 +100,46 @@ struct Share {
     conn: u64,
     channel: u32,
     viewers: Vec<u32>,
+    /// The connection each viewer is watching on.
+    ///
+    /// Same argument as `conn` above, for the other side of the share: without
+    /// it a viewer who closed their laptop could only be noticed by the whole
+    /// share ending, so their peer connection stayed in the SFU and was fed a
+    /// timeout on every tick for as long as the broadcast ran.
+    viewer_conns: HashMap<u32, u64>,
     /// Which signalling announced it, and therefore which the server must
     /// answer it in.
     dialect: Dialect,
+}
+
+/// What this service is holding.
+#[derive(Debug, Clone)]
+struct ShareGauges {
+    shares: starling_runtime::pressure::Gauge,
+    viewers: starling_runtime::pressure::Gauge,
+}
+
+impl ShareGauges {
+    fn new(pressure: &starling_runtime::pressure::Pressure) -> Self {
+        // No declared ceiling on either: nothing caps how many shares a server
+        // runs, so these report counts. The number that matters is whether
+        // they come back to zero when everybody stops.
+        Self {
+            shares: pressure.gauge("shares", 0),
+            viewers: pressure.gauge("viewers", 0),
+        }
+    }
+
+    /// Publish both, from the map that owns them.
+    fn observe(&self, shares: &HashMap<String, Share>) {
+        self.shares.observe(shares.len() as u64);
+        self.viewers.observe(
+            shares
+                .values()
+                .map(|share| share.viewers.len() as u64)
+                .sum(),
+        );
+    }
 }
 
 /// Which signalling a share is being conducted in.
@@ -214,6 +251,12 @@ const VIEW_GATE: &str = "screenshare_roster_warm";
 #[derive(Debug)]
 pub struct ScreenshareService {
     shares: Mutex<HashMap<String, Share>>,
+    /// Live broadcasts, and the viewers watching them.
+    ///
+    /// Two gauges rather than one: a share is a session in the SFU and a viewer
+    /// is a peer connection inside it, so the pair is what says whether defect
+    /// 9's per-viewer removal is working. See `scripts/canon-gauges.json`.
+    gauges: ShareGauges,
     endpoint: (String, u32),
     fanout: Fanout,
     permit: Permit,
@@ -409,6 +452,7 @@ impl ScreenshareService {
                     conn: inbound.conn,
                     channel: start.channel,
                     viewers: Vec::new(),
+                    viewer_conns: HashMap::new(),
                     dialect: Dialect::Canon,
                 },
             );
@@ -573,6 +617,7 @@ impl ScreenshareService {
                     conn: inbound.conn,
                     channel,
                     viewers: Vec::new(),
+                    viewer_conns: HashMap::new(),
                     dialect: Dialect::Signal,
                 },
             );
@@ -718,8 +763,11 @@ impl ScreenshareService {
                 let Some(share) = shares.get_mut(&request.share_id) else {
                     return Vec::new();
                 };
-                if inbound.session != share.presenter && !share.viewers.contains(&inbound.session) {
-                    share.viewers.push(inbound.session);
+                if inbound.session != share.presenter {
+                    if !share.viewers.contains(&inbound.session) {
+                        share.viewers.push(inbound.session);
+                    }
+                    let _ = share.viewer_conns.insert(inbound.session, inbound.conn);
                 }
                 tracing::debug!(
                     share = %request.share_id,
@@ -727,7 +775,9 @@ impl ScreenshareService {
                     viewers = share.viewers.len(),
                     "viewer list"
                 );
-                share.viewers.clone()
+                let listed = share.viewers.clone();
+                self.gauges.observe(&shares);
+                listed
             })
             .unwrap_or_default();
         let reply = ScreenshareEnvelope {
@@ -753,10 +803,56 @@ impl ScreenshareService {
             || self.allows(inbound, share.channel, Perm::MUTE_DEAFEN).await
     }
 
+    /// Take `conn` out of every share it was watching.
+    ///
+    /// Separate from ending a share: the presenter leaving stops the broadcast,
+    /// while a viewer leaving only stops their copy of it.
+    fn drop_viewer(&self, conn: u64) {
+        let Ok(mut shares) = self.shares.lock() else {
+            return;
+        };
+        let mut report = false;
+        // Sorted, so two runs of one server do the same thing in the same
+        // order. A connection appears in at most one share's viewers, so the
+        // order cannot change the outcome -- but a log read while diagnosing
+        // one of these is easier when it does not shuffle.
+        let mut ids: Vec<String> = shares.keys().cloned().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(share) = shares.get_mut(&id) else {
+                continue;
+            };
+            let Some(session) = share
+                .viewer_conns
+                .iter()
+                .find(|(_, held)| **held == conn)
+                .map(|(session, _)| *session)
+            else {
+                continue;
+            };
+            let _ = share.viewer_conns.remove(&session);
+            share.viewers.retain(|viewer| *viewer != session);
+            report = true;
+            if let Some(sfu) = self.sfu.as_ref() {
+                sfu.remove_viewer(share.presenter, session);
+            }
+            tracing::debug!(
+                presenter = share.presenter,
+                viewer = session,
+                remaining = share.viewers.len(),
+                "viewer left: their peer connection is dropped"
+            );
+        }
+        if report {
+            self.gauges.observe(&shares);
+        }
+    }
+
     /// End a share and tell its channel, whatever ended it.
     fn end(&self, share_id: &str, share: &Share, actor: u32) -> Actions {
         if let Ok(mut shares) = self.shares.lock() {
             let _ = shares.remove(share_id);
+            self.gauges.observe(&shares);
         }
         if let Some(sfu) = self.sfu.as_ref() {
             // Every peer attached to it goes with it. Without this a presenter
@@ -874,6 +970,12 @@ impl ClientService for ScreenshareService {
             );
             actions.extend(self.end(share_id, share, share.presenter));
         }
+
+        // A viewer leaving is not the end of the share, but their peer in the
+        // SFU has to go: `outbound` had no per-viewer removal at all, so a
+        // viewer who watched for a minute stayed resident for the whole
+        // broadcast, fed a timeout every tick and scanned for every packet.
+        self.drop_viewer(conn);
         actions
     }
 }
@@ -924,6 +1026,7 @@ impl Serve for ScreenshareService {
         };
         Ok(Arc::new(Self {
             shares: Mutex::new(HashMap::new()),
+            gauges: ShareGauges::new(&ctx.pressure),
             endpoint,
             sfu,
             fanout: Fanout::default(),
@@ -981,6 +1084,7 @@ mod tests {
         );
         Arc::new(ScreenshareService {
             shares: Mutex::new(HashMap::new()),
+            gauges: ShareGauges::new(&starling_runtime::pressure::Pressure::new()),
             endpoint: ("sfu.example.org".to_owned(), 7000),
             // No media plane in these tests: they are about signalling, and an
             // SFU would bind a UDP port per test.
@@ -1180,6 +1284,43 @@ mod tests {
         // anyone enumerate live share ids by asking.
         let service = permissive();
         assert!(service.frame(frame(4, &stop_of("never"))).await.is_empty());
+    }
+
+    /// Defect 9: the SFU had no per-viewer removal at all.
+    #[tokio::test]
+    async fn a_viewer_who_disconnects_leaves_the_share_running_without_them() {
+        let service = permissive();
+        seat(&service, &[(1, 3), (4, 3), (5, 3)]);
+        let _ = service.frame(frame(4, &start_of("s9", 3))).await;
+
+        // Asking for the viewer list is how a client joins.
+        let viewers = ScreenshareEnvelope {
+            body: Some(screenshare_envelope::Body::Viewers(Viewers {
+                share_id: "s9".to_owned(),
+                sessions: Vec::new(),
+            })),
+        };
+        let _ = service.frame(frame(5, &viewers)).await;
+        assert_eq!(
+            service.share("s9").expect("the share is live").viewers,
+            vec![5],
+            "asking for the list joins"
+        );
+
+        // The viewer's connection, per the `frame` helper's numbering.
+        let _ = service.closed(105, "gone").await;
+
+        let share = service
+            .share("s9")
+            .expect("a viewer leaving must not end the broadcast");
+        assert!(
+            share.viewers.is_empty(),
+            "the departed viewer must be dropped from the share"
+        );
+        assert!(
+            share.viewer_conns.is_empty(),
+            "and from the connections behind it, so nothing outlives them"
+        );
     }
 
     #[tokio::test]
