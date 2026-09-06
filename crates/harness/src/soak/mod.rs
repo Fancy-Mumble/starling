@@ -1,7 +1,7 @@
 //! The soak harness: sample a running deployment, then say what it means.
 //!
 //! Two halves, deliberately separate. [`sample`] and [`Sampler`] observe;
-//! [`assess`] judges. Splitting them is what lets the judgement be unit-tested
+//! [`assess()`] judges. Splitting them is what lets the judgement be unit-tested
 //! against hand-built runs -- every threshold in [`assess::Budget`] has a test
 //! that constructs the defect it exists to catch, which is the only way to know
 //! a check works before waiting six hours for one that does not.

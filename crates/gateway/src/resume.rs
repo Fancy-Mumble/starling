@@ -150,7 +150,7 @@ impl ResumeStore {
     /// The store an operator asked for.
     ///
     /// The constructor the gateway uses. [`ResumeStore::new`] hardcoded
-    /// [`DEFAULT_TTL`] and nothing passed `gateway.resume.ttl` through, so the
+    /// `DEFAULT_TTL` and nothing passed `gateway.resume.ttl` through, so the
     /// documented default of two minutes was silently ten, and
     /// `gateway.resume.enabled = false` set a health warning and changed no
     /// behaviour. Both keys are now the ones in the file.

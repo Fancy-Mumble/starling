@@ -7,7 +7,7 @@
 //! argued with rather than silenced by editing a literal in the middle of a
 //! function.
 //!
-//! The ordering is deliberate: [`quiesce`] first, because a level assertion on
+//! The ordering is deliberate: `quiesce` first, because a level assertion on
 //! an idle server is the one result that is never ambiguous.
 
 use std::collections::BTreeMap;
@@ -77,7 +77,7 @@ pub struct Budget {
     /// tell the two apart.
     ///
     /// So this catches only a gross regression -- a leak large enough to clear
-    /// the startup cost outright. [`cycles`] is what catches a leak, and it
+    /// the startup cost outright. `cycles` is what catches a leak, and it
     /// needs no constant at all.
     pub quiesced_fd_slack: u64,
     /// Descriptors allowed per live connection during the run.
@@ -295,6 +295,12 @@ fn quiesce(samples: &[Sample], budget: Budget) -> Vec<Failure> {
 /// allowance between them is **zero** for descriptors, tasks and gauges. A leak
 /// of one entry per connection fails this at any population; a pool that warmed
 /// once passes it at every population.
+///
+/// This rests on the cycles running the *same* load, which is why
+/// [`drive::run`](super::drive::run) seeds each client from the run and the
+/// client and not from the cycle. Vary the work per cycle and a later cycle can
+/// be the first to take some path, whose one-time cost then arrives mid-run and
+/// is indistinguishable here from a leak.
 fn cycles(samples: &[Sample]) -> Vec<Failure> {
     let (Some(first), Some(last)) = (first_quiesced(samples), quiesced(samples)) else {
         return Vec::new();

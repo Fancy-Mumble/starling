@@ -90,7 +90,7 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DRAIN_GRACE: Duration = Duration::from_secs(30);
 /// How long to wait for the live channel to report itself started.
 ///
-/// Generous on purpose: see [`started`]. It bounds a whole deployment coming
+/// Generous on purpose: see `started`. It bounds a whole deployment coming
 /// up, not the delivery of a frame, and the two have no reason to share a
 /// number.
 pub const LIVE_START_TIMEOUT: Duration = Duration::from_secs(60);

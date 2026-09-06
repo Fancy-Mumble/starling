@@ -16,7 +16,7 @@
 //!
 //! **And one download.** `--all-in-one` with no `--config` on a machine that has
 //! never run Starling writes a configuration where this platform keeps them,
-//! creates the administrator, and prints both; see [`firstrun`]. That is what
+//! creates the administrator, and prints both; see the `firstrun` module. That is what
 //! makes the `.deb`, the `.AppImage`, the `.dmg` and the `.exe` in `docs/
 //! RELEASING.md` something a person can double-click.
 
