@@ -64,7 +64,13 @@ impl Pipe {
     }
 
     /// The path the OS is asked for.
-    fn path(&self) -> String {
+    ///
+    /// Public so a caller that has to reason about the name outside this
+    /// transport -- the test harness waits for a restarted service's instances
+    /// to go away -- asks the same question `bind` does rather than rebuilding
+    /// the prefix rules beside it.
+    #[must_use]
+    pub fn path(&self) -> String {
         format!("{PREFIX}{}", self.name)
     }
 }

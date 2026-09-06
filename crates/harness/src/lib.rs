@@ -597,6 +597,30 @@ impl Deployment {
             let _ = std::fs::remove_file(path);
         }
 
+        // The Windows counterpart, and not symmetric with it: a pipe name has
+        // no file to unlink, what has to happen is that every *instance* of it
+        // goes away. The drained service releases the connected ones when the
+        // runtime polls the tasks its `JoinSet` aborted, and an abort is not a
+        // join -- so they outlive the handle awaited above by however long the
+        // scheduler takes. `bind` asks for `first_pipe_instance`, so one
+        // straggler is enough for the replacement to be refused with
+        // `Access is denied`.
+        //
+        // Waited for here rather than retried inside `bind`, which would blunt
+        // the guard that stops two deployments quietly sharing a name: this is
+        // a restart, where a predecessor is expected, and that is knowledge the
+        // harness has and the transport does not.
+        #[cfg(windows)]
+        if let Some(pipe) = self
+            .config
+            .services
+            .get(name)
+            .and_then(|service| service.endpoint.as_deref())
+            .and_then(|endpoint| endpoint.strip_prefix("pipe:"))
+        {
+            wait_until_pipe_is_free(pipe, name).await;
+        }
+
         let shutdown = Shutdown::new();
         let handle = starling::units::spawn(
             name,
@@ -750,6 +774,42 @@ impl Drop for Deployment {
             "this deployment was dropped without `stop().await`, so nothing \
              checked whether its services came down cleanly"
         );
+    }
+}
+
+/// Wait until no instance of `pipe` is left, so a replacement can bind it.
+///
+/// Probed with the very operation the replacement will attempt, because that is
+/// the only thing that actually answers the question: a name with one connected
+/// instance still open is indistinguishable, from outside, from a free one.
+/// Succeeding means the name was free, and dropping the instance immediately
+/// puts it back the way it was found.
+///
+/// # Panics
+///
+/// If the name is still held after [`DRAIN_GRACE`], which is a service that did
+/// not let go rather than a scheduler that was slow.
+#[cfg(windows)]
+async fn wait_until_pipe_is_free(pipe: &str, name: &str) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    // Built by the transport, not beside it: `Pipe` owns the prefix rules and
+    // accepts either a bare name or a full path.
+    let path = starling_runtime::transport::Pipe::new(pipe).path();
+
+    let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+    loop {
+        match ServerOptions::new().first_pipe_instance(true).create(&path) {
+            Ok(probe) => {
+                drop(probe);
+                return;
+            }
+            Err(error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "{name} still held {path} {DRAIN_GRACE:?} after it drained: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
