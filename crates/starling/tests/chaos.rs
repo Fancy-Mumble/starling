@@ -31,13 +31,6 @@ use prost::Message as _;
 use starling_harness::{Client, Deployment, TempDir, handshake};
 use starling_proto::proto::tcp;
 
-/// How long to wait for a close that must not come.
-///
-/// Short on purpose. This is paid once per service and it is asserting the
-/// *absence* of an event, so the only thing a longer wait buys is a slower
-/// suite; a disconnect caused by the kill arrives immediately or not at all.
-const NOT_CLOSED: Duration = Duration::from_millis(200);
-
 /// How long a message may take to cross a server whose parts are restarting.
 ///
 /// Longer than the same wait in `e2e.rs`, because the transport between two
@@ -134,21 +127,32 @@ async fn a_restarted_session_view_still_routes_a_message() {
 
     deployment.restart("session-view").await;
 
-    // Retried, because the repair is on `session-lifecycle`'s sweep and the
-    // restart lands at an arbitrary point in it. What is being asserted is that
-    // the server heals, not how many milliseconds it takes; a single attempt
-    // here would be a test of where in the tick the restart happened to fall.
-    let deadline = tokio::time::Instant::now() + REPAIR;
-    let mut after = false;
-    while !after && tokio::time::Instant::now() < deadline {
-        after = relayed(&mut alice, alice_session, &mut bob, "after").await;
-    }
+    let after = relayed_within(&mut alice, alice_session, &mut bob, "after").await;
 
     deployment.stop().await;
     assert!(
         after,
         "a message no longer crossed the server after `session-view` restarted"
     );
+}
+
+/// [`relayed`], retried until it works or [`REPAIR`] runs out.
+///
+/// A service that comes back empty is repaired on `session-lifecycle`'s sweep,
+/// and a restart lands at an arbitrary point in one. Asking once would assert
+/// where in the tick the restart happened to fall; asking until the deadline
+/// asserts that the server heals, which is the property. It costs nothing when
+/// nothing is broken, because the first attempt answers in milliseconds.
+async fn relayed_within(from: &mut Client, sender: u32, to: &mut Client, tag: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + REPAIR;
+    loop {
+        if relayed(from, sender, to, tag).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 /// Send from `from` and wait for `to` to hear it.
@@ -166,22 +170,94 @@ async fn relayed(from: &mut Client, sender: u32, to: &mut Client, tag: &str) -> 
     heard_text(to, tag, RELAY).await
 }
 
+/// A restarted `session-lifecycle` cannot repair a `session-view` restarted after it.
+///
+/// `Connections` is a `HashMap` in this service's memory and there is no store
+/// behind it, so an instance that has just started holds nobody. On its own
+/// that is survivable: the view still has the roster, and this probe measures
+/// that the relay does still cross straight after.
+///
+/// What is not survivable is the pair. [`Handshake::reconcile_view`] repairs a
+/// restarted view by re-announcing what *this* service is holding, and it is
+/// the only path that can, so once this service is the empty one the repair is
+/// a no-op and the next `session-view` restart takes routing down for good.
+/// The sweep found it that way round: `session-lifecycle` is the first unit in
+/// `units.rs`, so it restarted first, and every service after `session-view`
+/// then failed too.
+///
+/// Neither of these two is authoritative about who is connected -- the gateway
+/// owns the sockets -- so refilling this service from the view would copy a
+/// cache back into the thing that feeds it, and a client the gateway has since
+/// dropped would become a ghost re-announced forever. The fix belongs on the
+/// gateway, which knows.
+///
+/// Recorded in `docs/RELIABILITY.md` as defect 25. Thirty seconds, and it is
+/// the reproduction, so it is ignored rather than deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "defect 25: a restarted session-lifecycle can no longer repair the view"]
+async fn a_restarted_session_lifecycle_can_still_repair_a_restarted_view() {
+    let dir = TempDir::new("chaos-lifecycle");
+    let mut deployment = Deployment::start(dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _bob_session = handshake(&mut bob, "bob").await;
+
+    // Once before, so the failure below cannot be "these two never could".
+    assert!(
+        relayed(&mut alice, alice_session, &mut bob, "before").await,
+        "the two clients must be able to hear each other to begin with"
+    );
+
+    // Survivable alone, and asserted rather than assumed: it is what makes the
+    // failure below specific to the pair rather than to this restart.
+    deployment.restart("session-lifecycle").await;
+    assert!(
+        relayed_within(&mut alice, alice_session, &mut bob, "after-lifecycle").await,
+        "restarting `session-lifecycle` alone must not stop the server routing"
+    );
+
+    deployment.restart("session-view").await;
+    let after = relayed_within(&mut alice, alice_session, &mut bob, "after-view").await;
+
+    deployment.stop().await;
+    assert!(
+        after,
+        "a message no longer crossed the server after `session-view` restarted \
+         behind a `session-lifecycle` that had restarted first"
+    );
+}
+
+/// Services this sweep does not restart, and why each one is out.
+///
+/// `gateway` owns the client sockets, so stopping it disconnects everyone by
+/// construction. `session-lifecycle` is defect 25: it holds the only copy of
+/// who is connected, an instance that has just started holds nobody, and after
+/// that it can no longer repair a restarted `session-view` -- so leaving it in
+/// makes every later service in the list fail for one defect that is not
+/// theirs, which is the whole reason this list exists.
+/// [`a_restarted_session_lifecycle_can_still_repair_a_restarted_view`] is that
+/// failure on its own in thirty seconds instead.
+const EXCLUDED: [&str; 2] = ["gateway", "session-lifecycle"];
+
 /// Restart every service in turn, with two clients connected throughout.
 ///
 /// One at a time, and after each: the service bound its endpoint again, the
-/// deployment describes itself again, and neither client was disconnected.
-/// Twenty services stopped and started under a live connection, and nobody is
-/// hung up on.
+/// deployment describes itself again, and a message still crosses from one
+/// client to the other. Twenty services stopped and started under two live
+/// connections, with the server still doing its job between each.
 ///
-/// **Not asserted here: that the server still routes between them.** It does
-/// not, from `session-view` onwards, and
-/// [`a_restarted_session_view_still_routes_a_message`] is that failure on its
-/// own in twelve seconds rather than as nineteen entries in a list. Asserting
-/// it twice would mean this test fails for a defect it is not about, and every
-/// other thing it checks would stop being run.
+/// The relay is the assertion worth having, and it subsumes the weaker one this
+/// started with. It goes through the gateway, `session-view`'s roster,
+/// `permissions`, `text` and the fan-out, so a client that was hung up on and a
+/// server that forgot how to route both fail it, and neither can pass by
+/// accident. It also avoids `Client::closed_by_server`, which reads raw bytes
+/// and would leave these clients mid-frame for the next iteration.
 ///
-/// The gateway is excluded. It owns the client sockets, so stopping it
-/// disconnects everyone by construction; that it does is not a finding, and
+/// Two services are held out, for the reasons on [`EXCLUDED`]. For the gateway
+/// that is by construction: it owns the client sockets, so stopping it
+/// disconnects everyone; that it does is not a finding, and
 /// what *should* happen afterwards is a resume test rather than this one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_service_can_be_restarted_without_dropping_a_client() {
@@ -189,14 +265,14 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
     let mut deployment = Deployment::start(dir.path()).await;
 
     let mut alice = Client::connect(deployment.port).await;
-    let _alice_session = handshake(&mut alice, "alice").await;
+    let alice_session = handshake(&mut alice, "alice").await;
     let mut bob = Client::connect(deployment.port).await;
     let _bob_session = handshake(&mut bob, "bob").await;
 
     let services: Vec<&'static str> = deployment
         .services()
         .into_iter()
-        .filter(|name| *name != "gateway")
+        .filter(|name| !EXCLUDED.contains(name))
         .collect();
     assert!(
         services.len() > 10,
@@ -206,9 +282,9 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
 
     // Collected rather than asserted in the loop, so one run names every
     // service that failed instead of stopping at the first.
-    let mut dropped_a_client = Vec::new();
+    let mut lost_the_relay = Vec::new();
 
-    for name in &services {
+    for (round, name) in services.iter().enumerate() {
         deployment.restart(name).await;
 
         // The collector polls every service, so this is the cheapest
@@ -228,8 +304,16 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        if alice.closed_by_server(NOT_CLOSED).await || bob.closed_by_server(NOT_CLOSED).await {
-            dropped_a_client.push(*name);
+        // The real assertion. A message from one client reaching the other goes
+        // through the gateway, `session-view`'s roster, `permissions`, `text`
+        // and the fan-out, so it covers both halves at once: that neither
+        // client was hung up on, and that the server still knows how to route
+        // between two it never disconnected.
+        //
+        eprintln!("PROGRESS restarted {name}");
+        let needle = format!("after-{round}-{name}");
+        if !relayed_within(&mut alice, alice_session, &mut bob, &needle).await {
+            lost_the_relay.push(*name);
         }
     }
 
@@ -238,8 +322,8 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
     deployment.stop().await;
 
     assert!(
-        dropped_a_client.is_empty(),
-        "restarting these disconnected a client that was already connected: \
-         {dropped_a_client:?}"
+        lost_the_relay.is_empty(),
+        "after restarting these, a message no longer crossed the server between \
+         two clients that were never disconnected: {lost_the_relay:?}"
     );
 }

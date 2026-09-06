@@ -41,7 +41,8 @@ figures a soak reports are still a test binary's and not a server's, and the
 7 has its in-process restart half and Stage 9 its per-PR jobs. Defects 2, 3, 4,
 7, 8, 10, 18 and 22 are closed with regression tests, 6 is closed for
 visibility, and 16 and 19 are partly closed. Restarting one service at a time
-then found two the audit had not looked for, 23 and 24; both are closed too.
+then found three the audit had not looked for: 23 and 24 are closed, and 25 --
+which only the routing assertion could see -- is open.
 
 Defect 7 turned out to have a second half the register missed --
 `serve::run` discarded a panicking background task's `JoinError` before
@@ -88,14 +89,17 @@ a service panic fail a test.
 ### Found by Stage 7, not by the original audit
 
 A restart is a fault the audit never injected, so nothing here was visible until
-`crates/starling/tests/chaos.rs` stopped one service at a time. Both are closed,
-and the tests that found them are the regression tests: they are not `#[ignore]`d
-and each was re-run against the fix reverted.
+`crates/starling/tests/chaos.rs` stopped one service at a time. 23 and 24 are
+closed, and the tests that found them are the regression tests: they are not
+`#[ignore]`d and each was re-run against the fix reverted. 25 is open, and was
+found by the same sweep once it asserted routing rather than only that nobody
+had been hung up on.
 
 | # | Defect | Evidence |
 |---|---|---|
 | 23 | **CLOSED.** *(`listen::serve_routes` runs its own accept loop over a `JoinSet` and closes what is left at the deadline it already logged about)* **A drained service is still held by its callers' connections, so it can never be restarted.** `serve_routes` waited `DRAIN_GRACE` and returned anyway, but the per-connection tasks belonged to hyper, spawned by `serve_with_incoming_shutdown` and detached; each held the `Routes`, and so an `Arc` to the service. They ended only when the caller closed the stream, and the caller is not the thing being restarted. `voice` is where it was fatal: its UDP port stayed bound, the replacement failed to build with `Address already in use`, and `serve::run` did not retry a failed construction. Both halves are fixed -- `build` now retries with the same backoff a failing background task gets, because a bind that is waiting for a predecessor is a wait and not a verdict. | `crates/runtime/src/listen.rs`; `serve::build_with_retry`; tests `listen::tests::a_drained_service_is_let_go_of_and_not_merely_stopped_waiting_for`, `chaos.rs::voice_can_be_restarted` |
 | 24 | **CLOSED.** *(`session-lifecycle` re-announces on its sweep what the view is missing)* **A restarted `session-view` forgets who is connected.** It holds the roster in memory and starts empty, and nothing was going to tell it otherwise: every announcement describes a *change*, and the sessions it is missing are the ones not changing. Two clients who never disconnected could no longer hear each other. **Not a consequence of 23**, which was the obvious suspect and was measured after 23 was fixed: it still failed. The repair goes through the existing `list`, so it also covers an announcement lost to a failed dial and a subscriber dropped for lagging. | `Handshake::reconcile_view`, `Connections::established`, called from `session-lifecycle`'s sweep; repro `chaos.rs::a_restarted_session_view_still_routes_a_message` |
+| 25 | **A restarted `session-lifecycle` can no longer repair a `session-view` restarted after it.** Its `Connections` is a `HashMap` in memory with no store behind it, so a new instance holds nobody. Alone that is survivable and the relay still crosses, because the view still has the roster. The pair is not: defect 24's repair works by re-announcing what `session-lifecycle` is holding, so once it is the empty one the repair is a no-op and the next `session-view` restart takes routing down permanently. Found because `session-lifecycle` is the first unit in `units.rs`, so the sweep restarted it first and then lost the relay from `session-view` onwards, twenty services in a row. **The fix does not belong on either of these two.** Neither is authoritative about who is connected -- the gateway owns the sockets -- so refilling `session-lifecycle` from the view would copy a cache back into the thing that feeds it, and a client the gateway had since dropped would become a ghost re-announced forever. It belongs on the gateway, which knows. Until then the sweep holds `session-lifecycle` out, next to the gateway. | `Connections` `crates/services/session-lifecycle/src/state.rs:286`; the no-op short-circuit `Handshake::reconcile_view` (`ours.is_empty()`); repro `chaos.rs::a_restarted_session_lifecycle_can_still_repair_a_restarted_view`, and `chaos.rs::EXCLUDED` for the sweep's hold-out |
 
 
 ### What the audit found to be clean

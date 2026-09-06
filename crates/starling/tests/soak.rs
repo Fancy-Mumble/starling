@@ -15,10 +15,10 @@
 //!
 //! **This half owns the state assertions**, not the resource ones. Resident
 //! memory measured inside a test binary that also holds two hundred clients and
-//! their TLS buffers is not the server's resident memory; `scripts/soak.sh`
-//! measures that from outside, against the real `--all-in-one` binary, and
-//! shares this file's assessment module so the two disagree about scale and
-//! about nothing else.
+//! their TLS buffers is not the server's resident memory, so read the figures
+//! here as a shape over time and not as a server's footprint. The out-of-process
+//! driver that would measure that from outside, against the real `--all-in-one`
+//! binary, is not written; see `crates/harness/src/soak/mod.rs`.
 
 // A test binary. See `crates/starling/tests/e2e.rs`.
 #![allow(
