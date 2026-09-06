@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -87,12 +88,29 @@ pub enum ResumeOutcome {
 /// touching a caller.
 #[derive(Debug, Clone, Default)]
 pub struct ResumeStore {
-    sessions: Arc<Mutex<HashMap<String, Ring>>>,
+    sessions: Arc<Mutex<Sessions>>,
     ring_size: usize,
     /// Bytes one session's ring may hold. See [`DEFAULT_BYTE_BUDGET`].
     byte_budget: usize,
     /// How long a ring outlives its last use. See [`DEFAULT_TTL`].
     ttl: Duration,
+    /// Whether to keep anything at all. See [`ResumeStore::from_config`].
+    enabled: bool,
+    /// Ring entries every sweep has looked at, for the test that holds the
+    /// sweep to a bound and for the gauge that will report it.
+    swept: Arc<AtomicU64>,
+}
+
+/// The rings, and when they were last swept.
+///
+/// One lock over both. The sweep clock is read on the same path that takes this
+/// lock and nothing else needs it, so a second lock would only add an ordering
+/// to get wrong.
+#[derive(Debug, Default)]
+struct Sessions {
+    rings: HashMap<String, Ring>,
+    /// `None` until the first sweep.
+    last_sweep: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -120,10 +138,31 @@ impl ResumeStore {
     #[must_use]
     pub fn new(ring_size: usize) -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(Sessions::default())),
             ring_size: ring_size.max(1),
             byte_budget: DEFAULT_BYTE_BUDGET,
             ttl: DEFAULT_TTL,
+            enabled: true,
+            swept: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The store an operator asked for.
+    ///
+    /// The constructor the gateway uses. [`ResumeStore::new`] hardcoded
+    /// [`DEFAULT_TTL`] and nothing passed `gateway.resume.ttl` through, so the
+    /// documented default of two minutes was silently ten, and
+    /// `gateway.resume.enabled = false` set a health warning and changed no
+    /// behaviour. Both keys are now the ones in the file.
+    #[must_use]
+    pub fn from_config(config: &starling_runtime::config::ResumeConfig) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            ring_size: config.ring.max(1),
+            byte_budget: DEFAULT_BYTE_BUDGET,
+            ttl: config.ttl.get(),
+            enabled: config.enabled,
+            swept: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -131,11 +170,32 @@ impl ResumeStore {
     #[must_use]
     pub fn with_limits(ring_size: usize, byte_budget: usize, ttl: Duration) -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(Sessions::default())),
             ring_size: ring_size.max(1),
             byte_budget: byte_budget.max(1),
             ttl,
+            enabled: true,
+            swept: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Whether resume is on at all.
+    ///
+    /// Read by the gateway before it tells a peer its frames are sequenced: a
+    /// sequence number on the wire that no ring is keeping is a client that
+    /// will ask to resume and be told to start over.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Ring entries every sweep has visited so far.
+    ///
+    /// The cost this module has to keep bounded, exposed so a test can hold it
+    /// to a bound rather than time it, and so the gauge work can report it.
+    #[must_use]
+    pub fn swept(&self) -> u64 {
+        self.swept.load(Ordering::Relaxed)
     }
 
     /// Stamp an outbound frame and remember it.
@@ -145,6 +205,12 @@ impl ResumeStore {
     /// `payload` is [`Bytes`] so that a broadcast shares one buffer across
     /// every recipient's ring rather than copying it per client.
     pub fn stamp(&self, token: &str, type_id: u16, payload: &Bytes) -> u64 {
+        // Nothing kept, nothing to key: the operator turned resume off, and
+        // this is the path that would otherwise allocate a ring per session
+        // whether or not anything could ever replay from it.
+        if !self.enabled {
+            return 0;
+        }
         let Ok(mut sessions) = self.sessions.lock() else {
             return 0;
         };
@@ -153,21 +219,29 @@ impl ResumeStore {
         // Amortised eviction, here rather than on a timer: this is the only
         // path that runs often enough to keep the store bounded, and a sweep
         // task would be a second thing to own for a map that is already locked.
-        Self::evict_expired(&mut sessions, self.ttl, now);
+        //
+        // Rate-limited, because this runs once per *recipient* per broadcast
+        // and used to sweep every session each time: one message to a thousand
+        // clients was a million comparisons under one lock, and the sweep can
+        // find nothing new until a ring has had `ttl` of silence anyway.
+        self.sweep_due(&mut sessions, now);
 
         // `get_mut` first: the common case is a ring that exists, and
         // `entry(token.to_owned())` allocates a `String` on *every* stamp,
         // once per recipient per broadcast, just to look one up.
-        let ring = if let Some(ring) = sessions.get_mut(token) {
+        let ring = if let Some(ring) = sessions.rings.get_mut(token) {
             ring
         } else {
-            sessions.entry(token.to_owned()).or_insert_with(|| Ring {
-                next_seq: 1,
-                frames: VecDeque::new(),
-                bytes: 0,
-                floor: 1,
-                touched: now,
-            })
+            sessions
+                .rings
+                .entry(token.to_owned())
+                .or_insert_with(|| Ring {
+                    next_seq: 1,
+                    frames: VecDeque::new(),
+                    bytes: 0,
+                    floor: 1,
+                    touched: now,
+                })
         };
 
         let seq = ring.next_seq;
@@ -202,12 +276,26 @@ impl ResumeStore {
         seq
     }
 
-    /// Drop rings nothing has touched within `ttl`.
-    fn evict_expired(sessions: &mut HashMap<String, Ring>, ttl: Duration, now: Instant) {
-        // Cheap when nothing has expired, which is the usual case: the closure
-        // is a subtraction per session and this runs on the control path, not
-        // the audio one.
-        sessions.retain(|_, ring| now.duration_since(ring.touched) < ttl);
+    /// Drop rings nothing has touched within `ttl`, at most once per `ttl / 4`.
+    ///
+    /// Quartered rather than halved so a ring outlives its TTL by at most a
+    /// quarter of it, and exactness does not depend on the schedule anyway:
+    /// [`ResumeStore::resume`] checks a ring's own age, so a ring still here
+    /// because the sweep has not come round is not a ring that can be resumed
+    /// from.
+    fn sweep_due(&self, sessions: &mut Sessions, now: Instant) {
+        if let Some(last) = sessions.last_sweep
+            && now.saturating_duration_since(last) < self.ttl / 4
+        {
+            return;
+        }
+        sessions.last_sweep = Some(now);
+        let _ = self
+            .swept
+            .fetch_add(sessions.rings.len() as u64, Ordering::Relaxed);
+        sessions
+            .rings
+            .retain(|_, ring| now.saturating_duration_since(ring.touched) < self.ttl);
     }
 
     /// What to do for a client resuming from `last_seq`.
@@ -216,12 +304,19 @@ impl ResumeStore {
         let Ok(mut sessions) = self.sessions.lock() else {
             return ResumeOutcome::Unknown;
         };
-        let Some(ring) = sessions.get_mut(token) else {
+        let Some(ring) = sessions.rings.get_mut(token) else {
             return ResumeOutcome::Unknown;
         };
+        let now = Instant::now();
+        // Checked here rather than left to the sweep, so how long a ring
+        // survives is the TTL an operator configured and not however long it
+        // took the next sweep to come round.
+        if now.saturating_duration_since(ring.touched) >= self.ttl {
+            return ResumeOutcome::Unknown;
+        }
         // A client that resumed is a client still here; the ring should not
         // then expire out from under a second reconnect.
-        ring.touched = Instant::now();
+        ring.touched = now;
 
         // The floor, not the front of the ring. An oversized frame is dropped
         // without leaving anything at the front to read a sequence off, and
@@ -242,20 +337,36 @@ impl ResumeStore {
     /// Forget a session, once it can no longer resume.
     pub fn forget(&self, token: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            let _ = sessions.remove(token);
+            let _ = sessions.rings.remove(token);
         }
     }
 
     /// How many sessions are held, for the readiness warning.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.sessions.lock().map(|s| s.len()).unwrap_or_default()
+        self.sessions
+            .lock()
+            .map(|s| s.rings.len())
+            .unwrap_or_default()
     }
 
     /// Whether nothing is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Bytes every ring is holding together.
+    ///
+    /// What actually bounds this store's memory: the session count says how
+    /// many rings exist and nothing about how large they are, and one client
+    /// with avatars in its ring costs what a hundred idle ones do.
+    #[must_use]
+    pub fn bytes_total(&self) -> usize {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.rings.values().map(|ring| ring.bytes).sum())
+            .unwrap_or_default()
     }
 
     /// Bytes one session's ring is holding, for the tests and the admin surface.
@@ -268,7 +379,7 @@ impl ResumeStore {
         self.sessions
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(token).map(|ring| ring.bytes))
+            .and_then(|sessions| sessions.rings.get(token).map(|ring| ring.bytes))
             .unwrap_or_default()
     }
 }
@@ -276,6 +387,102 @@ impl ResumeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defect 3: the sweep used to run in full on every stamp.
+    ///
+    /// Counted rather than timed. A wall-clock assertion here would be a flake
+    /// on a loaded machine and would say nothing about *why* it was slow; the
+    /// number of ring entries the sweeps looked at is the cost itself.
+    #[test]
+    fn stamping_does_not_sweep_the_whole_store_every_time() {
+        let store = ResumeStore::with_limits(16, 64 * 1024, Duration::from_secs(600));
+        let payload = Bytes::from_static(b"x");
+        for session in 0..1_000 {
+            let _ = store.stamp(&format!("tok-{session}"), 7, &payload);
+        }
+        let after_fill = store.swept();
+
+        // A thousand stamps into a store already holding a thousand sessions:
+        // the shape of one broadcast to a full server, which is exactly where
+        // this was quadratic.
+        for session in 0..1_000 {
+            let _ = store.stamp(&format!("tok-{session}"), 7, &payload);
+        }
+
+        let swept = store.swept() - after_fill;
+        assert!(
+            swept < 4_000,
+            "1 000 stamps swept {swept} ring entries; the whole-store sweep this \
+             replaced would have visited about a million"
+        );
+    }
+
+    /// Defect 3, the other half: a rate-limited sweep still has to sweep.
+    #[test]
+    fn a_ring_nothing_touches_is_still_evicted() {
+        let store = ResumeStore::with_limits(16, 64 * 1024, Duration::from_millis(40));
+        let _ = store.stamp("stale", 7, &Bytes::from_static(b"x"));
+        assert_eq!(store.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+        // Somebody else's traffic, which is what drives the sweep.
+        let _ = store.stamp("live", 7, &Bytes::from_static(b"x"));
+
+        assert_eq!(store.len(), 1, "the stale ring must be gone");
+        assert!(
+            store.bytes_held("live") > 0,
+            "and the live one must be what is left"
+        );
+    }
+
+    /// Defect 3: expiry is the operator's TTL, not the sweep's schedule.
+    #[test]
+    fn an_expired_ring_cannot_be_resumed_from_even_before_it_is_swept() {
+        let store = ResumeStore::with_limits(16, 64 * 1024, Duration::from_millis(30));
+        let _ = store.stamp("tok", 7, &Bytes::from_static(b"x"));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Nothing has stamped since, so no sweep has run and the ring is still
+        // in the map. It must still be unresumable.
+        assert_eq!(store.resume("tok", 0), ResumeOutcome::Unknown);
+    }
+
+    /// Defect 4: `gateway.resume.ttl` was hardcoded and never read.
+    #[test]
+    fn the_configured_ttl_is_the_one_the_store_uses() {
+        let config = starling_runtime::config::ResumeConfig {
+            enabled: true,
+            ring: 32,
+            ttl: starling_runtime::config::HumanDuration::secs(5),
+        };
+        let store = ResumeStore::from_config(&config);
+        assert_eq!(store.ttl, Duration::from_secs(5));
+        assert_eq!(store.ring_size, 32);
+    }
+
+    /// Defect 4: `enabled = false` set a health warning and nothing else.
+    #[test]
+    fn a_disabled_store_keeps_nothing() {
+        let config = starling_runtime::config::ResumeConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let store = ResumeStore::from_config(&config);
+
+        assert!(!store.enabled(), "the gateway asks before it sequences");
+        for i in 0..100_u8 {
+            assert_eq!(
+                store.stamp("tok", 7, &Bytes::copy_from_slice(&[i])),
+                0,
+                "a disabled store must not hand out sequence numbers"
+            );
+        }
+        assert!(
+            store.is_empty(),
+            "a disabled store must not allocate a ring"
+        );
+        assert_eq!(store.resume("tok", 0), ResumeOutcome::Unknown);
+    }
 
     #[test]
     fn a_resuming_client_replays_only_the_gap() {
@@ -419,5 +626,125 @@ mod tests {
             shared.as_ptr(),
             "the payload was copied per recipient rather than shared"
         );
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Everything the ring promises, checked against one store.
+    ///
+    /// Gathered in one place because they are not independent: the byte total
+    /// is what bounds memory, the floor is what makes a replay honest, and a
+    /// store that satisfied one while breaking another would still be wrong.
+    fn assert_invariants(store: &ResumeStore, token: &str) -> Result<(), TestCaseError> {
+        let sessions = store.sessions.lock().expect("not poisoned");
+        let Some(ring) = sessions.rings.get(token) else {
+            return Ok(());
+        };
+
+        let summed: usize = ring.frames.iter().map(|frame| frame.payload.len()).sum();
+        prop_assert_eq!(ring.bytes, summed, "the running byte total must be exact");
+        prop_assert!(
+            ring.frames.len() <= store.ring_size,
+            "the ring must not exceed its frame count"
+        );
+        prop_assert!(
+            ring.bytes <= store.byte_budget || ring.frames.is_empty(),
+            "the ring must not exceed its byte budget while holding anything"
+        );
+        if let Some(front) = ring.frames.front() {
+            prop_assert!(
+                ring.floor <= front.seq,
+                "the floor must not be past the oldest frame kept"
+            );
+        }
+        // Sequence numbers strictly increase, with no gaps inside the ring.
+        for pair in ring.frames.iter().collect::<Vec<_>>().windows(2) {
+            if let [earlier, later] = pair {
+                prop_assert!(earlier.seq < later.seq, "sequence numbers must increase");
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// No sequence of stamps can break the ring's own accounting.
+        #[test]
+        fn stamping_keeps_every_invariant(
+            sizes in prop::collection::vec(0_usize..2048, 1..64),
+            ring_size in 1_usize..16,
+            budget in 64_usize..4096,
+        ) {
+            let store = ResumeStore::with_limits(ring_size, budget, Duration::from_secs(600));
+            let mut last = 0;
+            for size in &sizes {
+                let seq = store.stamp("tok", 7, &Bytes::from(vec![0_u8; *size]));
+                prop_assert!(seq > last, "sequence numbers must strictly increase");
+                last = seq;
+                assert_invariants(&store, "tok")?;
+            }
+        }
+
+        /// A replay is contiguous, in order, and never crosses the floor.
+        ///
+        /// The property behind the module's own warning: a client handed a
+        /// replay with a hole believes it caught up and renders the wrong world
+        /// forever, with nothing in any log.
+        #[test]
+        fn a_replay_is_a_contiguous_run(
+            count in 1_usize..64,
+            ring_size in 1_usize..32,
+            from in 0_u64..70,
+        ) {
+            let store = ResumeStore::with_limits(ring_size, 1 << 20, Duration::from_secs(600));
+            for _ in 0..count {
+                let _ = store.stamp("tok", 7, &Bytes::from_static(b"xy"));
+            }
+
+            match store.resume("tok", from) {
+                ResumeOutcome::Replay(frames) => {
+                    for pair in frames.windows(2) {
+                        if let [earlier, later] = pair {
+                            prop_assert_eq!(
+                                earlier.seq + 1,
+                                later.seq,
+                                "a replay with a gap is worse than a resync"
+                            );
+                        }
+                    }
+                    if let Some(first) = frames.first() {
+                        prop_assert!(first.seq > from, "a client is not sent what it has");
+                    }
+                }
+                // Both are honest answers; only a holed replay is not.
+                ResumeOutcome::FullResyncRequired | ResumeOutcome::Unknown => {}
+            }
+        }
+
+        /// Defect 3 as a property: the sweep cost does not scale with the store.
+        #[test]
+        fn sweeping_does_not_scale_with_the_number_of_sessions(
+            sessions in 1_usize..200,
+        ) {
+            let store = ResumeStore::with_limits(8, 1 << 16, Duration::from_secs(600));
+            for session in 0..sessions {
+                let _ = store.stamp(&format!("tok-{session}"), 7, &Bytes::from_static(b"x"));
+            }
+            let after_fill = store.swept();
+            for session in 0..sessions {
+                let _ = store.stamp(&format!("tok-{session}"), 7, &Bytes::from_static(b"x"));
+            }
+            // The old code swept every session on every stamp, which is
+            // `sessions * sessions`. Anything linear is fine; quadratic is not.
+            prop_assert!(
+                store.swept() - after_fill <= (sessions * 4) as u64,
+                "{} entries swept for {} stamps",
+                store.swept() - after_fill,
+                sessions
+            );
+        }
     }
 }

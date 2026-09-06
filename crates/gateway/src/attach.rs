@@ -461,7 +461,12 @@ fn apply(action: &ServerAction, ctx: &AttachContext) {
         }
         Some(server_action::Action::Sequence(sequence)) => {
             if let Some(handle) = ctx.registry.by_conn(sequence.conn) {
-                handle.set_sequenced(sequence.enabled);
+                // `&&`, because a service negotiating sequencing with a peer
+                // does not know whether this gateway is keeping a ring. With
+                // `gateway.resume.enabled = false` nothing is, and a sequence
+                // number on the wire would only buy the client a resume request
+                // answered with "start over".
+                handle.set_sequenced(sequence.enabled && ctx.resume.enabled());
                 handle.set_compresses(sequence.compress);
             }
         }
