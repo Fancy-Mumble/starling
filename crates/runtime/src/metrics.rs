@@ -68,6 +68,31 @@ impl Metrics {
             .clone()
     }
 
+    /// Every counter, as name and value.
+    ///
+    /// # Why this is safe to call from anywhere, unlike `Pressure::sample`
+    ///
+    /// A counter is cumulative and reading it changes nothing, so **any number
+    /// of readers may take this**: a Prometheus scrape, the health collector
+    /// and a test can all read the same registry and none of them takes
+    /// anything from the others.
+    ///
+    /// [`crate::pressure::Pressure::sample`] is the opposite and the asymmetry
+    /// is easy to miss: it *clears the peak*, so exactly one reader may call
+    /// it, and a second one silently steals intervals from the first. When
+    /// wiring a new consumer, counters can be shared and gauges cannot.
+    #[must_use]
+    pub fn sample(&self) -> Vec<(String, u64)> {
+        let counters = match self.counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        counters
+            .iter()
+            .map(|(name, counter)| (name.clone(), counter.get()))
+            .collect()
+    }
+
     /// The registry in Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
@@ -98,6 +123,24 @@ mod tests {
         metrics.counter("starling_audio_frames_dropped").inc();
         metrics.counter("starling_audio_frames_dropped").add(2);
         assert_eq!(metrics.counter("starling_audio_frames_dropped").get(), 3);
+    }
+
+    #[test]
+    fn a_sample_is_repeatable_because_counters_are_cumulative() {
+        // The property that lets `/metrics` and the health collector read the
+        // same registry. `Pressure::sample` does not have it, which is the
+        // distinction most likely to be miscopied.
+        let metrics = Metrics::new();
+        metrics.counter("starling_frames_routed").add(7);
+
+        let first = metrics.sample();
+        let second = metrics.sample();
+        assert_eq!(first, second, "reading a counter must not consume it");
+        assert_eq!(
+            first,
+            vec![("starling_frames_routed".to_owned(), 7)],
+            "and it must report what was counted"
+        );
     }
 
     #[test]

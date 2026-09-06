@@ -87,6 +87,21 @@ message Load {
   uint64 rejected = 5;
 }
 
+// One cumulative counter: what has already happened.
+//
+// The other half of `Load`. A gauge answers "how full is it now" and cannot be
+// read twice -- `Pressure::sample` clears the peak, so exactly one reader may
+// take it. A counter only ever goes up, so **any number of readers may read
+// it**, and a reader that misses a poll loses nothing. That asymmetry is the
+// thing to get right when wiring a second consumer: a Prometheus scrape and a
+// dashboard can share these and would steal peaks from each other.
+message CounterSample {
+  // What it is called, in an operator's words.
+  string name = 1;
+  // Cumulative since the process started.
+  uint64 value = 2;
+}
+
 message ServiceHealth {
   // The configuration key, which is also the log name.
   string service = 1;
@@ -106,6 +121,13 @@ message ServiceHealth {
   uint64 latency_us = 6;
   // What this service has queued, and how close to full it is.
   repeated Load load = 7;
+  // What this service has counted since it started.
+  //
+  // Carried here rather than through a per-service `/metrics` listener: the
+  // collector already polls every service every five seconds and the operator
+  // API already serves the aggregate, so this is one field rather than
+  // twenty-three HTTP servers.
+  repeated CounterSample counters = 8;
 
   reserved 4;
   reserved "latency_ms";

@@ -17,10 +17,11 @@
 //! is the one nobody remembered to instrument.
 
 use starling_proto_fancy::health::health_server::{Health as HealthRpc, HealthServer};
-use starling_proto_fancy::health::{CheckRequest, Gate, Load, ServiceHealth, State};
+use starling_proto_fancy::health::{CheckRequest, CounterSample, Gate, Load, ServiceHealth, State};
 use tonic::{Request, Response, Status};
 
 use crate::health::{Health, Readiness};
+use crate::metrics::Metrics;
 use crate::pressure::Pressure;
 
 /// One service answering for itself.
@@ -36,16 +37,28 @@ pub struct HealthReporter {
     /// produces a dashboard where a row is green and its queue is overflowing,
     /// with no way to tell whether that is a race or the truth.
     pressure: Pressure,
+    /// What this service has counted since it started.
+    ///
+    /// Carried on the same call for the same reason as `pressure`, and safe to
+    /// share in a way `pressure` is not: counters are cumulative, so this
+    /// reader takes nothing from any other. See [`Metrics::sample`].
+    metrics: Metrics,
 }
 
 impl HealthReporter {
     /// A reporter for `name`, reading `health` and `pressure`.
     #[must_use]
-    pub fn new(name: impl Into<String>, health: Health, pressure: Pressure) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        health: Health,
+        pressure: Pressure,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             name: name.into(),
             health,
             pressure,
+            metrics,
         }
     }
 
@@ -83,6 +96,12 @@ impl HealthReporter {
                     capacity: load.capacity,
                     rejected: load.rejected,
                 })
+                .collect(),
+            counters: self
+                .metrics
+                .sample()
+                .into_iter()
+                .map(|(name, value)| CounterSample { name, value })
                 .collect(),
             // The service cannot time its own round trip; the collector fills
             // this in. Left zero rather than invented.
@@ -140,8 +159,9 @@ pub fn with_health(
     name: &str,
     health: &Health,
     pressure: &Pressure,
+    metrics: &Metrics,
 ) -> tonic::service::Routes {
-    let reporter = HealthReporter::new(name, health.clone(), pressure.clone());
+    let reporter = HealthReporter::new(name, health.clone(), pressure.clone(), metrics.clone());
     routes.add_service(reporter.into_server())
 }
 
@@ -153,7 +173,7 @@ mod tests {
     fn a_service_with_no_gates_is_ready() {
         // A service that caches nothing has nothing to warm, and must not be
         // reported as warming forever because it declared no gates.
-        let reporter = HealthReporter::new("text", Health::new(), Pressure::new());
+        let reporter = HealthReporter::new("text", Health::new(), Pressure::new(), Metrics::new());
         let snapshot = reporter.snapshot();
         assert_eq!(snapshot.service, "text");
         assert_eq!(snapshot.state, i32::from(State::Ready));
@@ -171,7 +191,8 @@ mod tests {
         health.gate("session view");
         health.ready("udp socket");
 
-        let snapshot = HealthReporter::new("voice", health, Pressure::new()).snapshot();
+        let snapshot =
+            HealthReporter::new("voice", health, Pressure::new(), Metrics::new()).snapshot();
         assert_eq!(snapshot.state, i32::from(State::Warming));
         assert_eq!(snapshot.gates.len(), 2);
         let cold = snapshot
@@ -191,7 +212,8 @@ mod tests {
         health.ready("listener");
         health.set("session store", Readiness::Warning);
 
-        let snapshot = HealthReporter::new("gateway", health, Pressure::new()).snapshot();
+        let snapshot =
+            HealthReporter::new("gateway", health, Pressure::new(), Metrics::new()).snapshot();
         assert_eq!(snapshot.state, i32::from(State::Warning));
     }
 
@@ -203,7 +225,8 @@ mod tests {
         health.gate("cache");
         health.set("optional thing", Readiness::Warning);
 
-        let snapshot = HealthReporter::new("svc", health, Pressure::new()).snapshot();
+        let snapshot =
+            HealthReporter::new("svc", health, Pressure::new(), Metrics::new()).snapshot();
         assert_eq!(snapshot.state, i32::from(State::Warming));
     }
 }

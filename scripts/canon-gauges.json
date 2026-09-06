@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Every bounded or client-driven map that must report its size, and the gauge",
+    "that reports it. Checked by `crates/runtime/tests/canon_gauges.rs`.",
+    "",
+    "The point is not the gauge. It is that adding a map a client can grow, and",
+    "not reporting it, becomes a deliberate line in a diff rather than an",
+    "oversight nobody sees until a soak run six weeks later. Same pattern as",
+    "`canon-fixtures.json` and `cpp-citations.json`.",
+    "",
+    "`omitted` records a map that deliberately has no gauge, with the reason.",
+    "An entry there is a decision; an entry missing from both lists is a bug."
+  ],
+  "gauges": [
+    {
+      "service": "gateway",
+      "gauge": "connections",
+      "map": "Registry, one entry per connected client",
+      "why": "the first number an operator asks for, and the denominator for every per-connection limit"
+    },
+    {
+      "service": "gateway",
+      "gauge": "resume.sessions",
+      "map": "ResumeStore::sessions",
+      "why": "defect 3 and 4: keyed by a session token, freed only by a TTL sweep"
+    },
+    {
+      "service": "gateway",
+      "gauge": "resume.bytes",
+      "map": "the sum of every ring's payloads",
+      "why": "what actually bounds memory; the session count says nothing about size"
+    },
+    {
+      "service": "gateway",
+      "gauge": "handshakes.pending",
+      "map": "Admission, handshakes in flight",
+      "why": "defect 2: the slot count an unauthenticated peer can occupy"
+    },
+    {
+      "service": "social",
+      "gauge": "watches",
+      "map": "SocialService::watches",
+      "why": "defect 8: keyed by a client-supplied 64-byte string"
+    },
+    {
+      "service": "screenshare",
+      "gauge": "shares",
+      "map": "ScreenshareService::shares",
+      "why": "one entry per live broadcast, removed when the presenter's connection closes"
+    },
+    {
+      "service": "screenshare",
+      "gauge": "viewers",
+      "map": "the sum of every share's viewers",
+      "why": "defect 9: each viewer is a peer connection in the SFU"
+    },
+    {
+      "service": "session-lifecycle",
+      "gauge": "sessions.in_use",
+      "map": "SessionAllocator::live",
+      "why": "defect 18: against `max_users * 2`, which is the capacity a full server refuses at"
+    }
+  ],
+  "omitted": [
+    {
+      "map": "Metrics::counters and Pressure::gauges",
+      "why": "bounded by the number of call sites in the source, not by anything a client does"
+    },
+    {
+      "map": "Acls, the per-scope ACL tables",
+      "why": "one entry per channel, which the channel tree already bounds and reports"
+    }
+  ]
+}

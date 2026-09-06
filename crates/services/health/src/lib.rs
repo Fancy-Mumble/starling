@@ -276,6 +276,7 @@ async fn check(ctx: &ServiceContext, name: &str) -> ServiceHealth {
         load: Vec::new(),
         latency_us: micros_since(started),
         error,
+        counters: Vec::new(),
     };
 
     let Ok(channel) = ctx.resolver.channel(name) else {
@@ -410,6 +411,7 @@ mod tests {
             load: Vec::new(),
             latency_us: 1,
             error: String::new(),
+            counters: Vec::new(),
         }
     }
 
@@ -593,6 +595,7 @@ mod tests {
                 state: i32::from(State::Warming),
             }],
             load: Vec::new(),
+            counters: Vec::new(),
             latency_us: 3,
             error: String::new(),
         };

@@ -1,0 +1,146 @@
+# Alerts for Starling, ranked by how well each predicts an outage.
+#
+# Scrape `/metrics` on the operator API. It renders the health collector's last
+# snapshot, so one target covers every service in both topologies -- all-in-one
+# and one pod per service -- and no scrape ever calls `Pressure::sample`, which
+# clears the peak and belongs to the collector alone.
+#
+# The ordering below is deliberate. An alert nobody acts on trains people to
+# ignore the ones that matter, so there are nine of them and the first is the
+# only page.
+groups:
+  - name: starling.critical
+    rules:
+      # The wedge signature, and the reason `/livez` exists.
+      #
+      # `/healthz` passing means the process is up and the socket accepts.
+      # `/livez` failing means a background task has died and is not coming
+      # back. Together they describe a server that looks perfectly healthy to
+      # every other check while doing no work at all: clients connect, the
+      # handshake completes, and nothing is routed.
+      #
+      # Kubernetes and systemd both act on this by themselves; the alert exists
+      # because a server that keeps needing to be restarted is a bug, and a
+      # restart nobody was told about is a bug nobody investigates.
+      - alert: StarlingWedged
+        expr: probe_success{job="starling-livez"} == 0 and probe_success{job="starling-healthz"} == 1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Starling is serving but not working ({{ $labels.instance }})"
+          description: >-
+            /livez is failing while /healthz passes, which means a background
+            task has stopped and the process cannot recover on its own. Check
+            the response body of /livez: it names the heartbeat that went stale
+            and how late it is.
+
+  - name: starling.warning
+    rules:
+      # A service that cannot stay up. The supervisor restarts a failed
+      # background task with backoff and gives up after five, so any sustained
+      # rate here is a task failing repeatedly rather than a one-off.
+      - alert: StarlingServiceRestarting
+        expr: increase(starling_service_restarts[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} keeps restarting its background task"
+          description: >-
+            A restart or two after a transient failure is expected. A rate that
+            does not settle means the task fails every time it starts, and after
+            five attempts the process stops reporting itself live.
+
+      # A bounded thing near its bound. The peak, not the current value: a queue
+      # that fills and drains between two scrapes refused work and reads as idle
+      # in both, which is exactly the event worth seeing.
+      #
+      # 80%, because the interesting moment is before the refusals, not after.
+      - alert: StarlingQueueNearCapacity
+        expr: >-
+          starling_load_peak / starling_load_capacity > 0.8
+          and starling_load_capacity > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} is running near a limit"
+          description: >-
+            A queue or pool has been above 80% of its capacity for five minutes.
+            A deployment that passes a soak at 99% occupancy fails at 1.01x the
+            load, so this is the margin, not the failure.
+
+      # Anything refused. Cumulative by design: a reader that misses a scrape
+      # must not lose a refusal, because a refusal is a request the server did
+      # not serve.
+      - alert: StarlingRefusingWork
+        expr: increase(starling_load_rejected[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} refused work it was asked to do"
+
+      # Memory growing steadily. A leak is linear and noise is not, so this asks
+      # for a slope over a day rather than a level: a level threshold either
+      # fires on a busy afternoon or never fires at all.
+      - alert: StarlingMemoryGrowing
+        expr: deriv(process_resident_memory_bytes[6h]) * 86400 / process_resident_memory_bytes > 0.01
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Starling's memory is growing about {{ $value | humanizePercentage }} a day"
+          description: >-
+            Steady growth under steady load. The soak harness asserts the same
+            property before release; this catches the workload that only
+            production has.
+
+      # File descriptors. The accept loop backs off on EMFILE rather than
+      # spinning, so the symptom is refused connections rather than a busy
+      # loop -- which means nothing is loud about it until users complain.
+      - alert: StarlingDescriptorsHigh
+        expr: process_open_fds / process_max_fds > 0.6
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Starling is holding {{ $value | humanizePercentage }} of its descriptor limit"
+          description: >-
+            One socket per client plus the databases and the log. Raise
+            LimitNOFILE in the unit, or find what is not being closed.
+
+      # A spike in failed TLS handshakes: a certificate that expired, a client
+      # pinned to an old TLS version, or somebody probing the port.
+      - alert: StarlingTlsFailures
+        expr: rate(starling_gateway_tls_failures[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS handshakes are failing at {{ $value | printf \"%.1f\" }}/s"
+
+      # Admission refusals: the per-address or server-wide handshake ceiling
+      # being reached. Either an attack or a ceiling set too low, and the
+      # difference is whether the refusals come from one address.
+      - alert: StarlingRefusingConnections
+        expr: rate(starling_gateway_admission_refused[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connections are being refused before the TLS handshake"
+          description: >-
+            gateway.max_pending_handshakes or max_pending_per_address is being
+            reached. Check whether the refusals share a source address before
+            raising either.
+
+      # Errors in the operator log. Not per-message, because the alert that
+      # fires on every transient failure is the alert that gets silenced.
+      - alert: StarlingErrorRate
+        expr: rate(starling_log_records{severity="error"}[10m]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Starling is logging errors steadily"
