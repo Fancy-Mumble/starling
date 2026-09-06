@@ -109,18 +109,20 @@ async fn a_deployment_under_load_comes_back_to_where_it_started() {
     let seed = seed();
 
     let data_dir = TempDir::new("soak");
-    // Everything but `directory`, which announces this server to a public list
-    // 60 to 180 seconds after boot, jittered. Two reasons it does not belong in
-    // a soak. It is an outbound call to the internet from a run that is
-    // measuring this process, and its first attempt dials `server-config`,
-    // which opens one pooled connection over the local transport: two
-    // descriptors and four tasks, once, at a random point inside the run.
+    // Everything but `directory`, whose first announcement is due 60 to 180
+    // seconds after boot, jittered. It does not get as far as announcing here
+    // -- nothing configures it, so it reads `server-config`, finds this server
+    // ineligible and stops -- but that read is the problem: it is the first
+    // dial of `server-config` from this service, and it opens one pooled
+    // connection over the local transport. Two descriptors and four tasks,
+    // once, at a random point inside the run.
     //
-    // That is a real and bounded cost, not a leak, but it lands between two
-    // idle samples and there is no way to tell it from a leak from the outside
-    // -- it cost two runs to identify. Excluding it is what lets the cycle
-    // check below stay at an allowance of zero; the e2e suite is where
-    // `directory` is covered.
+    // A real and bounded cost, not a leak, but it lands between two idle
+    // samples and nothing observing from outside can tell the two apart; it
+    // cost two runs to identify. Excluding it is what lets the cycle check stay
+    // at an allowance of zero. The e2e suite is where `directory` is covered,
+    // and a soak of a *configured* one would want the announcement stubbed
+    // rather than the service disabled.
     let deployment = Deployment::start_with(data_dir.path(), |config| {
         if let Some(directory) = config.services.get_mut("directory") {
             directory.enabled = false;

@@ -6,9 +6,12 @@
 //! that constructs the defect it exists to catch, which is the only way to know
 //! a check works before waiting six hours for one that does not.
 //!
-//! The out-of-process driver (`scripts/soak.sh`) reads the same JSONL through
-//! `/metrics` and `/proc/<pid>`, and shares this assessment module, so a
-//! nightly and a per-PR smoke test disagree about scale and about nothing else.
+//! The out-of-process driver is **not written yet**. When it is
+//! (`scripts/soak.sh`, `docs/RELIABILITY.md` Stage 6) it reads the same JSONL
+//! through `/metrics` and `/proc/<pid>` and shares [`assess()`], so a nightly
+//! and a per-PR smoke test disagree about scale and about nothing else. Until
+//! then the resident-memory figures here are a test binary's, holding every
+//! virtual client and its TLS buffers, and not a server's.
 
 pub mod assess;
 pub mod drive;

@@ -4,10 +4,13 @@
 //! asks whether a healthy server stays healthy; this asks whether a damaged one
 //! comes back. The two share the harness and nothing else.
 //!
-//! The fault modelled here is a service that *stopped* -- panicked, was
-//! OOM-killed, lost its runtime -- not one that was asked to leave.
-//! [`Deployment::restart`] aborts the task rather than draining it, because a
-//! service given the chance to finish its work is a different, easier fault.
+//! The fault modelled here is a service that *went away and came back*, which
+//! is what a supervisor does to one it has decided is unhealthy.
+//! [`Deployment::restart`] drains it rather than aborting the task, and not
+//! because draining is gentler: aborting does not work. A service's `run`
+//! spawns tasks of its own, `tokio::spawn` detaches them, and cancelling `run`
+//! leaves every one of them holding what the service had bound. Draining is
+//! the only way to stop one service, which is why each has a drain of its own.
 
 // A test binary. See `crates/starling/tests/e2e.rs`.
 #![allow(
@@ -109,10 +112,13 @@ async fn voice_can_be_restarted() {
 /// server routes their messages to a roster of nobody. The sweep sees it as
 /// every later restart failing too, because it never recovers.
 ///
-/// A service that can be restarted but forgets the deployment's state is not
-/// restartable in any sense a supervisor cares about. The answer is for
-/// `session-lifecycle` to re-publish on a subscriber it has not seen before,
-/// which is the same reconnect the gateway already does for its own streams.
+/// How much of this is defect 23 is unmeasured. A new `session-view` is
+/// refilled by whoever next announces or re-subscribes, and under 23 nobody
+/// does: the old instance's connections never die, so no subscriber's stream
+/// ends and none of them notice there is a new one to talk to. **Re-run this
+/// before writing a fix for it** -- 23 may be the whole of it. What would be
+/// left is that `session-lifecycle` has no path for a subscriber it has not
+/// seen before, only announcements as sessions change.
 ///
 /// Recorded in `docs/RELIABILITY.md` as defect 24. Twelve seconds, and it is
 /// the reproduction, so it is ignored rather than deleted.

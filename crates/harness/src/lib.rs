@@ -525,12 +525,16 @@ impl Deployment {
             .unwrap_or_default()
     }
 
-    /// The services this deployment actually started, gateway last.
+    /// The services this deployment actually started, in no particular order.
     ///
     /// Read off the handles rather than from `units::names`, because a
     /// deployment starts what its configuration enables: a chaos test that
     /// walked the full list would try to restart services this deployment
     /// never had.
+    ///
+    /// Unordered because [`Self::restart`] moves the unit it replaces to the
+    /// end. Anything that cares which unit it is looking at should say so by
+    /// name.
     #[must_use]
     pub fn services(&self) -> Vec<&'static str> {
         self.handles.iter().map(|unit| unit.name).collect()
@@ -1147,6 +1151,13 @@ impl Client {
     /// Anything still arriving is consumed and discarded: a refusal is
     /// followed by a close, but the close is the assertion, not what happens
     /// to be in flight ahead of it.
+    ///
+    /// **This client cannot be read from afterwards.** The discard is raw
+    /// bytes off the socket, not whole frames, so it will happily eat half of
+    /// one and leave the stream mid-frame. Fine when the next thing is the
+    /// close, which is every caller today; a trap for the first test that asks
+    /// "is it still there?" and then expects to keep talking, which is exactly
+    /// what a chaos run wants to do between restarts.
     pub async fn closed_by_server(&mut self, within: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + within;
         let mut scratch = [0_u8; 8 * 1024];

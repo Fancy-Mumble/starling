@@ -520,10 +520,13 @@ async fn supervise<S: Serve>(service: Arc<S>, ctx: ServiceContext) -> Result<(),
 /// service, still holding its sockets and its subscriptions on other services.
 ///
 /// It stayed invisible because nothing cancelled a service until Stage 7's
-/// restart test did. Killing `voice` and starting it again left the old UDP
-/// loop bound to the audio port, so the replacement could not listen: a service
-/// that was restarted but never came back, reported as a bind timeout with
-/// nothing in the log to say why.
+/// restart test did, and it is worth being exact about what that proved.
+/// Aborting `voice` left its old UDP loop bound to the audio port, so the
+/// replacement could not listen -- but this guard did not fix that on its own:
+/// the restart failed the same way with it in place. The remaining holder is
+/// defect 23 in `docs/RELIABILITY.md`, the callers' connections *into* a
+/// service outliving it. What this closes is the runtime's own half, a leak on
+/// every cancellation path that would have outlived the fix for that one.
 struct Background(tokio::task::JoinHandle<Result<(), ServiceError>>);
 
 impl Drop for Background {
