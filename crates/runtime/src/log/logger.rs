@@ -13,6 +13,13 @@ use crate::log::sink::LogSink;
 enum Message {
     Write(Box<LogEvent>),
     Flush,
+    /// Flush, then say so on the channel.
+    ///
+    /// For the panic hook. `Flush` is advisory and returns before the write
+    /// lands, which is no use to a caller whose next instruction aborts the
+    /// process: the record of the crash would still be in the queue when the
+    /// queue stopped existing.
+    FlushAcked(SyncSender<()>),
     Stop,
 }
 
@@ -27,6 +34,11 @@ enum Message {
 pub struct Logger {
     tx: SyncSender<Message>,
     dropped: Arc<AtomicU64>,
+    /// One count per [`Severity`], in its declared order.
+    ///
+    /// Shared with every clone, so under `--all-in-one` this is the whole
+    /// server's tally rather than one service's.
+    counts: Arc<[AtomicU64; SEVERITIES]>,
     /// murmur's `obfuscate`: whether addresses are written as pseudonyms.
     ///
     /// Shared with the writer thread, and with every clone of this logger. An
@@ -35,6 +47,12 @@ pub struct Logger {
     /// to `spawn`.
     obfuscate: Arc<AtomicBool>,
 }
+
+/// How many [`Severity`] levels there are.
+///
+/// A constant rather than a `strum` derive: it is six, it has been six since
+/// syslog, and the array below is indexed by it.
+pub const SEVERITIES: usize = 6;
 
 /// Stops the writer, flushing what is queued.
 ///
@@ -67,6 +85,7 @@ impl Logger {
         let logger = Self {
             tx: tx.clone(),
             dropped,
+            counts: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             obfuscate,
         };
         (logger, LoggerShutdown { tx, thread })
@@ -104,9 +123,27 @@ impl Logger {
     /// [`Self::dropped`]. Blocking here would let a slow sink apply
     /// backpressure to the server, which is exactly what a log must never do.
     pub fn log(&self, event: LogEvent) {
+        if let Some(count) = self.counts.get(event.severity as usize) {
+            let _ = count.fetch_add(1, Ordering::Relaxed);
+        }
         if self.tx.try_send(Message::Write(Box::new(event))).is_err() {
             let _ = self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// How many records of each severity this logger has accepted.
+    ///
+    /// Indexed by [`Severity`] in its declared order. Kept here rather than in
+    /// a `Metrics` registry because the logger is built before any service and
+    /// outlives all of them, and because an error *rate* is the one thing a
+    /// log can tell an alert that reading the log cannot.
+    #[must_use]
+    pub fn counts(&self) -> [u64; SEVERITIES] {
+        std::array::from_fn(|index| {
+            self.counts
+                .get(index)
+                .map_or(0, |count| count.load(Ordering::Relaxed))
+        })
     }
 
     /// How many records have been dropped because the queue was full.
@@ -134,6 +171,22 @@ impl Logger {
     /// Advisory: returns as soon as the request is queued, not once it is done.
     pub fn request_flush(&self) {
         let _ = self.tx.try_send(Message::Flush);
+    }
+
+    /// Flush, and wait for it, up to `timeout`.
+    ///
+    /// For a caller that is about to end the process: the panic hook, where the
+    /// record being flushed is the explanation for everything after it being
+    /// missing. Bounded rather than unbounded, because a writer already wedged
+    /// on a full disk must not turn a panic into a hang.
+    ///
+    /// Returns whether the flush was acknowledged in time.
+    pub fn flush_blocking(&self, timeout: Duration) -> bool {
+        let (done, wait) = sync_channel(1);
+        if self.tx.send(Message::FlushAcked(done)).is_err() {
+            return false;
+        }
+        wait.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -210,6 +263,12 @@ impl Writer {
                     self.emit(&event);
                 }
                 Ok(Message::Flush) => self.flush(),
+                Ok(Message::FlushAcked(done)) => {
+                    self.flush();
+                    // The caller may already have given up; a full or closed
+                    // channel is not an error here.
+                    let _ = done.try_send(());
+                }
                 Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
                     // Only when there is something to lose: an idle server should
@@ -282,6 +341,37 @@ pub fn cheapest_useful_severity() -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_record_is_counted_by_severity() {
+        // What the error-rate alert reads. Counting here rather than parsing
+        // the log means an alert can exist without a log pipeline, which is the
+        // difference between an alert an operator has and one they might set up.
+        let (logger, shutdown) = Logger::disabled();
+        logger.log(LogEvent::error(Category::Server, "one"));
+        logger.log(LogEvent::error(Category::Server, "two"));
+        logger.log(LogEvent::info(Category::Server, "three"));
+
+        let counts = logger.counts();
+        assert_eq!(counts[Severity::Error as usize], 2);
+        assert_eq!(counts[Severity::Info as usize], 1);
+        assert_eq!(counts[Severity::Critical as usize], 0);
+        shutdown.shutdown();
+    }
+
+    #[test]
+    fn a_clone_counts_into_the_same_tally() {
+        // Under `--all-in-one` every service holds a clone, and the number an
+        // operator wants is the server's, not one service's.
+        let (logger, shutdown) = Logger::disabled();
+        let other = logger.clone();
+        logger.log(LogEvent::error(Category::Server, "from one"));
+        other.log(LogEvent::error(Category::Server, "from the other"));
+
+        assert_eq!(logger.counts()[Severity::Error as usize], 2);
+        assert_eq!(other.counts(), logger.counts());
+        shutdown.shutdown();
+    }
     use crate::log::sinks::{FanoutSink, MemorySink, NullSink};
 
     fn logger_with_memory(

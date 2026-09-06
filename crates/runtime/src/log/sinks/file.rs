@@ -90,6 +90,25 @@ impl FileSink {
         Ok(())
     }
 
+    /// Append one line, rotating first if it would not fit.
+    ///
+    /// Public because the operator audit writes its own JSON records through
+    /// the same rotation rather than reimplementing it: an audit log with no
+    /// rotation is a disk that fills in month six.
+    ///
+    /// # Errors
+    ///
+    /// [`SinkError`] if the rotation or the write fails.
+    pub fn write_line(&mut self, line: &str) -> Result<(), SinkError> {
+        let size = line.len() as u64 + 1;
+        if self.should_rotate(size) {
+            self.rotate()?;
+        }
+        writeln!(self.writer, "{line}").sink("file")?;
+        self.written += size;
+        Ok(())
+    }
+
     fn numbered(&self, generation: usize) -> PathBuf {
         let mut name = self.path.as_os_str().to_os_string();
         name.push(format!(".{generation}"));
@@ -103,15 +122,7 @@ impl LogSink for FileSink {
     }
 
     fn write(&mut self, event: &LogEvent) -> Result<(), SinkError> {
-        let line = ConsoleSink::format(event);
-        let size = line.len() as u64 + 1;
-
-        if self.should_rotate(size) {
-            self.rotate()?;
-        }
-        writeln!(self.writer, "{line}").sink("file")?;
-        self.written += size;
-        Ok(())
+        self.write_line(&ConsoleSink::format(event))
     }
 
     fn flush(&mut self) -> Result<(), SinkError> {

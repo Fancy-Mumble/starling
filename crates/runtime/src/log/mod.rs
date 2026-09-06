@@ -48,7 +48,7 @@ pub use event::{
     Category, Field, FieldValue, IntoFieldValue, LogEvent, Severity, UnknownCategory,
     UnknownSeverity,
 };
-pub use logger::{Logger, LoggerShutdown};
+pub use logger::{Logger, LoggerShutdown, SEVERITIES};
 pub use setup::{FileSpec, LogConfig, LogHandles, LogRuntime, LogSpec};
 pub use sink::{LogSink, SinkContext, SinkError};
 pub use sinks::{
