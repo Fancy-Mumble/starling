@@ -280,19 +280,7 @@ pub fn context(
 /// queries. A background task that *panicked* is reported as this service
 /// failing, because a release build would already have aborted on it.
 pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
-    let service = match S::build(ctx.clone()).await {
-        Ok(service) => service,
-        Err(error) => {
-            // A service that cannot be built is the operator's problem, not the
-            // developer's: it means the configuration it was handed is wrong.
-            ctx.logger.log(
-                LogEvent::error(Category::Server, "service failed to start")
-                    .with("service", ctx.name.clone())
-                    .with("error", error.to_string()),
-            );
-            return Err(error);
-        }
-    };
+    let service = build_with_retry::<S>(&ctx).await?;
     ctx.logger
         .log(LogEvent::info(Category::Server, "service started").with("service", ctx.name.clone()));
 
@@ -510,6 +498,48 @@ async fn supervise<S: Serve>(service: Arc<S>, ctx: ServiceContext) -> Result<(),
         backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
     }
     Ok(())
+}
+
+/// Build the service, retrying with the same backoff a failing task gets.
+///
+/// A construction failure used to end the service outright, on the reasoning
+/// that a service which cannot be built has been handed a configuration that is
+/// wrong, and retrying a wrong configuration is just a slower way to fail. True
+/// of a bad storage URL. Not true of the other thing `build` does, which is
+/// claim what the service listens on: a restart hands the replacement whatever
+/// the previous instance has not finished letting go of, and `Address already
+/// in use` is a wait, not a verdict.
+///
+/// Every attempt is logged, so a genuinely wrong configuration still says so
+/// five times before the service gives up rather than disappearing quietly.
+async fn build_with_retry<S: Serve>(ctx: &ServiceContext) -> Result<Arc<S>, ServiceError> {
+    let mut backoff = RESTART_BACKOFF;
+    for attempt in 0..=MAX_RESTARTS {
+        match S::build(ctx.clone()).await {
+            Ok(service) => return Ok(service),
+            Err(error) => {
+                ctx.logger.log(
+                    LogEvent::error(Category::Server, "service failed to start")
+                        .with("service", ctx.name.clone())
+                        .with("error", error.to_string())
+                        .with("attempt", u64::from(attempt)),
+                );
+                if attempt == MAX_RESTARTS {
+                    return Err(error);
+                }
+            }
+        }
+        tokio::select! {
+            // A drain during start-up is not a failure to report: the answer to
+            // "why did it never come up" is "it was asked to stop".
+            () = ctx.shutdown.wait() => return Err(ServiceError::service("drained while starting")),
+            () = tokio::time::sleep(backoff) => {}
+        }
+        ctx.metrics.counter("starling_service_restarts").inc();
+        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+    }
+    // Unreachable: the loop returns on the last attempt either way.
+    Err(ServiceError::service("build gave up"))
 }
 
 /// A service's background task, aborted if the task that owns it is cancelled.

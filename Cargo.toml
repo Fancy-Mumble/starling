@@ -149,7 +149,15 @@ h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 rcgen = "0.14.8"
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server"] }
+# `server-auto` and `service` are what `runtime::listen` needs to run its own
+# accept loop instead of `tonic::transport::Server`, which spawns a detached
+# task per connection and so cannot be made to let one go (defect 23).
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "server",
+    "server-auto",
+    "service",
+] }
 http-body-util = "0.1"
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
