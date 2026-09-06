@@ -80,13 +80,72 @@ fn engine() -> Result<&'static Engine, LoadError> {
     }
     let mut cfg = Config::new();
     let _ = cfg.wasm_component_model(true);
+    // The ceiling on guest run time. Hooks are synchronous by contract, so a
+    // guest that loops forever wedges the calling thread permanently, and
+    // nothing here stopped it: no fuel, no epoch, no store limits, no call
+    // timeout.
+    //
+    // Epoch interruption rather than `consume_fuel`, deliberately. Fuel meters
+    // every instruction, which taxes correct plugins for the sake of bounding
+    // incorrect ones, and it bounds *work* rather than time: the number that
+    // makes a spin loop trap in a second on one machine lets it run for three
+    // on another. An epoch deadline is a wall clock, which is the thing being
+    // promised, and costs a flag check at loop back-edges.
+    let _ = cfg.epoch_interruption(true);
     let built = Engine::new(&cfg).map_err(|e| LoadError::Invalid {
         path: PathBuf::new(),
         message: format!("wasmtime engine init failed: {e}"),
     })?;
     // A racing thread may have initialised first; `get_or_init` keeps the
     // winner and drops our spare engine.
-    Ok(ENGINE.get_or_init(|| built))
+    let engine = ENGINE.get_or_init(|| built);
+    start_epoch_ticker(engine);
+    Ok(engine)
+}
+
+/// How often the epoch advances.
+///
+/// The granularity of every deadline below: a guest overruns by at most one
+/// tick. Ten milliseconds is far finer than any deadline here and is a timer
+/// wakeup per plugin *process*, not per call.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long one exported call may run, in ticks of [`EPOCH_TICK`].
+///
+/// Five seconds. A hook is meant to return promptly -- it is called on the
+/// server's own thread -- and no legitimate one comes close, while a guest that
+/// has not returned by then is not going to.
+const CALL_DEADLINE_TICKS: u64 = 500;
+
+/// Most linear memory one plugin instance may map.
+///
+/// A guest that asks for more gets a failed allocation, which is a trap it can
+/// report, rather than the host being pushed into the OOM killer with every
+/// other service in the process.
+const MAX_GUEST_MEMORY: usize = 64 * 1024 * 1024;
+
+/// Advance the engine's epoch forever, once per process.
+///
+/// A detached thread rather than a tokio task: it must keep ticking even when
+/// every runtime worker is blocked inside a guest, which is exactly the
+/// situation the deadline exists for.
+fn start_epoch_ticker(engine: &'static Engine) {
+    static TICKER: OnceLock<()> = OnceLock::new();
+    let _ = TICKER.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("wasm-epoch".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    engine.increment_epoch();
+                }
+            });
+        if let Err(error) = spawned {
+            // Without the ticker an epoch deadline never fires, so say so
+            // rather than leaving a limit that looks armed and is not.
+            tracing::error!(%error, "the wasm epoch ticker could not start: guest calls are unbounded");
+        }
+    });
 }
 
 /// Per-store state holding the [`PluginContext`](mumble_plugin_api::PluginContext)
@@ -104,6 +163,8 @@ struct HostState {
     /// the typed UI bridge ([`UiHostImports::send_interaction_response`])
     /// produces so the guest never has to repeat it.
     plugin_name: String,
+    /// The memory ceiling this instance is held to. See [`MAX_GUEST_MEMORY`].
+    limits: wasmtime::StoreLimits,
     /// Sandboxed WASI context (no filesystem, network, env or args). Present
     /// only when the `wasm-wasi` feature links WASI into the component linker.
     #[cfg(feature = "wasm-wasi")]
@@ -175,6 +236,10 @@ impl WasmPlugin {
         f: impl FnOnce(&Self, &mut Store<HostState>) -> wasmtime::Result<Result<(), WitError>>,
     ) -> PluginResult<()> {
         let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        // Per call, not per store: the deadline is consumed when it fires, and
+        // a store whose deadline has passed would trap every later call. Each
+        // hook gets the whole budget.
+        guard.set_epoch_deadline(CALL_DEADLINE_TICKS);
         guard.data_mut().active_ctx = ContextPtr(ctx as *const _);
         let result = f(self, &mut guard);
         guard.data_mut().active_ctx = ContextPtr(std::ptr::null());
@@ -437,6 +502,9 @@ pub(crate) fn load_wasm_plugin(path: &Path) -> Result<LoadedPlugin, LoadError> {
         HostState {
             active_ctx: ContextPtr(std::ptr::null()),
             plugin_name: String::new(),
+            limits: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(MAX_GUEST_MEMORY)
+                .build(),
             // A deliberately empty WASI context: no preopened directories, no
             // network, no environment and no CLI args. `stderr` is inherited so a
             // misbehaving guest's diagnostics reach the server log.
@@ -448,6 +516,10 @@ pub(crate) fn load_wasm_plugin(path: &Path) -> Result<LoadedPlugin, LoadError> {
             table: wasmtime_wasi::ResourceTable::new(),
         },
     );
+    store.limiter(|state| &mut state.limits);
+    // Armed before instantiation, which runs the guest's own start function and
+    // is as able to loop forever as any hook.
+    store.set_epoch_deadline(CALL_DEADLINE_TICKS);
     let world = PluginWorld::instantiate(&mut store, &component, &linker).map_err(|e| {
         LoadError::Invalid {
             path: path.to_path_buf(),
