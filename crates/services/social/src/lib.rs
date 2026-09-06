@@ -156,11 +156,26 @@ impl Polls {
     }
 }
 
+/// One watch-together session, and the connections behind its participants.
+///
+/// The wire message carries sessions, which is what other clients need. The
+/// connections are kept beside it because [`ClientService::closed`] names a
+/// connection and the roster may already have forgotten the session by the time
+/// it runs -- the same reason `screenshare` matches a share on its connection.
+#[derive(Debug, Clone)]
+struct WatchRecord {
+    state: WatchState,
+    /// The connection the host is on.
+    host_conn: u64,
+    /// The connection each viewer is on.
+    viewer_conns: HashMap<u32, u64>,
+}
+
 /// The service.
 #[derive(Debug)]
 pub struct SocialService {
     polls: Mutex<Polls>,
-    watches: Mutex<HashMap<String, WatchState>>,
+    watches: Mutex<HashMap<String, WatchRecord>>,
     /// Who is in which channel, so a relay can be addressed at one.
     roster: Arc<Roster>,
     /// Asks `permissions` before a reaction reaches a channel.
@@ -171,6 +186,11 @@ pub struct SocialService {
     /// while a keystroke-rate typing indicator is not worth a round trip.
     permit: Permit,
     fanout: Fanout,
+    /// How many watch sessions are held. See `scripts/canon-gauges.json`.
+    ///
+    /// The map is keyed by a client-supplied string, so this is the number that
+    /// says whether [`SocialService::closed`] is doing its job.
+    watches_gauge: starling_runtime::pressure::Gauge,
 }
 
 impl SocialService {
@@ -361,35 +381,45 @@ impl SocialService {
     }
 
     /// Start or update a watch-together session.
-    fn watch(&self, sync: &WatchSync, actor: u32) -> Option<WatchState> {
+    fn watch(&self, sync: &WatchSync, actor: u32, conn: u64) -> Option<WatchState> {
         if sync.session_id.is_empty() || sync.session_id.len() > MAX_ID_BYTES {
             return None;
         }
         let mut watches = self.watches.lock().ok()?;
         let kind = watch_sync::Kind::try_from(sync.kind).unwrap_or(watch_sync::Kind::State);
-        let state = watches
+        let record = watches
             .entry(sync.session_id.clone())
-            .or_insert_with(|| WatchState {
-                session_id: sync.session_id.clone(),
-                channel: sync.channel,
-                host: actor,
-                viewers: Vec::new(),
-                url: sync.url.clone(),
-                position_s: sync.position_s,
-                playing: sync.playing,
+            .or_insert_with(|| WatchRecord {
+                state: WatchState {
+                    session_id: sync.session_id.clone(),
+                    channel: sync.channel,
+                    host: actor,
+                    viewers: Vec::new(),
+                    url: sync.url.clone(),
+                    position_s: sync.position_s,
+                    playing: sync.playing,
+                },
+                host_conn: conn,
+                viewer_conns: HashMap::new(),
             });
+        let state = &mut record.state;
 
         match kind {
             watch_sync::Kind::Start => {
                 state.host = actor;
                 state.url = sync.url.clone();
+                record.host_conn = conn;
             }
             watch_sync::Kind::Join => {
                 if !state.viewers.contains(&actor) {
                     state.viewers.push(actor);
                 }
+                let _ = record.viewer_conns.insert(actor, conn);
             }
-            watch_sync::Kind::Leave => state.viewers.retain(|viewer| *viewer != actor),
+            watch_sync::Kind::Leave => {
+                state.viewers.retain(|viewer| *viewer != actor);
+                let _ = record.viewer_conns.remove(&actor);
+            }
             watch_sync::Kind::State => {
                 // Only the host drives. Accepting a position from a viewer
                 // would let one late buffer drag everybody else back.
@@ -406,18 +436,80 @@ impl SocialService {
                     return None;
                 }
                 state.host = sync.new_host;
+                // The new host's connection, if they were watching as a viewer.
+                // Unknown otherwise, and a host whose connection is unknown is
+                // one whose disconnect cannot end the session, so the entry
+                // would outlive them. `u64::MAX` is no connection, which the
+                // sweep below treats as already gone.
+                record.host_conn = record
+                    .viewer_conns
+                    .get(&sync.new_host)
+                    .copied()
+                    .unwrap_or(u64::MAX);
             }
             watch_sync::Kind::End => {
                 let ended = state.clone();
                 let _ = watches.remove(&sync.session_id);
+                self.watches_gauge.observe(watches.len() as u64);
                 return Some(ended);
             }
         }
-        Some(state.clone())
+        let updated = state.clone();
+        self.watches_gauge.observe(watches.len() as u64);
+        Some(updated)
+    }
+
+    /// Drop everything `conn` was holding, and say what the channel should see.
+    ///
+    /// The host leaving ends the session, exactly as an explicit `End` does; a
+    /// viewer leaving is the `Leave` they did not get to send. Without this the
+    /// map only ever shrank on an explicit `End`, so a client could mint an
+    /// entry per 64-byte id it invented and every one of them outlived it.
+    fn forget_conn(&self, conn: u64) -> Vec<(u32, WatchState)> {
+        let Ok(mut watches) = self.watches.lock() else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        watches.retain(|_, record| {
+            if record.host_conn == conn {
+                changed.push((record.state.channel, record.state.clone()));
+                return false;
+            }
+            let Some((viewer, _)) = record
+                .viewer_conns
+                .iter()
+                .find(|(_, held)| **held == conn)
+                .map(|(viewer, held)| (*viewer, *held))
+            else {
+                return true;
+            };
+            let _ = record.viewer_conns.remove(&viewer);
+            record.state.viewers.retain(|other| *other != viewer);
+            changed.push((record.state.channel, record.state.clone()));
+            true
+        });
+        self.watches_gauge.observe(watches.len() as u64);
+        changed
     }
 }
 
 impl ClientService for SocialService {
+    async fn closed(&self, conn: u64, _reason: &str) -> Actions {
+        // The one client-facing service that did not implement this. Its watch
+        // map is keyed by a *client-supplied* 64-byte string and only shrank on
+        // an explicit `End`, so a client could mint unlimited entries and every
+        // one of them outlived the connection that made it.
+        let mut actions = Actions::new();
+        for (channel, state) in self.forget_conn(conn) {
+            let sessions = self.channel_including(channel);
+            actions.extend(Self::relay(
+                sessions,
+                social_envelope::Body::WatchState(state),
+            ));
+        }
+        actions
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Social.outer_type();
         if inbound.type_id != outer {
@@ -504,7 +596,7 @@ impl ClientService for SocialService {
                 Self::relay(sessions, social_envelope::Body::Vote(stamped))
             }
             Some(social_envelope::Body::Watch(sync)) => {
-                let Some(state) = self.watch(&sync, inbound.session) else {
+                let Some(state) = self.watch(&sync, inbound.session, inbound.conn) else {
                     return Actions::new();
                 };
                 let sessions = self.channel_including(state.channel);
@@ -540,6 +632,11 @@ impl Serve for SocialService {
             polls: Mutex::new(Polls::default()),
             watches: Mutex::new(HashMap::new()),
             roster: Arc::new(Roster::new()),
+            // No declared ceiling: nothing caps the number of watch sessions a
+            // server may hold, so this reports a count rather than a
+            // percentage. What it is for is the shape over time -- a count that
+            // does not come back down when everybody disconnects is the leak.
+            watches_gauge: ctx.pressure.gauge("watches", 0),
             permit: Permit::new(ctx.resolver),
             fanout: Fanout::default(),
         }))
@@ -589,6 +686,7 @@ mod tests {
         Arc::new(SocialService {
             polls: Mutex::new(Polls::default()),
             watches: Mutex::new(HashMap::new()),
+            watches_gauge: starling_runtime::pressure::Pressure::new().gauge("watches", 0),
             roster: Arc::new(roster),
             // Points at a `permissions` nothing is serving, so every check
             // denies. Only reactions ask, and the reaction test says so.
@@ -909,16 +1007,99 @@ mod tests {
             actor: 0,
             new_host: 0,
         };
-        let _ = service.watch(&start, 5).expect("host starts");
+        let _ = service.watch(&start, 5, 100).expect("host starts");
 
         let seek = WatchSync {
             kind: watch_sync::Kind::State as i32,
             position_s: 90.0,
             ..start
         };
-        assert!(service.watch(&seek, 6).is_none(), "a viewer cannot seek");
-        let driven = service.watch(&seek, 5).expect("the host can");
+        assert!(
+            service.watch(&seek, 6, 101).is_none(),
+            "a viewer cannot seek"
+        );
+        let driven = service.watch(&seek, 5, 100).expect("the host can");
         assert!((driven.position_s - 90.0).abs() < f64::EPSILON);
+    }
+
+    /// Defect 8: `social` never implemented `closed`.
+    #[tokio::test]
+    async fn a_disconnect_takes_every_watch_that_connection_minted() {
+        let service = service(&[7, 8]);
+
+        // One client, a hundred ids it made up. The map is keyed by this
+        // string, so this is the whole of the attack: no permission is needed
+        // and nothing but an explicit `End` used to remove an entry.
+        for id in 0..100 {
+            let sync = WatchSync {
+                session_id: format!("mint-{id}"),
+                channel: CHANNEL,
+                kind: watch_sync::Kind::Start as i32,
+                url: "https://example.org/v".to_owned(),
+                position_s: 0.0,
+                playing: true,
+                actor: 0,
+                new_host: 0,
+            };
+            let _ = service.watch(&sync, 7, 42).expect("the host starts one");
+        }
+        assert_eq!(
+            service.watches.lock().expect("watches").len(),
+            100,
+            "the set-up itself must be what the client can do today"
+        );
+
+        let _ = service.closed(42, "gone").await;
+
+        assert!(
+            service.watches.lock().expect("watches").is_empty(),
+            "every entry a closed connection minted must go with it"
+        );
+    }
+
+    /// Defect 8: a viewer leaving is not the same event as a host leaving.
+    #[tokio::test]
+    async fn a_viewer_disconnecting_leaves_the_session_up_without_them() {
+        let service = service(&[7, 8]);
+        let start = WatchSync {
+            session_id: "w1".to_owned(),
+            channel: CHANNEL,
+            kind: watch_sync::Kind::Start as i32,
+            url: "https://example.org/v".to_owned(),
+            position_s: 0.0,
+            playing: true,
+            actor: 0,
+            new_host: 0,
+        };
+        let _ = service.watch(&start, 7, 100).expect("the host starts");
+        let joined = service
+            .watch(
+                &WatchSync {
+                    kind: watch_sync::Kind::Join as i32,
+                    ..start
+                },
+                8,
+                101,
+            )
+            .expect("a viewer joins");
+        assert_eq!(joined.viewers, vec![8]);
+
+        let actions = service.closed(101, "gone").await;
+
+        let watches = service.watches.lock().expect("watches");
+        let record = watches.get("w1").expect("the session outlives its viewer");
+        assert!(
+            record.state.viewers.is_empty(),
+            "the departed viewer must be dropped from the state"
+        );
+        assert!(
+            record.viewer_conns.is_empty(),
+            "and from the connections behind it"
+        );
+        assert!(
+            !actions.is_empty(),
+            "the channel must be told, the way an explicit Leave tells it"
+        );
     }
 
     #[tokio::test]
