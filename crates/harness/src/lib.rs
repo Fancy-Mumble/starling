@@ -134,6 +134,23 @@ pub const AUDIO_ATTEMPT: Duration = Duration::from_millis(250);
 pub static ONE_AT_A_TIME: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// One running unit: what it is called, how to stop it, and its task.
+#[derive(Debug)]
+struct Unit {
+    /// Named, because "a service panicked" is not actionable and "`voice`
+    /// panicked" is. The name is the one `units::spawn` was called with.
+    name: &'static str,
+    /// The drain that stops *this* unit and nothing else.
+    ///
+    /// One token per unit rather than one for the deployment, which is what
+    /// [`Deployment::restart`] needs: a service cannot be stopped by aborting
+    /// its task, because everything it spawned goes on running with the socket
+    /// it was holding. Draining is the way to stop a service, and draining one
+    /// of these stops one service.
+    shutdown: Shutdown,
+    handle: JoinHandle<Result<(), ServiceError>>,
+}
+
 /// Every service plus the gateway, over a real TCP port instead of a socket
 /// nobody outside the process can dial.
 #[derive(Debug)]
@@ -142,10 +159,13 @@ pub struct Deployment {
     pub port: u16,
     /// Where voice is listening for audio, so a test can send it a datagram.
     pub voice_port: u16,
-    shutdown: Shutdown,
-    /// Named, because "a service panicked" is not actionable and "`voice`
-    /// panicked" is. The name is the one `units::spawn` was called with.
-    handles: Vec<(&'static str, JoinHandle<Result<(), ServiceError>>)>,
+    /// Kept so [`Deployment::restart`] can build a service a second context.
+    /// `Resolver` holds the same two, privately, and a chaos test needs them
+    /// by name.
+    config: Arc<Config>,
+    broker: Broker,
+    /// Every unit this deployment started.
+    handles: Vec<Unit>,
     log: LogRuntime,
     /// Kept so a test can call a service's gRPC surface directly, for the
     /// set-up a client is not permitted to do for itself.
@@ -194,7 +214,6 @@ impl Deployment {
         }
         adjust(&mut config);
         let config = Arc::new(config);
-        let shutdown = Shutdown::new();
         let broker = Broker::new();
 
         // A real log runtime, not `Logger::null()`, so a deployment
@@ -214,6 +233,7 @@ impl Deployment {
             if !starling::compose::enabled(&config, name) {
                 continue;
             }
+            let shutdown = Shutdown::new();
             let ctx = context(
                 name,
                 Arc::clone(&config),
@@ -222,21 +242,28 @@ impl Deployment {
                 logger.clone(),
             );
             if let Some(handle) = starling::units::spawn(name, ctx) {
-                handles.push((*name, handle));
+                handles.push(Unit {
+                    name,
+                    shutdown,
+                    handle,
+                });
             }
         }
 
+        let gateway_shutdown = Shutdown::new();
         let gateway_ctx = context(
             "gateway",
             Arc::clone(&config),
             broker.clone(),
-            shutdown.clone(),
+            gateway_shutdown.clone(),
             logger,
         );
-        handles.push((
-            "gateway",
-            starling::units::spawn("gateway", gateway_ctx).expect("\"gateway\" is a known unit"),
-        ));
+        handles.push(Unit {
+            name: "gateway",
+            shutdown: gateway_shutdown,
+            handle: starling::units::spawn("gateway", gateway_ctx)
+                .expect("\"gateway\" is a known unit"),
+        });
 
         // Wait for the services the handshake calls, not just for the gateway's
         // port. Everything is spawned concurrently and each service opens its own
@@ -261,10 +288,11 @@ impl Deployment {
         Self {
             port,
             voice_port,
-            shutdown,
             handles,
             log,
-            resolver: starling_runtime::channel::Resolver::new(Arc::clone(&config), broker),
+            resolver: starling_runtime::channel::Resolver::new(Arc::clone(&config), broker.clone()),
+            config,
+            broker,
             running: true,
             _exclusive: exclusive,
         }
@@ -497,6 +525,125 @@ impl Deployment {
             .unwrap_or_default()
     }
 
+    /// The services this deployment actually started, gateway last.
+    ///
+    /// Read off the handles rather than from `units::names`, because a
+    /// deployment starts what its configuration enables: a chaos test that
+    /// walked the full list would try to restart services this deployment
+    /// never had.
+    #[must_use]
+    pub fn services(&self) -> Vec<&'static str> {
+        self.handles.iter().map(|unit| unit.name).collect()
+    }
+
+    /// Stop one service and start it again, the way a supervisor would.
+    ///
+    /// **Drained, not aborted.** Aborting the task looks like the harsher and
+    /// therefore better test, and it is neither: a service's `run` spawns tasks
+    /// of its own -- `voice` alone spawns three, each holding an `Arc` to the
+    /// service and so to its UDP socket -- and cancelling `run` leaves every one
+    /// of them running, because `tokio::spawn` detaches. The replacement then
+    /// cannot bind the port the killed service is still listening on, which is
+    /// how this was found. Draining is the only way to stop a service, which is
+    /// why each one here has a drain of its own.
+    ///
+    /// Callers that had a channel to this service keep it. The local transport
+    /// dials lazily and retries, so a cached `Channel` reconnects on its next
+    /// request over the new socket, and *that* is the property a restart test
+    /// is asking about: not whether the service comes back, but whether the
+    /// twenty-two others notice it went.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not a service this deployment started, if it does not stop
+    /// within [`DRAIN_GRACE`], or if the replacement does not bind within the
+    /// grace a first start gets.
+    pub async fn restart(&mut self, name: &str) {
+        let index = self
+            .handles
+            .iter()
+            .position(|unit| unit.name == name)
+            .unwrap_or_else(|| panic!("{name} is not one of this deployment's services"));
+        let unit = self.handles.swap_remove(index);
+        let name = unit.name;
+
+        unit.shutdown.drain();
+        let stopped = timeout(DRAIN_GRACE, unit.handle).await;
+        match stopped {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => panic!("{name} stopped with an error before restarting: {error}"),
+            Ok(Err(error)) if error.is_panic() => {
+                panic!("{name} panicked on the way out: {}", panic_message(error))
+            }
+            Ok(Err(error)) => panic!("{name} was cancelled rather than drained: {error}"),
+            Err(_) => panic!("{name} did not drain within {DRAIN_GRACE:?}"),
+        }
+
+        // Removed between the two, so the wait below observes the *new*
+        // instance binding. A `UnixListener` does not unlink its path on drop,
+        // so `is_bound` would otherwise be satisfied by the file the stopped
+        // service left behind and the restart would look instant.
+        if let Some(path) = self
+            .config
+            .services
+            .get(name)
+            .and_then(|service| service.endpoint.as_deref())
+            .and_then(|endpoint| endpoint.strip_prefix("unix:"))
+        {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let shutdown = Shutdown::new();
+        let handle = starling::units::spawn(
+            name,
+            context(
+                name,
+                Arc::clone(&self.config),
+                self.broker.clone(),
+                shutdown.clone(),
+                self.log.logger().clone(),
+            ),
+        )
+        .unwrap_or_else(|| panic!("{name} is a known unit"));
+        self.handles.push(Unit {
+            name,
+            shutdown,
+            handle,
+        });
+
+        // Not `wait_until_serving`, which can only say that a socket never
+        // appeared. A service that did not come back has almost always said why
+        // -- "service failed to start", with the bind error on it -- and a
+        // restart test that made you re-run it to find that out would be a
+        // restart test nobody uses.
+        let Some(endpoint) = self
+            .config
+            .services
+            .get(name)
+            .and_then(|service| service.endpoint.as_deref())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + SERVICE_BIND_TIMEOUT;
+        while !is_bound(&endpoint) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{name} never bound {endpoint} again. Its own account:\n{}",
+                self.records()
+                    .into_iter()
+                    .filter(|event| event.severity >= Severity::Warning)
+                    .map(|event| format!(
+                        "  [{:?}] {} {:?}",
+                        event.severity, event.message, event.fields
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Drain every service, then assert this deployment came down cleanly.
     ///
     /// This used to call `abort()` on each handle without awaiting it, which
@@ -522,7 +669,11 @@ impl Deployment {
         // panicking `stop` must not also trip the `Drop` guard, whose message
         // would replace the one naming the real fault.
         self.running = false;
-        self.shutdown.drain();
+        // Every unit's own drain, raised together. One token per unit is what
+        // makes `restart` possible; a teardown still has to reach all of them.
+        for unit in &self.handles {
+            unit.shutdown.drain();
+        }
 
         // One deadline for the whole teardown rather than one per service:
         // twenty-three services each allowed the full grace is a wedge that
@@ -531,7 +682,7 @@ impl Deployment {
         let mut panicked = Vec::new();
         let mut failed = Vec::new();
         let mut stuck = Vec::new();
-        for (name, handle) in std::mem::take(&mut self.handles) {
+        for Unit { name, handle, .. } in std::mem::take(&mut self.handles) {
             let aborter = handle.abort_handle();
             match tokio::time::timeout_at(deadline, handle).await {
                 Ok(Ok(Ok(()))) => {}
