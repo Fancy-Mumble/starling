@@ -44,6 +44,12 @@ const NOT_CLOSED: Duration = Duration::from_millis(200);
 /// services dials lazily and the first request after a kill pays a reconnect.
 const RELAY: Duration = Duration::from_secs(5);
 
+/// How long the server may take to notice a service came back empty.
+///
+/// Four of `session-lifecycle`'s five-second sweeps, which is what re-announces
+/// the roster a restarted `session-view` is missing.
+const REPAIR: Duration = Duration::from_secs(20);
+
 /// How long the health collector may take to describe the deployment again.
 ///
 /// Three of its own five-second sweeps. A restarted collector knows nothing
@@ -70,32 +76,21 @@ async fn heard_text(client: &mut Client, needle: &str, within: Duration) -> bool
     false
 }
 
-/// The service that cannot be restarted, and why.
+/// The service with something a second instance cannot share.
 ///
-/// `voice` drains, `run` returns, and its UDP port is **still bound**, so the
-/// replacement fails to build with `Address already in use` and never comes
-/// back -- `serve::run` does not retry a construction that failed, and a
-/// service that cannot construct has nothing to supervise.
+/// `voice` is the one that binds more than a socket whose path the harness can
+/// unlink: it owns a UDP port, so a restart that leaves the old instance alive
+/// anywhere fails here and nowhere else. It is the reproduction for defect 23,
+/// and the reason that defect was found at all.
 ///
-/// What holds it is not `voice`. A drained service waits `listen::DRAIN_GRACE`
-/// for its connections and then returns anyway, but the per-connection tasks
-/// under `serve_with_incoming_shutdown` are hyper's, spawned and detached; each
-/// one holds the `Routes`, which hold the `Arc<VoiceService>`, which holds the
-/// socket. They end when the *caller* closes the stream, and the caller here is
-/// the gateway, which is not the thing being restarted. Measured: the service is
-/// dropped, but only when the whole deployment drains.
-///
-/// So this is not `voice`'s bug and not a missing `abort` anywhere. It is that
-/// nothing owns a service's inbound connections, and the fix is for
-/// `listen::serve_routes` to hold them itself -- an accept loop over a
-/// `JoinSet` it can cut off at the deadline it already logs about. Two
-/// consequences, this one and a quieter one: every restart leaks the instance
-/// before it, with its database pool, until the process exits.
-///
-/// Recorded in `docs/RELIABILITY.md` as defect 23. Ignored rather than deleted,
-/// because it is the reproduction, and it passes the day that lands.
+/// It used to fail with `Address already in use`. A drained service waited
+/// `listen::DRAIN_GRACE` for its connections and returned anyway, but under
+/// `serve_with_incoming_shutdown` the per-connection tasks were hyper's,
+/// spawned and detached; each held the `Routes`, and so an `Arc` to the
+/// service, and so its socket. They ended when the *caller* closed the stream,
+/// and the caller was the gateway, which is not the thing being restarted.
+/// `listen::serve_routes` now runs its own accept loop and can close them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "defect 23: a drained service is still held by its callers' connections"]
 async fn voice_can_be_restarted() {
     let dir = TempDir::new("chaos-voice");
     let mut deployment = Deployment::start(dir.path()).await;
@@ -112,18 +107,16 @@ async fn voice_can_be_restarted() {
 /// server routes their messages to a roster of nobody. The sweep sees it as
 /// every later restart failing too, because it never recovers.
 ///
-/// How much of this is defect 23 is unmeasured. A new `session-view` is
-/// refilled by whoever next announces or re-subscribes, and under 23 nobody
-/// does: the old instance's connections never die, so no subscriber's stream
-/// ends and none of them notice there is a new one to talk to. **Re-run this
-/// before writing a fix for it** -- 23 may be the whole of it. What would be
-/// left is that `session-lifecycle` has no path for a subscriber it has not
-/// seen before, only announcements as sessions change.
+/// Not defect 23, which was the obvious suspect: a new `session-view` is
+/// refilled by whoever next announces or re-subscribes, and while the old
+/// instance's connections outlived it nobody did either. Measured after 23 was
+/// fixed and `voice_can_be_restarted` went green, this still fails, so the two
+/// are separate. What is left is that `session-lifecycle` has no path for a
+/// subscriber it has not seen before, only announcements as sessions change.
 ///
 /// Recorded in `docs/RELIABILITY.md` as defect 24. Twelve seconds, and it is
 /// the reproduction, so it is ignored rather than deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "defect 24: a restarted session-view starts empty and nobody refills it"]
 async fn a_restarted_session_view_still_routes_a_message() {
     let dir = TempDir::new("chaos-view");
     let mut deployment = Deployment::start(dir.path()).await;
@@ -140,7 +133,16 @@ async fn a_restarted_session_view_still_routes_a_message() {
     );
 
     deployment.restart("session-view").await;
-    let after = relayed(&mut alice, alice_session, &mut bob, "after").await;
+
+    // Retried, because the repair is on `session-lifecycle`'s sweep and the
+    // restart lands at an arbitrary point in it. What is being asserted is that
+    // the server heals, not how many milliseconds it takes; a single attempt
+    // here would be a test of where in the tick the restart happened to fall.
+    let deadline = tokio::time::Instant::now() + REPAIR;
+    let mut after = false;
+    while !after && tokio::time::Instant::now() < deadline {
+        after = relayed(&mut alice, alice_session, &mut bob, "after").await;
+    }
 
     deployment.stop().await;
     assert!(
@@ -178,14 +180,9 @@ async fn relayed(from: &mut Client, sender: u32, to: &mut Client, tag: &str) -> 
 /// it twice would mean this test fails for a defect it is not about, and every
 /// other thing it checks would stop being run.
 ///
-/// Two units are excluded. The gateway owns the client sockets, so stopping it
+/// The gateway is excluded. It owns the client sockets, so stopping it
 /// disconnects everyone by construction; that it does is not a finding, and
 /// what *should* happen afterwards is a resume test rather than this one.
-/// `voice` is excluded because it cannot be restarted at all yet -- see
-/// [`voice_can_be_restarted`], which is that defect's reproduction. Every other
-/// service comes back, because the only thing they bind is a socket whose path
-/// the harness unlinks; `voice` also owns a UDP port, which is what makes it
-/// the one that shows the problem.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_service_can_be_restarted_without_dropping_a_client() {
     let dir = TempDir::new("chaos-restart");
@@ -199,7 +196,7 @@ async fn every_service_can_be_restarted_without_dropping_a_client() {
     let services: Vec<&'static str> = deployment
         .services()
         .into_iter()
-        .filter(|name| *name != "gateway" && *name != "voice")
+        .filter(|name| *name != "gateway")
         .collect();
     assert!(
         services.len() > 10,

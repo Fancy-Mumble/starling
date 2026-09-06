@@ -1290,6 +1290,85 @@ impl Handshake {
         }
     }
 
+    /// Re-announce every session `session-view` is not holding.
+    ///
+    /// The view is a composed cache with no store behind it: it learns a
+    /// session from [`Self::announce_up`] and keeps it in memory. An instance
+    /// that has just started therefore holds nothing, and nothing was ever
+    /// going to tell it otherwise, because every announcement describes a
+    /// *change* and the sessions it is missing are the ones not changing. The
+    /// server then routes to a roster of nobody: the clients it forgot stay
+    /// connected, send messages that reach no one, and nothing is logged.
+    ///
+    /// Called from the sweep in `run`, so one route repairs a restarted view,
+    /// an announcement lost to a dial that failed, and a subscriber that fell
+    /// behind and was dropped. `session-lifecycle` holds the only other copy of
+    /// who is connected, which is what makes it the one that can.
+    ///
+    /// # Why this cannot resurrect a ghost
+    ///
+    /// It re-announces any session the view has not got, and a session that has
+    /// *left* is one of those. What makes it safe is the order on the way out:
+    /// `SessionLifecycleService::closed` calls `Connections::close` before
+    /// [`Self::announce_down`], so a session is gone from here before the view
+    /// is told, and can never be in `Connections::established` while the view
+    /// is right to be missing it. **Reorder those two and this becomes a ghost
+    /// factory**, which is why it is written down rather than left to be
+    /// rediscovered.
+    ///
+    /// # Cost
+    ///
+    /// One `list` per sweep, which is the whole roster: kilobytes over a Unix
+    /// socket every five seconds at the few hundred sessions a Mumble server
+    /// holds, and not worth avoiding. If this ever serves tens of thousands,
+    /// the change to make is for `session-view` to report a generation the
+    /// sweep can compare -- not to run the repair less often, because five
+    /// seconds of routing to a roster nobody is on is already the visible part
+    /// of the bug this closes.
+    ///
+    /// Returns how many it re-announced, for the log line and for the test.
+    pub async fn reconcile_view(&self, connections: &Connections, scope: u32) -> usize {
+        let ours = connections.established();
+        if ours.is_empty() {
+            return 0;
+        }
+        let Ok(channel) = self.resolver.channel("session-view") else {
+            return 0;
+        };
+        let Ok(theirs) = SessionViewClient::new(channel)
+            .list(starling_proto_fancy::sessionview::SubscribeRequest {
+                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
+                subscriber: "session-lifecycle".to_owned(),
+            })
+            .await
+        else {
+            return 0;
+        };
+
+        let known: std::collections::HashSet<u32> = theirs
+            .into_inner()
+            .sessions
+            .into_iter()
+            .map(|session| session.session)
+            .collect();
+
+        let mut repaired: usize = 0;
+        for pending in ours {
+            if known.contains(&pending.session) {
+                continue;
+            }
+            self.announce(Announcement {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    instance: pending.scope,
+                }),
+                what: Some(announcement::What::Up(session_record(&pending))),
+            })
+            .await;
+            repaired = repaired.saturating_add(1);
+        }
+        repaired
+    }
+
     /// Drop a session's membership, at the end of its visit.
     ///
     /// Nothing called this before, and the tree kept a membership per session

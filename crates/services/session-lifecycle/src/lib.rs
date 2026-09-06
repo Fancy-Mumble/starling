@@ -1816,6 +1816,22 @@ impl Serve for SessionLifecycleService {
                 );
                 self.fanout.push(disconnect(conn, "timed out"));
             }
+
+            // On the same tick, because both are the same kind of work: a
+            // record somewhere else that no longer matches what this service
+            // holds. See `Handshake::reconcile_view` for why nothing else can
+            // notice a `session-view` that has forgotten everyone.
+            let scope = ctx.instances().first().copied().unwrap_or(1);
+            let repaired = self
+                .handshake
+                .reconcile_view(&self.connections, scope)
+                .await;
+            if repaired > 0 {
+                ctx.logger.log(
+                    LogEvent::notice(Category::Session, "re-announced sessions to session-view")
+                        .with("sessions", repaired as u64),
+                );
+            }
         }
     }
 }

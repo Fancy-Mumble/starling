@@ -769,6 +769,27 @@ impl Connections {
         None
     }
 
+    /// Every connection that has been given a session id.
+    ///
+    /// For re-announcing what `session-view` is missing: it holds the roster in
+    /// memory, so an instance that has just started holds nothing, and this is
+    /// the only copy of what it should be holding. Filtered on the id rather
+    /// than returning everything, because a connection still mid-handshake has
+    /// not been announced a first time and must not be announced now.
+    #[must_use]
+    pub fn established(&self) -> Vec<PendingConnection> {
+        self.inner
+            .lock()
+            .map(|inner| {
+                inner
+                    .values()
+                    .filter(|pending| pending.session != 0)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Connections that have not been heard from since `cutoff_ms`.
     #[must_use]
     pub fn timed_out(&self, cutoff_ms: u64) -> Vec<u64> {
