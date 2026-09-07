@@ -1262,11 +1262,50 @@ mod tests {
         );
     }
 
+    /// A directory this test owns, gone when it goes out of scope.
+    struct TempDataDir(std::path::PathBuf);
+
+    impl TempDataDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "starling-gateway-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The shipped defaults, with a data directory belonging to this test.
+    ///
+    /// Building a gateway over the defaults untouched generates a self-signed
+    /// identity into `starling-data`, which is *relative* - so every test doing
+    /// it wrote into whatever directory the test binary was started in, and two
+    /// of them doing it at once raced. `File::create_new` refuses the second,
+    /// which is `os error 80` on Windows and a test failing for what another
+    /// test did on any platform. It only ever showed up on CI, because a fresh
+    /// checkout has no `starling-data` and a working tree has had one since the
+    /// first time these tests ran.
+    fn shipped_defaults(tag: &str) -> (Config, TempDataDir) {
+        let dir = TempDataDir::new(tag);
+        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        config.runtime.data_dir = dir.0.clone();
+        (config, dir)
+    }
+
     #[test]
     fn a_gateway_with_nothing_routed_refuses_to_start() {
         // Accepting clients it can answer none of looks like a hang, and a hang
         // is the hardest failure to attribute.
-        let mut config = Config::with_defaults(Path::new("/run/starling"));
+        let (mut config, _data) = shipped_defaults("no-routes");
         config.services.clear();
         let err = Gateway::new(
             Arc::new(config),
@@ -1280,15 +1319,21 @@ mod tests {
     }
 
     /// A gateway wired over the shipped defaults, for a gauge assertion.
-    fn shipped_gateway(pressure: &Pressure) -> Gateway {
-        Gateway::new(
-            Arc::new(Config::with_defaults(Path::new("/run/starling"))),
+    ///
+    /// The directory comes back with it: the identity is read at construction
+    /// and held in memory, but a caller that drops it early is asking a
+    /// question about a gateway whose data directory has gone.
+    fn shipped_gateway(pressure: &Pressure) -> (Gateway, TempDataDir) {
+        let (config, data) = shipped_defaults("gauges");
+        let gateway = Gateway::new(
+            Arc::new(config),
             Metrics::new(),
             pressure,
             Health::new(),
             Logger::null(),
         )
-        .expect("the defaults must be servable")
+        .expect("the defaults must be servable");
+        (gateway, data)
     }
 
     #[tokio::test]
@@ -1304,7 +1349,9 @@ mod tests {
         // this is the deterministic half: a stale gauge does not need load or
         // time to reproduce, only an arrival followed by a departure.
         let pressure = Pressure::new();
-        let gateway = shipped_gateway(&pressure);
+        let (gateway, _data) = shipped_gateway(&pressure);
+        // Limits are read off the config and copied, so this one needs no
+        // directory of its own - nothing here loads an identity.
         let limits = Arc::new(Limits::from_config(
             &Config::with_defaults(Path::new("/run/starling")).gateway,
         ));
@@ -1372,7 +1419,7 @@ mod tests {
 
     #[test]
     fn a_gateway_over_the_shipped_defaults_routes_every_service() {
-        let config = Config::with_defaults(Path::new("/run/starling"));
+        let (config, _data) = shipped_defaults("routes");
         let gateway = Gateway::new(
             Arc::new(config),
             Metrics::new(),
