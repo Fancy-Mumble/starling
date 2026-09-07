@@ -1196,6 +1196,74 @@ async fn a_sender_key_distribution_reaches_the_member_it_names() {
 }
 
 #[tokio::test]
+async fn a_relayed_text_message_carries_a_clock_whether_or_not_its_sender_sent_one() {
+    // The finding: a message from a client that sends no `timestamp` reached
+    // every reader without one, and nothing downstream can invent it - so the
+    // reader drew the message at no particular moment, while the sender's own
+    // copy, stamped locally on the way out, showed a time. The server is the
+    // one party that knows when it arrived.
+    let data_dir = TempDir::new("text-clock");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake(&mut bob, "bob").await;
+
+    // A sender that stamped its message keeps its stamp: its own copy is
+    // already on screen reading that.
+    alice
+        .send(
+            11,
+            &tcp::TextMessage {
+                actor: Some(alice_session),
+                channel_id: vec![0],
+                message: "stamped".to_owned(),
+                timestamp: Some(1_700_000_000_000),
+                ..tcp::TextMessage::default()
+            },
+        )
+        .await;
+    let (_, payload) = bob.recv_until(11).await;
+    let received = tcp::TextMessage::decode(payload.as_slice()).expect("a TextMessage");
+    assert_eq!(received.message, "stamped");
+    assert_eq!(received.timestamp, Some(1_700_000_000_000));
+
+    // A sender that stamped nothing gets the server's clock.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis() as u64;
+    alice
+        .send(
+            11,
+            &tcp::TextMessage {
+                actor: Some(alice_session),
+                channel_id: vec![0],
+                message: "unstamped".to_owned(),
+                ..tcp::TextMessage::default()
+            },
+        )
+        .await;
+    let (_, payload) = bob.recv_until(11).await;
+    let received = tcp::TextMessage::decode(payload.as_slice()).expect("a TextMessage");
+    assert_eq!(received.message, "unstamped");
+    let stamped = received
+        .timestamp
+        .expect("the relay stamps a message that arrived with no clock");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis() as u64;
+    assert!(
+        (before..=after).contains(&stamped),
+        "stamped {stamped} outside [{before}, {after}]"
+    );
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
 async fn two_clients_complete_the_handshake_and_exchange_text() {
     let data_dir = TempDir::new("text");
     let deployment = Deployment::start(data_dir.path()).await;

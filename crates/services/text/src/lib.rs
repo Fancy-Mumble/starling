@@ -654,10 +654,7 @@ impl TextService {
         // channel nobody is sitting in is exactly the one push exists for.
         self.notify_absent(inbound, &message).await;
 
-        let echo = starling_proto::proto::tcp::TextMessage {
-            actor: Some(inbound.session),
-            ..message
-        };
+        let echo = echo_of(message, inbound.session, stored.sent_at_ms);
 
         if recipients.is_empty() {
             // Nobody to tell. Deliberately not a broadcast: an empty answer
@@ -1304,6 +1301,32 @@ impl TextService {
     }
 }
 
+/// The frame the recipients get: the sender's own, attributed and stamped.
+///
+/// The clock is the part that was nobody's. This server decides when a message
+/// arrived, writes that into the archive and publishes it on the event bus, and
+/// then used to hand the readers an echo carrying none of it. Their only other
+/// source is the sender, and a client that does not implement the timestamp
+/// extension sends none, so every reader drew that message with no time on it
+/// at all, while the sender's own copy, stamped locally on the way out, showed
+/// one.
+///
+/// A sender that did supply a time keeps it. Its own copy is already on screen
+/// reading that, and a relay that overwrote it would put two different times on
+/// one message for no gain: the server's clock is the fallback for a message
+/// that has none, not a correction of one that has.
+fn echo_of(
+    message: starling_proto::proto::tcp::TextMessage,
+    actor: u32,
+    sent_at_ms: u64,
+) -> starling_proto::proto::tcp::TextMessage {
+    starling_proto::proto::tcp::TextMessage {
+        actor: Some(actor),
+        timestamp: message.timestamp.or(Some(sent_at_ms)),
+        ..message
+    }
+}
+
 /// The line a notification shows under the sender's name.
 ///
 /// Markup comes off first: the body is delivered to clients as it was sent,
@@ -1926,6 +1949,31 @@ mod tests {
             .expect("stored");
         let _ = service.deliver_due(1).await;
         assert_eq!(actor_of(&delivered.try_recv().expect("a delivery")), None);
+    }
+
+    #[test]
+    fn a_relay_stamps_a_message_whose_sender_sent_no_clock() {
+        // The finding: a client that does not implement the timestamp
+        // extension sends none, the relay forwarded the frame as it stood, and
+        // every reader drew the message with no time on it - while the sender,
+        // stamping its own copy locally, saw one. The server knows the answer:
+        // it is the same instant it just filed in the archive.
+        let echo = echo_of(addressed_to(vec![4], Vec::new()), 7, 1_700_000_000_000);
+
+        assert_eq!(echo.timestamp, Some(1_700_000_000_000));
+        assert_eq!(echo.actor, Some(7));
+    }
+
+    #[test]
+    fn a_relay_keeps_the_clock_its_sender_supplied() {
+        // Overwriting it would put two different times on one message: the
+        // sender's copy is already on screen reading what it sent.
+        let mut message = addressed_to(vec![4], Vec::new());
+        message.timestamp = Some(1_600_000_000_000);
+
+        let echo = echo_of(message, 7, 1_700_000_000_000);
+
+        assert_eq!(echo.timestamp, Some(1_600_000_000_000));
     }
 
     #[test]
