@@ -1085,6 +1085,55 @@ async fn an_encrypted_message_reaches_the_other_member_of_its_channel() {
 }
 
 #[tokio::test]
+async fn a_pin_reaches_the_channel_including_whoever_set_it() {
+    // A pin is channel state rather than a message, and the client holds no
+    // optimistic copy of it: it learns the pin took by being sent it. The relay
+    // skips the sender by default, which made the one person who saw nothing
+    // happen the person who clicked Pin.
+    //
+    // Both halves are asserted here because either alone is a working feature
+    // for somebody: bob proves the relay, alice proves the echo.
+    let data_dir = TempDir::new("pchat-pin");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let (_, _) = handshake_epoch1(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let (_, _) = handshake_epoch1(&mut bob, "bob").await;
+
+    const PINNED: &str = "01234567-89ab-7def-8123-456789abcdef";
+    let envelope = fancy::pchat::PchatEnvelope {
+        body: Some(fancy::pchat::pchat_envelope::Body::Pin(fancy::pchat::Pin {
+            message_id: PINNED.to_owned(),
+            channel: 0,
+            unpin: false,
+        })),
+    };
+    alice
+        .send_raw(PCHAT_OUTER_TYPE, &envelope.encode_to_vec())
+        .await;
+
+    for (who, client) in [("bob", &mut bob), ("alice", &mut alice)] {
+        let (_, delivered) = client.recv_until(PCHAT_OUTER_TYPE).await;
+        let Some(fancy::pchat::pchat_envelope::Body::Pin(pin)) =
+            fancy::pchat::PchatEnvelope::decode(delivered.as_slice())
+                .expect("a well-formed PchatEnvelope")
+                .body
+        else {
+            panic!("{who} expected a pin");
+        };
+        assert_eq!(
+            pin.message_id, PINNED,
+            "{who} was told about the wrong message"
+        );
+        assert!(!pin.unpin, "{who} saw a pin arrive as an unpin");
+        assert_eq!(pin.channel, 0);
+    }
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
 async fn a_sender_key_distribution_reaches_the_member_it_names() {
     // How Signal sender keys actually travel. The client has no canon form for
     // `PchatSenderKeyDistribution`, so it relays it the epoch-independent way:

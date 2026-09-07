@@ -486,6 +486,16 @@ struct Relay {
     /// A recipient named by certificate, to be resolved against the roster when
     /// `unicast` carries no usable session.
     recipient_cert: Option<Vec<u8>>,
+    /// Whether the sender is one of the people this body is news to.
+    ///
+    /// Off for every relay by default, because the usual case is a body the
+    /// sender composed and already knows: echoing a key announce back to its
+    /// announcer is noise. A pin is the exception. It is channel state rather
+    /// than a message, the client that set it holds no copy until it is told,
+    /// and this server is the thing that decides whether the pin is allowed at
+    /// all - so the pinner learns the pin took by being sent it, like everybody
+    /// else, rather than by assuming it did.
+    echoes: bool,
     /// The certificate this body claims for its own sender, when it names one.
     ///
     /// Read so the relay can refuse a body claiming somebody else's identity.
@@ -507,6 +517,7 @@ impl Relay {
                 unicast: None,
                 recipient_cert: None,
                 claims: None,
+                echoes: false,
             })
         };
         let claiming = |channel, needs, cert: &[u8]| {
@@ -516,6 +527,7 @@ impl Relay {
                 unicast: None,
                 recipient_cert: None,
                 claims: Some(cert.to_vec()),
+                echoes: false,
             })
         };
         match body {
@@ -539,6 +551,7 @@ impl Relay {
                     .then(|| deliver.recipient_cert.clone())
                     .filter(|cert| !cert.is_empty()),
                 claims: None,
+                echoes: false,
             }),
             Body::KeyAnnounce(announce) => {
                 claiming(announce.channel, Perm::ENTER, &announce.holder_cert)
@@ -548,7 +561,14 @@ impl Relay {
             }
             Body::HolderReport(report) => in_channel(report.channel, Perm::ENTER),
             Body::HolderQuery(query) => in_channel(query.channel, Perm::ENTER),
-            Body::Pin(pin) => in_channel(pin.channel, Perm::TEXT_MESSAGE),
+            Body::Pin(pin) => Some(Self {
+                channel: pin.channel,
+                needs: Perm::TEXT_MESSAGE,
+                unicast: None,
+                recipient_cert: None,
+                claims: None,
+                echoes: true,
+            }),
             Body::Delete(delete) => in_channel(delete.channel, Perm::DELETE_MESSAGE),
             // Server-to-client answers. A client that sends one is trying to
             // forge somebody else's history or pin list, and the verbatim relay
@@ -606,15 +626,28 @@ impl PchatService {
     /// An empty roster produces no action at all rather than a broadcast. That
     /// is the difference between "membership is unknown" and "everyone", and
     /// conflating them is the leak this replaced.
-    fn to_channel(&self, inbound: &Inbound, channel: u32, payload: Vec<u8>) -> Actions {
-        let members = self.roster.in_channel(channel, inbound.session);
+    fn to_channel(
+        &self,
+        inbound: &Inbound,
+        channel: u32,
+        echoes: bool,
+        payload: Vec<u8>,
+    ) -> Actions {
+        let mut members = self.roster.in_channel(channel, inbound.session);
+        if members.is_empty() && !self.roster.is_warm() {
+            tracing::warn!(
+                channel,
+                "the session-view roster is cold; a pchat relay reached nobody"
+            );
+            // An echo cannot rescue this. Membership is unknown, so telling the
+            // sender its pin took would be the one client on the server that
+            // believes it.
+            return Actions::new();
+        }
+        if echoes {
+            members.push(inbound.session);
+        }
         if members.is_empty() {
-            if !self.roster.is_warm() {
-                tracing::warn!(
-                    channel,
-                    "the session-view roster is cold; a pchat relay reached nobody"
-                );
-            }
             return Actions::new();
         }
         vec![to_sessions(
@@ -750,7 +783,9 @@ impl PchatService {
         };
 
         let mut actions = vec![acknowledgement];
-        actions.extend(self.to_channel(inbound, channel, relay.encode_to_vec()));
+        // No echo: a sender learns its own message landed from the `ack`
+        // above, which says more than a copy of what it just sent.
+        actions.extend(self.to_channel(inbound, channel, false, relay.encode_to_vec()));
         actions
     }
 
@@ -855,7 +890,12 @@ impl PchatService {
                 );
                 Actions::new()
             }
-            _ => self.to_channel(inbound, relay.channel, inbound.payload.clone()),
+            _ => self.to_channel(
+                inbound,
+                relay.channel,
+                relay.echoes,
+                inbound.payload.clone(),
+            ),
         }
     }
 }
@@ -1597,6 +1637,90 @@ mod tests {
 
         assert_eq!(relay.unicast, Some(8));
         assert_eq!(relay.channel, 4);
+    }
+
+    #[tokio::test]
+    async fn a_pin_comes_back_to_whoever_set_it() {
+        // The pinner used to be the one person in the channel who never saw the
+        // pin: the relay excludes the sender, and the client holds no optimistic
+        // copy, so clicking Pin looked like nothing happening at all.
+        //
+        // Driven through `to_channel` rather than `frame`, because the test
+        // resolver denies every permission and a frame test would pass on the
+        // refusal and prove nothing about the addressing.
+        let service = service_with_members().await;
+        let inbound = frame(pchat_envelope::Body::Pin(Pin {
+            message_id: "m".to_owned(),
+            channel: 4,
+            unpin: false,
+        }));
+
+        let actions = service.to_channel(&inbound, 4, true, inbound.payload.clone());
+        assert_eq!(actions.len(), 1);
+        let (sessions, broadcast) = addressed(&actions[0]);
+        assert!(!broadcast);
+        assert!(
+            sessions.contains(&inbound.session),
+            "the pinner is told its own pin took: {sessions:?}"
+        );
+        assert!(sessions.contains(&8), "and so is the rest of the channel");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_does_not_echo_still_skips_its_sender() {
+        // The default, and the reason `echoes` is per-body rather than global:
+        // a key announce is composed by the announcer, who gains nothing from
+        // being handed it back.
+        let service = service_with_members().await;
+        let inbound = frame(pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+            channel: 4,
+            epoch: 1,
+            public_key: vec![1],
+            holder_cert: SPEAKER_CERT.to_vec(),
+            ..KeyAnnounce::default()
+        }));
+
+        let actions = service.to_channel(&inbound, 4, false, inbound.payload.clone());
+        assert_eq!(actions.len(), 1);
+        let (sessions, _) = addressed(&actions[0]);
+        assert!(!sessions.contains(&inbound.session));
+    }
+
+    #[test]
+    fn a_pin_is_the_only_body_that_echoes() {
+        // Left as an assertion rather than a comment because the field is a
+        // routing decision: a body that starts echoing by accident hands every
+        // sender a copy of what it just sent.
+        for (body, echoes) in [
+            (
+                pchat_envelope::Body::Pin(Pin {
+                    message_id: "m".to_owned(),
+                    channel: 4,
+                    unpin: false,
+                }),
+                true,
+            ),
+            (
+                pchat_envelope::Body::Delete(Delete {
+                    channel: 5,
+                    message_ids: vec!["m".to_owned()],
+                }),
+                false,
+            ),
+            (
+                pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
+                    channel: 6,
+                    epoch: 1,
+                    public_key: vec![1],
+                    holder_cert: SPEAKER_CERT.to_vec(),
+                    ..KeyAnnounce::default()
+                }),
+                false,
+            ),
+        ] {
+            let relay = Relay::of(&body).expect("relayable");
+            assert_eq!(relay.echoes, echoes, "echo for {body:?}");
+        }
     }
 
     #[test]
