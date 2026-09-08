@@ -1429,7 +1429,7 @@ mod tests {
         )
         .expect("the defaults must be servable");
         assert!(gateway.router.current().route(11).is_some());
-        assert_eq!(gateway.router.current().services().len(), 18);
+        assert_eq!(gateway.router.current().services().len(), 19);
     }
 
     /// A writer that records each write call as one entry, vectored or not.
