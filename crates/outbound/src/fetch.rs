@@ -266,6 +266,26 @@ impl Want {
         matches!(self, Self::Image | Self::Json)
     }
 
+    /// Whether an answer with this `content-type` is one to read.
+    ///
+    /// **An absent header is not a wrong one.** Amazon answers a product page
+    /// with `200`, 1.7 MB of HTML and no `content-type` at all, and treating
+    /// the empty string like a declared `video/mp4` threw the page away before
+    /// a byte of it was parsed - the reader got "that link is not a page" for a
+    /// page that was right there. The refusal exists to avoid *downloading* a
+    /// thing we cannot use, and a server that declared nothing has not told us
+    /// it is one of those; the byte cap already bounds what the guess costs.
+    ///
+    /// Only for a page. An image and a JSON document are wanted whole and
+    /// decoded, so an undeclared one is a guess with a decoder on the end of
+    /// it, and those stay strict.
+    fn accepts_answer(self, kind: &str) -> bool {
+        if kind.is_empty() {
+            return matches!(self, Self::Page);
+        }
+        self.accepts(kind)
+    }
+
     /// Whether a `content-type` is the kind this fetch was for.
     fn accepts(self, kind: &str) -> bool {
         let kind = kind.to_ascii_lowercase();
@@ -564,10 +584,11 @@ impl Fetcher {
             .and_then(|value| value.to_str().ok())
             .map(|kind| kind.split(';').next().unwrap_or(kind).trim().to_owned())
             .unwrap_or_default();
-        if !want.accepts(&mime) {
+        if !want.accepts_answer(&mime) {
             // Refused rather than parsed hopefully. A preview of a 4 GB video
             // is a 4 GB download for a title we were never going to find, and
             // the byte cap only bounds the damage rather than avoiding it.
+            tracing::debug!(%url, mime, ?want, "refused: not what this fetch asked for");
             return Err(FetchError::NotHtml);
         }
 
@@ -1406,6 +1427,63 @@ mod exchange {
                 .await
                 .expect_err("silence"),
             FetchError::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_that_declares_no_type_is_still_a_page() {
+        // Amazon, 2026-09-08: a product page answered `200` with 1.7 MB of
+        // HTML and **no content-type header at all**. Reading the empty string
+        // as a declared non-page threw it away before a byte was parsed, and
+        // the reader was told "that link is not a page" about a page that was
+        // right there. The byte cap already bounds what reading it costs.
+        let base = serving(|_| {
+            Response::builder()
+                .body(Full::new(Bytes::from(
+                    "<head><title>Undeclared</title></head>".to_owned(),
+                )))
+                .expect("a response")
+        })
+        .await;
+        let page = Fetcher::against_loopback(Limits::default())
+            .fetch(&base)
+            .await
+            .expect("an undeclared page is still fetched");
+        assert!(page.html.contains("Undeclared"));
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_image_is_still_refused() {
+        // The other half of the same rule. A page is read for a marker near
+        // the front and truncated at the cap, so guessing costs little; an
+        // image is handed to a decoder whole, so an undeclared one is a guess
+        // with a decoder on the end of it.
+        let base = serving(|_| {
+            Response::builder()
+                .body(Full::new(Bytes::from(jpeg(16))))
+                .expect("a response")
+        })
+        .await;
+        assert_eq!(
+            Fetcher::against_loopback(Limits::default())
+                .fetch_image(&base)
+                .await
+                .expect_err("an undeclared image"),
+            FetchError::NotHtml
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_non_page_is_refused_as_it_always_was() {
+        // The refusal still does its job: a 4 GB video is not downloaded for a
+        // title it was never going to have.
+        let base = serving(|_| asset("video/mp4", vec![0; 64])).await;
+        assert_eq!(
+            Fetcher::against_loopback(Limits::default())
+                .fetch(&base)
+                .await
+                .expect_err("a declared video"),
+            FetchError::NotHtml
         );
     }
 
