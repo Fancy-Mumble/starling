@@ -14,10 +14,11 @@
 //! anything but the proxy, or a way to stop it writing to the disk it shares
 //! with the server.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -40,6 +41,13 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// single command, so a browser that has stopped answering is noticed rather
 /// than waited on for the whole render.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much of the browser's own account of its failure to keep.
+///
+/// Chrome says what went wrong in a line or two and then repeats itself; this
+/// is enough to carry the reason into the error an operator reads, and little
+/// enough that a browser logging steadily cannot grow it.
+const KEPT_STDERR_LINES: usize = 12;
 
 /// What the operator settled about the browser.
 #[derive(Debug, Clone)]
@@ -171,11 +179,20 @@ impl Browser {
         // waits on it. A pipe nobody reads fills, and a browser whose stderr is
         // full stops - which would look exactly like a browser that hangs on
         // the tenth page.
+        //
+        // The last few lines are kept, because they are the difference between
+        // "the browser would not start" and an operator knowing why. Chrome
+        // says exactly what is wrong on the way down - a namespace it could not
+        // create, a library that is missing, a profile directory it cannot
+        // write - and that sentence used to go to a trace log nobody had on.
+        let said: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = child.stderr.take() {
+            let keeping = Arc::clone(&said);
             drop(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::trace!(line, "browser");
+                    keep(&keeping, line);
                 }
             }));
         }
@@ -190,8 +207,13 @@ impl Browser {
                 .await
             {
                 Ok(Ok(endpoint)) => endpoint,
-                Ok(Err(gone)) => return Err(RenderError::Launch(gone)),
-                Err(_) => return Err(RenderError::Launch("it never opened a debugger".to_owned())),
+                Ok(Err(gone)) => return Err(RenderError::Launch(explain(&gone, &said))),
+                Err(_) => {
+                    return Err(RenderError::Launch(explain(
+                        "it never opened a debugger",
+                        &said,
+                    )));
+                }
             };
 
         let cdp = Cdp::connect(&endpoint).await.map_err(RenderError::Cdp)?;
@@ -595,6 +617,67 @@ fn endpoint_from(text: &str) -> Option<String> {
         return None;
     }
     Some(format!("ws://127.0.0.1:{port}{path}"))
+}
+
+/// Remember one line the browser said, dropping the oldest when full.
+///
+/// Its own function so the reading loop stays a reading loop: what to keep is a
+/// decision about a bounded buffer, and it is the same decision every time.
+fn keep(said: &Arc<Mutex<VecDeque<String>>>, line: String) {
+    let mut kept = said
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.len() == KEPT_STDERR_LINES {
+        let _ = kept.pop_front();
+    }
+    kept.push_back(line);
+}
+
+/// A launch failure, with what the browser said and - where the answer is
+/// known - what to do about it.
+///
+/// The sandbox case earns its own sentence because it is the one an operator
+/// cannot guess from the message. Chrome reports a namespace it could not
+/// create; the cause is a container runtime whose default seccomp profile
+/// permits the namespace `clone` only for a container holding `CAP_SYS_ADMIN`,
+/// so a pod that drops every capability has dropped this too. Nothing about
+/// that is visible in "Failed to move to new namespace".
+fn explain(what: &str, said: &Arc<Mutex<VecDeque<String>>>) -> String {
+    let kept: Vec<String> = said
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    let tail = kept.join(" | ");
+    if is_sandbox_failure(&tail) {
+        return format!(
+            "{what}: the browser could not create its sandbox. This is what a container that \
+             drops CAP_SYS_ADMIN looks like: the runtime's default seccomp profile only \
+             permits the namespace clone for a container that holds it. Either give the pod a \
+             seccomp profile that allows it (see deploy/render-k8s.yaml, no capability and no \
+             privilege escalation required), or set browser_no_sandbox = \"true\" and read \
+             what that means. The browser said: {tail}"
+        );
+    }
+    if tail.is_empty() {
+        return what.to_owned();
+    }
+    format!("{what}. The browser said: {tail}")
+}
+
+/// Whether what the browser said is the sandbox refusing to start.
+fn is_sandbox_failure(said: &str) -> bool {
+    let said = said.to_ascii_lowercase();
+    [
+        "failed to move to new namespace",
+        "no usable sandbox",
+        "sandbox helper",
+        "clone_newuser",
+        "operation not permitted",
+    ]
+    .iter()
+    .any(|marker| said.contains(marker))
 }
 
 /// The flags every launch carries.
