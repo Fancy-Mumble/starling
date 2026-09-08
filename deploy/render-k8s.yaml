@@ -1,0 +1,227 @@
+# The `render` service on Kubernetes, under the `restricted` Pod Security
+# Standard: no capabilities, no privilege escalation, non-root, read-only root
+# filesystem.
+#
+# ---------------------------------------------------------------------------
+# Why this file exists at all
+# ---------------------------------------------------------------------------
+#
+# Chrome's own sandbox needs to create a **user namespace**, and a restricted
+# pod cannot. The reason is worth stating precisely, because the obvious guess
+# is wrong: it is not the capability drop by itself. The container runtime's
+# default seccomp profile permits `clone` with namespace flags only when
+# CAP_SYS_ADMIN is in the *bounding set* -- see containerd's
+# `contrib/seccomp/seccomp_default.go`, where the whole namespace-clone rule
+# sits behind `if !admin`. So `drop: [ALL]` removes the permission along with
+# the capability, and `allowPrivilegeEscalation: false` (which sets
+# `no_new_privs`) separately rules out the setuid sandbox helper Chrome would
+# otherwise fall back to.
+#
+# There are three ways to run a browser here. They are not equal, and the one
+# this file uses by default is the third.
+#
+#   1. A SANDBOXING RUNTIME. gVisor (`runtimeClassName: gvisor`) or Kata. The
+#      container is the boundary, implemented by the runtime, and Chrome's own
+#      sandbox stops being the thing that matters. If your cluster has one,
+#      this is the answer: set `runtimeClassName` below, drop
+#      `browser_no_sandbox`, and stop reading.
+#
+#   2. A Localhost SECCOMP PROFILE that re-permits the namespace clone. This
+#      needs **no capability and no privilege escalation** -- it is a seccomp
+#      change, not a privilege one -- and it gives Chrome its real sandbox
+#      back. `restricted` allows `Localhost` profiles, so this stays compliant.
+#      What it costs is a file on every node. See the recipe at the bottom.
+#
+#   3. `browser_no_sandbox = "true"`, with the compensating controls in this
+#      file. The renderer runs unsandboxed *inside* a container that has
+#      nothing to take: no capabilities, nothing writable, no service-account
+#      token, no route to the cluster network, and a V8 with no JIT. Chrome's
+#      sandbox exists to contain a renderer compromise; here the pod does that
+#      job, and the JIT -- where most renderer compromises live -- is gone.
+#
+# The service logs a warning on every start under (3), deliberately.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: render
+  labels: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+spec:
+  selector: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: render
+  labels: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+spec:
+  # One is a real deployment: a render is seconds of CPU and the service holds
+  # one browser with a couple of tabs. Scale out rather than up -- `render_
+  # concurrency` past a handful is a promise of that many renderers' worth of
+  # memory to whoever pastes links.
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+    spec:
+      # (1) The best answer, if you have it. Uncomment and remove
+      # `browser_no_sandbox` from the ConfigMap.
+      # runtimeClassName: gvisor
+
+      # Nothing in this pod calls the API server, and a renderer running a
+      # stranger's script should not be holding a credential for it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # Pinned numerically, and it has to be: the image's `USER starling` is a
+        # name, and the kubelet cannot verify that a *name* is not root -- a pod
+        # asking for `runAsNonRoot` with a named image user fails to start with
+        # "image has non-numeric user". Everything the process writes is on the
+        # mounts below, which `fsGroup` makes writable, so the uid need not
+        # match the one in the image.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          # (2) To give Chrome its sandbox back, replace these two lines with:
+          #   type: Localhost
+          #   localhostProfile: starling/chrome.json
+          # ...and see the recipe at the bottom of this file. No capability and
+          # no privilege escalation is added by that change.
+          type: RuntimeDefault
+      containers:
+        - name: render
+          # Built from deploy/render.Dockerfile: the server image plus chromium.
+          image: ghcr.io/fancy-mumble/starling-render:latest
+          args: ["render", "--config", "/etc/starling/starling.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            # A browser will use what it is given. This is the ceiling on what
+            # one page can cost the node, and the service is designed to be
+            # killed and restarted: the browser is relaunched on the next
+            # render, and no state is lost because there is none.
+            limits: { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            - { name: config, mountPath: /etc/starling, readOnly: true }
+            # The profile directory and everything the browser writes. Chrome
+            # needs a writable temp directory and the root filesystem is
+            # read-only, so this is not optional.
+            - { name: tmp, mountPath: /tmp }
+            - { name: data, mountPath: /var/lib/starling }
+          livenessProbe:
+            tcpSocket: { port: grpc }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap: { name: starling-config }
+        # `medium: Memory` keeps a stranger's rendered pages off the node's
+        # disk; sized because a tmpfs with no limit is the node's memory.
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 512Mi }
+        - name: data
+          emptyDir: {}
+---
+# What a compromised renderer can reach, in the case where it is not sandboxed.
+#
+# This is the control that replaces the sandbox, and it is the one worth having
+# even when the sandbox is on. The service's own SSRF guard makes the *browser*
+# talk only to a loopback proxy that refuses every address inside the
+# deployment - but a renderer running attacker code is no longer bound by what
+# the browser was configured to do. It is still bound by this.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: render
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: starling, app.kubernetes.io/component: render }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only link-preview dials it. Nothing else in the cluster has any business
+    # asking this pod to fetch a URL.
+    - from:
+        - podSelector:
+            matchLabels:
+              { app.kubernetes.io/name: starling, app.kubernetes.io/component: link-preview }
+      ports:
+        - { port: 50051, protocol: TCP }
+  egress:
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+      to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+    # The internet, and specifically not the estate. The same list the SSRF
+    # guard enforces in the proxy, enforced again where a compromised process
+    # cannot argue with it. Add your own cluster/service CIDRs to `except` --
+    # these are the RFC 1918 ranges, the link-local range that holds cloud
+    # metadata, and their IPv6 equivalents.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 100.64.0.0/10
+      ports:
+        - { port: 80, protocol: TCP }
+        - { port: 443, protocol: TCP }
+---
+# ---------------------------------------------------------------------------
+# (2) The seccomp profile, for a cluster that will take one
+# ---------------------------------------------------------------------------
+#
+# The change is one rule: permit `clone` with the namespace flags, which the
+# runtime default permits only for a container holding CAP_SYS_ADMIN. Nothing
+# else about the profile changes, and the pod still drops every capability and
+# still forbids privilege escalation.
+#
+# Derive it from the runtime's own default rather than writing one by hand -- a
+# hand-written profile is a permanent divergence from the runtime's, and the
+# divergence is where the next escape lives:
+#
+#   curl -sSL -o default.json \
+#     https://raw.githubusercontent.com/moby/moby/v27.5.1/profiles/seccomp/default.json
+#
+#   jq '.syscalls += [{
+#         "names": ["clone", "unshare"],
+#         "action": "SCMP_ACT_ALLOW"
+#       }]' default.json > chrome.json
+#
+# Install `chrome.json` at `<kubelet-root>/seccomp/starling/chrome.json` on
+# every node that may run this pod (a DaemonSet writing to a hostPath, or your
+# node image), then set in the pod spec above:
+#
+#   seccompProfile:
+#     type: Localhost
+#     localhostProfile: starling/chrome.json
+#
+# ...and remove `browser_no_sandbox` from the ConfigMap. Verify it took: the
+# service logs no sandbox warning at startup, and a render of
+# `https://example.org/` still works.
+#
+# What this permits, stated plainly: a process in the pod may create new
+# namespaces. That is what Chrome's sandbox is built out of, and it is also a
+# capability an attacker inside the container could use to build one of their
+# own. It is a smaller hole than an unsandboxed renderer, which is why it is
+# option (2) and not option (4).

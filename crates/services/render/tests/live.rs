@@ -60,21 +60,102 @@ use starling_render::proxy::Guarded;
 ///   code, so a test that cannot run without it should say so out loud rather
 ///   than quietly turn the sandbox off for everybody.
 fn options() -> Options {
+    let no_sandbox = std::env::var("STARLING_TEST_NO_SANDBOX").is_ok();
     Options {
         binary: std::env::var("STARLING_TEST_BROWSER").unwrap_or_default(),
-        no_sandbox: std::env::var("STARLING_TEST_NO_SANDBOX").is_ok(),
+        no_sandbox,
+        // Mirrors what the service does with these two options, so that running
+        // these tests unsandboxed exercises the configuration a locked-down pod
+        // actually runs rather than a halfway one that exists nowhere.
+        jitless: no_sandbox,
         ..Options::default()
     }
 }
 
 /// A browser behind the guard, or the reason there is not one.
 async fn browser() -> Browser {
+    launched(options()).await
+}
+
+/// The same, with the options a particular test needs.
+async fn launched(options: Options) -> Browser {
     let guarded = Guarded::bind(64).await.expect("a loopback port");
     let address = guarded.address();
     drop(tokio::spawn(guarded.serve()));
-    Browser::launch(address, &options(), 2)
+    Browser::launch(address, &options, 2)
         .await
         .expect("a browser: install chromium, or set STARLING_TEST_BROWSER")
+}
+
+/// What one line of script saw, rendered into the document's title.
+///
+/// A `data:` URL, so this asks the browser about itself without involving a
+/// host or the network: the question is what the *renderer* was given, and a
+/// page fetched to ask it would only add a way for the answer to be wrong.
+async fn asked_of_the_page(browser: &Browser, expression: &str) -> String {
+    let url = format!(
+        "data:text/html,<html><head><script>document.title=String({expression})</script></head><body></body></html>"
+    );
+    let page = browser
+        .render(&url, Duration::from_secs(20))
+        .await
+        .expect("a render");
+    let html = page.html;
+    let start = html.find("<title>").map(|at| at + "<title>".len());
+    let end = html.find("</title>");
+    match (start, end) {
+        (Some(start), Some(end)) if end >= start => {
+            html.get(start..end).unwrap_or_default().trim().to_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a browser"]
+async fn the_hardening_flags_reach_the_renderer() {
+    // A flag Chrome does not recognise is *ignored*, silently, which is the
+    // failure mode this test exists for: a deployment that dropped the sandbox
+    // in exchange for `--jitless` should not discover years later that the
+    // exchange never happened. So this asks the renderer what it actually has.
+    //
+    // `WebAssembly` is the observable: V8 will not expose it without a JIT, so
+    // its absence is the JIT's absence, and it is one property rather than an
+    // inference from timing.
+    let hardened = launched(Options {
+        no_sandbox: true,
+        jitless: true,
+        ..options()
+    })
+    .await;
+    assert_eq!(
+        asked_of_the_page(&hardened, "typeof WebAssembly").await,
+        "undefined",
+        "the JIT is still there: --js-flags=--jitless did not reach V8"
+    );
+    assert_eq!(
+        asked_of_the_page(
+            &hardened,
+            "!!document.createElement('canvas').getContext('webgl')"
+        )
+        .await,
+        "false",
+        "WebGL is still there: --disable-3d-apis did not reach the renderer"
+    );
+
+    // ...and that the same browser without the hardening does have them, so a
+    // passing test above cannot be a browser that never had either.
+    let ordinary = launched(Options {
+        no_sandbox: true,
+        jitless: false,
+        ..options()
+    })
+    .await;
+    assert_eq!(
+        asked_of_the_page(&ordinary, "typeof WebAssembly").await,
+        "object",
+        "a browser with its JIT should expose WebAssembly; if this fails the          observable has changed and the assertion above proves nothing"
+    );
 }
 
 #[tokio::test]

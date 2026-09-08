@@ -208,6 +208,9 @@ impl Serve for RenderService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let service = ctx.service();
         let default = Options::default();
+        let no_sandbox = service
+            .option::<bool>("browser_no_sandbox")
+            .unwrap_or(false);
         let options = Options {
             binary: service
                 .option::<String>("browser_binary")
@@ -220,9 +223,15 @@ impl Serve for RenderService {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            no_sandbox: service
-                .option::<bool>("browser_no_sandbox")
-                .unwrap_or(false),
+            no_sandbox,
+            // The two are one decision: a renderer with no sandbox around it
+            // should not also be compiling a stranger's script to native code.
+            // An operator can still separate them - a sandboxed browser that
+            // wants no JIT either, or an unsandboxed one that needs a page only
+            // the JIT is fast enough for - but the default follows the sandbox.
+            jitless: service
+                .option::<bool>("browser_jitless")
+                .unwrap_or(no_sandbox),
             settle: service
                 .option::<u64>("browser_settle_ms")
                 .map_or(default.settle, Duration::from_millis),
@@ -245,6 +254,20 @@ impl Serve for RenderService {
                 ServiceError::Service(format!("render: no loopback port for the guard: {error}"))
             })?;
         let proxy_address = guarded.address();
+
+        if no_sandbox {
+            // Loud, once, at startup rather than only in a config file: this is
+            // the setting whose consequences an operator most needs to have
+            // been told about, and a log is where somebody inheriting the
+            // deployment will find it.
+            tracing::warn!(
+                "render: the browser runs without its own sandbox; the container is the boundary"
+            );
+            ctx.logger.log(LogEvent::warning(
+                Category::Server,
+                "render: the browser runs without Chrome's sandbox (browser_no_sandbox)",
+            ));
+        }
 
         // Declared warming rather than ready: nothing has started a browser
         // yet, and a service reporting ready before it knows whether it has one

@@ -446,12 +446,31 @@ max_upload = "512MiB"
 # Flags to add, for a deployment that needs one nobody anticipated.
 # browser_args = ""
 # **Read this before setting it.** Chrome's sandbox is what stands between a
-# page a stranger pasted and the rest of the container. Turning it off is
-# sometimes the only way to run a renderer where the kernel features it needs
-# are not granted -- but the answer to that is usually to grant them (a seccomp
-# profile, or --cap-add SYS_ADMIN) rather than to render hostile pages
-# unsandboxed.
+# page a stranger pasted and the rest of the container, and it needs to create a
+# user namespace. A Kubernetes pod under the `restricted` profile cannot -- not
+# because of the capability drop itself, but because the runtime's default
+# seccomp profile permits the namespace `clone` only for a container holding
+# CAP_SYS_ADMIN, so `drop: [ALL]` takes the permission with it.
+#
+# Before setting this, read `deploy/render-k8s.yaml`: a sandboxing runtime
+# (gVisor, Kata) or a Localhost seccomp profile that re-permits that one call
+# both give Chrome its sandbox back, and neither needs a capability or
+# privilege escalation. This is the third option, not the first.
+#
+# Setting it also turns `browser_jitless` on by default, and the service logs a
+# warning on every start.
 # browser_no_sandbox = "false"
+# Run V8 with no just-in-time compiler. Defaults to whatever `browser_no_sandbox`
+# is, because the two are one decision: most remote-code-execution bugs in a
+# browser are in the JIT, which turns a stranger's script into native code, and
+# a renderer with no sandbox around it should not be doing that. It also removes
+# `WebAssembly`, which V8 will not expose without a JIT.
+#
+# Affordable here specifically: this browser reads a page's head rather than
+# running an application. Measured on idealo's JavaScript bot-wall challenge --
+# the heaviest thing this service does -- a jitless render took 3.8s against
+# 3.0s with the JIT, inside a 20s budget.
+# browser_jitless = "false"
 # How long after a page goes quiet before its DOM is read. Metadata written by
 # script is written in that window.
 # browser_settle_ms = "300"

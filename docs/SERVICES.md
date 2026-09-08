@@ -652,6 +652,43 @@ is the entire reason a browser was spent.
   hundred milliseconds, and every render cost its whole deadline: 17.5s for
   idealo, against 2.6s once frame events are filtered to the main frame.
 
+**Running it where Chrome cannot sandbox itself.** A Kubernetes pod under the
+`restricted` profile — `drop: [ALL]`, `allowPrivilegeEscalation: false` — cannot
+start Chrome's own sandbox, and the reason is not the obvious one. It is not the
+capability drop by itself: the container runtime's default seccomp profile
+permits `clone` with namespace flags **only when `CAP_SYS_ADMIN` is in the
+bounding set** (containerd's `seccomp_default.go` puts the whole namespace-clone
+rule behind `if !admin`), so dropping every capability drops the permission with
+it. `no_new_privs` separately rules out the setuid helper Chrome would fall back
+to. Three ways out, in `deploy/render-k8s.yaml`:
+
+1. **a sandboxing runtime** — gVisor or Kata — where the container is the
+   boundary and Chrome's sandbox is not what stands between a page and anything;
+2. **a `Localhost` seccomp profile** that re-permits that one call, which needs
+   no capability and no privilege escalation and gives Chrome its real sandbox
+   back;
+3. **`browser_no_sandbox`**, with what compensates for it.
+
+The third is the one most clusters land on, so the service makes it mean
+something. Setting it turns on `browser_jitless`, and that pairing is the point:
+Chrome's sandbox exists to contain a renderer compromise, and the overwhelming
+majority of renderer compromises are in the JIT — the machinery that turns a
+stranger's script into native code. `--js-flags=--jitless` removes it, and
+`WebAssembly` with it, since V8 will not expose a second compiler without the
+first. WebGL goes too. Measured on idealo's JavaScript bot-wall — the heaviest
+thing this service does — a jitless render costs 3.8s against 3.0s, inside a 20s
+budget. The flags are asserted to *reach* the renderer by a live test, because a
+flag Chrome does not recognise is ignored in silence, and a deployment that
+traded its sandbox for `--jitless` should not find out years later that the
+trade never happened.
+
+The rest of the containment is the pod: no capabilities, nothing writable, no
+service-account token, memory limits, and a `NetworkPolicy` whose egress
+`except` list is the SSRF guard's deny list written again at the network layer —
+enforced where a compromised renderer cannot argue with it, because a renderer
+running attacker code is no longer bound by the proxy the *browser* was pointed
+at.
+
 **The browser is rate-limited per person, not per frame.** The gateway's bucket
 counts frames, and a frame costs a browser render or nothing at all depending on
 a host's bot wall — the wrong unit. So the headless rung has two buckets of its

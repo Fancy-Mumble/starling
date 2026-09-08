@@ -59,12 +59,42 @@ pub struct Options {
     pub extra_args: Vec<String>,
     /// Whether to hand the renderer `--no-sandbox`.
     ///
-    /// Off, and it should stay off. It exists because a container that cannot
-    /// grant the kernel features Chrome's sandbox needs will not start a
-    /// renderer at all, and an operator in that position needs a way to say so
-    /// deliberately - having read that the sandbox is what stands between a
-    /// page a stranger pasted and the rest of the container.
+    /// Off by default, and worth understanding before turning on. Chrome's own
+    /// sandbox needs one thing this deployment may not be able to give it: the
+    /// ability to create a user namespace. A pod running the Kubernetes
+    /// `restricted` profile cannot, and **not because of the capability drop
+    /// itself**: the container runtime's default seccomp profile permits
+    /// `clone` with namespace flags only when `CAP_SYS_ADMIN` is in the
+    /// bounding set (containerd's `seccomp_default.go`), so `drop: [ALL]`
+    /// removes the permission along with the capability. `no_new_privs`, which
+    /// `allowPrivilegeEscalation: false` sets, separately rules out the setuid
+    /// helper Chrome would otherwise fall back to.
+    ///
+    /// So on such a pod there are three honest ways forward, in order of
+    /// preference, and `deploy/render-k8s.yaml` spells all three out:
+    ///
+    /// 1. a sandboxing *runtime* - gVisor or Kata - where the container itself
+    ///    is the boundary and Chrome's own sandbox is not the thing standing
+    ///    between a page and anything;
+    /// 2. a `Localhost` seccomp profile that re-permits the namespace `clone`,
+    ///    which needs **no capability and no privilege escalation** and gives
+    ///    Chrome its real sandbox back;
+    /// 3. this - with [`Options::jitless`], which is why that exists.
     pub no_sandbox: bool,
+    /// Whether to run V8 with no just-in-time compiler.
+    ///
+    /// Defaults to *on when the sandbox is off*, because the two decisions are
+    /// the same decision. The overwhelming majority of remote-code-execution
+    /// bugs in a browser are in the JIT compilers: they turn a stranger's
+    /// script into native code, and a bug there is native code the page chose.
+    /// `--jitless` removes that machinery, and with it `WebAssembly`, which
+    /// V8 will not expose without a JIT.
+    ///
+    /// It is affordable *here* specifically. This browser exists to read a
+    /// page's head, not to run an application: interpreted script is slower at
+    /// something the deadline already bounds, and the pages it costs the most
+    /// are the ones a preview learns least from.
+    pub jitless: bool,
     /// How long after the load event to let a page settle before the DOM is
     /// read. Metadata written by script is written in that window.
     pub settle: Duration,
@@ -80,6 +110,7 @@ impl Default for Options {
             binary: String::new(),
             extra_args: Vec::new(),
             no_sandbox: false,
+            jitless: false,
             settle: Duration::from_millis(300),
             window: (1280, 900),
             language: "en-US,en".to_owned(),
@@ -727,6 +758,24 @@ fn browser_args(proxy: SocketAddr, profile: &Path, options: &Options) -> Vec<Str
     ];
     if options.no_sandbox {
         args.push("--no-sandbox".to_owned());
+        // What is left when the sandbox is gone. Each of these removes a class
+        // of attack surface that a preview has no use for, and they are the
+        // reason an unsandboxed render is not simply "a browser with the door
+        // open": the door is off, so the rooms behind it are emptied.
+        args.extend([
+            // WebGL and the GPU command buffers behind it: a large native
+            // surface reachable from script, on a service that draws nothing.
+            "--disable-3d-apis".to_owned(),
+            // Nothing here plays media, and the codecs are C++ parsers fed by
+            // whatever the page links.
+            "--autoplay-policy=user-gesture-required".to_owned(),
+        ]);
+    }
+    if options.jitless {
+        // `--jitless` is V8's own switch for "interpret, never compile". It
+        // also takes `WebAssembly` with it, which V8 will not expose without a
+        // JIT - and which is a second compiler taking bytes from the page.
+        args.push("--js-flags=--jitless".to_owned());
     }
     args
 }
