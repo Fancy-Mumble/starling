@@ -53,9 +53,70 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
 /// stopped describing itself and started describing its layout.
 const MAX_DEPTH: u8 = 6;
 
+/// The `schema.org` types worth reading, and what each one means about a page.
+///
+/// Deliberately a short list of *content* types. `WebSite`, `WebPage`,
+/// `Organization` and `BreadcrumbList` are on almost every page that publishes
+/// any of this and describe the site rather than the thing, so reading them
+/// would classify the whole web as "a page".
+const CONTENT_TYPES: &[&str] = &[
+    "videoobject",
+    "movie",
+    "tvepisode",
+    "musicvideoobject",
+    "imageobject",
+    "photograph",
+    "painting",
+    "visualartwork",
+    "audioobject",
+    "musicrecording",
+    "podcastepisode",
+    "newsarticle",
+    "article",
+    "blogposting",
+    "report",
+    "techarticle",
+    "liveblogposting",
+    "discussionforumposting",
+    "socialmediaposting",
+    "question",
+    "answer",
+    "product",
+    "productgroup",
+    "offer",
+    "person",
+    "profilepage",
+];
+
+/// Keys whose value describes something *else* - the author, the picture, the
+/// publisher - rather than the thing the page is about.
+///
+/// The walk does not descend into them when it is looking for a type: an
+/// article's `image` is an `ImageObject`, and reading that as the page's own
+/// type turns every illustrated news story into a photograph.
+const SUB_ENTITY_KEYS: &[&str] = &[
+    "image",
+    "thumbnail",
+    "author",
+    "creator",
+    "publisher",
+    "logo",
+    "breadcrumb",
+    "potentialaction",
+    "aggregaterating",
+    "interactionstatistic",
+    "provider",
+    "sponsor",
+    "video",
+];
+
 /// What a page's structured data said, where it said anything.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Structured {
+    /// The `@type` of the thing the page is about, lowercased.
+    ///
+    /// The shallowest one that names actual content; see `CONTENT_TYPES`.
+    pub kind: String,
     /// `author` or `creator`, as a name.
     pub author: String,
     /// `datePublished`, `uploadDate` or `dateCreated`, as written.
@@ -146,9 +207,12 @@ fn walk(value: &Value, depth: u8, found: &mut Structured) {
                 take(key, field, found);
             }
             // And down, because the keys above are as often on a node nested
-            // under `@graph` or `mainEntity` as on the document's root.
-            for field in fields.values() {
-                if field.is_object() || field.is_array() {
+            // under `@graph` or `mainEntity` as on the document's root - but
+            // never into a key that describes something else, or an article's
+            // picture would answer for the article.
+            for (key, field) in fields {
+                let sub = SUB_ENTITY_KEYS.contains(&key.to_ascii_lowercase().as_str());
+                if !sub && (field.is_object() || field.is_array()) {
                     walk(field, depth + 1, found);
                 }
             }
@@ -195,6 +259,26 @@ fn take(key: &str, value: &Value, found: &mut Structured) {
             set(&mut found.rating_count, count);
         }
         "interactionstatistic" => interactions(value, found),
+        // What the page says it *is*, which is the most precise thing it ever
+        // says: `og:type` has five useful values and this vocabulary has a
+        // hundred, and a list written for a search engine is filled in with
+        // more care than the tag a share button reads.
+        "@type" => {
+            let named = match value {
+                Value::String(text) => text.to_ascii_lowercase(),
+                // A node may claim several types; the first recognised one is
+                // as good an answer as any.
+                Value::Array(items) => items
+                    .iter()
+                    .map(|item| text_of(item).to_ascii_lowercase())
+                    .find(|text| CONTENT_TYPES.contains(&text.as_str()))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            if CONTENT_TYPES.contains(&named.as_str()) {
+                set(&mut found.kind, named);
+            }
+        }
         _ => {}
     }
 }
@@ -271,6 +355,38 @@ fn text_of(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_type_read_is_the_page_s_own_and_not_its_picture_s() {
+        // The trap this exists for: every illustrated article carries an
+        // `ImageObject` under `image`, and a walk that read types wherever it
+        // found them would call every news story a photograph.
+        let found = read(
+            r#"<head><script type="application/ld+json">
+                 {"@type":"NewsArticle","headline":"A Story",
+                  "image":{"@type":"ImageObject","url":"https://cdn/x.jpg"},
+                  "author":{"@type":"Person","name":"A Reporter"}}
+               </script></head>"#,
+        );
+        assert_eq!(found.kind, "newsarticle");
+        assert_eq!(found.author, "A Reporter");
+    }
+
+    #[test]
+    fn the_sites_own_furniture_is_not_a_type() {
+        // `WebSite`, `Organization` and `BreadcrumbList` are on every page
+        // that publishes any of this, and describe the site rather than the
+        // thing on it.
+        let found = read(
+            r#"<head><script type="application/ld+json">
+                 {"@context":"https://schema.org","@graph":[
+                    {"@type":"WebSite","name":"Example"},
+                    {"@type":"BreadcrumbList"},
+                    {"@type":"VideoObject","name":"A Clip"}]}
+               </script></head>"#,
+        );
+        assert_eq!(found.kind, "videoobject");
+    }
 
     #[test]
     fn a_page_with_no_structured_data_says_nothing() {

@@ -393,14 +393,24 @@ max_upload = "512MiB"
 #   honest    this server, by name (preview_user_agent below)
 #   crawler   Discord's crawler -- untrue, and the only thing Reddit answers
 #   browser   a browser's user-agent on a client that is not one
+#   oembed    the provider's own published embed endpoint, asked without the
+#             page. Only for the providers with a documented one (YouTube,
+#             Vimeo, SoundCloud, Spotify, Flickr, Dailymotion, Reddit, TikTok,
+#             Bluesky); the request goes to the provider whose link was pasted,
+#             so it tells nobody anything the fetch would not have.
 #   headless  a real browser, in the `render` service
+#   slug      the title in the URL's own path, when everything else refused.
+#             No request, so nothing can refuse it. It says only what the URL
+#             said -- a title and the host, never a description or a picture --
+#             and a URL whose path is an identifier produces no card at all
+#             rather than one asserting something nobody wrote.
 #
 # The browser is **not** on the default ladder. Adding it means running the
 # `render` service, which is a browser: a second container, a few hundred
 # megabytes, and a renderer executing script from pages strangers paste. Add it
 # where previews of bot-walled sites (idealo and the rest of the Akamai tier)
 # are worth that, and leave it out otherwise.
-# preview_ladder = "honest,crawler,browser"
+# preview_ladder = "honest,crawler,browser,oembed,slug"
 # What the honest rung calls itself. Name your server and a way to be contacted
 # and a site owner who dislikes it can say so; blank keeps the default, since a
 # request with no user-agent is refused outright by a good share of the web.

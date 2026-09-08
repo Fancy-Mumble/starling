@@ -18,6 +18,7 @@ pub mod ladder;
 pub mod oembed;
 pub mod parse;
 pub mod quota;
+pub mod slug;
 pub mod structured;
 pub mod thumbnail;
 
@@ -30,6 +31,11 @@ pub use starling_outbound::{
     DEFAULT_USER_AGENT, FetchError, Fetcher, Limits, Page, Refusal, fetch, vet,
 };
 
+// A dev-dependency, and used by the `probe` example alone: the library must
+// never install a subscriber, and an example is its own crate.
+#[cfg(test)]
+use tracing_subscriber as _;
+
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{
     LinkPreviewEnvelope, Preview, PreviewError, PreviewRequest, link_preview_envelope, preview,
@@ -41,7 +47,7 @@ use starling_runtime::ratelimit::Rate;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
 use crate::climb::{Climb, Reached, Renderer};
-use crate::ladder::{Cooldowns, Ladder, Memory};
+use crate::ladder::{Cooldowns, Ladder, Memory, Rung};
 use crate::quota::{Limit, Quota};
 
 /// The service.
@@ -175,8 +181,24 @@ impl LinkPreviewService {
                     // The picture is fetched as whoever fetched the page: an
                     // `og:image` behind the same wall answers the same client.
                     let fetcher = climb.fetcher_for(rung);
+                    // Whether the document is the *rendered* one decides
+                    // whether the classifier may read its body: every other
+                    // rung stops at `</head>`, so what it holds below that is
+                    // not a document, it is a truncation.
+                    let rendered = rung == Rung::Headless;
                     link_preview_envelope::Body::Preview(
-                        of_page(&fetcher, request.request_id, page).await,
+                        of_page(&fetcher, request.request_id, page, rendered).await,
+                    )
+                }
+                // A card with no page behind it: an embed endpoint answered
+                // directly, or the URL was read for its own title. It still
+                // gets the picture, the icon and the classification a fetched
+                // page would have got - the difference is only where the words
+                // came from.
+                Reached::Card { card, url, rung } => {
+                    let fetcher = climb.fetcher_for(rung);
+                    link_preview_envelope::Body::Preview(
+                        of_card(&fetcher, request.request_id, &url, *card, None).await,
                     )
                 }
                 // Not a page, which for a link somebody pasted usually means
@@ -189,10 +211,20 @@ impl LinkPreviewService {
                     let fetcher = climb.fetcher_for(climb.ladder.cheapest());
                     match of_media(&fetcher, &request.request_id, &url).await {
                         Some(preview) => link_preview_envelope::Body::Preview(preview),
-                        None => link_preview_envelope::Body::Error(PreviewError {
-                            request_id: request.request_id,
-                            reason: format!("{url}: {}", FetchError::NotHtml.reason()),
-                        }),
+                        None => {
+                            // The second half of the same diagnosis: the host
+                            // said "not a page", and it was not a picture
+                            // either. Without this line the operator sees a
+                            // refusal with no reason anywhere in the log.
+                            tracing::debug!(
+                                %url,
+                                "link preview: not a page, and not a picture either"
+                            );
+                            link_preview_envelope::Body::Error(PreviewError {
+                                request_id: request.request_id,
+                                reason: format!("{url}: {}", FetchError::NotHtml.reason()),
+                            })
+                        }
                     }
                 }
                 Reached::Nothing(reason) => {
@@ -235,7 +267,7 @@ impl LinkPreviewService {
 ///
 /// Public for `tests/card.rs`, which is where the composition of the two
 /// fetches is exercised, as [`picture_for`] is and for the same reason.
-pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Preview {
+pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page, rendered: bool) -> Preview {
     let mut card = parse::card(&page.html);
     // Before anything is decided: the page's own embed endpoint answers what
     // its tags would not. `YouTube` serves a `<title>` of "- YouTube" and no
@@ -244,20 +276,46 @@ pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Previ
     if let Some(embed) = oembed::ask(fetcher, &page.url, &card.oembed).await {
         adopt(&mut card, embed);
     }
-    let kind = classify::Kind::of(&page.url, &card);
+    // The rendered body is evidence in its own right - a `<video>` is a video
+    // - and it is only *there* when a browser was spent on the page, which is
+    // exactly the case where the page's own metadata answered nothing.
+    let body = rendered.then_some(page.html.as_str());
+    of_card(fetcher, request_id, &page.url, card, body).await
+}
+
+/// The card for what a *rung other than a page fetch* found.
+///
+/// The tail of [`of_page`], from the point where there is a [`parse::Card`]:
+/// classify it, go and get its picture and its icon, and assemble the answer.
+/// Split out because two rungs reach that point without any HTML behind them -
+/// an oEmbed endpoint asked directly, and a title read out of the URL - and
+/// both deserve the same picture, the same icon and the same classification as
+/// a card that came from a page.
+///
+/// Public for `tests/card.rs`, as [`of_page`] is and for the same reason.
+pub async fn of_card(
+    fetcher: &Fetcher,
+    request_id: String,
+    url: &str,
+    card: parse::Card,
+    body: Option<&str>,
+) -> Preview {
+    let verdict = classify::classify(url, &card, body);
+    tracing::debug!(%url, kind = ?verdict.kind, why = verdict.why, "link classified");
+    let kind = verdict.kind;
     // A second fetch, of a second host, before the answer goes out: the card
     // is worth more with the picture on it, and the picture is only safe to
     // show because the server is the one that went and got it.
-    let picture = picture_for(fetcher, &page.url, &card).await;
+    let picture = picture_for(fetcher, url, &card).await;
     // And the site's own mark, which is the one thing on a card that says
     // where a link goes before a word of it is read. Fetched here for the
     // reason the picture is: a favicon loaded by every viewer is a request
     // per reader to a host that then knows who is in the channel.
-    let icon = icon_for(fetcher, &page.url, &card).await;
+    let icon = icon_for(fetcher, url, &card).await;
     // A page that never named itself is labelled with its host, which is what
     // a reader wanted from that line anyway: where this link goes.
     let site = if card.site.is_empty() {
-        host_of(&page.url)
+        host_of(url)
     } else {
         card.site
     };
@@ -265,7 +323,7 @@ pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Previ
         request_id,
         // Where it *ended up*: a preview of a shortened link that shows the
         // shortener has told the reader nothing.
-        url: page.url,
+        url: url.to_owned(),
         title: card.title,
         description: card.description,
         site,

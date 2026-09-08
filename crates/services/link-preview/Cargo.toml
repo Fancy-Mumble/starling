@@ -1,7 +1,7 @@
 [package]
 name = "starling-link-preview"
 description = "server-side link previews, fetched with an SSRF guard"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,6 +26,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The probe example shares the library's own log rather than printing beside
+# it: one ordered account of a fetch instead of two interleaved ones.
+tracing-subscriber.workspace = true
 # A card is composed from two fetches, and testing that composition needs a
 # server to fetch from. Dev-only, and checked to stay that way: see the
 # `loopback` feature in `starling-outbound`.

@@ -24,6 +24,7 @@ use serde_json as _;
 use starling_runtime as _;
 use tonic as _;
 use tracing as _;
+use tracing_subscriber as _;
 
 use starling_link_preview::{Fetcher, Limits, of_media, of_page, parse, picture_for};
 use starling_outbound::testing::{asset, html, serving, status};
@@ -154,7 +155,7 @@ async fn a_card_says_what_the_page_said_it_was() {
 
     let fetcher = Fetcher::against_loopback(Limits::default());
     let page = fetcher.fetch(&base).await.expect("fetched");
-    let preview = of_page(&fetcher, "r1".to_owned(), page).await;
+    let preview = of_page(&fetcher, "r1".to_owned(), page, false).await;
 
     assert_eq!(preview.kind, preview::Kind::Video as i32);
     assert_eq!(preview.site, "YouTube");
@@ -238,7 +239,7 @@ async fn a_page_that_withholds_its_metadata_is_asked_for_it_properly() {
 
     let fetcher = Fetcher::against_loopback(Limits::default());
     let page = fetcher.fetch(&base).await.expect("fetched");
-    let preview = of_page(&fetcher, "r4".to_owned(), page).await;
+    let preview = of_page(&fetcher, "r4".to_owned(), page, false).await;
 
     // The endpoint's answer to "what is this" outranks the page's own tags,
     // and everything the tags left empty comes from it.
@@ -290,7 +291,7 @@ async fn a_page_that_named_its_own_picture_keeps_it() {
         .fetch(&format!("{served}/page"))
         .await
         .expect("fetched");
-    let preview = of_page(&fetcher, "r5".to_owned(), page).await;
+    let preview = of_page(&fetcher, "r5".to_owned(), page, false).await;
 
     assert_eq!(preview.title, "From The Tags");
     // The kind still comes from the endpoint, because the tags have no answer

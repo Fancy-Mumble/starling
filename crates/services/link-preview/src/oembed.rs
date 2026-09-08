@@ -14,13 +14,26 @@
 //! asks: what is this (`video`, `photo`, `rich`, `link`), what is it called,
 //! who made it, and where is its thumbnail. `YouTube` answers it happily.
 //!
-//! # It is not a list of hosts
+//! # Discovery, and the one case where it cannot happen
 //!
-//! The endpoint is not guessed: the page advertises it in
+//! Normally the endpoint is not guessed: the page advertises it in
 //! `<link rel="alternate" type="application/json+oembed">`, which is the
 //! discovery mechanism the specification defines, and a page that advertises
 //! none is not asked. The URL is vetted and fetched exactly like the picture
 //! is - it is a stranger's host, named by a stranger's page.
+//!
+//! That requires the page. The case this module also has to answer is the one
+//! where the page cannot be had at all: a host that refuses every rung of the
+//! ladder, a real browser included. Discovery is impossible there and the
+//! answer may still be sitting behind a published endpoint, so `KNOWN` is a
+//! short table of providers whose endpoint is a documented constant.
+//!
+//! It is a table of **measured** entries, not a copy of a registry: every one
+//! was asked for a real URL on 2026-09-08 and answered with a title. The
+//! public registry lists 378 providers and most of them are services nobody
+//! pastes into a chat; a table nobody can check is a table that rots. Twitter
+//! is the reason to check rather than copy - `publish.twitter.com/oembed`
+//! answers `301` now and is not in the list below.
 
 use serde_json::Value;
 
@@ -43,6 +56,84 @@ pub struct OEmbed {
     pub width: u32,
     /// And down, paired with [`OEmbed::width`].
     pub height: u32,
+}
+
+/// Providers whose oEmbed endpoint is published and answers.
+///
+/// `(host suffix, endpoint)`. The suffix matches the host or any subdomain of
+/// it, so `youtu.be` and `m.youtube.com` are covered without a rule each.
+///
+/// The endpoint is asked with the pasted URL as the `url` parameter, which is
+/// the specification's own shape, so the request goes to **the provider whose
+/// link was pasted** - no third party learns anything it would not have
+/// learned from the fetch this replaces.
+const KNOWN: &[(&str, &str)] = &[
+    (
+        "youtube.com",
+        "https://www.youtube.com/oembed?format=json&url=",
+    ),
+    (
+        "youtu.be",
+        "https://www.youtube.com/oembed?format=json&url=",
+    ),
+    ("vimeo.com", "https://vimeo.com/api/oembed.json?url="),
+    (
+        "soundcloud.com",
+        "https://soundcloud.com/oembed?format=json&url=",
+    ),
+    ("spotify.com", "https://open.spotify.com/oembed?url="),
+    (
+        "flickr.com",
+        "https://www.flickr.com/services/oembed/?format=json&url=",
+    ),
+    (
+        "dailymotion.com",
+        "https://www.dailymotion.com/services/oembed?url=",
+    ),
+    ("reddit.com", "https://www.reddit.com/oembed?url="),
+    ("tiktok.com", "https://www.tiktok.com/oembed?url="),
+    ("bsky.app", "https://embed.bsky.app/oembed?format=json&url="),
+];
+
+/// The endpoint to ask about `url`, if this is a provider with a known one.
+///
+/// Used only when the page itself could not be read; a page that was fetched
+/// advertises its own endpoint and that one is preferred, because it is the
+/// site's current answer rather than this table's.
+#[must_use]
+pub fn known_endpoint(url: &str) -> Option<String> {
+    let host = host_of(url)?.to_ascii_lowercase();
+    KNOWN.iter().find_map(|(suffix, endpoint)| {
+        (host == *suffix || host.ends_with(&format!(".{suffix}")))
+            .then(|| format!("{endpoint}{}", encoded(url)))
+    })
+}
+
+/// The host of a URL, lowercased by the caller.
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, rest)| rest)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.split('@').next_back().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// `url` as a query-parameter value.
+///
+/// Percent-encoded here rather than by a dependency: the reserved set is
+/// short, and what must not survive is the character that would end the
+/// parameter and start another one.
+fn encoded(url: &str) -> String {
+    let mut out = String::with_capacity(url.len() + 16);
+    for byte in url.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte));
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Fetch and read the endpoint `page` advertised, if it advertised one.
@@ -128,6 +219,36 @@ mod tests {
             width: 0,
             height: 0,
         }
+    }
+
+    #[test]
+    fn a_known_provider_is_asked_at_its_own_endpoint() {
+        // The request goes to the provider whose link was pasted, so nothing
+        // is disclosed that the fetch this replaces would not have disclosed.
+        let asked = known_endpoint("https://www.youtube.com/watch?v=B5EwrXHvE5o&t=1s")
+            .expect("YouTube is a known provider");
+        assert!(asked.starts_with("https://www.youtube.com/oembed?format=json&url="));
+        // The whole URL survives as one parameter: an unencoded `&` would end
+        // it and turn `t=1s` into a parameter of the *endpoint*.
+        assert!(
+            asked.ends_with("https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DB5EwrXHvE5o%26t%3D1s")
+        );
+    }
+
+    #[test]
+    fn a_subdomain_and_a_short_link_reach_the_same_provider() {
+        assert!(known_endpoint("https://m.youtube.com/watch?v=x").is_some());
+        assert!(known_endpoint("https://youtu.be/x").is_some());
+        assert!(known_endpoint("https://open.spotify.com/track/x").is_some());
+    }
+
+    #[test]
+    fn a_host_that_merely_ends_in_a_providers_name_is_not_that_provider() {
+        // `notyoutube.com` is not a subdomain of `youtube.com`, and matching
+        // on a bare suffix would send a stranger's URL to YouTube's endpoint.
+        assert_eq!(known_endpoint("https://notyoutube.com/watch?v=x"), None);
+        assert_eq!(known_endpoint("https://youtube.com.evil.example/x"), None);
+        assert_eq!(known_endpoint("https://example.org/watch"), None);
     }
 
     #[test]

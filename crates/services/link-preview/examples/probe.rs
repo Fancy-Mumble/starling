@@ -1,4 +1,4 @@
-//! Preview one URL from the command line, and print what the crawler made of it.
+//! Preview one URL from the command line, and log what the crawler made of it.
 //!
 //! `cargo run -p starling-link-preview --example probe -- https://example.org/`
 //!
@@ -11,29 +11,47 @@
 //!
 //! Deliberately an example rather than a test: it talks to the internet, so it
 //! is run by a person looking into something, never by CI.
-
-#![allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "a command-line probe whose whole output is what it printed"
-)]
+//!
+//! # Why it logs rather than prints
+//!
+//! Because the thing being diagnosed logs. A probe that printed its own findings
+//! to stdout while the code under it wrote `tracing` events to stderr gave two
+//! accounts of one fetch, interleaved by luck, and the interesting half was
+//! usually the one the probe did not write - the fetcher's own line about which
+//! rung was refused, at which URL, with which reason. Sharing the subscriber
+//! means one ordered account, with `RUST_LOG` deciding how much of it appears:
+//!
+//! ```text
+//! RUST_LOG=debug cargo run -p starling-link-preview --example probe -- <url>
+//! ```
 
 use starling_link_preview::{Fetcher, Limits, classify, of_page, parse};
+use tracing::info;
 
 // Linked by the library, not by this: an example is its own crate.
 use image as _;
 use prost as _;
 use serde_json as _;
 use starling_outbound as _;
-use starling_proto_fancy as _;
 use starling_runtime as _;
 use tonic as _;
-use tracing as _;
 
 #[tokio::main]
 async fn main() {
+    // The library's own events go to the same place as this probe's, in the
+    // order they happened. `info` by default so a run says something without
+    // an environment variable, and `RUST_LOG=debug` for the fetcher's own
+    // account of which rung answered what.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let Some(url) = std::env::args().nth(1) else {
-        eprintln!("usage: probe <url>");
+        tracing::error!("usage: probe <url>");
         return;
     };
     // The user agent an operator would get by default, because which crawler
@@ -42,16 +60,15 @@ async fn main() {
     let page = match fetcher.fetch(&url).await {
         Ok(page) => page,
         Err(error) => {
-            eprintln!("fetch failed: {error:?}");
+            tracing::error!(?error, %url, "the fetch failed");
             return;
         }
     };
-    println!("-- fetch ---------------------------------------------------");
-    println!("ended at   {}", page.url);
-    println!("bytes read {}", page.html.len());
-    println!(
-        "head ends  {:?}",
-        page.html.to_ascii_lowercase().find("</head")
+    info!(
+        ended_at = %page.url,
+        bytes = page.html.len(),
+        head_ends = ?page.html.to_ascii_lowercase().find("</head"),
+        "fetched"
     );
     for marker in [
         "og:title",
@@ -61,36 +78,36 @@ async fn main() {
         "<title",
         "itemprop=\"duration\"",
     ] {
-        println!("  {marker:22} at {:?}", page.html.find(marker));
+        info!(marker, at = ?page.html.find(marker), "marker");
     }
 
     let card = parse::card(&page.html);
-    println!("-- card ----------------------------------------------------");
-    println!("{card:#?}");
-    println!(
-        "kind (before oembed) {:?}",
-        classify::Kind::of(&page.url, &card)
-    );
+    info!(?card, "the card the page's own tags describe");
+    // Before the oEmbed endpoint has been asked, and with no rendered body:
+    // what the page's own tags alone are worth, and which of them weighed
+    // most - which is the question when a card comes out the wrong shape.
+    let verdict = classify::classify(&page.url, &card, None);
+    info!(kind = ?verdict.kind, why = %verdict.why, "kind, from the tags alone");
 
-    let preview = of_page(&fetcher, "probe".to_owned(), page).await;
-    println!("-- preview -------------------------------------------------");
-    println!("kind      {}", preview.kind);
-    println!("title     {}", preview.title);
-    println!("site      {}", preview.site);
-    println!("author    {}", preview.author);
-    println!("duration  {}", preview.duration_seconds);
-    println!("published {}", preview.published_at);
-    println!("rating    {}", preview.content_rating);
-    println!(
-        "image     {} bytes, {}x{} from {}x{}",
-        preview.image.len(),
-        preview.image_width,
-        preview.image_height,
-        preview.source_width,
-        preview.source_height
+    let preview = of_page(&fetcher, "probe".to_owned(), page, false).await;
+    info!(
+        kind = ?starling_proto_fancy::fancy::feature::preview::Kind::try_from(preview.kind),
+        title = %preview.title,
+        site = %preview.site,
+        author = %preview.author,
+        duration = preview.duration_seconds,
+        published = %preview.published_at,
+        rating = %preview.content_rating,
+        "the preview a client would draw"
     );
-    println!("icon      {} bytes", preview.icon.len());
+    info!(
+        bytes = preview.image.len(),
+        thumbnail = format!("{}x{}", preview.image_width, preview.image_height),
+        source = format!("{}x{}", preview.source_width, preview.source_height),
+        icon_bytes = preview.icon.len(),
+        "the picture on it"
+    );
     for fact in &preview.facts {
-        println!("fact      {} = {} ({})", fact.label, fact.value, fact.key);
+        info!(key = %fact.key, label = %fact.label, value = %fact.value, "fact");
     }
 }

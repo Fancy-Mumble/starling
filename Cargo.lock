@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "starling-link-preview"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "image",
  "prost",
@@ -3886,6 +3886,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3969,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "starling-outbound"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -4096,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "starling-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "serde_json",

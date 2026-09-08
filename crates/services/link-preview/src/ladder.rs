@@ -73,13 +73,35 @@ pub enum Rung {
     Crawler,
     /// A browser's user-agent, on an HTTP client that is not a browser.
     Browser,
+    /// The provider's own embed endpoint, asked without the page.
+    ///
+    /// Not a way of getting the page: a different, *published* answer to the
+    /// same question, at a URL the specification defines. It only exists for
+    /// the providers in `oembed::KNOWN`, and for those it often answers when
+    /// nothing else will - Reddit's endpoint gives a full card to a request
+    /// its HTML would have refused.
+    Oembed,
     /// A real browser, in the `render` service.
     Headless,
+    /// What the URL itself says.
+    ///
+    /// Last, and cheapest of all: no request, so nothing can refuse it. It is
+    /// the floor rather than a rung - a card with a title read out of the path
+    /// and nothing else - and it exists because the alternative is four lines
+    /// of hyphenated URL. See [`crate::slug`].
+    Slug,
 }
 
 impl Rung {
     /// Every rung, cheapest and most honest first.
-    pub const ALL: &'static [Self] = &[Self::Honest, Self::Crawler, Self::Browser, Self::Headless];
+    pub const ALL: &'static [Self] = &[
+        Self::Honest,
+        Self::Crawler,
+        Self::Browser,
+        Self::Oembed,
+        Self::Headless,
+        Self::Slug,
+    ];
 
     /// The name an operator writes in `preview_ladder`.
     #[must_use]
@@ -88,7 +110,9 @@ impl Rung {
             Self::Honest => "honest",
             Self::Crawler => "crawler",
             Self::Browser => "browser",
+            Self::Oembed => "oembed",
             Self::Headless => "headless",
+            Self::Slug => "slug",
         }
     }
 
@@ -109,7 +133,12 @@ impl Rung {
             Self::Honest => Some(honest),
             Self::Crawler => Some(starling_outbound::DEFAULT_USER_AGENT),
             Self::Browser => Some(BROWSER_USER_AGENT),
-            Self::Headless => None,
+            // A published API asked as ourselves: there is nobody to fool at
+            // an endpoint that exists to be called.
+            Self::Oembed => Some(honest),
+            // Neither of these is a fetch with a user-agent of its own: one is
+            // a browser, the other is a string operation on the URL.
+            Self::Headless | Self::Slug => None,
         }
     }
 }
@@ -128,7 +157,13 @@ impl Default for Ladder {
     /// script, none of which should arrive because somebody upgraded.
     fn default() -> Self {
         Self {
-            rungs: vec![Rung::Honest, Rung::Crawler, Rung::Browser],
+            rungs: vec![
+                Rung::Honest,
+                Rung::Crawler,
+                Rung::Browser,
+                Rung::Oembed,
+                Rung::Slug,
+            ],
         }
     }
 }
@@ -175,7 +210,13 @@ impl Ladder {
     /// Whether the operator asked for the browser at all.
     #[must_use]
     pub fn has_headless(&self) -> bool {
-        self.rungs.contains(&Rung::Headless)
+        self.has(Rung::Headless)
+    }
+
+    /// Whether `rung` is on this ladder.
+    #[must_use]
+    pub fn has(&self, rung: Rung) -> bool {
+        self.rungs.contains(&rung)
     }
 
     /// The cheapest rung on this ladder.

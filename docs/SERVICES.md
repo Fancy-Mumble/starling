@@ -508,7 +508,9 @@ it produced nothing worth showing:
 | `honest` | this server, by name | most of the web, YouTube and tagesschau included |
 | `crawler` | Discord's crawler | the only rung Reddit gives a card to |
 | `browser` | a browser's user-agent on a client that is not one | sites that read the string and not the handshake |
+| `oembed` | the provider's own published endpoint, asked without the page | answers for Reddit, YouTube, Spotify, TikTok, Bluesky and five more |
 | `headless` | a real browser, in `render` | the only rung idealo (Akamai) gives anything to |
+| `slug` | the words in the URL's own path | the floor: no request, so nothing can refuse it |
 
 Reddit is the case that shapes it. An honest fetch of a thread gets a 200 with
 an eight-kilobyte script shell whose whole head is `<title>Reddit</title>`;
@@ -517,6 +519,28 @@ again. So a rung cannot be judged by whether the fetch succeeded — the shell i
 a 200 — but by whether the card is worth showing: a title **and** a description
 or a picture. Judging it any other way stops the ladder one rung below the card
 on every Reddit link there is.
+
+**Two rungs never fetch the page.** `oembed` asks the endpoint the provider
+publishes for embedders — the specification's own mechanism — which answers the
+questions a preview actually has: what this is, what it is called, who made it,
+where its thumbnail is. Normally it is discovered from the page's own
+`<link rel="alternate" type="application/json+oembed">`, but that needs the page;
+for a host that serves no page to anything, a short table of providers whose
+endpoint is a documented constant is asked directly. The table is measured
+rather than copied from the public registry of 378 providers: each entry was
+asked for a real URL and answered. Twitter is why — `publish.twitter.com/oembed`
+answers `301` now, so it is not in the table.
+
+`slug` is the floor, and it is the answer to "the browser was blocked too". The
+URL arrives carrying most of its own title —
+`/deals/abholung-dhl-paketshop-retro-games-ltd-the-c64-maxi-…-2836700` — and a
+card saying where a link goes and roughly what it is beats four lines of
+hyphenated URL, which is what a reader got before. It says **only what the URL
+said**: a title and the host, never a description or a picture. A path that is
+an identifier (`/8837211`, an Amazon ASIN, a UUID) yields no card at all rather
+than one asserting something nobody wrote, and the floor is never *learned* as
+the rung that worked — learning it would start every later link to that host at
+the floor and the real rungs would never be tried again.
 
 **Which rung a host needed is remembered, and the memory expires.** Walking four
 rungs on every paste of the same host is three wasted requests, so the rung that

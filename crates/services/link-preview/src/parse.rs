@@ -90,6 +90,29 @@ pub struct Card {
     /// scale maps onto another, so this is a label to print rather than a
     /// number to compare.
     pub rating: String,
+    /// The `schema.org` type the page gave itself, lowercased.
+    ///
+    /// From its `JSON-LD`; see [`crate::structured`]. The most precise thing
+    /// a page ever says about itself - `og:type` has five useful values and
+    /// this vocabulary has a hundred.
+    pub schema_type: String,
+    /// A video the page names, by `og:video` or `twitter:player`.
+    ///
+    /// Its presence is the signal, not its contents: a page that names a
+    /// player has something to play, whatever `og:type` says - and `website`
+    /// is what a great many video pages say.
+    pub video: String,
+    /// The same for `og:audio`.
+    pub audio: String,
+    /// Whether the page used the `product:` vocabulary at all.
+    ///
+    /// A brand, a retailer's item number, a condition. Weaker than a price -
+    /// a listing that is sold out states no price and is still a listing.
+    pub product_tags: bool,
+    /// Whether it used `profile:` - a username, a first name.
+    pub profile_tags: bool,
+    /// Whether it used the `article:` namespace beyond the parts read above.
+    pub article_tags: bool,
     /// The oEmbed endpoint the page advertises, or `""`.
     ///
     /// `<link rel="alternate" type="application/json+oembed">`, which is the
@@ -156,23 +179,6 @@ pub fn card(html: &str) -> Card {
     let head = head_of(html);
     let mut card = Card::default();
 
-    // First value wins for each field, so a page that repeats a tag does not
-    // have its own preferred answer overwritten by an afterthought further
-    // down.
-    let take = |slot: &mut String, value: String| {
-        if slot.is_empty() && !value.is_empty() {
-            *slot = value;
-        }
-    };
-    // Same rule for the dimensions, and unparseable means absent: a page that
-    // writes `og:image:width` as "large" has said nothing about the size, which
-    // is exactly the state a `0` already means.
-    let take_number = |slot: &mut u32, value: &str| {
-        if *slot == 0 {
-            *slot = value.trim().parse().unwrap_or(0);
-        }
-    };
-
     // The labelled facts arrive as two halves - `twitter:label2` here,
     // `twitter:data2` three tags further down - so they are collected by index
     // and paired once the head has been read. Four, because that is as many as
@@ -193,96 +199,7 @@ pub fn card(html: &str) -> Card {
             continue;
         };
         let content = decode(&content);
-        match key.as_str() {
-            "og:title" | "twitter:title" => take(&mut card.title, content),
-            "og:description" | "twitter:description" | "description" => {
-                take(&mut card.description, content);
-            }
-            // `twitter:site` is deliberately not here: by Twitter's own
-            // definition it is an @handle for an account, not the name of a
-            // publication, so reading it as one labelled cards "@rustlang" and
-            // "@github". A page that names no site gets its host, which the
-            // caller fills in because it is the only one that knows the URL.
-            "og:site_name" => take(&mut card.site, content),
-            // `og:image:secure_url` before `og:image`, and both before
-            // Twitter's: a page that offers https for the same picture is
-            // offering the one a fetch can actually use.
-            "og:image:secure_url"
-            | "og:image"
-            | "og:image:url"
-            | "twitter:image"
-            | "twitter:image:src" => take(&mut card.image, content),
-            "og:image:width" | "twitter:image:width" => {
-                take_number(&mut card.image_width, &content);
-            }
-            "og:image:height" | "twitter:image:height" => {
-                take_number(&mut card.image_height, &content);
-            }
-            // What the page says it is. Lowercased here rather than at every
-            // reader: `og:type` is a vocabulary, not prose, and pages write
-            // "Article" as readily as "article".
-            "og:type" => take(&mut card.page_type, content.to_ascii_lowercase()),
-            "twitter:card" => take(&mut card.twitter_card, content.to_ascii_lowercase()),
-            "generator" => take(&mut card.generator, content.to_ascii_lowercase()),
-            // When it went out. Several spellings, because the vocabularies
-            // for this never converged: `OpenGraph`'s article namespace,
-            // Dublin Core, Google Scholar's citation set, and the plain
-            // `date` a news CMS writes.
-            "article:published_time"
-            | "og:article:published_time"
-            | "datepublished"
-            | "date"
-            | "dc.date"
-            | "dcterms.date"
-            | "citation_publication_date"
-            | "pubdate" => take(&mut card.published, content),
-            // What it is rated. `rating` is the old convention and still what
-            // image boards and adult sites write; `og:restrictions:age` is
-            // `OpenGraph`'s, and carries "18+" rather than a word.
-            "rating" | "og:rating" | "content-rating" | "og:restrictions:age" => {
-                take(&mut card.rating, content.to_ascii_lowercase());
-            }
-            // A byline, in the several places pages put one. `article:author`
-            // is as often a profile URL as a name, and a URL printed where a
-            // name goes reads as a bug, so [`byline`] drops those.
-            "author" | "article:author" | "og:article:author" | "og:video:director"
-            | "og:music:musician" | "book:author"
-            // Dublin Core and the citation set, which is what an academic
-            // publisher and a good half of the CMSs in the world write.
-            | "dc.creator" | "dcterms.creator" | "citation_author" => {
-                take(&mut card.author, byline(&content));
-            }
-            "og:video:duration" | "video:duration" | "og:music:duration" | "music:duration"
-            | "duration"
-                if card.duration == 0 =>
-            {
-                card.duration = seconds(&content);
-            }
-            "og:price:amount" | "product:price:amount" | "og:product:price:amount" => {
-                take(&mut card.price.amount, decimal(&content));
-            }
-            "og:price:currency" | "product:price:currency" => {
-                take(&mut card.price.currency, content.to_ascii_uppercase());
-            }
-            // The "was" price, which every vocabulary spells differently and
-            // no two shops agree on.
-            "og:price:standard_amount"
-            | "product:original_price:amount"
-            | "product:price:original"
-            | "og:price:original_amount" => take(&mut card.price.was, decimal(&content)),
-            "og:availability" | "product:availability" => {
-                take(&mut card.price.availability, content.to_ascii_lowercase());
-            }
-            "twitter:label1" => labels[0] = labels[0].take().or(Some(content)),
-            "twitter:label2" => labels[1] = labels[1].take().or(Some(content)),
-            "twitter:label3" => labels[2] = labels[2].take().or(Some(content)),
-            "twitter:label4" => labels[3] = labels[3].take().or(Some(content)),
-            "twitter:data1" => values[0] = values[0].take().or(Some(content)),
-            "twitter:data2" => values[1] = values[1].take().or(Some(content)),
-            "twitter:data3" => values[2] = values[2].take().or(Some(content)),
-            "twitter:data4" => values[3] = values[3].take().or(Some(content)),
-            _ => {}
-        }
+        read_meta(&mut card, &key, content, &mut labels, &mut values);
     }
 
     labelled(&mut card, labels, values);
@@ -309,6 +226,141 @@ fn titled(card: &mut Card, head: &str) {
         // that writes `<title lang="en">` would otherwise have no title at all.
         let text = title.split_once('>').map_or(title, |(_, rest)| rest);
         card.title = decode(text.trim());
+    }
+}
+
+/// The four `twitter:labelN`/`twitter:dataN` slots, collected as they appear.
+type Slots = [Option<String>; 4];
+
+/// Read one `<meta>` tag into the card.
+///
+/// Its own function only because there are enough vocabularies now that the
+/// walk and the table of names do not fit on a screen together: `card` above
+/// is the walk, and this is the table.
+fn read_meta(card: &mut Card, key: &str, content: String, labels: &mut Slots, values: &mut Slots) {
+    // First value wins for each field, so a page that repeats a tag does not
+    // have its own preferred answer overwritten by an afterthought further
+    // down.
+    let take = |slot: &mut String, value: String| {
+        if slot.is_empty() && !value.is_empty() {
+            *slot = value;
+        }
+    };
+    // Same rule for the dimensions, and unparseable means absent: a page that
+    // writes `og:image:width` as "large" has said nothing about the size,
+    // which is exactly the state a `0` already means.
+    let take_number = |slot: &mut u32, value: &str| {
+        if *slot == 0 {
+            *slot = value.trim().parse().unwrap_or(0);
+        }
+    };
+    match key {
+        "og:title" | "twitter:title" => take(&mut card.title, content),
+        "og:description" | "twitter:description" | "description" => {
+            take(&mut card.description, content);
+        }
+        // `twitter:site` is deliberately not here: by Twitter's own
+        // definition it is an @handle for an account, not the name of a
+        // publication, so reading it as one labelled cards "@rustlang" and
+        // "@github". A page that names no site gets its host, which the
+        // caller fills in because it is the only one that knows the URL.
+        "og:site_name" => take(&mut card.site, content),
+        // `og:image:secure_url` before `og:image`, and both before
+        // Twitter's: a page that offers https for the same picture is
+        // offering the one a fetch can actually use.
+        "og:image:secure_url"
+        | "og:image"
+        | "og:image:url"
+        | "twitter:image"
+        | "twitter:image:src" => take(&mut card.image, content),
+        "og:image:width" | "twitter:image:width" => {
+            take_number(&mut card.image_width, &content);
+        }
+        "og:image:height" | "twitter:image:height" => {
+            take_number(&mut card.image_height, &content);
+        }
+        // Something to play, named. Read for its presence rather than
+        // its value: `og:type` is "website" on a great many pages that
+        // carry a player, and this is the tag that gives them away.
+        "og:video" | "og:video:secure_url" | "og:video:url" | "twitter:player" => {
+            take(&mut card.video, content);
+        }
+        "og:audio" | "og:audio:secure_url" | "og:audio:url" => {
+            take(&mut card.audio, content);
+        }
+        // What the page says it is. Lowercased here rather than at every
+        // reader: `og:type` is a vocabulary, not prose, and pages write
+        // "Article" as readily as "article".
+        "og:type" => take(&mut card.page_type, content.to_ascii_lowercase()),
+        "twitter:card" => take(&mut card.twitter_card, content.to_ascii_lowercase()),
+        "generator" => take(&mut card.generator, content.to_ascii_lowercase()),
+        // When it went out. Several spellings, because the vocabularies
+        // for this never converged: `OpenGraph`'s article namespace,
+        // Dublin Core, Google Scholar's citation set, and the plain
+        // `date` a news CMS writes.
+        "article:published_time"
+        | "og:article:published_time"
+        | "datepublished"
+        | "date"
+        | "dc.date"
+        | "dcterms.date"
+        | "citation_publication_date"
+        | "pubdate" => take(&mut card.published, content),
+        // What it is rated. `rating` is the old convention and still what
+        // image boards and adult sites write; `og:restrictions:age` is
+        // `OpenGraph`'s, and carries "18+" rather than a word.
+        "rating" | "og:rating" | "content-rating" | "og:restrictions:age" => {
+            take(&mut card.rating, content.to_ascii_lowercase());
+        }
+        // A byline, in the several places pages put one. `article:author`
+        // is as often a profile URL as a name, and a URL printed where a
+        // name goes reads as a bug, so [`byline`] drops those.
+        "author" | "article:author" | "og:article:author" | "og:video:director"
+        | "og:music:musician" | "book:author"
+        // Dublin Core and the citation set, which is what an academic
+        // publisher and a good half of the CMSs in the world write.
+        | "dc.creator" | "dcterms.creator" | "citation_author" => {
+            take(&mut card.author, byline(&content));
+        }
+        "og:video:duration" | "video:duration" | "og:music:duration" | "music:duration"
+        | "duration"
+            if card.duration == 0 =>
+        {
+            card.duration = seconds(&content);
+        }
+        "og:price:amount" | "product:price:amount" | "og:product:price:amount" => {
+            take(&mut card.price.amount, decimal(&content));
+        }
+        "og:price:currency" | "product:price:currency" => {
+            take(&mut card.price.currency, content.to_ascii_uppercase());
+        }
+        // The "was" price, which every vocabulary spells differently and
+        // no two shops agree on.
+        "og:price:standard_amount"
+        | "product:original_price:amount"
+        | "product:price:original"
+        | "og:price:original_amount" => take(&mut card.price.was, decimal(&content)),
+        "og:availability" | "product:availability" => {
+            take(&mut card.price.availability, content.to_ascii_lowercase());
+        }
+        // Which vocabularies the page reached for at all. A listing that
+        // is sold out names no price and is still a listing; a profile
+        // names a username and nothing else.
+        "product:brand" | "product:retailer_item_id" | "product:condition"
+        | "product:item_group_id" | "og:product:brand" => card.product_tags = true,
+        "profile:username" | "profile:first_name" | "profile:last_name"
+        | "og:profile:username" => card.profile_tags = true,
+        "article:section" | "article:tag" | "article:modified_time"
+        | "og:article:section" => card.article_tags = true,
+        "twitter:label1" => labels[0] = labels[0].take().or(Some(content)),
+        "twitter:label2" => labels[1] = labels[1].take().or(Some(content)),
+        "twitter:label3" => labels[2] = labels[2].take().or(Some(content)),
+        "twitter:label4" => labels[3] = labels[3].take().or(Some(content)),
+        "twitter:data1" => values[0] = values[0].take().or(Some(content)),
+        "twitter:data2" => values[1] = values[1].take().or(Some(content)),
+        "twitter:data3" => values[2] = values[2].take().or(Some(content)),
+        "twitter:data4" => values[3] = values[3].take().or(Some(content)),
+        _ => {}
     }
 }
 
@@ -383,6 +435,7 @@ fn structured(card: &mut Card, head: &str) {
     if card.published.is_empty() {
         card.published = found.published;
     }
+    card.schema_type = found.kind;
     if card.rating.is_empty() {
         card.rating = found.rating;
     }
