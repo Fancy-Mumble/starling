@@ -5,7 +5,7 @@
 //! issuing keys in January, and Discord moved its own picker to Klipy for the
 //! same reason. The shape here is nonetheless a *trait-free seam* rather than
 //! Klipy spelled through the service - [`Provider::endpoint`] and
-//! [`parse_page`] are the whole of what is provider-specific, and a second one
+//! `parse_page` are the whole of what is provider-specific, and a second one
 //! is those two functions rather than a refactor.
 //!
 //! # Why the key never leaves this process
