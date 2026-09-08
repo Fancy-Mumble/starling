@@ -91,6 +91,17 @@ impl Kind {
         if card.price.is_named() || page_type.starts_with("product") {
             return Self::Product;
         }
+        // What the page told an *embedder* it was. This outranks `og:type`
+        // because the two are answers to different questions: `og:type` is
+        // what a share button should say, filled in by a CMS that calls every
+        // page an article, and the oEmbed type is what the thing at the other
+        // end actually is, filled in by the code that would embed it.
+        if card.oembed_type == "video" {
+            return Self::Video;
+        }
+        if card.oembed_type == "photo" {
+            return Self::Image;
+        }
         // Playing time and a player card are both statements that there is
         // something to play, and `og:type` is where a page says which of the
         // two it is - `music.song` and `video.movie` are both "media with a
@@ -109,6 +120,15 @@ impl Kind {
         // alone is on the front page of every forum, which is not a thread.
         if is_thread(card) {
             return Self::Forum;
+        }
+        // "rich" is an embeddable widget, which art hosts, music services and
+        // social sites all answer. It settles nothing on its own - but a page
+        // that offers to be embedded *and* has a picture of itself is a piece
+        // of media on a site whose pages are media, not a story with a
+        // photograph on it. The forum and product rules ran first, so the two
+        // "rich" sources that are really discussions keep their kind.
+        if card.oembed_type == "rich" && !card.image.is_empty() {
+            return Self::Image;
         }
         if page_type.starts_with("article") || page_type.starts_with("book") {
             return Self::Article;
@@ -212,6 +232,50 @@ mod tests {
             page_type: page_type.to_owned(),
             ..Card::default()
         }
+    }
+
+    #[test]
+    fn what_the_page_told_an_embedder_beats_what_it_told_a_share_button() {
+        // The case this exists for: an art host declares `og:type=article` on
+        // every page it has, and tells an embedder the same page is a photo.
+        let art = Card {
+            page_type: "article".to_owned(),
+            oembed_type: "photo".to_owned(),
+            ..Card::default()
+        };
+        assert_eq!(Kind::of("https://art.example/1", &art), Kind::Image);
+
+        let video = Card {
+            page_type: "website".to_owned(),
+            oembed_type: "video".to_owned(),
+            ..Card::default()
+        };
+        assert_eq!(Kind::of("https://v.example/1", &video), Kind::Video);
+    }
+
+    #[test]
+    fn an_embeddable_widget_with_a_picture_of_itself_is_a_picture() {
+        // "rich" is what art hosts, music services and social sites all
+        // answer, so it settles nothing alone - with a picture of the work
+        // beside it, on a page that is otherwise an article, it does.
+        let art = Card {
+            page_type: "article".to_owned(),
+            oembed_type: "rich".to_owned(),
+            image: "https://cdn.example/work.png".to_owned(),
+            ..Card::default()
+        };
+        assert_eq!(Kind::of("https://art.example/1", &art), Kind::Image);
+
+        // The two "rich" sources that are really discussions keep their kind,
+        // because the forum rule runs first.
+        let thread = Card {
+            page_type: "article".to_owned(),
+            oembed_type: "rich".to_owned(),
+            image: "https://cdn.example/preview.png".to_owned(),
+            generator: "discourse 3.2.0".to_owned(),
+            ..Card::default()
+        };
+        assert_eq!(Kind::of("https://forum.example/t/1", &thread), Kind::Forum);
     }
 
     #[test]

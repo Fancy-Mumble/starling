@@ -24,6 +24,14 @@
 pub struct Card {
     /// What the page calls itself.
     pub title: String,
+    /// Whether that title came from a tag the author wrote *for* sharing.
+    ///
+    /// `og:title` and its Twitter twin are deliberate; `<title>` is the
+    /// browser tab, and on a site that renders its pages in the browser it is
+    /// whatever the server had before the script ran - "- `YouTube`", say.
+    /// The difference matters to anything that might have a better title to
+    /// offer, which is why it is recorded rather than lost.
+    pub title_declared: bool,
     /// Its own one-line summary.
     pub description: String,
     /// The publication, where it names one.
@@ -82,6 +90,21 @@ pub struct Card {
     /// scale maps onto another, so this is a label to print rather than a
     /// number to compare.
     pub rating: String,
+    /// The oEmbed endpoint the page advertises, or `""`.
+    ///
+    /// `<link rel="alternate" type="application/json+oembed">`, which is the
+    /// discovery mechanism the specification defines. Read but not fetched
+    /// here - see [`crate::oembed`] - and relative as often as not, like the
+    /// picture.
+    pub oembed: String,
+    /// What that endpoint said its content was: "video", "photo", "rich".
+    ///
+    /// Filled in by the caller after the endpoint has answered, because it is
+    /// the one thing on this card that costs a request. It is a *declaration
+    /// about the content*, which is why it outranks `og:type` in
+    /// [`crate::classify`]: a site whose CMS calls every page an article will
+    /// still tell an embedder that this one is a video.
+    pub oembed_type: String,
     /// The site's own icon, as the page's `<link rel="icon">` gave it.
     ///
     /// Relative as often as not, like [`Card::image`], and fetched by the
@@ -264,8 +287,21 @@ pub fn card(html: &str) -> Card {
 
     labelled(&mut card, labels, values);
     structured(&mut card, head);
+    card.oembed = oembed_of(head);
     card.icon = icon_of(head);
 
+    titled(&mut card, head);
+    card
+}
+
+/// Fall back to the browser tab, and record that it was a fallback.
+///
+/// A page that declared no `og:title` has not said what it is called. The tab
+/// is better than nothing - and on a site that renders in the browser it is
+/// whatever the server had before the script ran, which is why anything with
+/// a better answer is allowed to replace it. See [`Card::title_declared`].
+fn titled(card: &mut Card, head: &str) {
+    card.title_declared = !card.title.is_empty();
     if card.title.is_empty()
         && let Some(title) = between(head, "<title", "</title")
     {
@@ -274,7 +310,6 @@ pub fn card(html: &str) -> Card {
         let text = title.split_once('>').map_or(title, |(_, rest)| rest);
         card.title = decode(text.trim());
     }
-    card
 }
 
 /// Pair the `twitter:labelN`/`twitter:dataN` halves and read what they say.
@@ -379,6 +414,28 @@ fn structured(card: &mut Card, head: &str) {
         (false, false) => format!("{} ({})", found.stars, found.rating_count),
     };
     add("rating", "Rating", stars);
+}
+
+/// The oEmbed endpoint a page advertises, or `""`.
+///
+/// JSON only. The specification defines an XML form as well, and this crate
+/// has no XML parser and no reason to grow one for a format whose JSON twin
+/// every publisher also serves.
+fn oembed_of(head: &str) -> String {
+    for tag in tags(head, "link") {
+        let kind = attribute(tag, "type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !kind.contains("json+oembed") {
+            continue;
+        }
+        if let Some(href) = attribute(tag, "href").map(|href| decode(&href))
+            && !href.is_empty()
+        {
+            return href;
+        }
+    }
+    String::new()
 }
 
 /// The site icon a page declares, or `""`.
@@ -729,6 +786,17 @@ mod tests {
     }
 
     #[test]
+    fn a_title_written_for_sharing_is_told_apart_from_the_browser_tab() {
+        let declared = card(r#"<head><meta property="og:title" content="The Real Title"></head>"#);
+        assert!(declared.title_declared);
+        // A page whose only title is its tab has not said what it is called;
+        // anything with a better answer may say so.
+        let tab = card("<head><title>- YouTube</title></head>");
+        assert_eq!(tab.title, "- YouTube");
+        assert!(!tab.title_declared);
+    }
+
+    #[test]
     fn a_page_with_only_a_title_tag_still_previews() {
         let card = card("<html><head><title lang=\"en\">Just This</title></head>");
         assert_eq!(card.title, "Just This");
@@ -1073,6 +1141,21 @@ mod tests {
         );
         assert_eq!(card.author, "The Tag");
         assert_eq!(card.published, "2026-01-01");
+    }
+
+    #[test]
+    fn the_embed_endpoint_a_page_advertises_is_read_but_not_guessed() {
+        let advertised = card(
+            r#"<head>
+                 <link rel="alternate" type="application/xml+oembed" href="/oembed.xml">
+                 <link rel="alternate" type="application/json+oembed" href="/oembed?url=x">
+               </head>"#,
+        );
+        // The JSON twin, because this crate has no XML parser and no reason
+        // to grow one for a format every publisher also serves as JSON.
+        assert_eq!(advertised.oembed, "/oembed?url=x");
+        // A page that advertises none is not asked.
+        assert!(card("<head><title>x</title></head>").oembed.is_empty());
     }
 
     #[test]

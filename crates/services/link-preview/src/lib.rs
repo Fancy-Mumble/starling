@@ -15,6 +15,7 @@
 pub mod classify;
 pub mod climb;
 pub mod ladder;
+pub mod oembed;
 pub mod parse;
 pub mod quota;
 pub mod structured;
@@ -235,7 +236,14 @@ impl LinkPreviewService {
 /// Public for `tests/card.rs`, which is where the composition of the two
 /// fetches is exercised, as [`picture_for`] is and for the same reason.
 pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Preview {
-    let card = parse::card(&page.html);
+    let mut card = parse::card(&page.html);
+    // Before anything is decided: the page's own embed endpoint answers what
+    // its tags would not. `YouTube` serves a `<title>` of "- YouTube" and no
+    // picture to a crawler and a full answer here, and an art host describes
+    // the sharing card it drew in its tags and the work itself here.
+    if let Some(embed) = oembed::ask(fetcher, &page.url, &card.oembed).await {
+        adopt(&mut card, embed);
+    }
     let kind = classify::Kind::of(&page.url, &card);
     // A second fetch, of a second host, before the answer goes out: the card
     // is worth more with the picture on it, and the picture is only safe to
@@ -299,6 +307,35 @@ pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Previ
             .map(|mark| mark.mime.to_owned())
             .unwrap_or_default(),
         ..with_picture(picture.as_ref())
+    }
+}
+
+/// Take from an oEmbed answer whatever the page's own tags did not say.
+///
+/// Gap-filling rather than overriding, with one exception. The tags are what a
+/// publisher wrote *for* a card like this, so a title, a byline or a picture
+/// already there stays. `oembed_type` has no equivalent among them: it is the
+/// endpoint's answer to "what is this", published for embedders rather than
+/// for a share button, and it is the only statement of its kind that a site
+/// whose CMS calls every page an article still gets right.
+fn adopt(card: &mut parse::Card, embed: oembed::OEmbed) {
+    card.oembed_type = embed.kind;
+    // A title the page *declared* stays; the browser tab it fell back to does
+    // not. "- YouTube" is what that page's `<title>` says to anything without
+    // JavaScript, and the endpoint knows the video's actual name.
+    if (card.title.is_empty() || !card.title_declared) && !embed.title.is_empty() {
+        card.title = embed.title;
+    }
+    if card.author.is_empty() {
+        card.author = embed.author;
+    }
+    if card.site.is_empty() {
+        card.site = embed.provider;
+    }
+    if card.image.is_empty() {
+        card.image = embed.thumbnail;
+        card.image_width = embed.width;
+        card.image_height = embed.height;
     }
 }
 

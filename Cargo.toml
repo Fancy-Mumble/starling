@@ -188,6 +188,12 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "gif",
     "webp",
+    # For favicons, which are still `.ico` on half the web - and a site's own
+    # mark is the fastest thing on a preview card to read. The container is a
+    # wrapper around PNG and BMP, both of which are decoded under the same
+    # pixel and allocation caps as every other picture the server fetches.
+    "ico",
+    "bmp",
 ] }
 
 # -- data -------------------------------------------------------------------

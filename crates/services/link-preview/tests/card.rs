@@ -206,3 +206,94 @@ async fn a_link_that_is_neither_a_page_nor_a_picture_is_still_refused() {
     let fetcher = Fetcher::against_loopback(Limits::default());
     assert!(of_media(&fetcher, "r3", &base).await.is_none());
 }
+
+#[tokio::test]
+async fn a_page_that_withholds_its_metadata_is_asked_for_it_properly() {
+    // What YouTube actually serves a crawler: a `<title>` of "- YouTube", no
+    // picture, no byline - and a full answer at the oEmbed endpoint it
+    // advertises two lines further down the same head. Before this, that
+    // previewed as a card with a dash on it.
+    let base = serving(|path| {
+        if path.starts_with("/oembed") {
+            asset(
+                "application/json",
+                br#"{"type":"video","title":"UK Hardcore 1 Hour Mix #4",
+                     "author_name":"UberCrow","provider_name":"YouTube",
+                     "thumbnail_url":"/thumb.jpg","thumbnail_width":480,
+                     "thumbnail_height":360}"#
+                    .to_vec(),
+            )
+        } else if path == "/thumb.jpg" {
+            asset("image/jpeg", sized_jpeg(480, 360))
+        } else {
+            html(
+                r#"<head>
+                     <title>- YouTube</title>
+                     <link rel="alternate" type="application/json+oembed" href="/oembed?url=x">
+                   </head>"#,
+            )
+        }
+    })
+    .await;
+
+    let fetcher = Fetcher::against_loopback(Limits::default());
+    let page = fetcher.fetch(&base).await.expect("fetched");
+    let preview = of_page(&fetcher, "r4".to_owned(), page).await;
+
+    // The endpoint's answer to "what is this" outranks the page's own tags,
+    // and everything the tags left empty comes from it.
+    assert_eq!(preview.kind, preview::Kind::Video as i32);
+    assert_eq!(preview.title, "UK Hardcore 1 Hour Mix #4");
+    assert_eq!(preview.author, "UberCrow");
+    assert_eq!(preview.site, "YouTube");
+    // Including the picture, which is the whole difference between a card and
+    // a card worth looking at.
+    assert!(!preview.image.is_empty());
+    assert_eq!((preview.source_width, preview.source_height), (480, 360));
+}
+
+#[tokio::test]
+async fn a_page_that_named_its_own_picture_keeps_it() {
+    // Gap-filling, not overriding: the tags are what a publisher wrote *for*
+    // a card like this one, so a title and a picture already there stay.
+    let base = serving(|path| {
+        if path.starts_with("/oembed") {
+            asset(
+                "application/json",
+                br#"{"type":"photo","title":"From The Endpoint",
+                     "thumbnail_url":"/endpoint.jpg"}"#
+                    .to_vec(),
+            )
+        } else {
+            asset("image/jpeg", sized_jpeg(600, 400))
+        }
+    })
+    .await;
+    let base_for_page = base.clone();
+    let served = serving(move |path| {
+        if path == "/page" {
+            html(&format!(
+                r#"<head>
+                     <meta property="og:title" content="From The Tags">
+                     <meta property="og:image" content="{base_for_page}/own.jpg">
+                     <link rel="alternate" type="application/json+oembed" href="{base_for_page}/oembed">
+                   </head>"#
+            ))
+        } else {
+            status(404)
+        }
+    })
+    .await;
+
+    let fetcher = Fetcher::against_loopback(Limits::default());
+    let page = fetcher
+        .fetch(&format!("{served}/page"))
+        .await
+        .expect("fetched");
+    let preview = of_page(&fetcher, "r5".to_owned(), page).await;
+
+    assert_eq!(preview.title, "From The Tags");
+    // The kind still comes from the endpoint, because the tags have no answer
+    // to that question at all.
+    assert_eq!(preview.kind, preview::Kind::Image as i32);
+}
