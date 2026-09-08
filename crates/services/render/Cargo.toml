@@ -1,0 +1,43 @@
+[package]
+name = "starling-render"
+description = "the headless browser link-preview escalates to, behind an SSRF-guarded proxy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+# The deny list and the connect-to-the-address-you-checked step, shared with
+# every other outbound path rather than copied: the proxy in `proxy.rs` is that
+# guard wearing a different transport.
+starling-outbound.workspace = true
+
+futures-util.workspace = true
+serde_json.workspace = true
+# `process`: the browser is a child process this service owns the life of.
+tokio = { workspace = true, features = ["process"] }
+# The browser is driven over the DevTools protocol, which is JSON over a
+# WebSocket. A CDP crate would bring a browser-automation framework -- a
+# process supervisor, a DOM API, a screenshot pipeline -- for the four commands
+# this service sends. Already in the tree for live-doc's tests.
+tokio-tungstenite.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[features]
+# The loopback escape hatch, forwarded from `starling-outbound` for a test that
+# needs a server to proxy to. Never on a shipping edge; `scripts/check-crate-
+# layering.sh` fails the build if the binary ever links it.
+loopback = ["starling-outbound/loopback"]
+
+[dev-dependencies]
+# A server on loopback to point the proxy at: what the guard refuses is testable
+# without one, what it *forwards* is not. Dev-only, and checked to stay that
+# way by `scripts/check-crate-layering.sh`.
+starling-outbound = { workspace = true, features = ["loopback"] }
+
+[lints]
+workspace = true

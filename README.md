@@ -188,7 +188,7 @@ a TOML block.
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
 | **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config                                              | reject logins                         |
 | **core**      | voice, text, pchat, moderation                                                                                               | that feature is dead; the server runs |
-| **optional**  | screenshare, files, plugins, push, audit, onboarding, social, link-preview, context-actions, directory, health, operator-api | nobody notices                        |
+| **optional**  | screenshare, files, plugins, push, audit, onboarding, social, link-preview, gifs, context-actions, directory, health, operator-api | nobody notices                        |
 
 The gateway's own tier is `core`, which it never consults. A tier says what the
 gateway does while a service is unhealthy.

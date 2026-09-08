@@ -3662,6 +3662,7 @@ dependencies = [
  "starling-files",
  "starling-gate",
  "starling-gateway",
+ "starling-gifs",
  "starling-harness",
  "starling-health",
  "starling-link-preview",
@@ -3676,6 +3677,7 @@ dependencies = [
  "starling-proto",
  "starling-proto-fancy",
  "starling-push",
+ "starling-render",
  "starling-runtime",
  "starling-screenshare",
  "starling-server-config",
@@ -3822,6 +3824,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-gifs"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hmac",
+ "prost",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "starling-outbound",
+ "starling-proto-fancy",
+ "starling-runtime",
+ "subtle",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "starling-harness"
 version = "0.2.15"
 dependencies = [
@@ -3855,20 +3877,15 @@ dependencies = [
 name = "starling-link-preview"
 version = "0.2.1"
 dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
  "image",
  "prost",
- "rustls",
+ "serde_json",
+ "starling-outbound",
  "starling-proto-fancy",
  "starling-runtime",
  "tokio",
- "tokio-rustls",
  "tonic",
  "tracing",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3948,6 +3965,22 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "starling-outbound"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4059,6 +4092,21 @@ dependencies = [
  "tonic",
  "tracing",
  "webpki-roots",
+]
+
+[[package]]
+name = "starling-render"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "serde_json",
+ "starling-outbound",
+ "starling-proto-fancy",
+ "starling-runtime",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

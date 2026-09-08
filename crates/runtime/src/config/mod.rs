@@ -320,6 +320,19 @@ impl Config {
                 ..ServiceConfig::default()
             },
         );
+        // Not a `ServiceKind` (no client talks to it) but dialled, by
+        // `link-preview` when an operator puts `headless` on the preview
+        // ladder, so it needs a real endpoint. Optional in the strongest sense:
+        // it is inert until something asks it for a page, and a server whose
+        // ladder never reaches it never starts a browser at all.
+        let _ = config.services.insert(
+            "render".to_owned(),
+            ServiceConfig::new(
+                &crate::transport::local_endpoint(run_dir, "render"),
+                Tier::Optional,
+                &[],
+            ),
+        );
         // Not a `ServiceKind` either (no client talks to it) but unlike the
         // announcer it *is* dialled, by `operator-api` reading the aggregate,
         // so it needs a real endpoint. Optional: a server with no health
@@ -509,6 +522,12 @@ fn default_limit_name(kind: ServiceKind) -> Option<&'static str> {
         // signalling and tunnelled audio off it.
         ServiceKind::Permissions => Some("acl"),
         ServiceKind::Text => Some("chat"),
+        // A search box is a person typing, and a picker pages as they scroll.
+        // On the shared 1/s bucket, typing "cat" with a 250 ms debounce loses
+        // most of the keystrokes' worth of searches - and the *expensive*
+        // thing is not the frame anyway, it is the upstream call it may cause,
+        // which `gifs` bounds itself with a cache and two buckets of its own.
+        ServiceKind::Gifs => Some("gifs"),
         // Asking for a download URL is not a person typing: a client playing a
         // shared video asks once per signed URL it needs, and murmur's 1/s
         // dropped enough of those to stop the video partway through.

@@ -82,6 +82,11 @@ generated!(
     "starling.health.v1"
 );
 generated!(
+    /// A page as a browser sees it, for the links a plain fetch cannot read.
+    render,
+    "starling.render.v1"
+);
+generated!(
     /// The channel tree and membership.
     metadata,
     "starling.metadata.v1"
@@ -178,6 +183,11 @@ pub mod fancy {
         /// Outer type 1009.
         files,
         "starling.fancy.files.v1"
+    );
+    generated!(
+        /// Outer type 1018.
+        media,
+        "starling.fancy.media.v1"
     );
 }
 

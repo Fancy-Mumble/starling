@@ -39,6 +39,8 @@ pub fn spawn(
         "onboarding" => spawn::<starling_onboarding::OnboardingService>(ctx),
         "social" => spawn::<starling_social::SocialService>(ctx),
         "link-preview" => spawn::<starling_link_preview::LinkPreviewService>(ctx),
+        "render" => spawn::<starling_render::RenderService>(ctx),
+        "gifs" => spawn::<starling_gifs::GifsService>(ctx),
         "context-actions" => spawn::<starling_context_actions::ContextActionsService>(ctx),
         "directory" => spawn::<starling_directory::DirectoryService>(ctx),
         "operator-api" => spawn::<starling_operator_api::OperatorApi>(ctx),
@@ -70,6 +72,13 @@ pub fn names() -> &'static [&'static str] {
         "onboarding",
         "social",
         "link-preview",
+        // The browser `link-preview` escalates to. No wire type and no
+        // client: a viewer asks for a preview, and whether one took a
+        // browser is the server's business. Listed after the service that
+        // dials it, and inert until an operator puts `headless` on the
+        // preview ladder.
+        "render",
+        "gifs",
         "context-actions",
         // No wire type and no gRPC surface: nothing calls it, it calls out.
         "directory",

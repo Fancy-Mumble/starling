@@ -34,7 +34,7 @@ SERVICES=(
     starling-audit starling-context-actions starling-directory starling-files
     starling-health starling-link-preview starling-metadata starling-moderation
     starling-onboarding starling-pchat starling-permissions starling-plugins
-    starling-push starling-screenshare starling-server-config
+    starling-push starling-render starling-screenshare starling-server-config
     starling-session-lifecycle starling-session-view starling-social
     starling-text starling-userdata starling-voice
 )
@@ -106,7 +106,37 @@ for service in "${SERVICES[@]}"; do
     forbid "$service" "service" "$others"
 done
 
-# 5. Every workspace member inherits the workspace lint table.
+# 5. The loopback escape hatch never ships.
+#
+# `starling-outbound` refuses to connect to an address inside the deployment.
+# Its `loopback` feature switches that off so that a consumer's own tests can
+# fetch from a server on 127.0.0.1, and a `[dev-dependencies]` entry is the only
+# place it may be turned on: a dev edge is absent from the artifact, a normal
+# one is not.
+#
+# Resolved from **`starling`**, the binary every deployment runs, and not from
+# `starling-outbound` itself. That distinction is the whole check: features
+# unify across a graph, so the question "is loopback on" only has an answer
+# relative to a root, and asking it at the crate's own root always answers no -
+# which is a check that cannot fail. It was written that way first.
+#
+# `--edges normal` excludes dev edges, so link-preview's test-only entry is
+# invisible here, exactly as intended.
+if have starling && have starling-outbound; then
+    shipped=$(cargo tree -p starling --edges normal --prefix none --format '{p} {f}' 2>/dev/null \
+        | grep -F 'starling-outbound ' | sort -u || true)
+    if echo "$shipped" | grep -qw 'loopback'; then
+        echo "LAYERING VIOLATION: the starling binary links starling-outbound with \`loopback\` on." >&2
+        echo "    That disables the SSRF guard's address check in the shipped server." >&2
+        echo "    Move whichever dependency enables it into [dev-dependencies]:" >&2
+        cargo tree -p starling --edges normal --invert starling-outbound --prefix depth 2>/dev/null | sed 's/^/    /' >&2
+        status=1
+    else
+        echo "ok:   starling ships starling-outbound without the loopback escape hatch"
+    fi
+fi
+
+# 6. Every workspace member inherits the workspace lint table.
 #
 # Six plugin-host crates each hand-copied a subset of it, so a lint added to the
 # workspace silently missed all six -- and the crate with the thinnest table was

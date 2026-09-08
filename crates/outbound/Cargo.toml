@@ -1,0 +1,36 @@
+[package]
+name = "starling-outbound"
+description = "the SSRF-guarded HTTP client every service that calls out shares"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+# `client`: this crate exists to make outbound requests rather than answer them.
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+
+[features]
+# The loopback escape hatch, for a consumer whose own tests need a server.
+# **Never enable this on a shipping dependency edge**; a `[dev-dependencies]`
+# entry is the only legitimate one, and `scripts/check-crate-layering.sh` fails
+# the build if a normal edge turns it on. See `Fetcher::allow_private`.
+loopback = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Real JPEGs for the byte-cap and content-type tests: the point of those is
+# that the bytes survive the trip intact, which a fixture of zeroes cannot show.
+image.workspace = true
+
+[lints]
+workspace = true

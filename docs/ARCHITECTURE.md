@@ -210,7 +210,7 @@ login sequence and the audio budget as diagrams.
 |---|---|---|
 | **essential** | session-lifecycle, session-view, permissions, metadata, userdata, server-config | reject logins |
 | **core** | voice, text, pchat, moderation | that feature is dead; server runs |
-| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, context-actions, health, **directory**, **operator-api** | nobody notices |
+| **optional** | screenshare, files/http, plugins, push, audit, onboarding, social, link-preview, **render**, gifs, context-actions, health, **directory**, **operator-api** | nobody notices |
 
 ### The outward-facing plane is one service, and it is optional
 
@@ -508,7 +508,8 @@ crates/
     permissions/  metadata/  userdata/  server-config/
     voice/  text/  pchat/  moderation/
     screenshare/  files/  plugins/  push/  audit/
-    onboarding/  social/  link-preview/  context-actions/
+    onboarding/  social/  link-preview/  gifs/  context-actions/
+    render/           starling-render        a headless browser, no client, no wire type
     directory/        starling-directory     the public server list, outbound only
   operator-api/       starling-operator-api  REST + OpenAPI, pluggable auth
 ```

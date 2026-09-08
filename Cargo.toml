@@ -8,6 +8,8 @@ members = [
     "crates/proto/fancy",
     "crates/gate",
     "crates/crypto",
+    # The one HTTP client that talks to hosts we do not own, guard included.
+    "crates/outbound",
 
     # The media plane: one broadcaster in, N viewers out. Standalone, because
     # it owns its own runtime and sockets and knows nothing about the control
@@ -40,6 +42,11 @@ members = [
     "crates/services/social",
     "crates/services/health",
     "crates/services/link-preview",
+    # The browser the preview ladder escalates to, in its own crate so it can
+    # be its own container: it is the one component handed hostile input with a
+    # whole renderer to run it in.
+    "crates/services/render",
+    "crates/services/gifs",
     "crates/services/context-actions",
 
     # Outward-facing: what this server tells the world about itself.
@@ -84,6 +91,7 @@ starling-proto = { path = "crates/proto/classic" }
 starling-proto-fancy = { path = "crates/proto/fancy" }
 starling-gate = { path = "crates/gate" }
 starling-crypto = { path = "crates/crypto" }
+starling-outbound = { path = "crates/outbound" }
 starling-runtime = { path = "crates/runtime" }
 starling-sfu = { path = "crates/sfu" }
 starling-gateway = { path = "crates/gateway" }
@@ -106,6 +114,8 @@ starling-onboarding = { path = "crates/services/onboarding" }
 starling-social = { path = "crates/services/social" }
 starling-health = { path = "crates/services/health" }
 starling-link-preview = { path = "crates/services/link-preview" }
+starling-render = { path = "crates/services/render" }
+starling-gifs = { path = "crates/services/gifs" }
 starling-context-actions = { path = "crates/services/context-actions" }
 starling-directory = { path = "crates/services/directory" }
 starling-operator-api = { path = "crates/operator-api" }

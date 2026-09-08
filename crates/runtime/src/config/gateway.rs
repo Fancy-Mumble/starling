@@ -196,6 +196,24 @@ fn default_limits() -> BTreeMap<String, LimitConfig> {
         // Losing a message somebody typed is the worst failure in this table:
         // it is silent, it is attributed to nothing, and the sender believes
         // they were heard.
+        // GIF search. Interactive, like `acl` and `chat`: a debounced search
+        // box emits a few frames a second while somebody types, and a picker
+        // asks for the next page as they scroll.
+        //
+        // Deliberately not tight, because tightening it here would be guarding
+        // the wrong resource. This bounds *frames*; what actually costs the
+        // operator anything is a call to the provider, and most of these
+        // frames make none - the service answers them from its own cache. Its
+        // per-session and server-wide budgets are the limits that matter, and
+        // they sit in `[services.gifs]` where an operator setting a provider
+        // key will find them.
+        (
+            "gifs".to_owned(),
+            LimitConfig {
+                rate: Rate::per_second(4.0),
+                burst: 12,
+            },
+        ),
         (
             "chat".to_owned(),
             LimitConfig {

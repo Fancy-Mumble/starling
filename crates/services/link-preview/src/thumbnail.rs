@@ -33,6 +33,18 @@ pub struct Thumbnail {
     pub width: u32,
     /// The height of `bytes`, paired with [`Thumbnail::width`].
     pub height: u32,
+    /// The size of what was fetched, before the shrink.
+    ///
+    /// Read off the decoder rather than taken from the page's own
+    /// `og:image:width`, because the page is a stranger and the decoder is
+    /// the thing that actually looked. It is carried because the difference
+    /// between a 360x253 thumbnail and a 3000x2000 photograph is invisible
+    /// once both are inside the same box, and a client laying the card out
+    /// wants it: one may not be enlarged, the other may be cropped to a band.
+    pub source_width: u32,
+    /// The height of what was fetched, paired with
+    /// [`Thumbnail::source_width`].
+    pub source_height: u32,
 }
 
 /// JPEG quality for the re-encode.
@@ -84,7 +96,11 @@ pub fn shrink(bytes: &[u8], edge: u32, max_pixels: u32) -> Option<Thumbnail> {
     } else {
         decoded
     };
-    encode(&shrunk)
+    encode(&shrunk).map(|thumbnail| Thumbnail {
+        source_width: width,
+        source_height: height,
+        ..thumbnail
+    })
 }
 
 /// Re-encode, keeping transparency where there is any.
@@ -114,6 +130,10 @@ fn encode(image: &DynamicImage) -> Option<Thumbnail> {
         mime,
         width: image.width(),
         height: image.height(),
+        // Filled in by the caller, which is the only one that saw the
+        // original: by here the picture has already been shrunk.
+        source_width: 0,
+        source_height: 0,
     })
 }
 

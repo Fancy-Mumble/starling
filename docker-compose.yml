@@ -220,6 +220,52 @@ services:
     <<: *starling
     command: ["link-preview", "--config", "/etc/starling/starling.toml"]
 
+  # The headless browser `link-preview` escalates to for the sites that answer
+  # no HTTP client at all (idealo and the rest of the Akamai tier). Off unless
+  # asked for:
+  #
+  #   docker compose --profile render up -d
+  #
+  # ...and it does nothing until `preview_ladder` in starling.toml ends with
+  # `headless`. Its own image, because it is the only container that needs a
+  # browser: ~400 MB of chromium that no other service should carry.
+  #
+  # It is also the container to be strict with. It runs a renderer over pages
+  # strangers paste, which is the most attackable thing in this deployment, and
+  # it is separate precisely so that its crash is its own.
+  #
+  # Chrome's own sandbox needs kernel features Docker's default seccomp profile
+  # does not grant, and there are two ways out. The good one is to grant them,
+  # with Chromium's published seccomp profile:
+  #
+  #   security_opt:
+  #     - seccomp=/path/to/chrome.json
+  #
+  # The other is `browser_no_sandbox = "true"` under
+  # `[services.render.options]`, which runs the renderer unsandboxed: a page a
+  # stranger pasted and this container, with nothing in between. That is a
+  # deliberate decision to take with the container's isolation in mind, not a
+  # default to inherit -- which is why neither is set here.
+  render:
+    <<: *starling
+    profiles: ["render"]
+    image: ${STARLING_RENDER_IMAGE:-starling-render:local}
+    build:
+      context: .
+      dockerfile: deploy/render.Dockerfile
+      args:
+        STARLING_IMAGE: ${STARLING_IMAGE:-starling:local}
+    command: ["render", "--config", "/etc/starling/starling.toml"]
+
+  # GIF search. Runs with no provider key by default, in which case every search
+  # is refused as "unavailable" and a Fancy client falls back to a key of its
+  # own. The key is an `options` entry, which the environment mapping does not
+  # reach, so it goes in starling.toml as `gif_api_key` under
+  # [services.gifs.options]; see examples/reference.toml for the rest.
+  gifs:
+    <<: *starling
+    command: ["gifs", "--config", "/etc/starling/starling.toml"]
+
   context-actions:
     <<: *starling
     command: ["context-actions", "--config", "/etc/starling/starling.toml"]
@@ -370,6 +416,13 @@ services:
       STARLING_SERVICES_ONBOARDING_ENDPOINT: inproc:onboarding
       STARLING_SERVICES_SOCIAL_ENDPOINT: inproc:social
       STARLING_SERVICES_LINK_PREVIEW_ENDPOINT: inproc:link-preview
+      # Required even though this image has no browser in it: a service binds
+      # its own endpoint in every mode, so without this the all-in-one process
+      # tries to bind `http://render:50051` -- a container that is not running
+      # -- and dies before it serves anything. The service itself is inert
+      # until something asks it for a page.
+      STARLING_SERVICES_RENDER_ENDPOINT: inproc:render
+      STARLING_SERVICES_GIFS_ENDPOINT: inproc:gifs
       STARLING_SERVICES_CONTEXT_ACTIONS_ENDPOINT: inproc:context-actions
       STARLING_SERVICES_HEALTH_ENDPOINT: inproc:health
       STARLING_SERVICES_GATEWAY_ENDPOINT: inproc:gateway

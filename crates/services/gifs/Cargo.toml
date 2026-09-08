@@ -1,0 +1,39 @@
+[package]
+name = "starling-gifs"
+description = "GIF search against a provider the operator keys, rate-limited and cached"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+# The SSRF-guarded client, shared with `link-preview` rather than copied: one
+# deny list of private ranges, not two.
+starling-outbound.workspace = true
+
+prost.workspace = true
+# The provider's answer. Read field by field rather than deserialised into a
+# struct, so a provider that adds or reorders keys does not stop the picker.
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+# The media proxy's listener and its signed URLs. Only reached when
+# `gif_proxy_media` is on, but linked either way: a cargo feature here would be
+# one more build that only some deployments exercise.
+axum.workspace = true
+hmac.workspace = true
+rand.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -91,6 +91,8 @@ starling-onboarding.workspace = true
 starling-social.workspace = true
 starling-health.workspace = true
 starling-link-preview.workspace = true
+starling-render.workspace = true
+starling-gifs.workspace = true
 starling-context-actions.workspace = true
 starling-directory.workspace = true
 

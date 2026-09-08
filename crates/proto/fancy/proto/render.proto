@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+// A page as a *browser* sees it, for the links a plain fetch cannot read.
+//
+// `link-preview` fetches with an HTTP client, which is right for the web as it
+// is published and wrong for the part of it that is defended: a bot-management
+// service scores the TLS handshake and the header set, not the user-agent, so
+// a page behind one answers any HTTP client with 403 and a browser with the
+// document. Some sites also put their metadata behind script, which no fetch
+// of the HTML can execute.
+//
+// This is the last rung of that ladder and its own service for two reasons.
+// It carries a browser: a process tree, a profile directory and a few hundred
+// megabytes of memory that a server previewing nothing should not be paying
+// for, and it runs a renderer over bytes a stranger chose, which is the one
+// thing in this deployment worth putting in its own container with its own
+// limits. Split it out and `link-preview` dials it; leave it in `--all-in-one`
+// and the call never leaves the process.
+package starling.render.v1;
+
+// Served by the `render` service alone. No client speaks this: a viewer asks
+// for a preview, and whether one took a browser is the server's business.
+service Render {
+  rpc Fetch(FetchRequest) returns (FetchReply);
+}
+
+message FetchRequest {
+  // The page to render. Vetted here as well as by the caller: this service is
+  // dialable in a split deployment, and a guard that trusts its caller is a
+  // guard that holds only while the caller is the one you expected.
+  string url = 1;
+  // How long the whole render may take. Zero means the service's own default;
+  // a caller asking for longer than the operator allows gets the operator's
+  // number.
+  uint32 timeout_ms = 2;
+}
+
+message FetchReply {
+  // Where the render ended up, after redirects the browser followed itself.
+  string final_url = 1;
+  // The DOM as it stood when the render finished -- **after** script ran,
+  // which is the whole reason a browser was spent on it.
+  string html = 2;
+  // The main document's HTTP status, or 0 when the browser never reported one.
+  // A 403 that renders is still a 403, and a caller that cannot see the status
+  // would cache the block page as the answer.
+  uint32 status = 3;
+  // Empty on success. Set when there is no browser, when the render timed out,
+  // or when the guard refused the address -- and the caller turns it into the
+  // same "no preview" every other failure produces.
+  string error = 4;
+}

@@ -10,24 +10,26 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+# The SSRF-guarded client and its deny list. Shared with `gifs` rather than
+# copied into it, so there is one list of private ranges and not two.
+starling-outbound.workspace = true
 
-bytes.workspace = true
-# `client`, like `directory`: this is the second crate that makes an outbound
-# request rather than answering one, and it makes it to a host a stranger named.
-hyper = { workspace = true, features = ["client"] }
-hyper-util.workspace = true
-http-body-util.workspace = true
 image.workspace = true
 prost.workspace = true
-rustls.workspace = true
+# For the `JSON-LD` a page publishes about itself - see `structured`. A
+# hand-rolled reader over a document a stranger chose is what the HTML scanner
+# in `parse` exists to avoid, and JSON has a parser worth using.
+serde_json.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tonic.workspace = true
 tracing.workspace = true
-webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# A card is composed from two fetches, and testing that composition needs a
+# server to fetch from. Dev-only, and checked to stay that way: see the
+# `loopback` feature in `starling-outbound`.
+starling-outbound = { workspace = true, features = ["loopback"] }
 
 [lints]
 workspace = true

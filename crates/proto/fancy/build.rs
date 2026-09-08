@@ -25,6 +25,7 @@ const SERVICES: &[&str] = &[
     "plugins.proto",
     "contextactions.proto",
     "health.proto",
+    "render.proto",
 ];
 
 /// Contracts that carry only shared primitives, imported by the files below.
@@ -50,6 +51,7 @@ const ENVELOPES: &[&str] = &[
     "fancy/social.proto",
     "fancy/screenshare.proto",
     "fancy/files.proto",
+    "fancy/media.proto",
 ];
 
 fn main() -> Result<()> {

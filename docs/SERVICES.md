@@ -55,6 +55,7 @@ means logins are refused rather than served on a guess.
 | `social` | optional | **1015** | *client plane only* | — | — |
 | `link-preview` | optional | **1016** | *client plane only* | — | — |
 | `context-actions` | optional | 16, 17, **1017** | `ContextActions` | — | — |
+| `gifs` | optional | **1018** | *client plane only* | — | — |
 | `health` | optional | *none* | `HealthOverview` | — | every service, by poll |
 | `directory` | optional | *none* | *none at all* | — | metadata · server-config · session-view |
 
@@ -495,22 +496,111 @@ for once per viewer on the same connection as the conversation. The decode is
 gated on the *header's* dimensions rather than the file's size, since a small
 file can describe an enormous pixel buffer.
 
-**The fetch announces itself as Discord's crawler**, which is worth stating
-plainly because it is not true. The large sites publish `OpenGraph` metadata to
-an allow-list of *named* crawlers and to nobody else: Reddit answers
-`Discordbot`, `facebookexternalhit` and `Slackbot-LinkExpanding` with a full set
-of tags, and answers an honest `Starling/0.2` — or a browser string, or anything
-merely containing "bot" — with an eight-kilobyte script shell titled "Reddit".
-YouTube serves `og:title` in its first two kilobytes to a known crawler and
-buries it behind 690 KiB of script otherwise. The choice is between a preview
-service that does not work on the sites people paste and a header that is not
-strictly true; `preview_user_agent` is how an operator makes the other choice.
+**The fetch climbs a ladder, and asks honestly first.** There is no one way to
+fetch a page any more: what a site returns depends on what the fetch calls
+itself and what its TLS handshake looks like, and the answers differ enough that
+the choice cannot be made once and written into a constant. So there are four
+rungs, cheapest and most honest first, and each is tried only when the one below
+it produced nothing worth showing:
+
+| rung | what it is | measured 2026-09-08 |
+|---|---|---|
+| `honest` | this server, by name | most of the web, YouTube and tagesschau included |
+| `crawler` | Discord's crawler | the only rung Reddit gives a card to |
+| `browser` | a browser's user-agent on a client that is not one | sites that read the string and not the handshake |
+| `headless` | a real browser, in `render` | the only rung idealo (Akamai) gives anything to |
+
+Reddit is the case that shapes it. An honest fetch of a thread gets a 200 with
+an eight-kilobyte script shell whose whole head is `<title>Reddit</title>`;
+`Discordbot` gets the full card; and a *browser* user-agent gets the shell
+again. So a rung cannot be judged by whether the fetch succeeded — the shell is
+a 200 — but by whether the card is worth showing: a title **and** a description
+or a picture. Judging it any other way stops the ladder one rung below the card
+on every Reddit link there is.
+
+**Which rung a host needed is remembered, and the memory expires.** Walking four
+rungs on every paste of the same host is three wasted requests, so the rung that
+worked is used first next time. It is trusted for six hours and then the cheap
+rungs are tried again, which is the only way a host can ever come back down: a
+site that drops its bot wall would otherwise be fetched with a browser for the
+life of the process because of one bad afternoon. A host where nothing worked is
+remembered too, for fifteen minutes, so a channel full of one dead host costs one
+fetch per message instead of the whole ladder with a browser on the end of it.
+
+The dishonest rungs are still dishonest, and that is the trade being made
+deliberately rather than by default: the previous behaviour announced Discord's
+crawler on *every* request, which is a lie told to the whole web so that a few
+sites answer. `preview_ladder` is how an operator sets the price — `"honest"`
+alone is a server that tells the truth and previews less.
 
 ### `context-actions` — the menu entries a plugin adds, and the triggers back
 
 The server never learns what an action does. Each entry carries the plugin's own
 identifier, so a trigger routes back to the plugin that registered it without
 anything here understanding the feature.
+
+### `gifs` — one provider key for the server, not one per person
+
+The client used to hold a GIF provider's API key itself, typed into Advanced
+settings. That is a feature which works for whoever went and registered for a
+key and simply does not exist for everybody else, which on a chat server is
+almost everybody. One key, held once by the operator, is the point.
+
+It moves the *query* as well. A search box in a chat client is a stream of
+things people typed, and it now reaches the provider from one address with no
+per-person session attached rather than from each member's own machine.
+
+Discord made the same move and stopped halfway, which is worth stating because
+it is the obvious design and it is half a design: its client calls Discord's own
+`/gifs/*` rather than the provider's, but its picker still loads every thumbnail
+straight from the provider's CDN — handing that CDN each viewer's address and a
+`referer` naming the channel they are in. `gif_proxy_media` is the other half,
+off by default because it costs the deployment real bandwidth: a picker draws
+two dozen thumbnails a page and scrolls. Signal proxies everything; Teams
+proxies nothing.
+
+**The provider is the only one this build can talk to, and that is a supply
+decision rather than a preference.** Google decommissions the Tenor API on
+2026-06-30 and stopped issuing keys in January, so Klipy is what an operator can
+obtain a key for — and it is where Discord's picker went, for the same reason.
+
+#### What stops one search box costing the operator their quota
+
+The key is metered and shared by everyone on the server, so the limits count
+**upstream calls**, not requests. That distinction is the whole design: a limit
+on frames would be guarding the cheap thing.
+
+| Layer | Stops |
+|---|---|
+| the gateway's `gifs` bucket | one connection asking too often — ordinary route limiting, 4/s burst 12 |
+| the cache | a repeat costing anything at all; every picker opens on the same trending page |
+| coalescing | twenty people opening that picker in one second on a *cold* cache, where the cache cannot help because nothing has returned yet |
+| the per-session bucket | one person burning the key |
+| the server-wide bucket | a crowd burning it, each of them inside their own limit |
+
+**A cache hit is charged nothing.** Charging it would make opening the picker
+cost quota that no provider was ever asked for, and the frame it arrived in was
+already charged at the gateway. The two buckets are charged *together or not at
+all* — tried on copies and committed only when both say yes — because a token
+spent on a call the other bucket then refuses is a token nobody got any GIFs
+for, and if it is the shared one it was taken from everybody else.
+
+The refusal a client is told apart from the others is `UNAVAILABLE`, and only
+it: that means *this server does not do this*, and is the one case where a
+client falling back to a key of its own is right. Falling back on `THROTTLED`
+would route around the rate limit using the user's quota, which is the abuse the
+limit exists to stop.
+
+#### Why the media proxy is not an open proxy
+
+A URL naming a host to fetch, served by a public endpoint, is an open proxy
+unless something stops it. Three independent things do: an HMAC over
+`(url, expiry)` that only this process can mint, so the only fetchable URLs are
+ones the server itself put in a `GifPage`; an allow-list of the provider's own
+domains, matched on whole labels so `evilklipy.com` does not pass as
+`klipy.com`, which is what holds if the signing key ever leaks; and the same
+SSRF guard the search path uses, on the URL, on the resolved address, and again
+on every redirect hop.
 
 ## 6.4 Internal — nothing on the wire reaches these
 
@@ -519,6 +609,56 @@ anything here understanding the feature.
 Covered in §2.5. No wire type, no `ServiceKind`, no client. It is dialled, by
 `operator-api` reading the aggregate, so it needs a real endpoint. Optional: a
 server with no health collector is a poorer deployment, not a broken one.
+
+### `render` — the browser the preview ladder escalates to
+
+The last rung of the ladder above, and its own service. **No wire type, no
+client**: a viewer asks for a preview, and whether one took a browser is the
+server's business. `link-preview` dials it, and only when an operator has put
+`headless` on the ladder.
+
+**Why it is not part of `link-preview`.** It carries a browser — a process tree,
+a profile directory and a few hundred megabytes — which a server previewing
+nothing should not pay for, and it runs a renderer over bytes a stranger chose,
+which is the most attackable thing this deployment does. Split out, that is one
+container with its own seccomp profile and its own memory limit, and its crash
+is not the server's. In `--all-in-one` the call never leaves the process; the
+resolver decides, and neither side knows which.
+
+**The guard is a proxy, because it cannot be a check on the URL.** A browser
+resolves its own names and opens its own sockets, and a page is not one request:
+it is a document and then whatever that document asks for, each a name the guard
+never saw. So the browser is started with `--proxy-server` pointing at a loopback
+listener this service owns and `--proxy-bypass-list=<-loopback>` so that not even
+`localhost` escapes it. Chrome hands a proxy the *unresolved name*, so every hop
+of every render — document, redirect, script, tracker — is vetted, resolved to a
+public address and connected to **that address**, through the same
+`starling-outbound` guard the fetch path uses. `CONNECT` splices bytes, so TLS
+stays end to end: the handshake the far end fingerprints is the browser's, which
+is the entire reason a browser was spent.
+
+**What it took to actually work**, all of it measured rather than assumed:
+
+* headless Edge announces `HeadlessChrome/152.0.0.0`, and idealo answers that
+  with the same 403 it gives an HTTP client — a whole browser spent to be
+  refused by a substring. The browser's own user-agent is asked for over CDP and
+  the untrue token removed, keeping the version, which must match the handshake
+  that carries it.
+* the load event is not the end of a render. idealo's first answer is a 2.6 KB
+  script that runs, decides, and navigates to the real page; a render that read
+  the DOM at `load` captured an interstitial with no metadata at all.
+* an ad-heavy page runs a dozen iframes firing the same lifecycle events as the
+  document. Taking those at face value reset the "loaded" state every few
+  hundred milliseconds, and every render cost its whole deadline: 17.5s for
+  idealo, against 2.6s once frame events are filtered to the main frame.
+
+**The browser is rate-limited per person, not per frame.** The gateway's bucket
+counts frames, and a frame costs a browser render or nothing at all depending on
+a host's bot wall — the wrong unit. So the headless rung has two buckets of its
+own: one per session, so one person pasting forty links from a defended site
+cannot hold the browser for everybody else, and one server-wide, so twenty people
+each inside their own limit cannot do it between them. Both are charged or
+neither is, and a refusal says how long to wait.
 
 ### `directory` — what this server tells the outside world about itself
 

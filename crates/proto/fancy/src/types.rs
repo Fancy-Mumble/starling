@@ -45,9 +45,10 @@ pub const FANCY_PROTOCOL_EPOCH: u32 = 1;
 /// **Not a service, and deliberately far from where they are allocated.** This
 /// is a property of the connection rather than a destination on it: the gateway
 /// writes it and a client unwraps it, and what comes out is ordinary frames
-/// that route as they always did. Numbering it 1018 (the next service slot)
-/// would have made it look like the eighteenth service to every reader of this
-/// table and to every capture.
+/// that route as they always did. Numbering it at the next free service slot
+/// would have made it look like one more service to every reader of this table
+/// and to every capture. That slot was 1018 when this was written; `gifs` has
+/// it now, which is the outcome the gap was left for.
 ///
 /// The payload is one or more whole frames, `type ‖ len ‖ payload` each, zstd
 /// compressed. Only ever sent to a peer that announced `zstd` in its `Hello`,
@@ -99,6 +100,8 @@ pub enum ServiceKind {
     LinkPreview,
     /// 1017, plugin-defined menu entries.
     ContextActions,
+    /// 1018, animated-media search against a provider the operator keys.
+    Gifs,
 }
 
 impl ServiceKind {
@@ -128,6 +131,7 @@ impl ServiceKind {
             Self::Social => 15,
             Self::LinkPreview => 16,
             Self::ContextActions => 17,
+            Self::Gifs => 18,
         }
     }
 
@@ -153,6 +157,7 @@ impl ServiceKind {
             Self::Social => "social",
             Self::LinkPreview => "link-preview",
             Self::ContextActions => "context-actions",
+            Self::Gifs => "gifs",
         }
     }
 
@@ -178,6 +183,7 @@ impl ServiceKind {
             Self::Social,
             Self::LinkPreview,
             Self::ContextActions,
+            Self::Gifs,
         ]
     }
 

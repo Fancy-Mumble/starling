@@ -39,12 +39,18 @@ use tokio_rustls::TlsConnector;
 
 use crate::{Refusal, is_private_addr, vet};
 
-/// What the fetcher calls itself.
+/// Discord's crawler, which is not what this is.
 ///
-/// Discord's crawler, deliberately: Reddit and `YouTube` serve `OpenGraph` tags
-/// to an allow-list of named crawlers and bury them behind script for anyone
-/// else, so an honest `Starling/0.2` gets nothing. Fuck monopolies. The
-/// operator settles it - `preview_user_agent` overrides this default.
+/// Reddit and `YouTube` serve `OpenGraph` tags to an allow-list of named
+/// crawlers and bury them behind script for anyone else, so an honest
+/// `StarlingBot` gets a script shell titled "Reddit" and nothing more. Fuck
+/// monopolies.
+///
+/// **No longer what every fetch says.** `link-preview` asks honestly first and
+/// only comes here when that produced nothing worth showing - see its `ladder`
+/// module, where this is the second of four rungs. A caller with no ladder of
+/// its own still gets this string, because a fetcher that announced nothing
+/// would be refused outright by a good share of the web.
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)";
 
@@ -73,6 +79,12 @@ pub struct Limits {
     /// The most pixels the server will decode, checked against the header
     /// before any pixel buffer is allocated.
     pub image_pixels: u32,
+    /// How much of an API answer is read.
+    ///
+    /// A refusal threshold rather than a truncation point, like
+    /// [`Limits::image_bytes`] and for the same reason: a JSON document cut off
+    /// at the cap does not parse, so reading past it buys nothing.
+    pub json_bytes: usize,
 }
 
 impl Default for Limits {
@@ -103,6 +115,11 @@ impl Default for Limits {
             // 40 megapixels: larger than any photograph a page puts in an
             // `og:image`, and far below what a decompression bomb asks for.
             image_pixels: 40_000_000,
+            // A page of search results with a few dozen entries, each a handful
+            // of URLs and a title. Klipy's 24-item page is around 60 KiB, so
+            // this is roughly sixteen times the answer we expect and still far
+            // too small to be a memory-exhaustion primitive.
+            json_bytes: 1024 * 1024,
         }
     }
 }
@@ -187,6 +204,17 @@ pub struct Image {
     pub bytes: Vec<u8>,
 }
 
+/// An API answer, whole: a document that hit the byte cap is refused rather
+/// than handed on, because half a JSON object does not parse and a caller given
+/// one can only report a failure it cannot explain.
+#[derive(Debug, Clone)]
+pub struct Json {
+    /// Where it ended up.
+    pub url: String,
+    /// The document, entire.
+    pub bytes: Vec<u8>,
+}
+
 /// What a fetch expects back, which settles both what it asks for and what it
 /// will accept.
 ///
@@ -197,6 +225,9 @@ pub struct Image {
 enum Want {
     Page,
     Image,
+    /// An API answer. Bounded like an image rather than like a page - see
+    /// [`Want::stop_at`] and the overrun rule in [`Fetcher::once`].
+    Json,
 }
 
 impl Want {
@@ -206,6 +237,7 @@ impl Want {
         match self {
             Self::Page => "text/html,application/xhtml+xml",
             Self::Image => "image/*",
+            Self::Json => "application/json",
         }
     }
 
@@ -218,8 +250,20 @@ impl Want {
     const fn stop_at(self) -> Option<&'static [u8]> {
         match self {
             Self::Page => Some(b"</head"),
-            Self::Image => None,
+            // Neither is read for a marker near the front: an image is wanted
+            // whole, and half a JSON document does not parse.
+            Self::Image | Self::Json => None,
         }
+    }
+
+    /// Whether a body that hit the cap is refused rather than truncated.
+    ///
+    /// A page is read for its head, so a body cut off at the cap still previews
+    /// and truncation is the *answer*. An image and a JSON document are only
+    /// useful entire: half a JPEG is not half a picture and half an object does
+    /// not parse, so for those the cap is a refusal threshold.
+    const fn is_whole(self) -> bool {
+        matches!(self, Self::Image | Self::Json)
     }
 
     /// Whether a `content-type` is the kind this fetch was for.
@@ -231,6 +275,10 @@ impl Want {
             // is a document with scripts and external references in it, and
             // the decoder cannot read one anyway.
             Self::Image => kind.starts_with("image/") && !kind.starts_with("image/svg"),
+            // `text/json` is not the registered type but is what a fair number
+            // of APIs send, and refusing it would fail on the answer rather
+            // than on anything that matters.
+            Self::Json => kind.starts_with("application/json") || kind.starts_with("text/json"),
         }
     }
 }
@@ -246,12 +294,22 @@ pub struct Fetcher {
     agent: Arc<str>,
     /// Test-only: connect to loopback anyway.
     ///
-    /// `cfg(test)`, so it is not a configuration knob and no operator can
-    /// switch the guard off by accident. The HTTP exchange itself (statuses,
+    /// Not a configuration knob: no key reaches it, so no operator can switch
+    /// the guard off by accident. The HTTP exchange itself (statuses,
     /// redirects, the byte cap, the content-type refusal) is the part of this
     /// file that runs against a stranger's server, and it cannot be exercised
     /// at all without a server, and a test server is on loopback.
-    #[cfg(test)]
+    ///
+    /// `cfg(test)` alone was enough while the only tests that needed it lived
+    /// in this file. They no longer do - `link-preview` composes a card out of
+    /// two fetches and tests that composition - and a `cfg(test)` item is
+    /// invisible to another crate. Hence the `loopback` feature, which exists
+    /// **only** to be switched on from a `[dev-dependencies]` entry.
+    ///
+    /// That is a weaker guarantee than an absence, so it is checked rather
+    /// than trusted: `scripts/check-crate-layering.sh` fails if any crate
+    /// enables `loopback` on a shipping edge.
+    #[cfg(any(test, feature = "loopback"))]
     allow_private: bool,
 }
 
@@ -290,7 +348,7 @@ impl Fetcher {
             limits,
             permits: Arc::new(Semaphore::new(limits.concurrency)),
             agent: Arc::from(DEFAULT_USER_AGENT),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "loopback"))]
             allow_private: false,
         }
     }
@@ -316,8 +374,12 @@ impl Fetcher {
     }
 
     /// The same fetcher, willing to talk to loopback. Tests only.
-    #[cfg(test)]
-    pub(crate) fn against_loopback(limits: Limits) -> Self {
+    ///
+    /// Reachable from another crate only when that crate turns the `loopback`
+    /// feature on, which nothing that ships may do.
+    #[cfg(any(test, feature = "loopback"))]
+    #[must_use]
+    pub fn against_loopback(limits: Limits) -> Self {
         Self {
             allow_private: true,
             ..Self::new(limits)
@@ -367,6 +429,31 @@ impl Fetcher {
         })
     }
 
+    /// Fetch an API answer, whole.
+    ///
+    /// Its own entry point for the reason [`Self::fetch_image`] is: it asks for
+    /// a different content type, it is bounded by a different cap, and a body
+    /// that overruns that cap is a refusal here rather than a truncation.
+    ///
+    /// The guard applies exactly as it does to the other two. A provider
+    /// endpoint is operator-configured rather than named by a stranger, which
+    /// makes it a far smaller SSRF surface - but "far smaller" is not "none": an
+    /// operator can misconfigure one, and the redirect a provider serves is
+    /// written by the provider and re-vetted on every hop like any other.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError`], including [`FetchError::TooLarge`] for a document past
+    /// the cap and [`FetchError::NotHtml`] for an answer that is not JSON at
+    /// all - which is what a provider's HTML error page looks like from here.
+    pub async fn fetch_json(&self, url: &str) -> Result<Json, FetchError> {
+        let body = self.bounded(url, Want::Json).await?;
+        Ok(Json {
+            url: body.url,
+            bytes: body.bytes,
+        })
+    }
+
     /// One fetch, inside the permit and the timeout that bound every fetch.
     ///
     /// The permit is taken before the timeout starts, and released when this
@@ -374,9 +461,30 @@ impl Fetcher {
     /// the timeout would fail in a way that depends on the server's load rather
     /// than on the link.
     async fn bounded(&self, url: &str, want: Want) -> Result<Body, FetchError> {
-        let Ok(_permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+        // Queued, not refused on the spot. `try_acquire` was measured doing
+        // real damage: nine links in one screenful of chat, eight permits, and
+        // the ninth fetch refused in **0 ms** with "too many previews at once"
+        // - which the client renders as no card at all, never retries, and
+        // which lands on a different link every time. It reads as "previews
+        // work for some sites and not others" and is nothing of the kind.
+        //
+        // Waiting up to the fetch timeout for a permit costs a link nothing it
+        // was not already prepared to wait: a preview that takes five seconds
+        // because the queue was full is a preview, and an instant refusal is
+        // not. `Busy` survives for the case it actually describes - a server
+        // whose outbound capacity is full for longer than a whole fetch.
+        let Ok(Ok(_permit)) = tokio::time::timeout(
+            self.limits.timeout,
+            Arc::clone(&self.permits).acquire_owned(),
+        )
+        .await
+        else {
             return Err(FetchError::Busy);
         };
+        // The timeout starts once the permit is held, deliberately: a request
+        // that waited for a permit and then got a fraction of its budget would
+        // fail according to the server's load rather than according to the
+        // link.
         tokio::time::timeout(self.limits.timeout, self.follow(url, want))
             .await
             .unwrap_or(Err(FetchError::TimedOut))
@@ -473,16 +581,16 @@ impl Fetcher {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok());
-        if want == Want::Image && declared.is_some_and(|length| length > cap) {
+        if want.is_whole() && declared.is_some_and(|length| length > cap) {
             return Err(FetchError::TooLarge);
         }
 
-        // An image reads one byte past its cap, so that ending exactly on the
-        // cap is distinguishable from overrunning it, and an overrun is
-        // refused rather than decoded. A page keeps its cap exactly, because
-        // for a page the cap *is* the answer: it truncates and previews
+        // A body wanted whole reads one byte past its cap, so that ending
+        // exactly on the cap is distinguishable from overrunning it, and an
+        // overrun is refused rather than decoded. A page keeps its cap exactly,
+        // because for a page the cap *is* the answer: it truncates and previews
         // anyway.
-        let overrun = usize::from(want == Want::Image);
+        let overrun = usize::from(want.is_whole());
         let bytes = self
             .read_capped(response.into_body(), cap + overrun, want.stop_at())
             .await;
@@ -501,6 +609,7 @@ impl Fetcher {
         match want {
             Want::Page => self.limits.bytes,
             Want::Image => self.limits.image_bytes,
+            Want::Json => self.limits.json_bytes,
         }
     }
 
@@ -580,20 +689,20 @@ impl Fetcher {
     /// Whether this fetcher will talk to an address inside the deployment.
     ///
     /// Always false outside tests, and the compiler is what enforces it: the
-    /// field it reads only exists under `cfg(test)`.
-    pub(crate) const fn private_is_allowed(&self) -> bool {
-        #[cfg(test)]
+    /// field it reads only exists under `cfg(any(test, feature = "loopback"))`.
+    pub const fn private_is_allowed(&self) -> bool {
+        #[cfg(any(test, feature = "loopback"))]
         {
             self.allow_private
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "loopback")))]
         {
             false
         }
     }
 
     /// The address to connect to, having refused the ones inside.
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "loopback")))]
     async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, FetchError> {
         resolve_public(host, port).await
     }
@@ -601,7 +710,7 @@ impl Fetcher {
     /// The same, with the test-only escape hatch. There is no build in which
     /// both of these exist, so the release binary has no path to `resolve_any`
     /// at all, not a flag that defaults to off, an absence.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "loopback"))]
     async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, FetchError> {
         if self.allow_private {
             resolve_any(host, port).await
@@ -681,7 +790,7 @@ fn split(url: &str) -> Result<(bool, String, u16, String), Refusal> {
 }
 
 /// Resolve `host` to any address at all. Tests only, see `allow_private`.
-#[cfg(test)]
+#[cfg(any(test, feature = "loopback"))]
 async fn resolve_any(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
     tokio::net::lookup_host((host, port))
         .await
@@ -708,13 +817,52 @@ async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, FetchError>
         .ok_or(FetchError::ResolvesInside)
 }
 
+/// Connect to `host:port`, having refused every address inside the deployment.
+///
+/// The same guard as [`Fetcher`], for a caller whose transport is not this
+/// crate's HTTP client. `render` fronts its browser with a `CONNECT` proxy so
+/// that the browser resolves nothing and connects to nothing on its own, and
+/// that proxy needs precisely the step that cannot be done by reading a URL:
+/// resolve the name, drop the addresses that are inside, and **connect to the
+/// address that was checked** rather than to the name.
+///
+/// Exported rather than reimplemented there for the reason this crate exists
+/// at all: a second copy of the deny list is a second list to keep in step.
+///
+/// # Errors
+///
+/// [`FetchError::Unresolvable`] when the name says nothing,
+/// [`FetchError::ResolvesInside`] when every answer is inside the deployment,
+/// and [`FetchError::Unreachable`] when the address will not take a socket.
+pub async fn connect_public(host: &str, port: u16) -> Result<TcpStream, FetchError> {
+    let address = resolve_public(host, port).await?;
+    TcpStream::connect(address)
+        .await
+        .map_err(|_| FetchError::Unreachable)
+}
+
+/// The same, willing to talk to loopback. Tests only, and gated exactly as
+/// [`Fetcher::against_loopback`] is: a test proxy needs a test server, and a
+/// test server is on loopback.
+///
+/// # Errors
+///
+/// [`FetchError`], as [`connect_public`].
+#[cfg(any(test, feature = "loopback"))]
+pub async fn connect_any(host: &str, port: u16) -> Result<TcpStream, FetchError> {
+    let address = resolve_any(host, port).await?;
+    TcpStream::connect(address)
+        .await
+        .map_err(|_| FetchError::Unreachable)
+}
+
 /// Resolve `location` against the URL it came from.
 ///
 /// Only the two forms that matter: an absolute URL, and an absolute path.
 /// A relative path is joined onto the parent directory, which is the last case
 /// worth handling; anything stranger will fail `vet` on the next hop, which is
 /// the right outcome for a redirect nobody can read.
-pub(crate) fn join(base: &str, location: &str) -> String {
+pub fn join(base: &str, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         return location.to_owned();
     }
@@ -845,70 +993,31 @@ mod exchange {
     //! pipeline is stubbed: real sockets, real HTTP/1.1, real redirects.
 
     use super::*;
+    use crate::testing::{asset, html, redirect, serving, serving_requests};
     use http_body_util::Full;
-    use hyper::service::service_fn;
-    use hyper::{Response, body::Incoming};
-    use std::convert::Infallible;
+    use hyper::Response;
 
-    /// Serve `answer` for each request, and hand back the URL to fetch.
+    /// The `<title>` of a fetched page.
     ///
-    /// The port is whatever the OS gives us, because a fixed one makes the
-    /// suite fail whenever a developer happens to be running something on it.
-    async fn serving<F>(answer: F) -> String
-    where
-        F: Fn(&str) -> Response<Full<Bytes>> + Send + Sync + Clone + 'static,
-    {
-        serving_requests(move |request| answer(request.uri().path())).await
-    }
-
-    /// The same, for a test that cares what the *request* said rather than
-    /// only where it was aimed.
-    async fn serving_requests<F>(answer: F) -> String
-    where
-        F: Fn(&Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync + Clone + 'static,
-    {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let port = listener.local_addr().expect("bound").port();
-        drop(tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                drop(tokio::spawn(answering(stream, answer.clone())));
-            }
-        }));
-        format!("http://127.0.0.1:{port}")
-    }
-
-    /// One connection, answered by `answer` until the peer goes away.
-    async fn answering<F>(stream: TcpStream, answer: F)
-    where
-        F: Fn(&Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync + Clone + 'static,
-    {
-        let service = service_fn(move |request: Request<Incoming>| {
-            let answer = answer.clone();
-            async move { Ok::<_, Infallible>(answer(&request)) }
-        });
-        let _ = hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
-    }
-
-    fn html(body: &str) -> Response<Full<Bytes>> {
-        Response::builder()
-            .header("content-type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(body.to_owned())))
-            .expect("a response")
-    }
-
-    /// A response carrying `bytes` as `kind`.
-    fn asset(kind: &'static str, bytes: Vec<u8>) -> Response<Full<Bytes>> {
-        Response::builder()
-            .header("content-type", kind)
-            .body(Full::new(Bytes::from(bytes)))
-            .expect("a response")
+    /// Deliberately the crudest possible reader. These tests are about what
+    /// came back over the socket, and asserting through a real metadata parser
+    /// would make a fetch test fail when that parser changed.
+    fn title(html: &str) -> String {
+        // Case-insensitively, because `<TITLE>` is valid HTML and one of the
+        // fixtures below is shouty on purpose. `to_ascii_lowercase` preserves
+        // byte length, so an index found in the lowered copy is valid in the
+        // original.
+        let lower = html.to_ascii_lowercase();
+        let between = |open: &str, close: &str| {
+            let at = lower.find(open)? + open.len();
+            let end = at + lower.get(at..)?.find(close)?;
+            html.get(at..end).map(str::to_owned)
+        };
+        between("<title>", "</title>")
+            // A page that buries its metadata behind script puts the title in
+            // `og:title` and never opens a `<title>` at all.
+            .or_else(|| between(r#"property="og:title" content=""#, "\""))
+            .unwrap_or_default()
     }
 
     /// A real JPEG, `size` square, because the point of these tests is the
@@ -925,14 +1034,6 @@ mod exchange {
         out.into_inner()
     }
 
-    fn redirect(to: &str) -> Response<Full<Bytes>> {
-        Response::builder()
-            .status(302)
-            .header("location", to)
-            .body(Full::new(Bytes::new()))
-            .expect("a response")
-    }
-
     #[tokio::test]
     async fn a_page_comes_back_and_parses() {
         let base = serving(|_| html("<head><title>Hello</title></head>")).await;
@@ -940,7 +1041,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&page.html).title, "Hello");
+        assert_eq!(title(&page.html), "Hello");
     }
 
     #[tokio::test]
@@ -961,7 +1062,7 @@ mod exchange {
             .await
             .expect("fetched");
         assert!(page.url.ends_with("/end"), "got {}", page.url);
-        assert_eq!(crate::parse::card(&page.html).title, "Arrived");
+        assert_eq!(title(&page.html), "Arrived");
     }
 
     #[tokio::test]
@@ -1017,7 +1118,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&default.html).title, DEFAULT_USER_AGENT);
+        assert_eq!(title(&default.html), DEFAULT_USER_AGENT);
 
         let chosen = "Starling/0.2 (+https://example.org/previews)";
         let operators = Fetcher::against_loopback(Limits::default())
@@ -1025,7 +1126,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&operators.html).title, chosen);
+        assert_eq!(title(&operators.html), chosen);
 
         // A blank setting means "the default", not "send no user-agent": a
         // request without one is refused outright by a good share of the web,
@@ -1036,7 +1137,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&blank.html).title, DEFAULT_USER_AGENT);
+        assert_eq!(title(&blank.html), DEFAULT_USER_AGENT);
     }
 
     #[tokio::test]
@@ -1056,7 +1157,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&page.html).title, "Early");
+        assert_eq!(title(&page.html), "Early");
         // Not "the head and not one byte more": the read can only stop on a
         // frame boundary, so the frame the marker arrived in comes whole. What
         // is asserted is that the *remaining* two hundred kilobytes did not.
@@ -1084,7 +1185,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&page.html).title, "Deep");
+        assert_eq!(title(&page.html), "Deep");
     }
 
     #[tokio::test]
@@ -1103,7 +1204,7 @@ mod exchange {
             .fetch(&base)
             .await
             .expect("fetched");
-        assert_eq!(crate::parse::card(&page.html).title, "Shouty");
+        assert_eq!(title(&page.html), "Shouty");
         assert!(
             page.html.len() < 50_000,
             "read {} bytes of a 200 KB body",
@@ -1238,96 +1339,6 @@ mod exchange {
     }
 
     #[tokio::test]
-    async fn a_page_that_points_at_a_picture_ends_up_with_one_on_its_card() {
-        // The whole server half in one test: fetch the page, read its
-        // `og:image`, resolve it against the page it was found on, fetch that,
-        // and shrink it. The image is served from a *path* the page does not
-        // live at, because the relative resolution is the step that silently
-        // fetches the wrong thing when it is wrong.
-        let base = serving(|path| {
-            if path == "/media/card.jpg" {
-                asset("image/jpeg", jpeg(900))
-            } else {
-                html(
-                    r#"<head>
-                         <meta property="og:title" content="A Page">
-                         <meta property="og:image" content="/media/card.jpg">
-                       </head>"#,
-                )
-            }
-        })
-        .await;
-
-        let fetcher = Fetcher::against_loopback(Limits::default());
-        let page = fetcher.fetch(&base).await.expect("fetched");
-        let card = crate::parse::card(&page.html);
-        let thumb = crate::picture_for(&fetcher, &page.url, &card)
-            .await
-            .expect("a picture");
-
-        assert!(thumb.width <= 640 && thumb.height <= 640, "{thumb:?}");
-        assert_eq!(thumb.mime, "image/jpeg");
-    }
-
-    #[tokio::test]
-    async fn a_page_whose_picture_is_missing_still_previews() {
-        // A dead `og:image` is ordinary - CDNs expire, paths move - and it must
-        // cost the picture and nothing else.
-        let base = serving(|path| {
-            if path == "/gone.jpg" {
-                Response::builder()
-                    .status(404)
-                    .body(Full::new(Bytes::new()))
-                    .expect("a response")
-            } else {
-                html(r#"<head><meta property="og:image" content="/gone.jpg"></head>"#)
-            }
-        })
-        .await;
-
-        let fetcher = Fetcher::against_loopback(Limits::default());
-        let page = fetcher.fetch(&base).await.expect("fetched");
-        let card = crate::parse::card(&page.html);
-        assert!(
-            crate::picture_for(&fetcher, &page.url, &card)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_page_that_calls_its_picture_enormous_is_taken_at_its_word() {
-        // No request is made at all: the page has already said the decode
-        // would be refused, and the cheapest fetch is the one that does not
-        // happen. Served bytes that *would* have worked, so a failure here
-        // means the hint was ignored rather than that the picture was bad.
-        let base = serving(|path| {
-            if path == "/huge.jpg" {
-                asset("image/jpeg", jpeg(64))
-            } else {
-                html(
-                    r#"<head>
-                         <meta property="og:image" content="/huge.jpg">
-                         <meta property="og:image:width" content="30000">
-                         <meta property="og:image:height" content="30000">
-                       </head>"#,
-                )
-            }
-        })
-        .await;
-
-        let fetcher = Fetcher::against_loopback(Limits::default());
-        let page = fetcher.fetch(&base).await.expect("fetched");
-        let card = crate::parse::card(&page.html);
-        assert_eq!(card.image_width, 30000);
-        assert!(
-            crate::picture_for(&fetcher, &page.url, &card)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn an_error_status_is_not_parsed_as_a_page() {
         let base = serving(|_| {
             Response::builder()
@@ -1367,7 +1378,7 @@ mod exchange {
             .await
             .expect("fetched");
         assert!(page.html.len() <= 4096, "read {} bytes", page.html.len());
-        assert_eq!(crate::parse::card(&page.html).title, "Short Title");
+        assert_eq!(title(&page.html), "Short Title");
     }
 
     #[tokio::test]
@@ -1399,25 +1410,54 @@ mod exchange {
     }
 
     #[tokio::test]
-    async fn only_so_many_fetches_run_at_once() {
-        // The permit is what stops one client turning a channel full of links
-        // into a channel full of sockets.
+    async fn a_fetch_waits_for_a_permit_instead_of_being_refused_on_the_spot() {
+        // The bug this is the fix for: nine links in one screenful of chat,
+        // eight permits, and the ninth refused in 0 ms - which a client draws
+        // as no card at all and never retries. Which link lost was whichever
+        // one happened to be ninth, so it read as "previews work for some sites
+        // and not others".
         let limits = Limits {
             concurrency: 1,
-            timeout: Duration::from_millis(500),
+            timeout: Duration::from_millis(2_000),
+            ..Limits::default()
+        };
+        let fetcher = Fetcher::against_loopback(limits);
+        let base = serving(|_| html("<head><title>Queued</title></head>")).await;
+
+        let held = Arc::clone(&fetcher.permits)
+            .try_acquire_owned()
+            .expect("the one permit");
+        let waiting = tokio::spawn({
+            let fetcher = fetcher.clone();
+            let base = base.clone();
+            async move { fetcher.fetch(&base).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!waiting.is_finished(), "it must be queued, not refused");
+        drop(held);
+        let page = waiting.await.expect("the task").expect("a queued fetch");
+        assert!(page.html.contains("Queued"));
+    }
+
+    #[tokio::test]
+    async fn a_queue_that_never_drains_is_still_refused() {
+        // `Busy` survives for the case it actually describes: outbound capacity
+        // full for longer than a whole fetch would have taken. A refusal then
+        // is honest, and it still says so rather than hanging.
+        let limits = Limits {
+            concurrency: 1,
+            timeout: Duration::from_millis(200),
             ..Limits::default()
         };
         let fetcher = Fetcher::against_loopback(limits);
         let base = serving(|_| html("<head><title>Slow</title></head>")).await;
 
-        let held = Arc::clone(&fetcher.permits)
+        let _held = Arc::clone(&fetcher.permits)
             .try_acquire_owned()
             .expect("the one permit");
         assert_eq!(
-            fetcher.fetch(&base).await.expect_err("no permit left"),
+            fetcher.fetch(&base).await.expect_err("no permit ever"),
             FetchError::Busy
         );
-        drop(held);
-        assert!(fetcher.fetch(&base).await.is_ok(), "and it recovers");
     }
 }

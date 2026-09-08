@@ -7,152 +7,51 @@
 //!
 //! The guard is a deny list of destinations no legitimate preview target ever
 //! lives on: loopback, link-local, and the private ranges that hold a cloud
-//! metadata service.
+//! metadata service. It lives in `starling-outbound`, one tier below: the
+//! `gifs` service needs the same guard for the same reason, services may not
+//! link each other, and a second copy of that deny list is a second list to
+//! keep in step with this one.
 
-pub mod fetch;
+pub mod classify;
+pub mod climb;
+pub mod ladder;
 pub mod parse;
+pub mod quota;
+pub mod structured;
 pub mod thumbnail;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use fetch::{DEFAULT_USER_AGENT, FetchError, Fetcher, Limits};
+// Re-exported rather than renamed at every call site: these were this crate's
+// surface before the guard moved, and they still describe what a preview does.
+pub use starling_outbound::{
+    DEFAULT_USER_AGENT, FetchError, Fetcher, Limits, Page, Refusal, fetch, vet,
+};
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{
-    LinkPreviewEnvelope, Preview, PreviewError, PreviewRequest, link_preview_envelope,
+    LinkPreviewEnvelope, Preview, PreviewError, PreviewRequest, link_preview_envelope, preview,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
+use starling_runtime::ratelimit::Rate;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
-/// Why a URL will not be fetched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// Not `http` or `https`.
-    Scheme,
-    /// A host that resolves (or is written as) an address inside the
-    /// deployment rather than out on the internet.
-    PrivateAddress,
-    /// No host at all.
-    Malformed,
-}
-
-impl Refusal {
-    /// What the client is told.
-    #[must_use]
-    pub const fn reason(self) -> &'static str {
-        match self {
-            Self::Scheme => "only http and https links are previewed",
-            Self::PrivateAddress => "that address is inside the server's network",
-            Self::Malformed => "that is not a URL",
-        }
-    }
-}
-
-/// Whether `url` may be fetched.
-///
-/// # Errors
-///
-/// [`Refusal`] naming which rule it broke, so a client can say something more
-/// useful than "no preview".
-pub fn vet(url: &str) -> Result<(), Refusal> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or(Refusal::Scheme)?;
-    let authority = rest
-        .split('/')
-        .next()
-        .map(|authority| authority.split('@').next_back().unwrap_or(authority))
-        .filter(|authority| !authority.is_empty())
-        .ok_or(Refusal::Malformed)?;
-    // An IPv6 literal is bracketed precisely so its own colons cannot be
-    // mistaken for the port separator, `[::1]:8080`. Stripping the port by
-    // splitting on the first `:` instead treats `[::1]` as the malformed host
-    // `[`, which is not a recognised address and so was never checked against
-    // the private-range deny list, a bracketed loopback or link-local
-    // literal would sail straight through.
-    let host = if let Some(literal) = authority.strip_prefix('[') {
-        literal.split(']').next().unwrap_or(literal)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    if host.is_empty() {
-        return Err(Refusal::Malformed);
-    }
-
-    if is_private(host) {
-        return Err(Refusal::PrivateAddress);
-    }
-    Ok(())
-}
-
-/// Whether a host names something inside the deployment.
-///
-/// Textual rather than resolved, deliberately: this is the first gate, and the
-/// second is [`fetch`] refusing to connect to a private address. Both, not
-/// either, a DNS name can resolve to 169.254.169.254 whatever it looks like.
-fn is_private(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return true;
-    }
-    let Ok(address) = host.parse::<std::net::IpAddr>() else {
-        // A name, not an address. It passes this gate and is caught by the
-        // connect-time check.
-        return false;
-    };
-    is_private_addr(address)
-}
-
-/// Whether an address is inside the deployment.
-///
-/// The one predicate, used by the URL check *and* by the resolver check, so
-/// there is no second list of ranges to keep in step with this one.
-pub(crate) fn is_private_addr(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                // 169.254.169.254 is the cloud metadata service, and the single
-                // most valuable SSRF target there is.
-                || v4.octets()[..2] == [169, 254]
-                // Carrier-grade NAT (100.64.0.0/10) and the benchmarking range
-                // (198.18.0.0/15): neither is the public internet, and both are
-                // routable inside a deployment. Both are written as the ranges
-                // they are, 198.18.0.0/15 spans 198.18 *and* 198.19, and
-                // reading it as a /16 leaves half of it fetchable.
-                || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])
-                || v4.octets()[0] == 198 && (18..20).contains(&v4.octets()[1])
-        }
-        std::net::IpAddr::V6(v6) => {
-            // An IPv4-mapped address is an IPv4 address wearing a hat:
-            // `::ffff:127.0.0.1` connects to loopback, and a check that reads
-            // only the v6 predicates lets it through. This was the hole.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_addr(std::net::IpAddr::V4(v4));
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                // fc00::/7, the unique-local range, and fe80::/10, link-local.
-                // The v6 equivalents of everything above, and until now the v6
-                // arm checked neither.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
+use crate::climb::{Climb, Reached, Renderer};
+use crate::ladder::{Cooldowns, Ladder, Memory};
+use crate::quota::{Limit, Quota};
 
 /// The service.
 #[derive(Debug)]
 pub struct LinkPreviewService {
     fanout: Fanout,
     logger: Logger,
-    fetcher: Fetcher,
+    /// How a page is asked for, which rungs are allowed, what each host needed
+    /// last time and what a person may spend of the browser. Cloned into every
+    /// walk; see [`climb`].
+    climb: Climb,
 }
 
 impl ClientService for LinkPreviewService {
@@ -194,6 +93,7 @@ impl ClientService for LinkPreviewService {
                     // handler for seconds while a stranger's server decides.
                     self.spawn_fetch(
                         inbound.conn,
+                        inbound.session,
                         PreviewRequest {
                             request_id: request.request_id.clone(),
                             urls: vec![url.clone()],
@@ -255,64 +155,52 @@ impl LinkPreviewService {
 }
 
 impl LinkPreviewService {
-    /// Fetch in the background and push the answer when it arrives.
-    fn spawn_fetch(&self, conn: u64, request: PreviewRequest) {
-        let fetcher = self.fetcher.clone();
+    /// Climb the ladder in the background and push the answer when it arrives.
+    ///
+    /// Off this handler, because a preview is a request to a host somebody else
+    /// chose: it takes as long as that host takes, and awaiting it here would
+    /// hold this connection's frame handler for seconds while a stranger's
+    /// server decides - now several times over, since a walk may ask more than
+    /// once.
+    fn spawn_fetch(&self, conn: u64, session: u32, request: PreviewRequest) {
+        let climb = self.climb.clone();
         let fanout = self.fanout.clone();
         let logger = self.logger.clone();
         let outer = ServiceKind::LinkPreview.outer_type();
         drop(tokio::spawn(async move {
             let url = request.urls.first().cloned().unwrap_or_default();
-            let body = match fetcher.fetch(&url).await {
-                Ok(page) => {
-                    let card = parse::card(&page.html);
-                    // A second fetch, of a second host, before the answer goes
-                    // out: the card is worth more with the picture on it, and
-                    // the picture is only safe to show because the server is
-                    // the one that went and got it.
-                    let picture = picture_for(&fetcher, &page.url, &card).await;
-                    // A page that never named itself is labelled with its
-                    // host, which is what a reader wanted from that line
-                    // anyway: where this link goes.
-                    let site = if card.site.is_empty() {
-                        host_of(&page.url)
-                    } else {
-                        card.site
-                    };
-                    link_preview_envelope::Body::Preview(Preview {
-                        request_id: request.request_id,
-                        // Where it *ended up*: a preview of a shortened link
-                        // that shows the shortener has told the reader nothing.
-                        url: page.url,
-                        title: card.title,
-                        description: card.description,
-                        site,
-                        // Left empty, and this is the honest state rather than
-                        // an oversight: `image_key` names a full-resolution
-                        // object in the files service, and nothing here stores
-                        // one yet. The thumbnail below is what clients render,
-                        // and it travels as bytes precisely so no viewer has to
-                        // contact the origin to see it.
-                        image_key: String::new(),
-                        image: picture
-                            .as_ref()
-                            .map(|thumb| thumb.bytes.clone())
-                            .unwrap_or_default(),
-                        image_mime: picture
-                            .as_ref()
-                            .map(|thumb| thumb.mime.to_owned())
-                            .unwrap_or_default(),
-                        image_width: picture.as_ref().map_or(0, |thumb| thumb.width),
-                        image_height: picture.as_ref().map_or(0, |thumb| thumb.height),
-                    })
+            let body = match climb.walk(&url, session).await {
+                Reached::Page { page, rung } => {
+                    // The picture is fetched as whoever fetched the page: an
+                    // `og:image` behind the same wall answers the same client.
+                    let fetcher = climb.fetcher_for(rung);
+                    link_preview_envelope::Body::Preview(
+                        of_page(&fetcher, request.request_id, page).await,
+                    )
                 }
-                Err(error) => {
-                    // Logged with the detail the client is not given: the
-                    // difference between "does not resolve" and "resolves to a
-                    // machine inside the deployment" is a fact about the
-                    // network, and an operator needs it while a stranger
-                    // mapping the estate one URL at a time must not have it.
-                    if matches!(error, FetchError::ResolvesInside) {
+                // Not a page, which for a link somebody pasted usually means
+                // it is a picture: the host said so in its `content-type`,
+                // and that is a better answer than any page ever gives. It is
+                // fetched again as one - `fetch_image` accepts nothing else,
+                // so a type that only *looked* like an image still fails -
+                // and the picture becomes its own card.
+                Reached::NotAPage => {
+                    let fetcher = climb.fetcher_for(climb.ladder.cheapest());
+                    match of_media(&fetcher, &request.request_id, &url).await {
+                        Some(preview) => link_preview_envelope::Body::Preview(preview),
+                        None => link_preview_envelope::Body::Error(PreviewError {
+                            request_id: request.request_id,
+                            reason: format!("{url}: {}", FetchError::NotHtml.reason()),
+                        }),
+                    }
+                }
+                Reached::Nothing(reason) => {
+                    // The operator's line, which the client is not given: a
+                    // name that resolves inside the deployment is a fact about
+                    // this network, and a stranger mapping it one URL at a time
+                    // must not have it. The walk has already logged which rungs
+                    // were tried at debug level.
+                    if reason.contains(FetchError::ResolvesInside.reason()) {
                         logger.log(
                             LogEvent::warning(
                                 Category::Security,
@@ -321,10 +209,10 @@ impl LinkPreviewService {
                             .with("url", url.clone()),
                         );
                     }
-                    tracing::debug!(url = %url, ?error, "link preview failed");
+                    tracing::debug!(url = %url, reason, "link preview failed");
                     link_preview_envelope::Body::Error(PreviewError {
                         request_id: request.request_id,
-                        reason: format!("{url}: {}", error.reason()),
+                        reason: format!("{url}: {reason}"),
                     })
                 }
             };
@@ -335,6 +223,182 @@ impl LinkPreviewService {
             ));
         }));
     }
+}
+
+/// The card for a page that was read.
+///
+/// Everything a client draws comes from here, and what makes the several
+/// drawings possible is that the *kind* is decided on this side: the page's
+/// own declarations are in front of us, and they are not in front of a client
+/// holding a title and a thumbnail. See [`classify`].
+///
+/// Public for `tests/card.rs`, which is where the composition of the two
+/// fetches is exercised, as [`picture_for`] is and for the same reason.
+pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page) -> Preview {
+    let card = parse::card(&page.html);
+    let kind = classify::Kind::of(&page.url, &card);
+    // A second fetch, of a second host, before the answer goes out: the card
+    // is worth more with the picture on it, and the picture is only safe to
+    // show because the server is the one that went and got it.
+    let picture = picture_for(fetcher, &page.url, &card).await;
+    // And the site's own mark, which is the one thing on a card that says
+    // where a link goes before a word of it is read. Fetched here for the
+    // reason the picture is: a favicon loaded by every viewer is a request
+    // per reader to a host that then knows who is in the channel.
+    let icon = icon_for(fetcher, &page.url, &card).await;
+    // A page that never named itself is labelled with its host, which is what
+    // a reader wanted from that line anyway: where this link goes.
+    let site = if card.site.is_empty() {
+        host_of(&page.url)
+    } else {
+        card.site
+    };
+    Preview {
+        request_id,
+        // Where it *ended up*: a preview of a shortened link that shows the
+        // shortener has told the reader nothing.
+        url: page.url,
+        title: card.title,
+        description: card.description,
+        site,
+        // Left empty, and this is the honest state rather than an oversight:
+        // `image_key` names a full-resolution object in the files service, and
+        // nothing here stores one yet. The thumbnail below is what clients
+        // render, and it travels as bytes precisely so no viewer has to
+        // contact the origin to see it.
+        image_key: String::new(),
+        kind: kind.wire() as i32,
+        author: card.author,
+        duration_seconds: card.duration,
+        // The price only where the page named one, whatever the kind: a
+        // `PRODUCT` with an empty price block would have a client drawing a
+        // currency symbol next to nothing.
+        price: card.price.is_named().then_some(preview::Price {
+            amount: card.price.amount,
+            currency: card.price.currency,
+            was: card.price.was,
+            availability: card.price.availability,
+        }),
+        facts: card
+            .facts
+            .into_iter()
+            .map(|fact| preview::Fact {
+                key: fact.key,
+                label: fact.label,
+                value: fact.value,
+            })
+            .collect(),
+        published_at: card.published,
+        content_rating: card.rating,
+        icon: icon
+            .as_ref()
+            .map(|mark| mark.bytes.clone())
+            .unwrap_or_default(),
+        icon_mime: icon
+            .as_ref()
+            .map(|mark| mark.mime.to_owned())
+            .unwrap_or_default(),
+        ..with_picture(picture.as_ref())
+    }
+}
+
+/// The card for a URL that turned out to *be* a picture.
+///
+/// A link straight to an image had no preview at all before this: the fetch
+/// asks for a page, the host answers `image/png`, and a card that would have
+/// been the picture itself became "that link is not a page". The content type
+/// is the strongest classification there is - the host said what it was
+/// serving - so the picture is fetched as one and becomes its own card.
+///
+/// `None` where the second fetch fails too, and then the caller reports the
+/// original refusal rather than this one: what the reader needs to know is
+/// that the link did not preview, not that it did not preview twice.
+///
+/// Public for `tests/card.rs`; see [`of_page`].
+pub async fn of_media(fetcher: &Fetcher, request_id: &str, url: &str) -> Option<Preview> {
+    let limits = fetcher.limits();
+    let image = fetcher.fetch_image(url).await.ok()?;
+    let picture = thumbnail::shrink(&image.bytes, limits.image_edge, limits.image_pixels)?;
+    Some(Preview {
+        request_id: request_id.to_owned(),
+        // The file's own name, which is all the title there is: a picture
+        // carries no `<title>`, and an empty one leaves a client printing the
+        // URL it already has.
+        title: file_name_of(&image.url),
+        site: host_of(&image.url),
+        url: image.url,
+        kind: classify::Kind::Image.wire() as i32,
+        ..with_picture(Some(&picture))
+    })
+}
+
+/// The longest side of a site icon that travels.
+///
+/// A favicon is drawn at 13 points beside the source's name, so this is what
+/// that needs on a dense screen and nothing more: the 512-pixel PNG a site
+/// publishes for a phone's home screen is 40 kilobytes that no reader will
+/// ever see the detail of, paid once per viewer.
+const ICON_EDGE: u32 = 48;
+
+/// Fetch and shrink the site icon `card` declared, if it declared one.
+///
+/// `None` for every way it does not happen, exactly as [`picture_for`]: the
+/// card is drawn with a monogram instead, which is what a page that declares
+/// no icon gets anyway. It may never cost the preview.
+async fn icon_for(
+    fetcher: &Fetcher,
+    page_url: &str,
+    card: &parse::Card,
+) -> Option<thumbnail::Thumbnail> {
+    if card.icon.is_empty() || fetcher.limits().image_bytes == 0 {
+        return None;
+    }
+    let url = fetch::join(page_url, &card.icon);
+    if !fetcher.private_is_allowed()
+        && let Err(refusal) = vet(&url)
+    {
+        tracing::debug!(%url, reason = refusal.reason(), "site icon refused");
+        return None;
+    }
+    match fetcher.fetch_image(&url).await {
+        Ok(image) => thumbnail::shrink(&image.bytes, ICON_EDGE, fetcher.limits().image_pixels),
+        Err(error) => {
+            tracing::debug!(%url, ?error, "site icon could not be fetched");
+            None
+        }
+    }
+}
+
+/// The picture's half of a [`Preview`], or the empty state of those fields.
+///
+/// Its own function because both cards fill them the same way and there are
+/// six of them: two constructors that each spell out six fields is two places
+/// for the thumbnail and the original to be confused for each other.
+fn with_picture(picture: Option<&thumbnail::Thumbnail>) -> Preview {
+    Preview {
+        image: picture.map(|thumb| thumb.bytes.clone()).unwrap_or_default(),
+        image_mime: picture
+            .map(|thumb| thumb.mime.to_owned())
+            .unwrap_or_default(),
+        image_width: picture.map_or(0, |thumb| thumb.width),
+        image_height: picture.map_or(0, |thumb| thumb.height),
+        source_width: picture.map_or(0, |thumb| thumb.source_width),
+        source_height: picture.map_or(0, |thumb| thumb.source_height),
+        ..Preview::default()
+    }
+}
+
+/// The last path segment of `url`, without its extension, as a title.
+///
+/// `/art/summer-beach_2026.png` becomes "summer-beach 2026": a file name is
+/// what somebody called the picture, and the separators that make it a legal
+/// name are not part of what they called it.
+fn file_name_of(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let spaced = stem.replace(['_', '+', '%'], " ");
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The bare host of `url`, as a label for a page that named no site.
@@ -360,13 +424,16 @@ fn host_of(url: &str) -> String {
 
 /// Fetch and shrink the picture `card` points at, if it points at one.
 ///
+/// Public for `tests/card.rs`, which is the only place the *composition* of
+/// the two fetches can be exercised; nothing outside this crate calls it.
+///
 /// `None` covers every way this does not happen - the page named no image, the
 /// URL is one the guard refuses, the host would not answer, the file is past
 /// the cap, the bytes are not a picture the decoder knows. All of them are the
 /// same outcome for a reader: a card with words and no picture, which is the
 /// preview they would have had anyway. None of them may cost the *preview*,
 /// which is why this cannot return an error the caller might propagate.
-async fn picture_for(
+pub async fn picture_for(
     fetcher: &Fetcher,
     page_url: &str,
     card: &parse::Card,
@@ -455,19 +522,88 @@ impl Serve for LinkPreviewService {
             image_pixels: service
                 .option::<u32>("preview_image_max_pixels")
                 .unwrap_or(default.image_pixels),
+            // Not a preview knob and deliberately not offered as one: this
+            // service never asks for JSON, so the cap bounds nothing an
+            // operator here could tune. `gifs` owns that setting.
+            json_bytes: default.json_bytes,
         };
-        // Which crawler the fetch claims to be is an operator's call, because
-        // it is the one setting here with a cost outside the deployment: the
-        // default is the one that makes previews work on the sites people
-        // paste, and an operator who would rather be honest about it than have
-        // Reddit links preview says so here. See `DEFAULT_USER_AGENT`.
-        let agent = service
+        // What this server calls itself on the first rung. An operator who
+        // would rather be identifiable by name and contact address than by
+        // version says so here; the other rungs are not theirs to name, because
+        // each is a specific lie that a specific set of sites answers to. See
+        // `ladder`.
+        let honest = service
             .option::<String>("preview_user_agent")
-            .unwrap_or_default();
+            .filter(|agent| !agent.trim().is_empty())
+            .unwrap_or_else(|| ladder::HONEST_USER_AGENT.to_owned());
+        // Which rungs this server will climb, in order. The browser is not on
+        // the default ladder: it is a second container and a renderer running a
+        // stranger's script, and neither should arrive because somebody
+        // upgraded. See `preview_ladder` in `examples/reference.toml`.
+        let ladder = Ladder::parse(
+            &service
+                .option::<String>("preview_ladder")
+                .unwrap_or_default(),
+        );
+        let cooldowns = Cooldowns {
+            revalidate: service
+                .option::<u64>("preview_method_ttl_ms")
+                .map_or(Cooldowns::default().revalidate, Duration::from_millis),
+            hopeless: service
+                .option::<u64>("preview_method_retry_ms")
+                .map_or(Cooldowns::default().hopeless, Duration::from_millis),
+        };
+        // Both buckets are the browser's alone: every other rung is an HTTP
+        // request the fetch limits already bound, and charging those to a
+        // person would be charging them for the cheap thing.
+        let quota = Quota::new(
+            Limit {
+                rate: service
+                    .option::<Rate>("preview_browser_session_rate")
+                    .unwrap_or_else(|| Rate::per_second(3.0 / 60.0)),
+                burst: service
+                    .option::<u32>("preview_browser_session_burst")
+                    .unwrap_or(3),
+            },
+            Limit {
+                rate: service
+                    .option::<Rate>("preview_browser_server_rate")
+                    .unwrap_or_else(|| Rate::per_second(30.0 / 60.0)),
+                burst: service
+                    .option::<u32>("preview_browser_server_burst")
+                    .unwrap_or(10),
+            },
+            starling_runtime::ids::now_ms(),
+        );
+        // Dialled only if the operator put the browser on the ladder. A
+        // renderer nobody asked for is a service dialled for nothing.
+        let renderer = ladder.has_headless().then(|| Renderer {
+            resolver: ctx.resolver.clone(),
+            budget: service
+                .option::<u64>("preview_browser_timeout_ms")
+                .map_or(Duration::from_secs(20), Duration::from_millis),
+        });
+        tracing::info!(
+            ladder = ladder.describe(),
+            browser = renderer.is_some(),
+            "link preview ladder"
+        );
         Ok(Arc::new(Self {
             fanout: Fanout::default(),
             logger: ctx.logger,
-            fetcher: Fetcher::new(limits).announcing(&agent),
+            climb: Climb {
+                fetcher: Fetcher::new(limits),
+                ladder,
+                memory: Arc::new(Memory::new(
+                    cooldowns,
+                    service
+                        .option::<usize>("preview_method_hosts")
+                        .unwrap_or(4096),
+                )),
+                quota: Arc::new(quota),
+                honest: Arc::from(honest.trim()),
+                renderer,
+            },
         }))
     }
 
@@ -494,88 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn the_cloud_metadata_address_is_refused() {
-        // The single most valuable SSRF target in any cloud deployment.
+    fn the_guard_still_refuses_what_it_always_did() {
+        // The deny list itself is tested where it now lives. This asserts the
+        // *wiring*: this service reaches that guard, so moving the crate under
+        // it cannot quietly leave previews unguarded.
         assert_eq!(
             vet("http://169.254.169.254/latest/meta-data/"),
             Err(Refusal::PrivateAddress)
         );
-    }
-
-    #[test]
-    fn loopback_and_private_ranges_are_refused() {
-        for url in [
-            "http://127.0.0.1/admin",
-            "http://localhost:8080/",
-            "http://10.0.0.5/",
-            "http://192.168.1.1/",
-            "http://[::1]/",
-        ] {
-            assert!(vet(url).is_err(), "{url} must be refused");
-        }
-    }
-
-    #[test]
-    fn an_ipv4_address_wearing_an_ipv6_hat_is_still_loopback() {
-        // `::ffff:127.0.0.1` is an IPv4-mapped IPv6 address: it connects to
-        // 127.0.0.1, and a check that reads only the v6 predicates
-        // (`is_loopback`, `is_unspecified`) says it is public. It was the hole.
-        for url in [
-            "http://[::ffff:127.0.0.1]/",
-            "http://[::ffff:169.254.169.254]/latest/meta-data/",
-            "http://[::ffff:10.0.0.1]/",
-        ] {
-            assert_eq!(
-                vet(url),
-                Err(Refusal::PrivateAddress),
-                "{url} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn the_ipv6_private_ranges_are_refused_as_well_as_the_ipv4_ones() {
-        // fc00::/7 is where a deployment's own machines live on v6, and
-        // fe80::/10 is the link. Neither was checked.
-        for url in ["http://[fd00::1]/", "http://[fe80::1]/"] {
-            assert_eq!(
-                vet(url),
-                Err(Refusal::PrivateAddress),
-                "{url} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn carrier_grade_nat_and_the_benchmark_range_are_not_the_internet() {
-        assert_eq!(vet("http://100.64.0.1/"), Err(Refusal::PrivateAddress));
-        assert_eq!(vet("http://198.18.0.1/"), Err(Refusal::PrivateAddress));
-        // The neighbours of both, which are ordinary public addresses and must
-        // stay fetchable, a guard that is too wide is a feature that does not
-        // work, and nobody reports it as a security bug.
-        assert!(vet("http://100.63.255.255/").is_ok());
-        assert!(vet("http://100.128.0.1/").is_ok());
-        assert_eq!(vet("http://198.19.255.255/"), Err(Refusal::PrivateAddress));
-        assert!(vet("http://198.20.0.1/").is_ok());
-    }
-
-    #[test]
-    fn a_non_http_scheme_is_refused_rather_than_attempted() {
-        assert_eq!(vet("file:///etc/passwd"), Err(Refusal::Scheme));
-        assert_eq!(vet("gopher://example.org/"), Err(Refusal::Scheme));
-    }
-
-    #[test]
-    fn an_ordinary_public_url_passes() {
         assert!(vet("https://example.org/article").is_ok());
-    }
-
-    #[test]
-    fn credentials_in_the_authority_do_not_hide_the_host() {
-        // http://example.org@127.0.0.1/ is a classic filter bypass.
-        assert_eq!(
-            vet("http://example.org@127.0.0.1/"),
-            Err(Refusal::PrivateAddress)
-        );
     }
 }

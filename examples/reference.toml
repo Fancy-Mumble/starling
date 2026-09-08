@@ -300,8 +300,8 @@ records = 1000
 #
 # The names: session-lifecycle, session-view, permissions, metadata, userdata,
 # server-config, voice, text, pchat, moderation, screenshare, files, plugins,
-# push, audit, onboarding, social, link-preview, context-actions, directory,
-# health, gateway, operator-api.
+# push, audit, onboarding, social, link-preview, gifs, context-actions,
+# directory, health, gateway, operator-api.
 
 [services.text]
 # Whether this service runs at all. A disabled service is a supported
@@ -386,13 +386,162 @@ max_upload = "512MiB"
 # preview_image_max_bytes = "2097152"
 # preview_image_edge = "640"
 # preview_image_max_pixels = "40000000"
-# What the fetch calls itself. The default is Discord's crawler, and that is a
-# decision: Reddit and YouTube publish their OpenGraph tags to an allow-list of
-# named crawlers and answer anything else -- an honest "Starling/0.2" included
-# -- with a script shell carrying no metadata at all. Set this to whatever you
-# would rather send; blank keeps the default, since a request with no
-# user-agent is refused outright by a good share of the web.
-# preview_user_agent = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+# How a page is asked for, cheapest and most honest first. Each rung is tried
+# only when the one below it produced nothing worth showing, and what a host
+# needed is remembered, so the ordinary link costs exactly one fetch.
+#
+#   honest    this server, by name (preview_user_agent below)
+#   crawler   Discord's crawler -- untrue, and the only thing Reddit answers
+#   browser   a browser's user-agent on a client that is not one
+#   headless  a real browser, in the `render` service
+#
+# The browser is **not** on the default ladder. Adding it means running the
+# `render` service, which is a browser: a second container, a few hundred
+# megabytes, and a renderer executing script from pages strangers paste. Add it
+# where previews of bot-walled sites (idealo and the rest of the Akamai tier)
+# are worth that, and leave it out otherwise.
+# preview_ladder = "honest,crawler,browser"
+# What the honest rung calls itself. Name your server and a way to be contacted
+# and a site owner who dislikes it can say so; blank keeps the default, since a
+# request with no user-agent is refused outright by a good share of the web.
+# The other rungs are not configurable: each is a specific string that a
+# specific set of sites answers to, and editing one only breaks it.
+# preview_user_agent = "Mozilla/5.0 (compatible; StarlingBot/0.2; +https://github.com/fancy-mumble/starling)"
+# How long the rung a host needed is trusted before the cheap rungs are tried
+# again (default 6 hours), and how long a host where *nothing* worked is left
+# alone before the whole ladder is walked again (default 15 minutes). The first
+# is what lets a site that drops its bot wall go back to being fetched honestly:
+# without it, one bad afternoon would pin a host to the browser for the life of
+# the process. The second stops a channel full of one dead host walking four
+# rungs per message.
+# preview_method_ttl_ms = "21600000"
+# preview_method_retry_ms = "900000"
+# How many hosts are remembered. The key is chosen by whoever pastes a link, so
+# it is bounded; the least recently used goes first.
+# preview_method_hosts = "4096"
+# What one person, and the whole server, may spend of the browser. Only the
+# headless rung is charged: every other rung is an HTTP request the caps above
+# already bound, and the browser is the one that costs a renderer. A refusal
+# tells the person how long to wait rather than silently dropping the preview.
+# Written as a rate and a burst, exactly like the gateway's buckets.
+# preview_browser_session_rate = "3/m"
+# preview_browser_session_burst = "3"
+# preview_browser_server_rate = "30/m"
+# preview_browser_server_burst = "10"
+# How long one render may take, end to end. The `render` service applies the
+# lower of this and its own ceiling.
+# preview_browser_timeout_ms = "20000"
+#
+# [services.render.options]
+# The browser `link-preview` escalates to, and nothing else dials it. Inert
+# unless `headless` is on the ladder above: no browser is started until
+# something asks for a page, so a server that never escalates pays for a gRPC
+# listener and nothing more.
+#
+# Which browser to run. Blank finds one: chromium, chromium-browser,
+# google-chrome, chrome or msedge, on PATH or in the usual places. Name one to
+# be sure which, and a name that is not there fails loudly rather than quietly
+# becoming a different browser.
+# browser_binary = "/usr/bin/chromium"
+# Flags to add, for a deployment that needs one nobody anticipated.
+# browser_args = ""
+# **Read this before setting it.** Chrome's sandbox is what stands between a
+# page a stranger pasted and the rest of the container. Turning it off is
+# sometimes the only way to run a renderer where the kernel features it needs
+# are not granted -- but the answer to that is usually to grant them (a seccomp
+# profile, or --cap-add SYS_ADMIN) rather than to render hostile pages
+# unsandboxed.
+# browser_no_sandbox = "false"
+# How long after a page goes quiet before its DOM is read. Metadata written by
+# script is written in that window.
+# browser_settle_ms = "300"
+# The viewport, which some sites serve different markup for, and the language
+# the browser asks in.
+# browser_width = "1280"
+# browser_height = "900"
+# browser_language = "en-US,en"
+# How many renders may run at once, as tabs in the one browser. Two, because a
+# render is a whole browser engine against a page a stranger chose: a server
+# that will run eight at once has promised a stranger eight renderers' worth of
+# memory.
+# render_concurrency = "2"
+# The ceiling on one render, whatever the caller asks for.
+# render_timeout_ms = "20000"
+# The most DOM that travels back to `link-preview`. A rendered page is the
+# document plus everything script built, and it crosses a gRPC hop in a split
+# deployment; the caller reads the head, so this costs a preview nothing.
+# render_max_html_bytes = "2097152"
+#
+# [services.gifs.options]
+# GIF search, run by the server so that one key serves everybody rather than
+# each person needing their own. Nothing here does anything until `gif_api_key`
+# is set; until then every search is refused as "unavailable", and a Fancy
+# client falls back to a key of its own if the user has one.
+#
+# Which provider, and the key for it. Klipy is the only one this build speaks
+# and the default, so the key is usually the only line needed. **The key is a
+# path segment in the provider's URL, which makes the URL itself a secret** --
+# nothing logs a built one.
+# gif_provider = "klipy"
+# gif_api_key = ""
+# How many results one page asks the provider for (default 24, capped at 50).
+# gif_per_page = "24"
+#
+# -- What stops one search box costing the operator their quota ---------------
+#
+# The provider key is metered and shared by everyone on the server, so these
+# bound *upstream calls*, not requests. A request answered from the cache is
+# charged nothing: the frame it arrived in was already charged to the `gifs`
+# bucket in [gateway.limits], and charging quota for a call nobody made would
+# make simply opening the picker expensive.
+#
+# How long an answer is reused, and how many are kept. The cache is the layer
+# doing most of the work on a busy server: every picker opens on the same
+# trending page. "0" for either switches it off, which is rarely what you want.
+# gif_cache_ttl_ms = "300000"
+# gif_cache_entries = "512"
+# One person's budget. The burst covers somebody typing a search and paging
+# through it; the rate is what they sustain.
+# gif_session_rate = "1/s"
+# gif_session_burst = "5"
+# The whole server's budget. This is the layer the per-session one cannot
+# provide: fifty people asking once each are fifty calls, and every one of them
+# is inside their own limit. Set it from what the provider actually allows you.
+# gif_server_rate = "10/s"
+# gif_server_burst = "30"
+# The ceiling on what one search may ask for. `gif_max_page` is not politeness:
+# every page number is a distinct cache key, so without a ceiling paging is the
+# cheapest way to miss the cache on demand.
+# gif_max_query = "100"
+# gif_max_page = "20"
+# The outbound fetch itself: how long to wait, how many may run at once, and
+# how much of an answer to read.
+# gif_timeout_ms = "8000"
+# gif_concurrency = "8"
+# gif_max_bytes = "1048576"
+#
+# -- Serving the pictures as well as finding them -----------------------------
+#
+# Off by default. With it off, a client is handed the provider's own CDN URLs
+# and loads thumbnails from there -- which is what Discord's picker does, and it
+# hands that CDN each viewer's address and a referer naming the channel they are
+# in. On, those URLs point at this server instead and the provider sees one
+# address, ours.
+#
+# It is a switch rather than a default because it is a real cost: a picker draws
+# two dozen thumbnails a page and scrolls. Turning it on requires `listen` or
+# `public_url` on [services.gifs], because a proxied URL has to point somewhere.
+# gif_proxy_media = "false"
+# The domains a proxied URL may name. Matched on the whole label, so
+# `evilklipy.com` does not pass as `klipy.com`. This is what holds if the
+# signing key ever leaks: without it, a signed URL is an open proxy.
+# gif_proxy_domains = "klipy.com,klipy.co"
+# How long a proxied URL stays good, and how many bytes of already-fetched
+# pictures to keep so that a room full of people opening the same page costs one
+# fetch rather than one each.
+# gif_proxy_ttl_ms = "3600000"
+# gif_media_cache_bytes = "67108864"
+# gif_media_max_bytes = "8388608"
 #
 # [services.screenshare.options]
 # The UDP port the SFU binds for media; 0 lets the OS pick.

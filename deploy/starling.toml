@@ -117,6 +117,16 @@ endpoint = "http://social:50051"
 [services.link-preview]
 endpoint = "http://link-preview:50051"
 
+# The browser `link-preview` escalates to, and only when `headless` is on its
+# ladder. Started by the `render` compose profile, because it needs an image
+# with a browser in it; the endpoint is here either way so that turning the
+# profile on is one flag rather than a configuration change.
+[services.render]
+endpoint = "http://render:50051"
+
+[services.gifs]
+endpoint = "http://gifs:50051"
+
 [services.context-actions]
 endpoint = "http://context-actions:50051"
 
