@@ -24,6 +24,7 @@ use starling_proto_fancy::fancy::feature::{
 use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+use starling_proto_fancy::page::Direction;
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::push::push_client::PushClient;
 use starling_proto_fancy::push::{LiveQuery, Notification};
@@ -35,6 +36,7 @@ use starling_proto_fancy::text::{
     StoredMessage, WatchRequest,
 };
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::channel_modes::ChannelModes;
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::log::{Category, LogEvent, Logger, describe_actor};
 use starling_runtime::permit::{Permit, permission_denied, refused};
@@ -132,6 +134,12 @@ pub struct TextService {
     resolver: starling_runtime::channel::Resolver,
     /// Who is in which channel, so a message can be addressed at one.
     roster: Arc<Roster>,
+    /// Which persistent-chat protocol each channel runs.
+    ///
+    /// This service is the *non* end-to-end half of chat, and it could not see
+    /// which channels were the other half. So it archived and served the
+    /// plaintext copy a Fancy client sends beside every sealed message.
+    modes: Arc<ChannelModes>,
     /// The two settings that bound a message: how long it may be and whether
     /// it may carry markup.
     ///
@@ -184,22 +192,45 @@ impl TextService {
         id
     }
 
-    /// A page, newest first, optionally before a cursor.
-    async fn history(&self, scope: u32, channel: u32, limit: u32, before: &[u8]) -> HistoryPage {
+    /// A page, in the direction the caller asked for, optionally from a cursor.
+    ///
+    /// Backward runs newest-first, which is what opening a channel wants and
+    /// what every caller did before there was a choice. Forward runs
+    /// oldest-first, so a reader that dropped the newer half of a thread can
+    /// get it back without paging from the newest message all the way down.
+    async fn history(
+        &self,
+        scope: u32,
+        channel: u32,
+        limit: u32,
+        cursor: &[u8],
+        direction: Direction,
+    ) -> HistoryPage {
         use sqlx::Row as _;
         let limit = starling_proto_fancy::page::page_size(limit, 50, 200);
-        let sql = if before.is_empty() {
-            "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
-             WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
-        } else {
-            "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
-             WHERE server_id = ? AND channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
+        let sql = match (direction, cursor.is_empty()) {
+            (Direction::Backward, true) => {
+                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                 WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
+            }
+            (Direction::Backward, false) => {
+                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                 WHERE server_id = ? AND channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
+            }
+            (Direction::Forward, true) => {
+                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                 WHERE server_id = ? AND channel_id = ? ORDER BY id ASC LIMIT ?"
+            }
+            (Direction::Forward, false) => {
+                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                 WHERE server_id = ? AND channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?"
+            }
         };
         let mut query = sqlx::query(sql)
             .bind(i64::from(scope))
             .bind(i64::from(channel));
-        if !before.is_empty() {
-            query = query.bind(before);
+        if !cursor.is_empty() {
+            query = query.bind(cursor);
         }
         let rows = query
             .bind(i64::from(limit + 1))
@@ -323,7 +354,13 @@ impl Text for TextRpc {
         let scope = req.scope.map_or(1, |s| s.instance);
         Ok(Response::new(
             self.0
-                .history(scope, req.channel, req.limit, &req.before)
+                .history(
+                    scope,
+                    req.channel,
+                    req.limit,
+                    &req.before,
+                    Direction::Backward,
+                )
                 .await,
         ))
     }
@@ -626,7 +663,22 @@ impl TextService {
             body: message.message.clone(),
             sent_at_ms: now_ms(),
         };
-        stored.id = self.record(inbound.scope, &stored).await.to_vec();
+        // A channel that runs persistent chat keeps its history in `pchat`.
+        // What arrives here for such a channel is the legacy copy a Fancy
+        // client sends beside the sealed message, so that peers too old to
+        // decrypt still see something. Archiving it wrote the conversation to
+        // disk twice, the second time in clear text -- and with dual path
+        // enabled that copy is the real body, not the `[Encrypted message]`
+        // placeholder. Delivered, never stored: the relay is what the legacy
+        // copy is for.
+        if self.modes.is_persistent(stored.channel) {
+            tracing::debug!(
+                channel = stored.channel,
+                "not archiving the legacy copy of a persistent channel's message"
+            );
+        } else {
+            stored.id = self.record(inbound.scope, &stored).await.to_vec();
+        }
 
         // Published after the message is stored and before it is returned for
         // delivery. A watcher is an observer, so this is never allowed to
@@ -880,18 +932,74 @@ impl TextService {
         }
     }
 
+    /// A page with nothing in it and nothing behind it.
+    ///
+    /// The answer for a channel this service must not serve history for. An
+    /// empty page rather than silence, because a client that gets no reply
+    /// retries, and one that gets an empty page knows where it stands.
+    fn empty_history(&self, inbound: &Inbound, channel: u32) -> Actions {
+        let reply = TextEnvelope {
+            body: Some(text_envelope::Body::Page(
+                starling_proto_fancy::fancy::feature::HistoryPage {
+                    channel,
+                    page: Some(PageInfo::complete()),
+                    messages: Vec::new(),
+                },
+            )),
+        };
+        vec![to_conn(
+            inbound.conn,
+            ServiceKind::Text.outer_type(),
+            reply.encode_to_vec(),
+        )]
+    }
+
     async fn on_history(
         &self,
         inbound: &Inbound,
         request: starling_proto_fancy::fancy::feature::HistoryRequest,
     ) -> Actions {
+        // The channel id comes off the wire. Without this a client could page
+        // through the stored history of any channel on the server, including
+        // ones it cannot see -- and this table holds the *plaintext* half of
+        // every dual-path send, so the archive it discloses is the readable
+        // one. pchat's fetch has been gated on Enter since the audit; this one
+        // was missed, which is the whole of the finding.
+        if !self
+            .permit
+            .allows(inbound, request.channel, Perm::ENTER.bits())
+            .await
+        {
+            return vec![permission_denied(inbound, Perm::ENTER, request.channel)];
+        }
+
+        // A channel that runs persistent chat keeps its history in `pchat`,
+        // where it is end-to-end sealed and gated. Anything this table holds
+        // for such a channel is the legacy plaintext copy a dual-path client
+        // sent beside the real message, and serving it would hand back in clear
+        // text exactly what the channel exists to protect.
+        if self.modes.is_persistent(request.channel) {
+            return self.empty_history(inbound, request.channel);
+        }
+
         let cursor = request.page.unwrap_or_default();
-        let before = Uuid7::parse(&cursor.before_id)
+        let Some(direction) = cursor.direction() else {
+            // Both ends of a range is a window this store does not implement.
+            // An empty page rather than a refusal: `TextEnvelope` has no
+            // refusal arm, and an empty page is the one answer that cannot be
+            // mistaken for more history.
+            return self.empty_history(inbound, request.channel);
+        };
+        let cursor_id = match direction {
+            Direction::Backward => &cursor.before_id,
+            Direction::Forward => &cursor.after_id,
+        };
+        let from = Uuid7::parse(cursor_id)
             .map(Uuid7::to_vec)
             .unwrap_or_default();
         let limit = cursor.page_size(50, 200);
         let page = self
-            .history(inbound.scope, request.channel, limit, &before)
+            .history(inbound.scope, request.channel, limit, &from, direction)
             .await;
         let messages: Vec<_> = page
             .messages
@@ -913,12 +1021,14 @@ impl TextService {
         // `history` already trimmed to `limit`, so the cursor comes from the
         // page it returned rather than from an unconsumed extra row.
         let page_info = if page.more {
-            PageInfo::more_before(
-                messages
-                    .last()
-                    .map(|message| message.message_id.clone())
-                    .unwrap_or_default(),
-            )
+            let last = messages
+                .last()
+                .map(|message| message.message_id.clone())
+                .unwrap_or_default();
+            match direction {
+                Direction::Backward => PageInfo::more_before(last),
+                Direction::Forward => PageInfo::more_after(last),
+            }
         } else {
             PageInfo::complete()
         };
@@ -1358,6 +1468,7 @@ impl Serve for TextService {
             settings,
             resolver: ctx.resolver,
             roster: Arc::new(Roster::new()),
+            modes: Arc::new(ChannelModes::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
             live_push: ctx
@@ -1370,6 +1481,7 @@ impl Serve for TextService {
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        let modes = Arc::clone(&self.modes).follow(ctx.clone(), Self::NAME);
         // Started here rather than in `build`, so a service that is only
         // constructed (a test, a config check) never posts anything.
         let deliveries = tokio::spawn(Arc::clone(&self).deliver_loop(ctx.instances()));
@@ -1380,6 +1492,7 @@ impl Serve for TextService {
         let watchers = self.settings.watch(&ctx.instances());
         ctx.shutdown.wait().await;
         follower.abort();
+        modes.abort();
         deliveries.abort();
         for watcher in watchers {
             watcher.abort();
@@ -1445,6 +1558,7 @@ mod tests {
             settings: Settings::fixed(resolver.clone(), config),
             resolver,
             roster: Arc::new(Roster::new()),
+            modes: Arc::new(ChannelModes::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
             // On, so the path a message takes in production is the path these
@@ -1473,11 +1587,104 @@ mod tests {
         for body in ["first", "second", "third"] {
             let _ = service.record(1, &message(9, body)).await;
         }
-        let page = service.history(1, 9, 10, &[]).await;
+        let page = service.history(1, 9, 10, &[], Direction::Backward).await;
         assert_eq!(
             page.messages.first().map(|m| m.body.as_str()),
             Some("third")
         );
+    }
+
+    /// A service that has been told `channel` runs `protocol`.
+    async fn service_running(channel: u32, protocol: u32) -> Arc<TextService> {
+        use starling_proto_fancy::metadata::{Channel, Tree, TreeEvent, tree_event};
+
+        let service = service().await;
+        let _ = service.modes.apply(TreeEvent {
+            event: Some(tree_event::Event::Snapshot(Tree {
+                channels: vec![Channel {
+                    id: channel,
+                    pchat_protocol: protocol,
+                    ..Channel::default()
+                }],
+                ..Tree::default()
+            })),
+        });
+        service
+    }
+
+    #[tokio::test]
+    async fn scrolling_forward_from_a_cursor_returns_only_newer_messages() {
+        // The other half of the scroll. Without it a reader that had dropped
+        // the newer part of a thread could only get it back by paging from the
+        // newest message all the way down.
+        let service = service().await;
+        for body in ["a", "b", "c", "d"] {
+            let _ = service.record(1, &message(7, body)).await;
+        }
+        let oldest = service.history(1, 7, 1, &[], Direction::Forward).await;
+        assert_eq!(
+            oldest.messages.first().map(|m| m.body.as_str()),
+            Some("a"),
+            "a forward page runs oldest first"
+        );
+
+        let cursor = oldest
+            .messages
+            .last()
+            .map(|m| m.id.clone())
+            .unwrap_or_default();
+        let newer = service.history(1, 7, 10, &cursor, Direction::Forward).await;
+        let bodies: Vec<_> = newer.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["b", "c", "d"], "ahead of the cursor, in order");
+    }
+
+    #[tokio::test]
+    async fn a_persistent_channels_plaintext_copy_is_never_archived() {
+        // The dual-path copy exists so peers too old to decrypt still see
+        // something; archiving it wrote the conversation to disk a second time
+        // in clear text. With dual path enabled that copy is the real body,
+        // not the `[Encrypted message]` placeholder.
+        let service = service_running(9, 2).await;
+        assert!(
+            service.modes.is_persistent(9),
+            "the channel runs end-to-end persistent chat"
+        );
+
+        // `record` is what `on_text_message` skips; asserting through it keeps
+        // the test off the permission path, which denies here by design.
+        let page = service.history(1, 9, 10, &[], Direction::Backward).await;
+        assert!(
+            page.messages.is_empty(),
+            "nothing of a persistent channel belongs in this table"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_for_a_persistent_channel_comes_back_empty() {
+        // Rows written by a build that predates the archive skip are still on
+        // disk. Refusing to *write* only protects a database that has always
+        // run this build; this is what keeps yesterday's plaintext unreadable
+        // without a data migration.
+        let service = service_running(9, 2).await;
+        for body in ["said", "in", "clear"] {
+            let _ = service.record(1, &message(9, body)).await;
+        }
+
+        let inbound = Inbound {
+            conn: 1,
+            session: 7,
+            type_id: ServiceKind::Text.outer_type(),
+            payload: Vec::new(),
+            gateway: String::new(),
+            scope: 1,
+        };
+        let actions = service.empty_history(&inbound, 9);
+        assert_eq!(actions.len(), 1, "an empty page, not silence");
+
+        // And the rows really are there, so the empty page is the guard rather
+        // than an empty table.
+        let raw = service.history(1, 9, 10, &[], Direction::Backward).await;
+        assert_eq!(raw.messages.len(), 3);
     }
 
     #[tokio::test]
@@ -1488,13 +1695,15 @@ mod tests {
         for body in ["a", "b", "c", "d"] {
             let _ = service.record(1, &message(8, body)).await;
         }
-        let newest = service.history(1, 8, 2, &[]).await;
+        let newest = service.history(1, 8, 2, &[], Direction::Backward).await;
         let cursor = newest
             .messages
             .last()
             .map(|m| m.id.clone())
             .unwrap_or_default();
-        let older = service.history(1, 8, 10, &cursor).await;
+        let older = service
+            .history(1, 8, 10, &cursor, Direction::Backward)
+            .await;
         assert!(older.messages.iter().all(|m| m.id < cursor));
     }
 
@@ -1504,8 +1713,18 @@ mod tests {
         for body in ["a", "b", "c"] {
             let _ = service.record(1, &message(7, body)).await;
         }
-        assert!(service.history(1, 7, 2, &[]).await.more);
-        assert!(!service.history(1, 7, 10, &[]).await.more);
+        assert!(
+            service
+                .history(1, 7, 2, &[], Direction::Backward)
+                .await
+                .more
+        );
+        assert!(
+            !service
+                .history(1, 7, 10, &[], Direction::Backward)
+                .await
+                .more
+        );
     }
 
     /// One `TextMessage` frame, as the gateway would deliver it.
