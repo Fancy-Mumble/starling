@@ -139,7 +139,7 @@ What `session-view` does not hold is asked of the service that owns it:
 `server-config` supplies the limits, `permissions` evaluates the ACL. §3 walks
 one login through all six.
 
-## 2.4 The four `starling-runtime` gives every service
+## 2.4 The five `starling-runtime` gives every service
 
 These are library modules, not services, and they are the reason four of the
 targets above are hubs rather than peers. Written once, so they are drawn once:
@@ -150,6 +150,7 @@ targets above are hubs rather than peers. Written once, so they are drawn once:
 | `roster` | `SessionView.Subscribe` | onboarding · pchat · push · screenshare · social · text |
 | `settings` | `ServerConfig.Watch` | audit · metadata · server-config · text · userdata · operator-api |
 | `trail` | `Audit.Record` | audit · metadata · moderation · session-lifecycle · userdata |
+| `channel_modes` | `Metadata.Watch` | pchat · text |
 
 `roster` is worth its own paragraph. A `Send` naming no connections and no
 sessions is delivered to **every** authenticated client the gateway holds. That
@@ -160,6 +161,15 @@ folds `session-view` events into a local membership table so a service can
 address a channel. **A cold roster addresses nobody**, deliberately — falling
 back to a broadcast is the leak the type exists to close, so gate readiness on
 `Roster::is_warm` rather than shipping the fallback.
+
+`channel_modes` is the same shape over `Metadata.Watch`, holding each channel's
+`pchat_protocol` for the two services that store what people say. Its cold rule
+is the opposite of `roster`'s, and deliberately: an unknown channel **reads** as
+"no opinion" and **writes** as "not yet". Withholding history because the table
+has not arrived breaks every channel during a metadata restart, and
+authorisation is a separate check that already ran; but storing a message under
+a mode nobody confirmed cannot be undone, and one of the modes means the server
+keeps a readable copy.
 
 ## 2.5 The two that reach everything
 
@@ -390,12 +400,30 @@ recipients through a `roster`; it used to name only the speaker as an exclusion,
 which left everyone else *on the server* rather than everyone else in the
 channel. Calls `push` for recipients who are not connected.
 
+Reads `channel_modes`, and for a channel that runs persistent chat it neither
+archives nor serves. What reaches it for such a channel is the legacy copy a
+Fancy client sends beside the sealed message so that older peers see something;
+storing that wrote the conversation to disk a second time in clear text, and
+with dual path enabled the copy is the real body rather than a placeholder.
+`HistoryRequest` is gated on `Enter` like pchat's fetch — it was not, which is
+the one place the audit's S1 finding had a twin.
+
 ### `pchat` — persistent chat: a relay and a store, never a decryptor
 
 The end-to-end crypto is the client's; this service never sees plaintext. It owns
 storage, fan-out, offline queues, key-holder bookkeeping and rate limiting. Key
 is `channel_id ‖ uuidv7`, so the table is physically ordered tenant → channel →
-time and both fetch shapes are one backwards range scan.
+time and every fetch shape is one range scan. Pages walk **both ways**:
+`Cursor.before_id` runs newest-first, `after_id` oldest-first, and a forward
+page that was not cut off reports an empty `next_after_id`, which is how a
+reader knows it has caught up and can follow the live tail. `total_stored` is
+counted on the first page of a thread only.
+
+Reads `channel_modes` to refuse a message whose declared protocol disagrees with
+its channel. The archive decision used to come from the protocol the *message*
+named, which trusted a client about its own history — survivable while every
+mode was end-to-end and the bytes were opaque either way, and not survivable
+once a mode exists where this server holds the key.
 
 ### `moderation` — bans and kicks
 

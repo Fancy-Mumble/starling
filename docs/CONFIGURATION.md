@@ -521,6 +521,37 @@ url = "sqlite:///var/lib/starling/userdata.db"
 In-memory SQLite is capped to one connection regardless: five connections to
 `:memory:` are five different databases.
 
+## The persistent-chat at-rest key
+
+A channel set to `SERVER_MANAGED` is the one persistent-chat mode that is **not**
+end-to-end encrypted. Its members are told the server holds the key, which is
+what buys them a late joiner who can read the whole archive and a client with no
+key exchange to do. Those messages are sealed on disk under a key this server
+holds, so a stolen backup or a disk that leaves the building is bytes nobody can
+open.
+
+The key is generated on first boot at `<data_dir>/pchat-at-rest.key`, 32 random
+bytes, mode `0600`. A deployment with a secret manager should hand it in instead:
+
+```
+STARLING_PCHAT_AT_REST_KEY=<32 bytes, base64>
+```
+
+The environment wins over the file when both are present.
+
+**Back it up with the database, not beside it.** Losing the key loses every
+server-managed message; there is no recovery path and there is not meant to be.
+A key file that exists but is the wrong length is a start-up error rather than a
+reason to generate a fresh one, because generating one would silently discard
+everything the old key sealed. If no key can be loaded at all, server-managed
+channels **refuse to store** rather than falling back to plaintext, and the
+refusal is logged at start-up.
+
+What this buys is the database at rest and nothing more. A running server reads
+those messages, and so does anyone holding the key file and the database
+together. The other persistent-chat modes are unaffected: the server cannot read
+them, does not try, and stores their bytes exactly as they arrived.
+
 ## Observability
 
 ```toml
