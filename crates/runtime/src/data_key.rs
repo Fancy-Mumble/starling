@@ -166,24 +166,24 @@ impl DataKey {
 }
 
 /// Write `bytes` to `path`, readable by this user alone.
+#[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        use std::io::Write as _;
-        return file.write_all(bytes);
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows inherits the directory's ACL, which for a service data
-        // directory is the account the service runs as.
-        std::fs::write(path, bytes)
-    }
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+/// Windows inherits the directory's ACL, which for a service data directory is
+/// the account the service runs as.
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 /// Decode standard base64, padded or not, or `None`.
