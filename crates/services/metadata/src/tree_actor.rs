@@ -18,6 +18,33 @@ use crate::ids::ROOT_CHANNEL;
 pub use starling_proto_fancy::channel::{
     FLAG_DETACHED, FLAG_HIDDEN, FLAG_STRUCTURAL, FLAG_TEMPORARY, is_detached,
 };
+/// The highest persistent-chat protocol this build knows.
+///
+/// `SIGNAL_V1` (`fancy/pchat.proto`). Kept as a number rather than reached for
+/// through the enum because `metadata` does not otherwise depend on what the
+/// modes mean, only on the fact that a channel cannot be set to one nothing
+/// implements.
+const HIGHEST_PCHAT_PROTOCOL: u32 = 4;
+
+/// The persistent-chat protocol to keep, given what was asked for.
+///
+/// Range-checked because two services now *act* on this value rather than only
+/// relaying it: a channel set to a number no build understands would have
+/// `pchat` refusing every message for it and `text` withholding its history,
+/// which reads as a channel that has silently stopped working. Keeping the
+/// current value is the conservative answer, and the warning is what says the
+/// edit did not take.
+fn accepted_protocol(channel: u32, current: u32, proposed: u32) -> u32 {
+    if proposed > HIGHEST_PCHAT_PROTOCOL {
+        tracing::warn!(
+            channel,
+            protocol = proposed,
+            "ignoring an unknown persistent-chat protocol"
+        );
+        return current;
+    }
+    proposed
+}
 
 /// `flags` with detachment forced to what the channel already was.
 ///
@@ -578,7 +605,19 @@ impl Trees {
                     "parent" => channel.parent = values.parent,
                     "expiry_mode" => channel.expiry_mode = values.expiry_mode,
                     "expiry_duration_s" => channel.expiry_duration_s = values.expiry_duration_s,
-                    "pchat_protocol" => channel.pchat_protocol = values.pchat_protocol,
+                    // Range-checked because two services now *act* on this
+                    // value rather than only relaying it: a channel set to a
+                    // number no build understands would have `pchat` refusing
+                    // every message for it and `text` withholding its history,
+                    // which reads as a channel that has silently stopped
+                    // working.
+                    "pchat_protocol" => {
+                        channel.pchat_protocol = accepted_protocol(
+                            channel.id,
+                            channel.pchat_protocol,
+                            values.pchat_protocol,
+                        );
+                    }
                     other => tracing::warn!(field = other, "ignoring an unknown channel field"),
                 }
             }
