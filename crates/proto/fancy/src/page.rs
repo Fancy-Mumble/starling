@@ -36,6 +36,37 @@ impl Cursor {
     }
 }
 
+/// Which way a caller is walking the store.
+///
+/// A page is a contiguous range either side of a cursor, and which side decides
+/// both the SQL and which half of [`PageInfo`] the reader continues from. Kept
+/// as a type rather than a `bool` because "true means forward" is exactly the
+/// kind of parameter that gets passed the wrong way round once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Older than the cursor, newest first. What every caller did before there
+    /// was a choice, and what a client too old to ask for anything else gets.
+    Backward,
+    /// Newer than the cursor, oldest first.
+    Forward,
+}
+
+impl Cursor {
+    /// Which way this cursor walks, or `None` if it names both ends.
+    ///
+    /// Both cursors set is refused rather than guessed at: it is a request for
+    /// a bounded range, which no store here implements, and picking one end
+    /// silently would serve a page the caller did not ask for.
+    #[must_use]
+    pub fn direction(&self) -> Option<Direction> {
+        match (self.before_id.is_empty(), self.after_id.is_empty()) {
+            (false, false) => None,
+            (true, false) => Some(Direction::Forward),
+            _ => Some(Direction::Backward),
+        }
+    }
+}
+
 impl PageInfo {
     /// The tail of a page with nothing behind it.
     #[must_use]
@@ -43,6 +74,7 @@ impl PageInfo {
         Self {
             more: false,
             next_before_id: String::new(),
+            next_after_id: String::new(),
         }
     }
 
@@ -56,6 +88,20 @@ impl PageInfo {
         Self {
             more: true,
             next_before_id: next_before_id.into(),
+            next_after_id: String::new(),
+        }
+    }
+
+    /// The tail of a forward page that has more ahead of it.
+    ///
+    /// The mirror of [`Self::more_before`]: a forward walk returns oldest
+    /// first, so "after the newest one you just got" is the next page.
+    #[must_use]
+    pub fn more_after(next_after_id: impl Into<String>) -> Self {
+        Self {
+            more: true,
+            next_before_id: String::new(),
+            next_after_id: next_after_id.into(),
         }
     }
 
@@ -66,10 +112,28 @@ impl PageInfo {
     /// case, so a caller that has nothing more to give never computes it.
     #[must_use]
     pub fn after(returned: usize, limit: u32, last_id: impl FnOnce() -> String) -> Self {
-        if returned > limit as usize {
-            Self::more_before(last_id())
-        } else {
-            Self::complete()
+        Self::walking(Direction::Backward, returned, limit, last_id)
+    }
+
+    /// [`Self::after`], for a caller that knows which way it walked.
+    ///
+    /// A page that was not cut off is [`Self::complete`] in both directions,
+    /// and for a forward walk that is the signal that matters: it means the
+    /// reader has reached the newest entry and can follow the live tail rather
+    /// than ask again.
+    #[must_use]
+    pub fn walking(
+        direction: Direction,
+        returned: usize,
+        limit: u32,
+        last_id: impl FnOnce() -> String,
+    ) -> Self {
+        if returned <= limit as usize {
+            return Self::complete();
+        }
+        match direction {
+            Direction::Backward => Self::more_before(last_id()),
+            Direction::Forward => Self::more_after(last_id()),
         }
     }
 }
@@ -120,6 +184,60 @@ mod tests {
             ..Cursor::default()
         };
         assert_eq!(asked.page_size(50, 200), 25);
+    }
+
+    #[test]
+    fn a_cursor_naming_neither_end_walks_backward() {
+        // What every caller did before there was a choice, and what a client
+        // too old to set `after_id` must keep getting.
+        assert_eq!(Cursor::default().direction(), Some(Direction::Backward));
+    }
+
+    #[test]
+    fn each_cursor_walks_its_own_way() {
+        let back = Cursor {
+            before_id: "id-9".to_owned(),
+            ..Cursor::default()
+        };
+        assert_eq!(back.direction(), Some(Direction::Backward));
+
+        let forward = Cursor {
+            after_id: "id-1".to_owned(),
+            ..Cursor::default()
+        };
+        assert_eq!(forward.direction(), Some(Direction::Forward));
+    }
+
+    #[test]
+    fn naming_both_ends_is_refused_rather_than_guessed_at() {
+        // A bounded range is not something any store here implements, and
+        // silently honouring one end would serve a page nobody asked for.
+        let both = Cursor {
+            before_id: "id-9".to_owned(),
+            after_id: "id-1".to_owned(),
+            ..Cursor::default()
+        };
+        assert_eq!(both.direction(), None);
+    }
+
+    #[test]
+    fn a_forward_page_continues_from_the_other_end() {
+        let cut_off = PageInfo::walking(Direction::Forward, 51, 50, || "id-50".to_owned());
+        assert!(cut_off.more);
+        assert_eq!(cut_off.next_after_id, "id-50");
+        // Not the backward field: a reader that continued from `next_before_id`
+        // here would walk away from the rows it has not seen.
+        assert!(cut_off.next_before_id.is_empty());
+    }
+
+    #[test]
+    fn a_forward_page_that_caught_up_says_so_by_saying_nothing() {
+        // The signal that lets a reader stop asking and follow the live tail.
+        let caught_up = PageInfo::walking(Direction::Forward, 12, 50, || {
+            panic!("not computed when complete")
+        });
+        assert!(!caught_up.more);
+        assert!(caught_up.next_after_id.is_empty());
     }
 
     #[test]
