@@ -26,7 +26,9 @@
 
 pub mod breaker;
 pub mod channel;
+pub mod channel_modes;
 pub mod config;
+pub mod data_key;
 pub mod greeting;
 pub mod greeting_binary;
 pub mod health;

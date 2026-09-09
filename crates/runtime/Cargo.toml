@@ -22,6 +22,12 @@ hyper-util.workspace = true
 # that turns a name check into a stall.
 regex.workspace = true
 
+# The server data key: real randomness, and a wipe the optimiser may not elide.
+rand.workspace = true
+zeroize.workspace = true
+# An operator's key, handed in by environment variable.
+base64.workspace = true
+
 serde.workspace = true
 # The admin API's configuration payloads, shared so both directions agree.
 serde_json.workspace = true
