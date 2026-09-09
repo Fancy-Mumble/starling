@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use starling_runtime::ids::now_ms;
-use starling_runtime::ratelimit::{Rate, TokenBucket};
+use starling_runtime::ratelimit::{Rate, Throttled, TokenBucket};
 
 /// What a client is asking for, for the purpose of budgeting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,10 +37,17 @@ impl Op {
     ///
     /// Sized for a person typing rather than a client syncing: the burst
     /// absorbs a paste or a reconnect, the rate is what a conversation needs.
+    ///
+    /// `Fetch` was 0.5/s with a burst of 10, which was sized for the only
+    /// reader that existed: one page when a channel opened, and nothing after.
+    /// A reader scrolling through history asks for a page at each edge of a
+    /// moving window, and a fast scroll through a long archive is a normal
+    /// thing to do rather than an attack. Still the tightest of the three,
+    /// because a page is a database scan where a message is an insert.
     const fn budget(self) -> (f64, u32) {
         match self {
             Self::Message => (2.0, 20),
-            Self::Fetch => (0.5, 10),
+            Self::Fetch => (2.0, 20),
             Self::Manage => (2.0, 30),
         }
     }
@@ -65,8 +72,17 @@ impl Limits {
     /// turns a bookkeeping fault into an outage, and the limiter is a budget
     /// rather than an authorisation.
     pub(crate) fn allow(&self, conn: u64, op: Op) -> bool {
+        self.check(conn, op).is_ok()
+    }
+
+    /// [`Self::allow`], keeping the retry hint when it refuses.
+    ///
+    /// The bucket has always known when it would next have a token; the caller
+    /// simply threw it away. A refusal a client can wait on is the difference
+    /// between backing off and giving up.
+    pub(crate) fn check(&self, conn: u64, op: Op) -> Result<(), Throttled> {
         let Ok(mut buckets) = self.buckets.lock() else {
-            return true;
+            return Ok(());
         };
         let now = now_ms();
         let (rate, burst) = op.budget();
@@ -74,7 +90,6 @@ impl Limits {
             .entry((conn, op))
             .or_insert_with(|| TokenBucket::new(Rate::per_second(rate), burst, now))
             .take(now)
-            .is_ok()
     }
 
     /// Drop everything held for `conn`.

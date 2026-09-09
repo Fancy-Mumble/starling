@@ -11,6 +11,7 @@
 //! are then one backwards range scan, which is what turns murmur's full scan of
 //! an unindexed `TEXT` UUID into an index seek (`docs/STORAGE.md` L3).
 
+mod at_rest;
 mod limits;
 
 use std::sync::Arc;
@@ -18,16 +19,20 @@ use std::sync::Arc;
 use prost::Message as _;
 use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::pchat::{
-    Ack, Fetch, FetchResponse, Message, PchatEnvelope, Protocol, ack, pchat_envelope,
+    Ack, Fetch, FetchRefused, FetchResponse, Message, PchatEnvelope, Protocol, ack, pchat_envelope,
 };
-use starling_proto_fancy::fancy::wire::PageInfo;
+use starling_proto_fancy::fancy::wire::{PageInfo, Refusal, refusal};
+use starling_proto_fancy::page::Direction;
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::channel_modes::ChannelModes;
+use starling_runtime::data_key::{DataKey, KeyId};
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
 };
+use starling_runtime::ratelimit::Throttled;
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
@@ -165,6 +170,20 @@ const SCHEMA: &[Migration<'static>] = &[
              ON pchat_message(server_id, channel_id, client_id)",
         ],
     ),
+    // Which key sealed this row, or NULL for a row this server never sealed.
+    //
+    // The *column* decides whether `ciphertext` needs opening, not the row's
+    // `protocol`. Those two answer different questions -- one is what the
+    // sender's crypto did, the other is what this server's storage did -- and
+    // a future re-seal or a channel that changes mode must not strand rows
+    // because the two disagreed.
+    //
+    // Nullable and not backfilled: every row written before this migration is
+    // end-to-end ciphertext, which is exactly what NULL means here.
+    Migration::new(
+        "0007_pchat_at_rest",
+        &["ALTER TABLE pchat_message ADD COLUMN at_rest_key_id INTEGER NULL"],
+    ),
 ];
 
 /// Whether a message of this protocol belongs in the archive at all.
@@ -213,20 +232,151 @@ pub struct PchatService {
     permit: Permit,
     /// Who is in which channel, so a relay can be addressed at one.
     roster: Arc<Roster>,
+    /// Which persistent-chat protocol each channel runs.
+    ///
+    /// The archive decision used to be made from the protocol the *message*
+    /// declared, which trusted a client about its own history. That was
+    /// tolerable while every mode was end-to-end; it is not once a mode exists
+    /// where this server keeps the key.
+    modes: Arc<ChannelModes>,
+    /// The key a server-managed channel's rows are sealed under at rest.
+    ///
+    /// `None` where one could not be loaded, and then a server-managed message
+    /// is refused rather than stored: the members of such a channel were told
+    /// this server keeps their history, not that it keeps it in the clear.
+    data_key: Option<DataKey>,
     /// Per-connection budgets.
     limits: Limits,
 }
 
+/// The file the at-rest key lives in, under the server's data directory.
+const KEY_NAME: &str = "pchat-at-rest";
+
+/// The environment variable that supplies it instead, base64.
+///
+/// For a deployment with a secret manager, which should not have to write the
+/// key to the container's disk to satisfy this service.
+const KEY_ENV: &str = "STARLING_PCHAT_AT_REST_KEY";
+
+/// The columns a page returns and the predicate every page shares.
+///
+/// A macro rather than a `const` so the four statements in [`PchatService::fetch`]
+/// can be assembled by `concat!` at compile time and stay `&'static str`.
+macro_rules! page_columns {
+    () => {
+        "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, supersedes, \
+         client_supersedes, sender_cert, epoch_fingerprint, chain_index, protocol, \
+         at_rest_key_id \
+         FROM pchat_message \
+         WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?)"
+    };
+}
+
+/// A throttle's retry hint, in the milliseconds the wire carries.
+///
+/// Saturating on purpose: a bucket whose rate is zero reports `Duration::MAX`,
+/// which is honest inside the server and useless on a wire field that is a
+/// `u32`. Clamped to an hour, which reads as "not soon" without inviting a
+/// client to treat the number as a countdown it should sleep through.
+fn retry_after_ms(throttled: &Throttled) -> u32 {
+    const AN_HOUR: u128 = 60 * 60 * 1000;
+    u32::try_from(throttled.retry_after.as_millis().min(AN_HOUR)).unwrap_or(u32::MAX)
+}
+
+/// What goes into the `ciphertext` and `at_rest_key_id` columns.
+#[derive(Debug)]
+struct Stored {
+    bytes: Vec<u8>,
+    /// `None` for an end-to-end payload, which this server stores as it
+    /// arrived because it cannot do anything else with it.
+    key_id: Option<KeyId>,
+}
+
 impl PchatService {
+    /// The bytes to store for `message`, sealed if its mode says so.
+    ///
+    /// `None` means "do not store this", never "store it in the clear".
+    fn seal_for_storage(&self, scope: u32, id: &Uuid7, message: &Message) -> Option<Stored> {
+        if message.protocol != Protocol::ServerManaged as i32 {
+            return Some(Stored {
+                bytes: message.ciphertext.clone(),
+                key_id: None,
+            });
+        }
+        // A server-managed message with no key configured is refused rather
+        // than stored: the members of that channel were told the server keeps
+        // their history, not that it keeps it in the clear.
+        let key = self.data_key.as_ref()?;
+        let sealed = at_rest::seal(
+            key,
+            at_rest::Placement {
+                scope,
+                channel: message.channel,
+                id: &id.to_vec(),
+                client_id: &message.message_id,
+            },
+            &message.ciphertext,
+        )?;
+        Some(Stored {
+            bytes: sealed,
+            key_id: Some(key.id()),
+        })
+    }
+
+    /// The payload to put on the wire for one stored row.
+    ///
+    /// `None` means the row will not open and must be left out of the page.
+    /// One answer for a wrong key, a truncated column and a row that was moved,
+    /// because telling them apart would be an oracle and the caller does the
+    /// same thing either way.
+    fn open_stored(&self, scope: u32, channel: u32, row: &sqlx::any::AnyRow) -> Option<Vec<u8>> {
+        use sqlx::Row as _;
+
+        let ciphertext: Vec<u8> = row.try_get("ciphertext").unwrap_or_default();
+        // NULL is every row written before this column existed, and every
+        // end-to-end row since: bytes this server never sealed and cannot open.
+        let Ok(Some(_key_id)) = row.try_get::<Option<i64>, _>("at_rest_key_id") else {
+            return Some(ciphertext);
+        };
+        let key = self.data_key.as_ref()?;
+        let id: Vec<u8> = row.try_get("id").unwrap_or_default();
+        let client_id: Option<String> = row.try_get("client_id").unwrap_or_default();
+        at_rest::open(
+            key,
+            at_rest::Placement {
+                scope,
+                channel,
+                id: &id,
+                client_id: client_id.as_deref().unwrap_or_default(),
+            },
+            &ciphertext,
+        )
+    }
+
     /// Store one ciphertext, and say which of the three things happened.
     async fn store_message(&self, scope: u32, message: &Message) -> Kept {
         let id = Uuid7::now();
+        // A server-managed channel's messages arrive in the clear -- that is
+        // what the mode is -- so this is where they stop being in the clear.
+        // The row is bound to its tenant, channel and both ids, so a copy
+        // lifted elsewhere fails to open rather than opening into the wrong
+        // conversation.
+        let Some(stored) = self.seal_for_storage(scope, &id, message) else {
+            // A refusal to seal is a refusal to store. The one thing this must
+            // never do is fall back to writing the message in clear because the
+            // cipher, or the key, was unavailable.
+            tracing::error!(
+                channel = message.channel,
+                "could not seal a server-managed message; not storing it"
+            );
+            return Kept::Failed;
+        };
         let result = sqlx::query(
             "INSERT INTO pchat_message \
                  (server_id, channel_id, id, sent_at_ms, sender, epoch, ciphertext, \
                   supersedes, sender_cert, epoch_fingerprint, chain_index, protocol, \
-                  client_id, client_supersedes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  client_id, client_supersedes, at_rest_key_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(message.channel))
@@ -243,7 +393,7 @@ impl PchatService {
         })
         .bind(i64::from(message.sender))
         .bind(i64::from(message.epoch))
-        .bind(message.ciphertext.as_slice())
+        .bind(stored.bytes.as_slice())
         // Kept for a sender that mints uuid7s, so the column goes on meaning
         // what it always meant; `client_supersedes` below is where a real edit
         // lands, verbatim and unparsed.
@@ -254,6 +404,7 @@ impl PchatService {
         .bind(i64::from(message.protocol))
         .bind((!message.message_id.is_empty()).then(|| message.message_id.clone()))
         .bind((!message.supersedes.is_empty()).then(|| message.supersedes.clone()))
+        .bind(stored.key_id.map(i64::from))
         .execute(self.store.pool())
         .await;
         match result {
@@ -324,33 +475,54 @@ impl PchatService {
         }
     }
 
-    /// A page of ciphertexts, newest first.
+    /// A page of ciphertexts, in the direction the cursor asked for.
+    ///
+    /// Backward pages run newest-first, which is what a client opening a
+    /// channel wants and what every client did before there was a choice.
+    /// Forward pages run oldest-first. Both are one index range scan on
+    /// `(server_id, channel_id, id)`, which is the whole reason that key is
+    /// shaped the way it is (`docs/STORAGE.md` L3).
     async fn fetch(&self, scope: u32, request: &Fetch) -> FetchResponse {
         use sqlx::Row as _;
         let page = request.page.clone().unwrap_or_default();
         let limit = page.page_size(50, 200);
-        let before = self
-            .cursor_of(scope, request.channel, &page.before_id)
-            .await;
+        let direction = page.direction().unwrap_or(Direction::Backward);
+        let cursor_id = match direction {
+            Direction::Backward => &page.before_id,
+            Direction::Forward => &page.after_id,
+        };
+        let cursor = if cursor_id.is_empty() {
+            None
+        } else {
+            self.cursor_of(scope, request.channel, cursor_id).await
+        };
         // The protocol predicate is here as well as in `on_message` on purpose:
         // refusing to write only protects a database that has always run this
         // build, and a deployment that upgraded into it still has yesterday's
         // signal_v1 rows on disk. This is what keeps them unreadable without a
         // data migration.
-        let sql = if before.is_some() {
-            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, supersedes, client_supersedes, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
-             WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
-             AND id < ? ORDER BY id DESC LIMIT ?"
-        } else {
-            "SELECT id, client_id, sent_at_ms, sender, epoch, ciphertext, supersedes, client_supersedes, sender_cert, epoch_fingerprint, chain_index, protocol FROM pchat_message \
-             WHERE server_id = ? AND channel_id = ? AND (protocol IS NULL OR protocol != ?) \
-             ORDER BY id DESC LIMIT ?"
+        // Four literals rather than one built string. Every statement here is
+        // fixed at compile time and only the bind values vary, which is what
+        // keeps the store's "no dynamic SQL" rule true: a page is chosen from
+        // this list, never assembled.
+        let sql = match (direction, cursor.is_some()) {
+            (Direction::Backward, true) => {
+                concat!(page_columns!(), " AND id < ? ORDER BY id DESC LIMIT ?")
+            }
+            (Direction::Backward, false) => concat!(page_columns!(), " ORDER BY id DESC LIMIT ?"),
+            (Direction::Forward, true) => {
+                concat!(page_columns!(), " AND id > ? ORDER BY id ASC LIMIT ?")
+            }
+            // A forward walk from no cursor is the oldest page, which is the
+            // honest reading of "newer than nothing" and is what a reader
+            // jumping to the start of an archive asks for.
+            (Direction::Forward, false) => concat!(page_columns!(), " ORDER BY id ASC LIMIT ?"),
         };
         let mut query = sqlx::query(sql)
             .bind(i64::from(scope))
             .bind(i64::from(request.channel))
             .bind(i64::from(Protocol::SignalV1 as i32));
-        if let Some(cursor) = &before {
+        if let Some(cursor) = &cursor {
             query = query.bind(cursor.as_slice());
         }
         let rows = query
@@ -362,7 +534,7 @@ impl PchatService {
         // The id a page is addressed by is the one the client will send back as
         // the next cursor, so it has to be the same identity the messages
         // themselves carry.
-        let page_info = PageInfo::after(rows.len(), limit, || {
+        let page_info = PageInfo::walking(direction, rows.len(), limit, || {
             rows.get(limit as usize - 1)
                 .map(wire_id)
                 .unwrap_or_default()
@@ -370,11 +542,20 @@ impl PchatService {
         let messages = rows
             .into_iter()
             .take(limit as usize)
-            .map(|row| Message {
+            // A row this server sealed is opened here, and one that will not
+            // open is left out of the page. Dropped rather than served: a
+            // message whose bytes this server cannot vouch for is not history,
+            // and handing back a blob the client will fail to decode looks to
+            // a reader exactly like a corrupt archive with no explanation.
+            .filter_map(|row| {
+                let ciphertext = self.open_stored(scope, request.channel, &row)?;
+                Some((row, ciphertext))
+            })
+            .map(|(row, ciphertext)| Message {
                 message_id: wire_id(&row),
                 channel: request.channel,
                 sender: row.try_get::<i64, _>("sender").unwrap_or_default() as u32,
-                ciphertext: row.try_get("ciphertext").unwrap_or_default(),
+                ciphertext,
                 sent_at_ms: row.try_get::<i64, _>("sent_at_ms").unwrap_or_default() as u64,
                 supersedes: wire_supersedes(&row),
                 epoch: row.try_get::<i64, _>("epoch").unwrap_or_default() as u32,
@@ -391,7 +572,17 @@ impl PchatService {
             channel: request.channel,
             messages,
             page: Some(page_info),
-            total_stored: self.count(scope, request.channel).await,
+            // Counted on the first page of a thread and never again. It is a
+            // `COUNT(*)` over the largest table in the system, and it was being
+            // paid on the hundredth page of a scroll-back to re-answer a
+            // question whose answer the client had already kept. Zero on a
+            // continuation means "no new information", which is how the client
+            // has always treated it.
+            total_stored: if cursor.is_none() {
+                self.count(scope, request.channel).await
+            } else {
+                0
+            },
         }
     }
 
@@ -573,7 +764,7 @@ impl Relay {
             // Server-to-client answers. A client that sends one is trying to
             // forge somebody else's history or pin list, and the verbatim relay
             // would have passed it on unaltered.
-            Body::FetchResponse(_) | Body::PinList(_) => None,
+            Body::FetchResponse(_) | Body::PinList(_) | Body::FetchRefused(_) => None,
             // Handled before this point.
             Body::Message(_) | Body::Fetch(_) | Body::Ack(_) => None,
         }
@@ -679,6 +870,27 @@ impl PchatService {
         )
     }
 
+    /// Why this message may not be stored in its channel, if it may not.
+    ///
+    /// A message must declare the mode its channel is configured for. Until
+    /// this check existed the archive decision was made from the protocol the
+    /// *message* named, so a client could mislabel its own message and have it
+    /// archived anyway. That was survivable while every mode was end-to-end and
+    /// the stored bytes were opaque either way. It is not survivable now that
+    /// one mode means "the server holds the key": without this, a client could
+    /// ask this server to keep a readable copy of a conversation whose members
+    /// were told it could not.
+    ///
+    /// Separate from [`Self::on_message`] so the decision can be read, and
+    /// tested, without a live `permissions` to get past first.
+    fn mode_refusal(&self, message: &Message) -> Option<&'static str> {
+        let protocol = u32::try_from(message.protocol).unwrap_or_default();
+        if self.modes.accepts(message.channel, protocol) {
+            return None;
+        }
+        Some("the message does not declare the protocol this channel runs")
+    }
+
     /// Store a message and relay it to its channel.
     async fn on_message(&self, inbound: &Inbound, mut message: Message) -> Actions {
         if !self.limits.allow(inbound.conn, Op::Message) {
@@ -711,6 +923,17 @@ impl PchatService {
         // to somebody else. `sender` addresses the live connection; the
         // certificate is what survives it and what the recipients' key ladder
         // is keyed on.
+        if let Some(detail) = self.mode_refusal(&message) {
+            tracing::debug!(
+                session = inbound.session,
+                channel = message.channel,
+                protocol = message.protocol,
+                configured = ?self.modes.get(message.channel),
+                "refused a message that disagrees with its channel's mode"
+            );
+            return vec![self.ack(inbound, &message.message_id, ack::Status::Refused, detail)];
+        }
+
         message.sender = inbound.session;
         message.sender_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
         // Relayed either way; this decides whether a row outlives the relay.
@@ -789,10 +1012,62 @@ impl PchatService {
         actions
     }
 
+    /// One refusal, addressed at the connection that asked.
+    ///
+    /// A fetch used to be refused by returning nothing at all, which a reader
+    /// cannot tell apart from the end of the archive: scrolling back stopped,
+    /// at a different message each time depending on how fast they scrolled.
+    fn fetch_refused(
+        &self,
+        inbound: &Inbound,
+        channel: u32,
+        kind: refusal::Kind,
+        detail: &str,
+        retry_after_ms: u32,
+    ) -> ServerAction {
+        let envelope = PchatEnvelope {
+            body: Some(pchat_envelope::Body::FetchRefused(FetchRefused {
+                channel,
+                refusal: Some(Refusal {
+                    kind: kind as i32,
+                    detail: detail.to_owned(),
+                    retry_after_ms,
+                }),
+            })),
+        };
+        to_conn(
+            inbound.conn,
+            ServiceKind::Pchat.outer_type(),
+            envelope.encode_to_vec(),
+        )
+    }
+
     /// Serve a page of the archive to the asker alone.
     async fn on_fetch(&self, inbound: &Inbound, request: Fetch) -> Actions {
-        if !self.limits.allow(inbound.conn, Op::Fetch) {
-            return Actions::new();
+        if let Err(throttled) = self.limits.check(inbound.conn, Op::Fetch) {
+            return vec![self.fetch_refused(
+                inbound,
+                request.channel,
+                refusal::Kind::RateLimited,
+                "too many fetches",
+                retry_after_ms(&throttled),
+            )];
+        }
+
+        // Both ends of a range is a request for a bounded window, which this
+        // store does not implement. Refused rather than half-honoured: picking
+        // an end silently serves a page the caller did not ask for, and the
+        // symptom is history that appears to skip.
+        if let Some(page) = &request.page
+            && page.direction().is_none()
+        {
+            return vec![self.fetch_refused(
+                inbound,
+                request.channel,
+                refusal::Kind::Invalid,
+                "a cursor names one end or neither, not both",
+                0,
+            )];
         }
 
         // The channel id comes off the wire, so without this a client could
@@ -912,6 +1187,20 @@ impl Serve for PchatService {
             fanout: Fanout::default(),
             permit: Permit::new(ctx.resolver.clone()),
             roster: Arc::new(Roster::new()),
+            modes: Arc::new(ChannelModes::new()),
+            // Loaded at boot rather than on first use, so a broken key file is
+            // a start-up failure an operator sees, not a message that silently
+            // will not store an hour later.
+            data_key: match DataKey::load(&ctx.config.runtime.data_dir, KEY_NAME, KEY_ENV) {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "no at-rest key; server-managed channels will refuse to store"
+                    );
+                    None
+                }
+            },
             limits: Limits::new(),
         }))
     }
@@ -923,11 +1212,13 @@ impl Serve for PchatService {
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        let modes = Arc::clone(&self.modes).follow(ctx.clone(), Self::NAME);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             tokio::select! {
                 _ = ctx.shutdown.wait() => {
                     follower.abort();
+                    modes.abort();
                     return Ok(());
                 }
                 _ = ticker.tick() => self.sweep().await,
@@ -977,8 +1268,33 @@ mod tests {
             fanout: Fanout::default(),
             permit: Permit::new(resolver),
             roster: Arc::new(Roster::new()),
+            // Cold, so `accepts` refuses anything but the unspecified
+            // protocol. The storage tests below call `store_message`/`fetch`
+            // directly and never reach it; `service_with_modes` is what a test
+            // that goes through `on_message` under a real mode uses.
+            modes: Arc::new(ChannelModes::new()),
+            data_key: Some(DataKey::from_bytes([9; 32], 1)),
             limits: Limits::new(),
         })
+    }
+
+    /// The same service, with `metadata` having described `channel` as running
+    /// `protocol`.
+    async fn service_with_modes(channel: u32, protocol: u32) -> Arc<PchatService> {
+        use starling_proto_fancy::metadata::{Channel, Tree, TreeEvent, tree_event};
+
+        let service = service_with_members().await;
+        let _ = service.modes.apply(TreeEvent {
+            event: Some(tree_event::Event::Snapshot(Tree {
+                channels: vec![Channel {
+                    id: channel,
+                    pchat_protocol: protocol,
+                    ..Channel::default()
+                }],
+                ..Tree::default()
+            })),
+        });
+        service
     }
 
     /// The same service with a warm roster, so a relay has somewhere to go.
@@ -1223,7 +1539,13 @@ mod tests {
         // fails - which is a server that will not boot, reported as a schema
         // error naming an index rather than the rows behind it.
         let store = memory_store().await;
-        let before = &SCHEMA[..SCHEMA.len() - 1];
+        // Named rather than counted back from the end, so adding a migration
+        // after `0006` does not silently move which upgrade this exercises.
+        let cut = SCHEMA
+            .iter()
+            .position(|migration| migration.name == "0006_pchat_one_row_per_sender_id")
+            .expect("the migration this test is about");
+        let before = &SCHEMA[..cut];
         assert_eq!(
             before.last().map(|m| m.name),
             Some("0005_pchat_client_supersedes"),
@@ -1387,6 +1709,413 @@ mod tests {
                 .iter()
                 .any(|m| m.message_id == second.messages[0].message_id),
             "a second page must not repeat the first"
+        );
+    }
+
+    /// `count` messages in `channel`, ids ascending and predictable.
+    async fn archive(service: &PchatService, channel: u32, count: u8) {
+        for n in 0..count {
+            let _ = service
+                .store_message(
+                    1,
+                    &Message {
+                        message_id: format!("0000000{n:x}-0000-4000-8000-000000000000"),
+                        ..message(channel, b"x")
+                    },
+                )
+                .await;
+        }
+    }
+
+    /// A forward page from `after`.
+    fn fetch_after(channel: u32, after: &str, limit: u32) -> Fetch {
+        Fetch {
+            channel,
+            page: Some(Cursor {
+                after_id: after.to_owned(),
+                limit,
+                ..Cursor::default()
+            }),
+        }
+    }
+
+    /// The wire id of the `n`th message [`archive`] wrote.
+    fn archived_id(n: u8) -> String {
+        format!("0000000{n:x}-0000-4000-8000-000000000000")
+    }
+
+    /// The same service over the same database, so a test can vary one field.
+    ///
+    /// Sharing the `Store` on purpose: the point of these tests is what a
+    /// *different key* makes of rows that are already written.
+    fn rebuild(service: &PchatService) -> PchatService {
+        PchatService {
+            store: service.store.clone(),
+            fanout: Fanout::default(),
+            permit: service.permit.clone(),
+            roster: Arc::clone(&service.roster),
+            modes: Arc::clone(&service.modes),
+            data_key: None,
+            limits: Limits::new(),
+        }
+    }
+
+    /// One server-managed message, as the client sends it: in the clear.
+    fn managed(channel: u32, body: &[u8]) -> Message {
+        Message {
+            protocol: Protocol::ServerManaged as i32,
+            message_id: "11111111-0000-4000-8000-000000000000".to_owned(),
+            ..message(channel, body)
+        }
+    }
+
+    /// The `ciphertext` column as it sits on disk.
+    async fn stored_bytes(service: &PchatService, channel: u32) -> Vec<u8> {
+        use sqlx::Row as _;
+
+        sqlx::query("SELECT ciphertext FROM pchat_message WHERE channel_id = ?")
+            .bind(i64::from(channel))
+            .fetch_one(service.store.pool())
+            .await
+            .expect("a stored row")
+            .try_get("ciphertext")
+            .expect("the column")
+    }
+
+    #[tokio::test]
+    async fn a_server_managed_message_is_not_on_disk_in_the_clear() {
+        // The whole claim of the mode. A client sends this one unsealed,
+        // because the mode is "the server holds the key" -- so if the row were
+        // stored as it arrived, the archive would be plaintext.
+        let service = service().await;
+        let _ = service
+            .store_message(1, &managed(4, b"the quiet part"))
+            .await;
+
+        let on_disk = stored_bytes(&service, 4).await;
+        assert!(
+            !on_disk.windows(5).any(|window| window == b"quiet"),
+            "a stolen backup must not hold the plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_managed_message_comes_back_readable() {
+        // And the other half: sealing it is only useful if the archive still
+        // serves it, which is what a late joiner reads.
+        let service = service().await;
+        let _ = service
+            .store_message(1, &managed(4, b"the quiet part"))
+            .await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(
+            page.messages[0].ciphertext.as_slice(),
+            b"the quiet part",
+            "opened on the way out"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_end_to_end_message_is_stored_exactly_as_it_arrived() {
+        // The other modes must be untouched by any of this: the server cannot
+        // open them, so it must not try, and the bytes it returns have to be
+        // the bytes the sender sealed or the AEAD refuses them.
+        let service = service().await;
+        let sealed_by_client = b"\x01\x02 opaque to this server";
+        let _ = service
+            .store_message(
+                1,
+                &Message {
+                    protocol: Protocol::FancyV1FullArchive as i32,
+                    ..message(4, sealed_by_client)
+                },
+            )
+            .await;
+
+        assert_eq!(stored_bytes(&service, 4).await, sealed_by_client);
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages[0].ciphertext.as_slice(), sealed_by_client);
+    }
+
+    #[tokio::test]
+    async fn a_row_this_key_cannot_open_is_left_out_of_the_page() {
+        // A key that changed under a populated database. Serving the sealed
+        // bytes would look to the reader like a corrupt archive with no
+        // explanation; a short page is the honest answer.
+        let service = service().await;
+        let _ = service
+            .store_message(1, &managed(4, b"the quiet part"))
+            .await;
+
+        let stranger = PchatService {
+            data_key: Some(DataKey::from_bytes([1; 32], 1)),
+            ..rebuild(&service)
+        };
+        let page = stranger.fetch(1, &fetch(4, 10)).await;
+        assert!(
+            page.messages.is_empty(),
+            "not served, and specifically not served as ciphertext"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_managed_message_is_refused_when_there_is_no_key() {
+        // Refused, never stored in the clear. The members of the channel were
+        // told the server keeps their history, not that it keeps it readable
+        // to anyone who opens the database file.
+        let service = service().await;
+        let keyless = PchatService {
+            data_key: None,
+            ..rebuild(&service)
+        };
+        let kept = keyless
+            .store_message(1, &managed(4, b"the quiet part"))
+            .await;
+
+        assert!(matches!(kept, Kept::Failed));
+        assert_eq!(keyless.count(1, 4).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_naming_neither_end_still_means_the_newest_page() {
+        // The compatibility rule the forward walk must not disturb: every
+        // shipping client sends an empty cursor to open a channel, and
+        // "no lower bound" plus "from the newest" is the newest page, not the
+        // oldest one.
+        let service = service().await;
+        archive(&service, 5, 4).await;
+
+        let page = service.fetch(1, &fetch(5, 2)).await;
+        assert_eq!(
+            page.messages[0].message_id,
+            archived_id(3),
+            "an empty cursor opens at the newest message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forward_page_walks_the_other_way_and_says_where_to_continue() {
+        // `after_id` has been on the wire since epoch 1 and was read nowhere,
+        // so a reader that had dropped the newer half of a thread could only
+        // get it back by paging from the newest message all the way down.
+        let service = service().await;
+        archive(&service, 5, 5).await;
+
+        let ahead = service.fetch(1, &fetch_after(5, &archived_id(0), 2)).await;
+        assert_eq!(ahead.messages.len(), 2);
+        assert_eq!(
+            ahead.messages[0].message_id,
+            archived_id(1),
+            "a forward page runs oldest first, starting after the cursor"
+        );
+        let page = ahead.page.expect("a page reports its tail");
+        assert!(page.more);
+        assert_eq!(
+            page.next_after_id,
+            ahead.messages.last().expect("two messages").message_id,
+            "the cursor names the newest message on the page"
+        );
+        assert!(
+            page.next_before_id.is_empty(),
+            "a reader continuing from the backward field would walk away from              the rows it has not seen"
+        );
+
+        let next = service
+            .fetch(1, &fetch_after(5, &page.next_after_id, 2))
+            .await;
+        assert_eq!(
+            next.messages[0].message_id,
+            archived_id(3),
+            "the page ahead of the cursor, with no repeat and no gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forward_walk_that_catches_up_stops_asking() {
+        // The signal a reader needs to stop paging and follow the live tail.
+        let service = service().await;
+        archive(&service, 5, 3).await;
+
+        let rest = service.fetch(1, &fetch_after(5, &archived_id(0), 50)).await;
+        let page = rest.page.expect("a page reports its tail");
+        assert!(!page.more);
+        assert!(page.next_after_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_two_directions_cover_the_archive_between_them() {
+        // The property the client's contiguous range depends on: a walk back
+        // from the newest and a walk forward from the oldest must agree about
+        // the archive, each seeing every message exactly once.
+        let service = service().await;
+        archive(&service, 5, 6).await;
+
+        let mut backward = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let page = service
+                .fetch(
+                    1,
+                    &Fetch {
+                        channel: 5,
+                        page: Some(Cursor {
+                            before_id: cursor,
+                            limit: 2,
+                            ..Cursor::default()
+                        }),
+                    },
+                )
+                .await;
+            backward.extend(page.messages.iter().map(|m| m.message_id.clone()));
+            let tail = page.page.expect("a page reports its tail");
+            if !tail.more {
+                break;
+            }
+            cursor = tail.next_before_id;
+        }
+        assert_eq!(backward.len(), 6, "every message, once");
+
+        // Forward starts *after* the oldest, which the backward walk just
+        // named, so the oldest is prepended to compare like with like.
+        let mut forward = vec![backward.last().expect("six messages").clone()];
+        let mut cursor = forward[0].clone();
+        loop {
+            let page = service.fetch(1, &fetch_after(5, &cursor, 2)).await;
+            forward.extend(page.messages.iter().map(|m| m.message_id.clone()));
+            let tail = page.page.expect("a page reports its tail");
+            if !tail.more {
+                break;
+            }
+            cursor = tail.next_after_id;
+        }
+
+        forward.reverse();
+        assert_eq!(backward, forward, "the same archive, walked both ways");
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_counted_once_and_not_on_every_page() {
+        // A `COUNT(*)` over the largest table in the system was being paid on
+        // the hundredth page of a scroll-back, to re-answer a question the
+        // client had already kept the answer to.
+        let service = service().await;
+        archive(&service, 5, 4).await;
+
+        let first = service.fetch(1, &fetch(5, 2)).await;
+        assert_eq!(first.total_stored, 4, "the first page carries the count");
+
+        let cursor = first.page.expect("a page reports its tail").next_before_id;
+        let second = service
+            .fetch(
+                1,
+                &Fetch {
+                    channel: 5,
+                    page: Some(Cursor {
+                        before_id: cursor,
+                        limit: 2,
+                        ..Cursor::default()
+                    }),
+                },
+            )
+            .await;
+        assert_eq!(
+            second.total_stored, 0,
+            "a continuation says nothing new about the total"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_naming_both_ends_is_refused_out_loud() {
+        let service = service_with_members().await;
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Fetch(Fetch {
+                channel: 4,
+                page: Some(Cursor {
+                    before_id: "00000009-0000-4000-8000-000000000000".to_owned(),
+                    after_id: "00000001-0000-4000-8000-000000000000".to_owned(),
+                    limit: 10,
+                }),
+            })))
+            .await;
+
+        let refusal = sole_refusal(&actions);
+        assert_eq!(refusal.kind, refusal::Kind::Invalid as i32);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_fetch_says_so_rather_than_looking_like_the_end() {
+        // The reason this is worth a wire arm: a dropped fetch and an exhausted
+        // archive are the same thing from the client, so scrolling back simply
+        // stopped, at a different message each time.
+        let service = service_with_members().await;
+        // Drained rather than counted, so the test does not restate the budget
+        // and break every time it is retuned.
+        let mut drained = 0;
+        while service.limits.allow(1, Op::Fetch) {
+            drained += 1;
+            assert!(drained < 1_000, "the fetch bucket should be exhaustible");
+        }
+
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Fetch(fetch(4, 10))))
+            .await;
+        let refusal = sole_refusal(&actions);
+        assert_eq!(refusal.kind, refusal::Kind::RateLimited as i32);
+        assert!(
+            refusal.retry_after_ms > 0,
+            "a refusal a client can wait on is the difference between backing \
+             off and giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_mislabelling_its_channels_mode_is_refused() {
+        // What makes a server-managed channel trustworthy: without this a
+        // client could ask this server to keep a readable copy of a
+        // conversation whose members were told it could not.
+        let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
+        let refusal = service.mode_refusal(&Message {
+            protocol: Protocol::ServerManaged as i32,
+            ..message(4, b"plaintext")
+        });
+        assert!(refusal.is_some(), "plaintext into an end-to-end channel");
+    }
+
+    #[tokio::test]
+    async fn a_message_declaring_its_channels_mode_is_kept() {
+        let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
+        assert!(
+            service
+                .mode_refusal(&Message {
+                    protocol: Protocol::FancyV1FullArchive as i32,
+                    ..message(4, b"sealed")
+                })
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_too_old_to_declare_a_protocol_is_still_served() {
+        // Zero is what every shipping client sends. Refusing it would have
+        // broken all of them the day this check landed.
+        let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
+        assert!(service.mode_refusal(&message(4, b"sealed")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_channel_no_mode_is_known_for_stores_nothing_under_a_mode() {
+        // The write-side fail-closed. A metadata restart must not be a window
+        // in which a client can pick which archive its message lands in.
+        let service = service_with_members().await;
+        assert!(
+            service
+                .mode_refusal(&Message {
+                    protocol: Protocol::ServerManaged as i32,
+                    ..message(4, b"plaintext")
+                })
+                .is_some()
         );
     }
 
@@ -1783,6 +2512,25 @@ mod tests {
     }
 
     /// The payload of a `Send` action, for asserting on what a refusal carries.
+    /// The one body these actions carry, decoded.
+    fn sole_body(actions: &[ServerAction]) -> pchat_envelope::Body {
+        assert_eq!(actions.len(), 1, "one answer, addressed at the asker");
+        PchatEnvelope::decode(sent_payload(&actions[0]).as_slice())
+            .expect("a decodable envelope")
+            .body
+            .expect("an envelope with a body")
+    }
+
+    /// The refusal these actions carry, or a panic naming what came instead.
+    fn sole_refusal(actions: &[ServerAction]) -> Refusal {
+        match sole_body(actions) {
+            pchat_envelope::Body::FetchRefused(refused) => {
+                refused.refusal.expect("a refusal says why")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     fn sent_payload(action: &ServerAction) -> Vec<u8> {
         match &action.action {
             Some(starling_proto_fancy::control::server_action::Action::Send(send)) => {
