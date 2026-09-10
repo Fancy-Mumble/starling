@@ -1084,6 +1084,213 @@ async fn an_encrypted_message_reaches_the_other_member_of_its_channel() {
     deployment.stop().await;
 }
 
+/// The wire number of the mode where this server holds the key.
+const PCHAT_SERVER_MANAGED: u32 = 3;
+
+/// Create a channel under the root running `protocol`.
+async fn create_pchat_channel(deployment: &Deployment, name: &str, protocol: u32) -> u32 {
+    use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+    use starling_proto_fancy::metadata::{Channel, CreateRequest};
+
+    let transport = deployment
+        .resolver
+        .channel("metadata")
+        .expect("metadata is reachable");
+    MetadataClient::new(transport)
+        .create(CreateRequest {
+            scope: None,
+            actor: None,
+            channel: Some(Channel {
+                name: name.to_owned(),
+                parent: Some(0),
+                pchat_protocol: protocol,
+                ..Channel::default()
+            }),
+            temporary: false,
+            invitee_user_ids: Vec::new(),
+            reuse_existing: true,
+        })
+        .await
+        .expect("the channel is created")
+        .into_inner()
+        .channel
+        .expect("a created channel is described")
+        .id
+}
+
+/// Send one server-managed message, retrying until the mode cache has caught up.
+///
+/// `pchat` learns a channel's mode from a `metadata` subscription, so a channel
+/// created a moment ago may not be in that table yet, and a message claiming
+/// this mode is refused until it is. That is the write-side fail-closed working
+/// as designed rather than a fault, so the test waits for it the way a client
+/// would have to.
+async fn send_server_managed(
+    client: &mut Client,
+    channel: u32,
+    message_id: &str,
+    body: &[u8],
+) -> fancy::pchat::Ack {
+    let mut last = None;
+    for _ in 0..40 {
+        let envelope = fancy::pchat::PchatEnvelope {
+            body: Some(fancy::pchat::pchat_envelope::Body::Message(
+                fancy::pchat::Message {
+                    message_id: message_id.to_owned(),
+                    channel,
+                    ciphertext: body.to_vec(),
+                    protocol: fancy::pchat::Protocol::ServerManaged as i32,
+                    ..fancy::pchat::Message::default()
+                },
+            )),
+        };
+        client
+            .send_raw(PCHAT_OUTER_TYPE, &envelope.encode_to_vec())
+            .await;
+
+        let (_, answered) = client.recv_until(PCHAT_OUTER_TYPE).await;
+        let Some(fancy::pchat::pchat_envelope::Body::Ack(ack)) =
+            fancy::pchat::PchatEnvelope::decode(answered.as_slice())
+                .expect("a well-formed PchatEnvelope")
+                .body
+        else {
+            panic!("a message is answered by an ack");
+        };
+        if ack.status != fancy::pchat::ack::Status::Refused as i32 {
+            return ack;
+        }
+        last = Some(ack);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    last.expect("the loop runs at least once")
+}
+
+#[tokio::test]
+async fn a_late_joiner_reads_a_server_managed_channels_whole_archive() {
+    use starling_proto_fancy::perm::Perm;
+
+    // The reason the mode exists. Every other persistent mode is end-to-end, so
+    // somebody arriving after the conversation needs a key from a member who
+    // was already there; here the server holds it, so the archive is readable
+    // the moment they can enter the channel. Asserted through a second client
+    // that was not connected when the message was sent, because "a late joiner"
+    // is the whole claim and a sender reading its own message proves nothing.
+    let data_dir = TempDir::new("pchat-server-managed");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let channel = create_pchat_channel(&deployment, "minutes", PCHAT_SERVER_MANAGED).await;
+
+    const SAID: &[u8] = b"the server can read this, and that is the point";
+    let mut alice = Client::connect(deployment.port).await;
+    let (alice_session, _) = handshake_epoch1(&mut alice, "alice").await;
+    deployment
+        .wait_until_permitted(alice_session, channel, Perm::TEXT_MESSAGE.bits())
+        .await;
+
+    let ack = send_server_managed(
+        &mut alice,
+        channel,
+        "01234567-89ab-7def-8123-000000000001",
+        SAID,
+    )
+    .await;
+    assert_eq!(
+        ack.status,
+        fancy::pchat::ack::Status::Stored as i32,
+        "a server-managed message in a server-managed channel is kept: {}",
+        ack.detail
+    );
+    alice.close().await;
+
+    // Connected only now, so nothing it holds could have come from the relay.
+    let mut bob = Client::connect(deployment.port).await;
+    let (bob_session, _) = handshake_epoch1(&mut bob, "bob").await;
+    deployment
+        .wait_until_permitted(bob_session, channel, Perm::ENTER.bits())
+        .await;
+
+    let fetch = fancy::pchat::PchatEnvelope {
+        body: Some(fancy::pchat::pchat_envelope::Body::Fetch(
+            fancy::pchat::Fetch {
+                channel,
+                page: Some(fancy::wire::Cursor {
+                    limit: 50,
+                    ..fancy::wire::Cursor::default()
+                }),
+            },
+        )),
+    };
+    bob.send_raw(PCHAT_OUTER_TYPE, &fetch.encode_to_vec()).await;
+
+    let (_, served) = bob.recv_until(PCHAT_OUTER_TYPE).await;
+    let Some(fancy::pchat::pchat_envelope::Body::FetchResponse(page)) =
+        fancy::pchat::PchatEnvelope::decode(served.as_slice())
+            .expect("a well-formed PchatEnvelope")
+            .body
+    else {
+        panic!("a fetch is answered by a page");
+    };
+
+    assert_eq!(page.messages.len(), 1, "the archive holds what was said");
+    assert_eq!(
+        page.messages[0].ciphertext, SAID,
+        "sealed on the way in and opened on the way out, so a reader who was          never handed a key still reads it"
+    );
+    assert_eq!(page.total_stored, 1, "the first page carries the count");
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn a_server_managed_message_is_not_on_disk_in_the_clear() {
+    use starling_proto_fancy::perm::Perm;
+
+    // The other half of the mode's claim, and the one a unit test cannot make
+    // about a real deployment: what is actually written to the database file.
+    let data_dir = TempDir::new("pchat-at-rest");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let channel = create_pchat_channel(&deployment, "minutes", PCHAT_SERVER_MANAGED).await;
+
+    const SAID: &[u8] = b"quarterly numbers before they are public";
+    let mut alice = Client::connect(deployment.port).await;
+    let (alice_session, _) = handshake_epoch1(&mut alice, "alice").await;
+    deployment
+        .wait_until_permitted(alice_session, channel, Perm::TEXT_MESSAGE.bits())
+        .await;
+    let ack = send_server_managed(
+        &mut alice,
+        channel,
+        "01234567-89ab-7def-8123-000000000002",
+        SAID,
+    )
+    .await;
+    assert_eq!(ack.status, fancy::pchat::ack::Status::Stored as i32);
+
+    deployment.stop().await;
+
+    // Every byte the server left behind, whatever it called the files.
+    let mut found = false;
+    let mut stack = vec![data_dir.path().to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                found = true;
+                assert!(
+                    !bytes.windows(SAID.len()).any(|window| window == SAID),
+                    "{} holds the plaintext; a stolen backup would read it",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(found, "the deployment wrote something to look through");
+}
+
 #[tokio::test]
 async fn a_pin_reaches_the_channel_including_whoever_set_it() {
     // A pin is channel state rather than a message, and the client holds no
