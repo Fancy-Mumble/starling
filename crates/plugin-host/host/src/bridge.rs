@@ -103,6 +103,114 @@ pub trait HostBridge: std::fmt::Debug + Send + Sync + 'static {
     /// Deliver a generic plugin message.
     fn send_plugin_message(&self, message: &OutboundMessage<'_>) -> Result<(), String>;
 
+    /// Read one key from `plugin`'s own storage.
+    ///
+    /// The name is supplied by the host, never by the plugin, which is what
+    /// makes the namespace unforgeable.
+    ///
+    /// The default has no storage, for a bridge that offers none.
+    fn kv_get(&self, plugin: &str, server_id: ServerId, key: &[u8]) -> Option<Vec<u8>> {
+        let _ = (plugin, server_id, key);
+        None
+    }
+
+    /// Every pair in `[start, end)` of `plugin`'s storage, in key order.
+    fn kv_scan(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let _ = (plugin, server_id, start, end, limit, reverse);
+        Vec::new()
+    }
+
+    /// Apply a batch of writes to `plugin`'s storage, atomically.
+    fn kv_write(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        ops: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), String> {
+        let _ = (plugin, server_id, ops);
+        Err("this host offers no plugin storage".to_owned())
+    }
+
+    /// Open a writable slot for one object in `plugin`'s namespace.
+    ///
+    /// Returns the key it will be stored under, the URL to send the bytes to,
+    /// the method, and when that URL stops working.
+    fn object_reserve(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        filename: &str,
+        content_type: &str,
+        size: u64,
+        public: bool,
+    ) -> Option<(String, String, String, u64)> {
+        let _ = (plugin, server_id, filename, content_type, size, public);
+        None
+    }
+
+    /// A short-lived signed URL to read one of `plugin`'s objects.
+    fn object_url(&self, plugin: &str, server_id: ServerId, key: &str) -> Option<String> {
+        let _ = (plugin, server_id, key);
+        None
+    }
+
+    /// Point one of `plugin`'s names at `key`, as a new revision.
+    fn name_put(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        name: &str,
+        key: &str,
+        keep: u64,
+    ) -> Result<u64, String> {
+        let _ = (plugin, server_id, name, key, keep);
+        Err("this host offers no plugin storage".to_owned())
+    }
+
+    /// What one of `plugin`'s names currently answers with: revision, key,
+    /// and when it was made.
+    fn name_latest(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        name: &str,
+    ) -> Option<(u64, String, u64)> {
+        let _ = (plugin, server_id, name);
+        None
+    }
+
+    /// A name's revisions, newest first.
+    fn name_revisions(
+        &self,
+        plugin: &str,
+        server_id: ServerId,
+        name: &str,
+        limit: u32,
+    ) -> Vec<(u64, String, u64)> {
+        let _ = (plugin, server_id, name, limit);
+        Vec::new()
+    }
+
+    /// Every name `plugin` has stored, each with its latest revision.
+    fn name_list(&self, plugin: &str, server_id: ServerId) -> Vec<(String, u64, String, u64)> {
+        let _ = (plugin, server_id);
+        Vec::new()
+    }
+
+    /// Forget one of `plugin`'s names and every revision of it.
+    fn name_forget(&self, plugin: &str, server_id: ServerId, name: &str) -> Result<(), String> {
+        let _ = (plugin, server_id, name);
+        Err("this host offers no plugin storage".to_owned())
+    }
+
     /// Whether `session` is connected right now.
     fn is_session_active(&self, server_id: ServerId, session: SessionId) -> bool;
 

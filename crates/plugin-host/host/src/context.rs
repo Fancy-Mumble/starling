@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use abi_stable::std_types::{RErr, RNone, ROk, ROption, RSlice, RSome, RStr, RString, RVec};
 use mumble_plugin_api::{
-    ChannelId, PluginContext, PluginError, PluginMessageOut, PluginResult, ServerId, SessionId,
+    ChannelId, KvOp, KvPair, NameRev, NamedObject, ObjectSlot, PluginContext, PluginError,
+    PluginMessageOut, PluginResult, ServerId, SessionId,
 };
 
 use crate::bridge::{HostBridge, NewChannel, OutboundMessage};
@@ -39,15 +40,34 @@ pub struct ScopedContext {
     bridge: Arc<dyn HostBridge>,
     /// `plugin.<name>`, prepended to every configuration key the plugin names.
     config_prefix: String,
+    /// The plugin's registered name, supplied to every storage call.
+    ///
+    /// Held rather than derived from the prefix at each call, and never taken
+    /// from the plugin: a plugin that could name its own storage namespace
+    /// could name another's.
+    plugin: String,
 }
 
 impl ScopedContext {
-    /// A context scoping configuration reads to `config_prefix`.
-    pub fn new(bridge: Arc<dyn HostBridge>, config_prefix: impl Into<String>) -> Self {
+    /// A context scoping configuration reads to `plugin.<name>`, and storage
+    /// to `name`.
+    pub fn new(bridge: Arc<dyn HostBridge>, plugin: impl Into<String>) -> Self {
+        let plugin = plugin.into();
         Self {
             bridge,
-            config_prefix: config_prefix.into(),
+            config_prefix: format!("plugin.{plugin}"),
+            plugin,
         }
+    }
+}
+
+/// One revision as the ABI carries it.
+fn revision((rev, key, created_at_ms): (u64, String, u64)) -> NameRev {
+    NameRev {
+        found: true,
+        rev,
+        key: RString::from(key),
+        created_at_ms,
     }
 }
 
@@ -196,6 +216,145 @@ impl PluginContext for ScopedContext {
         self.bridge
             .revoke_channel_access(server_id, channel, user_id)
     }
+
+    fn kv_get(&self, server_id: ServerId, key: RSlice<'_, u8>) -> ROption<RVec<u8>> {
+        match self.bridge.kv_get(&self.plugin, server_id, key.as_slice()) {
+            Some(value) => RSome(RVec::from(value)),
+            None => RNone,
+        }
+    }
+
+    fn kv_scan(
+        &self,
+        server_id: ServerId,
+        start: RSlice<'_, u8>,
+        end: RSlice<'_, u8>,
+        limit: u32,
+        reverse: bool,
+    ) -> RVec<KvPair> {
+        self.bridge
+            .kv_scan(
+                &self.plugin,
+                server_id,
+                start.as_slice(),
+                end.as_slice(),
+                limit,
+                reverse,
+            )
+            .into_iter()
+            .map(|(key, value)| KvPair {
+                key: RVec::from(key),
+                value: RVec::from(value),
+            })
+            .collect()
+    }
+
+    fn kv_write(&self, server_id: ServerId, ops: RSlice<'_, KvOp>) -> PluginResult<()> {
+        let owned: Vec<(Vec<u8>, Option<Vec<u8>>)> = ops
+            .iter()
+            .map(|op| {
+                (
+                    op.key.to_vec(),
+                    op.value.as_ref().map(RVec::to_vec).into_option(),
+                )
+            })
+            .collect();
+        match self.bridge.kv_write(&self.plugin, server_id, &owned) {
+            Ok(()) => ROk(()),
+            Err(error) => failed(error),
+        }
+    }
+
+    fn object_reserve(
+        &self,
+        server_id: ServerId,
+        filename: RStr<'_>,
+        content_type: RStr<'_>,
+        size: u64,
+        public: bool,
+    ) -> ROption<ObjectSlot> {
+        match self.bridge.object_reserve(
+            &self.plugin,
+            server_id,
+            filename.as_str(),
+            content_type.as_str(),
+            size,
+            public,
+        ) {
+            Some((key, url, method, expires_at_ms)) => RSome(ObjectSlot {
+                key: RString::from(key),
+                url: RString::from(url),
+                method: RString::from(method),
+                expires_at_ms,
+            }),
+            None => RNone,
+        }
+    }
+
+    fn object_url(&self, server_id: ServerId, key: RStr<'_>) -> ROption<RString> {
+        match self
+            .bridge
+            .object_url(&self.plugin, server_id, key.as_str())
+        {
+            Some(url) => RSome(RString::from(url)),
+            None => RNone,
+        }
+    }
+
+    fn name_put(
+        &self,
+        server_id: ServerId,
+        name: RStr<'_>,
+        key: RStr<'_>,
+        keep: u64,
+    ) -> PluginResult<u64> {
+        match self
+            .bridge
+            .name_put(&self.plugin, server_id, name.as_str(), key.as_str(), keep)
+        {
+            Ok(rev) => ROk(rev),
+            Err(error) => RErr(PluginError::Other(RString::from(error))),
+        }
+    }
+
+    fn name_latest(&self, server_id: ServerId, name: RStr<'_>) -> ROption<NameRev> {
+        match self
+            .bridge
+            .name_latest(&self.plugin, server_id, name.as_str())
+        {
+            Some(found) => RSome(revision(found)),
+            None => RNone,
+        }
+    }
+
+    fn name_revisions(&self, server_id: ServerId, name: RStr<'_>, limit: u32) -> RVec<NameRev> {
+        self.bridge
+            .name_revisions(&self.plugin, server_id, name.as_str(), limit)
+            .into_iter()
+            .map(revision)
+            .collect()
+    }
+
+    fn name_list(&self, server_id: ServerId) -> RVec<NamedObject> {
+        self.bridge
+            .name_list(&self.plugin, server_id)
+            .into_iter()
+            .map(|(name, rev, key, created_at_ms)| NamedObject {
+                name: RString::from(name),
+                latest: revision((rev, key, created_at_ms)),
+            })
+            .collect()
+    }
+
+    fn name_forget(&self, server_id: ServerId, name: RStr<'_>) -> PluginResult<()> {
+        match self
+            .bridge
+            .name_forget(&self.plugin, server_id, name.as_str())
+        {
+            Ok(()) => ROk(()),
+            Err(error) => failed(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,7 +427,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let ctx = ScopedContext::new(
             Arc::clone(&recorder) as Arc<dyn HostBridge>,
-            "plugin.fancy-friends",
+            "fancy-friends",
         );
 
         let _ = ctx.get_config(RStr::from_str("port"));
@@ -289,10 +448,7 @@ mod tests {
     fn a_bridge_that_offers_nothing_answers_no_rather_than_yes() {
         // The defaults matter: a half-implemented bridge must degrade to "the
         // host does not offer that", never to an accidental grant.
-        let ctx = ScopedContext::new(
-            Arc::new(Recorder::default()) as Arc<dyn HostBridge>,
-            "plugin.x",
-        );
+        let ctx = ScopedContext::new(Arc::new(Recorder::default()) as Arc<dyn HostBridge>, "x");
         assert!(ctx.all_sessions(1).is_empty());
         assert!(!ctx.grant_channel_access(1, 2, 3));
         assert_eq!(

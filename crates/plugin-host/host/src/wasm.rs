@@ -37,8 +37,8 @@ use abi_stable::sabi_trait::TD_Opaque;
 use abi_stable::std_types::{RArc, RErr, ROk, ROption, RSlice, RStr, RString, RVec};
 use mumble_plugin_api::client_manifest as ncm;
 use mumble_plugin_api::{
-    ClientInfo, MumblePlugin, MumblePlugin_TO, PluginContext_TO, PluginError, PluginMessageIn,
-    PluginMessageOut, PluginResult, ServerId, SessionId, WASM_ABI_VERSION,
+    ClientInfo, KvOp, MumblePlugin, MumblePlugin_TO, NameRev, PluginContext_TO, PluginError,
+    PluginMessageIn, PluginMessageOut, PluginResult, ServerId, SessionId, WASM_ABI_VERSION,
 };
 use mumble_plugin_api::{INTERACTION_PAYLOAD_TYPE, INTERACTION_RESPONSE_PAYLOAD_TYPE};
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -66,7 +66,8 @@ use bindings::exports::mumble::plugin::guest::{
 };
 use bindings::mumble::plugin::host::Host as HostImports;
 use bindings::mumble::plugin::types::{
-    PluginError as WitError, PluginMessageOut as WitPluginMessageOut,
+    KvOp as WitKvOp, KvPair as WitKvPair, NameRev as WitNameRev, NamedObject as WitNamedObject,
+    ObjectSlot as WitObjectSlot, PluginError as WitError, PluginMessageOut as WitPluginMessageOut,
 };
 use bindings::mumble::plugin::ui_host::Host as UiHostImports;
 use bindings::mumble::plugin::ui_types as wit_ui;
@@ -434,6 +435,157 @@ impl HostImports for HostState {
     fn find_session_by_name(&mut self, server_id: u32, name: String) -> Option<u32> {
         self.ctx()
             .and_then(|ctx| ropt(ctx.find_session_by_name(server_id, RStr::from(name.as_str()))))
+    }
+
+    // -- storage ------------------------------------------------------------
+    //
+    // Forwarded to the same `PluginContext` a native plugin calls, so a WASM
+    // plugin and a native one see one store with one set of rules. Before
+    // these existed a WASM plugin could not persist a byte: its sandbox has no
+    // filesystem, no network and no environment.
+
+    fn kv_get(&mut self, server_id: u32, key: Vec<u8>) -> Option<Vec<u8>> {
+        self.ctx().and_then(|ctx| {
+            ropt(ctx.kv_get(server_id, RSlice::from(key.as_slice()))).map(RVec::into_vec)
+        })
+    }
+
+    fn kv_scan(
+        &mut self,
+        server_id: u32,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: u32,
+        reverse: bool,
+    ) -> Vec<WitKvPair> {
+        let Some(ctx) = self.ctx() else {
+            return Vec::new();
+        };
+        ctx.kv_scan(
+            server_id,
+            RSlice::from(start.as_slice()),
+            RSlice::from(end.as_slice()),
+            limit,
+            reverse,
+        )
+        .into_iter()
+        .map(|pair| WitKvPair {
+            key: pair.key.into_vec(),
+            value: pair.value.into_vec(),
+        })
+        .collect()
+    }
+
+    fn kv_write(&mut self, server_id: u32, ops: Vec<WitKvOp>) -> Result<(), WitError> {
+        let Some(ctx) = self.ctx() else {
+            return Err(WitError::ContextDisposed);
+        };
+        let ops: Vec<KvOp> = ops
+            .into_iter()
+            .map(|op| KvOp {
+                key: RVec::from(op.key),
+                value: match op.value {
+                    Some(value) => ROption::RSome(RVec::from(value)),
+                    None => ROption::RNone,
+                },
+            })
+            .collect();
+        native_result_to_wit(ctx.kv_write(server_id, RSlice::from(ops.as_slice())))
+    }
+
+    fn object_reserve(
+        &mut self,
+        server_id: u32,
+        filename: String,
+        content_type: String,
+        size: u64,
+        public: bool,
+    ) -> Option<WitObjectSlot> {
+        let ctx = self.ctx()?;
+        ropt(ctx.object_reserve(
+            server_id,
+            RStr::from(filename.as_str()),
+            RStr::from(content_type.as_str()),
+            size,
+            public,
+        ))
+        .map(|slot| WitObjectSlot {
+            key: slot.key.into_string(),
+            url: slot.url.into_string(),
+            method: slot.method.into_string(),
+            expires_at_ms: slot.expires_at_ms,
+        })
+    }
+
+    fn object_url(&mut self, server_id: u32, key: String) -> Option<String> {
+        let ctx = self.ctx()?;
+        ropt(ctx.object_url(server_id, RStr::from(key.as_str()))).map(RString::into_string)
+    }
+
+    fn name_put(
+        &mut self,
+        server_id: u32,
+        name: String,
+        key: String,
+        keep: u64,
+    ) -> Result<u64, WitError> {
+        let Some(ctx) = self.ctx() else {
+            return Err(WitError::ContextDisposed);
+        };
+        match ctx.name_put(
+            server_id,
+            RStr::from(name.as_str()),
+            RStr::from(key.as_str()),
+            keep,
+        ) {
+            ROk(rev) => Ok(rev),
+            RErr(error) => Err(native_err_to_wit(error)),
+        }
+    }
+
+    fn name_latest(&mut self, server_id: u32, name: String) -> Option<WitNameRev> {
+        let ctx = self.ctx()?;
+        ropt(ctx.name_latest(server_id, RStr::from(name.as_str()))).map(wit_revision)
+    }
+
+    fn name_revisions(&mut self, server_id: u32, name: String, limit: u32) -> Vec<WitNameRev> {
+        let Some(ctx) = self.ctx() else {
+            return Vec::new();
+        };
+        ctx.name_revisions(server_id, RStr::from(name.as_str()), limit)
+            .into_iter()
+            .map(wit_revision)
+            .collect()
+    }
+
+    fn name_list(&mut self, server_id: u32) -> Vec<WitNamedObject> {
+        let Some(ctx) = self.ctx() else {
+            return Vec::new();
+        };
+        ctx.name_list(server_id)
+            .into_iter()
+            .map(|named| WitNamedObject {
+                name: named.name.into_string(),
+                latest: wit_revision(named.latest),
+            })
+            .collect()
+    }
+
+    fn name_forget(&mut self, server_id: u32, name: String) -> Result<(), WitError> {
+        let Some(ctx) = self.ctx() else {
+            return Err(WitError::ContextDisposed);
+        };
+        native_result_to_wit(ctx.name_forget(server_id, RStr::from(name.as_str())))
+    }
+}
+
+/// One stored revision, as the component sees it.
+fn wit_revision(revision: NameRev) -> WitNameRev {
+    WitNameRev {
+        found: revision.found,
+        rev: revision.rev,
+        key: revision.key.into_string(),
+        created_at_ms: revision.created_at_ms,
     }
 }
 

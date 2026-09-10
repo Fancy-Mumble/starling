@@ -820,10 +820,9 @@ fn contexts_for(
     bridge: &Arc<dyn HostBridge>,
     name: &str,
 ) -> (PluginContext_TO<RArc<()>>, PluginContext_TO<RArc<()>>) {
-    let prefix = format!("plugin.{name}");
     let make = || {
         PluginContext_TO::from_ptr(
-            RArc::new(ScopedContext::new(Arc::clone(bridge), prefix.clone())),
+            RArc::new(ScopedContext::new(Arc::clone(bridge), name)),
             abi_stable::sabi_trait::TD_Opaque,
         )
     };
