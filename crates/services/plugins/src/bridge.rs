@@ -34,6 +34,11 @@ use starling_plugin_host::{HostBridge, NewChannel, OutboundMessage};
 use starling_proto_fancy::common::{Actor, Internal, Scope, actor};
 use starling_proto_fancy::control::ServerAction;
 use starling_proto_fancy::fancy::feature::{Opaque, PluginsEnvelope, plugins_envelope};
+use starling_proto_fancy::files::files_client::FilesClient;
+use starling_proto_fancy::files::{
+    ListNamesRequest, NameRequest, PutNameRequest, ReserveRequest, RevisionsRequest, SignRequest,
+    sign_request,
+};
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
 use starling_proto_fancy::metadata::{AccessRequest, Channel, CreateRequest};
 use starling_proto_fancy::permissions::SessionCheckRequest;
@@ -394,6 +399,278 @@ impl HostBridge for StarlingBridge {
     fn revoke_channel_access(&self, server_id: u32, channel: u32, user_id: u32) -> bool {
         self.access(server_id, channel, user_id, Access::Revoke)
     }
+
+    fn kv_get(&self, plugin: &str, _server_id: u32, key: &[u8]) -> Option<Vec<u8>> {
+        // `plugin` is the namespace, supplied by the host. A plugin naming a
+        // key cannot reach past it, because it never names the namespace.
+        match self.runtime.block_on(self.kv.get(plugin, self.scope, key)) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin's storage read failed");
+                None
+            }
+        }
+    }
+
+    fn kv_scan(
+        &self,
+        plugin: &str,
+        _server_id: u32,
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self
+            .runtime
+            .block_on(self.kv.scan(plugin, self.scope, start, end, limit, reverse))
+        {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin's storage scan failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn kv_write(
+        &self,
+        plugin: &str,
+        _server_id: u32,
+        ops: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), String> {
+        let ops: Vec<KvOp> = ops
+            .iter()
+            .map(|(key, value)| KvOp {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        self.runtime
+            .block_on(self.kv.write(plugin, self.scope, &ops))
+            .map_err(|error| format!("cannot write plugin storage: {error}"))
+    }
+
+    fn object_reserve(
+        &self,
+        plugin: &str,
+        _server_id: u32,
+        filename: &str,
+        content_type: &str,
+        size: u64,
+        public: bool,
+    ) -> Option<(String, String, String, u64)> {
+        let Ok(transport) = self.resolver.channel("files") else {
+            tracing::warn!("cannot reach files; plugin storage is unavailable");
+            return None;
+        };
+        let request = ReserveRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+            filename: filename.to_owned(),
+            content_type: content_type.to_owned(),
+            size,
+            public,
+        };
+        let slot = self.runtime.block_on(async move {
+            FilesClient::new(transport)
+                .reserve(tonic::Request::new(request))
+                .await
+        });
+        match slot {
+            Ok(slot) => {
+                let slot = slot.into_inner();
+                Some((slot.key, slot.url, slot.method, slot.expires_at_ms))
+            }
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin could not reserve an object");
+                None
+            }
+        }
+    }
+
+    fn object_url(&self, plugin: &str, _server_id: u32, key: &str) -> Option<String> {
+        // A plugin may only read its own objects. Checked here rather than in
+        // `files`, because this is the layer that knows who is asking: the
+        // service is told a key and would have to take the caller's word.
+        if !key.starts_with(&format!("{}/", plugin_namespace(plugin))) {
+            tracing::warn!(
+                plugin,
+                key,
+                "a plugin asked for an object outside its namespace"
+            );
+            return None;
+        }
+        let Ok(transport) = self.resolver.channel("files") else {
+            tracing::warn!("cannot reach files; plugin storage is unavailable");
+            return None;
+        };
+        let request = SignRequest {
+            scope: self.scope(),
+            actor: self.actor(),
+            op: sign_request::Op::Get as i32,
+            key: key.to_owned(),
+            content_type: String::new(),
+            max_bytes: 0,
+        };
+        let signed = self.runtime.block_on(async move {
+            FilesClient::new(transport)
+                .sign(tonic::Request::new(request))
+                .await
+        });
+        match signed {
+            Ok(signed) => Some(signed.into_inner().url),
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin could not sign an object read");
+                None
+            }
+        }
+    }
+
+    fn name_put(
+        &self,
+        plugin: &str,
+        _server_id: u32,
+        name: &str,
+        key: &str,
+        keep: u64,
+    ) -> Result<u64, String> {
+        let transport = self
+            .resolver
+            .channel("files")
+            .map_err(|_| "cannot reach the file service".to_owned())?;
+        let request = PutNameRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+            name: name.to_owned(),
+            key: key.to_owned(),
+            keep,
+        };
+        self.runtime
+            .block_on(async move {
+                FilesClient::new(transport)
+                    .put_name(tonic::Request::new(request))
+                    .await
+            })
+            .map(|answer| answer.into_inner().rev)
+            .map_err(|error| format!("cannot store the name: {error}"))
+    }
+
+    fn name_latest(&self, plugin: &str, _server_id: u32, name: &str) -> Option<(u64, String, u64)> {
+        let Ok(transport) = self.resolver.channel("files") else {
+            tracing::warn!("cannot reach files; plugin storage is unavailable");
+            return None;
+        };
+        let request = NameRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+            name: name.to_owned(),
+        };
+        let answer = self.runtime.block_on(async move {
+            FilesClient::new(transport)
+                .latest_name(tonic::Request::new(request))
+                .await
+        });
+        match answer {
+            Ok(answer) => {
+                let revision = answer.into_inner();
+                revision
+                    .found
+                    .then_some((revision.rev, revision.key, revision.created_at_ms))
+            }
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin could not read a name");
+                None
+            }
+        }
+    }
+
+    fn name_revisions(
+        &self,
+        plugin: &str,
+        _server_id: u32,
+        name: &str,
+        limit: u32,
+    ) -> Vec<(u64, String, u64)> {
+        let Ok(transport) = self.resolver.channel("files") else {
+            tracing::warn!("cannot reach files; plugin storage is unavailable");
+            return Vec::new();
+        };
+        let request = RevisionsRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+            name: name.to_owned(),
+            limit,
+        };
+        let answer = self.runtime.block_on(async move {
+            FilesClient::new(transport)
+                .list_revisions(tonic::Request::new(request))
+                .await
+        });
+        match answer {
+            Ok(answer) => answer
+                .into_inner()
+                .revisions
+                .into_iter()
+                .map(|revision| (revision.rev, revision.key, revision.created_at_ms))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin could not list revisions");
+                Vec::new()
+            }
+        }
+    }
+
+    fn name_list(&self, plugin: &str, _server_id: u32) -> Vec<(String, u64, String, u64)> {
+        let Ok(transport) = self.resolver.channel("files") else {
+            tracing::warn!("cannot reach files; plugin storage is unavailable");
+            return Vec::new();
+        };
+        let request = ListNamesRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+        };
+        let answer = self.runtime.block_on(async move {
+            FilesClient::new(transport)
+                .list_names(tonic::Request::new(request))
+                .await
+        });
+        match answer {
+            Ok(answer) => answer
+                .into_inner()
+                .names
+                .into_iter()
+                .filter_map(|named| {
+                    let latest = named.latest?;
+                    Some((named.name, latest.rev, latest.key, latest.created_at_ms))
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(plugin, %error, "a plugin could not list names");
+                Vec::new()
+            }
+        }
+    }
+
+    fn name_forget(&self, plugin: &str, _server_id: u32, name: &str) -> Result<(), String> {
+        let transport = self
+            .resolver
+            .channel("files")
+            .map_err(|_| "cannot reach the file service".to_owned())?;
+        let request = NameRequest {
+            scope: self.scope(),
+            ns: plugin_namespace(plugin),
+            name: name.to_owned(),
+        };
+        self.runtime
+            .block_on(async move {
+                FilesClient::new(transport)
+                    .forget_name(tonic::Request::new(request))
+                    .await
+            })
+            .map(|_| ())
+            .map_err(|error| format!("cannot forget the name: {error}"))
+    }
 }
 
 /// Which half of the invitee pair is being called.
@@ -427,11 +704,15 @@ impl StarlingBridge {
     }
 }
 
-/// The smallest key that sorts after everything starting with `prefix`.
+/// The object namespace one plugin owns, without a trailing separator.
 ///
-/// Increment the last byte that can be incremented and drop what follows, which
-/// is the standard trick for turning a prefix into a half-open range. `None`
-/// when there is no such key: an empty prefix, or one that is all `0xFF`.
+/// `p/<name>`, matching `files`' own reading of a key's first component. The
+/// plugin never supplies this - the host does - so a plugin cannot name
+/// another's objects however it spells its request.
+fn plugin_namespace(plugin: &str) -> String {
+    format!("p/{plugin}")
+}
+
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
