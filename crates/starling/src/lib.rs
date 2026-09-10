@@ -12,6 +12,7 @@
 //! starling --all-in-one            every service, in-process transports
 //! starling migrate-config s.ini    print the equivalent TOML
 //! starling migrate-db --from ...   move a murmur database into this one
+//! starling migrate-fileserver ...   move a file-server plugin's storage in
 //! ```
 //!
 //! **And one download.** `--all-in-one` with no `--config` on a machine that has
@@ -34,6 +35,7 @@ mod check;
 pub mod compose;
 mod firstrun;
 mod migrate_db;
+mod migrate_fileserver;
 mod paths;
 mod superuser;
 pub mod units;
@@ -94,6 +96,16 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
                 .with_target(false)
                 .try_init();
             migrate_db::migrate_db(arguments)
+        }
+        Some("migrate-fileserver") => {
+            // As the others: the reader reports what it could not carry
+            // through `tracing`, which goes nowhere without a subscriber.
+            let _ = tracing_subscriber::fmt()
+                .with_writer(io::stderr)
+                .without_time()
+                .with_target(false)
+                .try_init();
+            migrate_fileserver::migrate_fileserver(arguments)
         }
         Some("check-config") => check::check_config(arguments),
         Some("set-superuser-password") => superuser::set_password(arguments),

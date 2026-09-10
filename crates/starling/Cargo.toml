@@ -66,6 +66,7 @@ assets = [
 ]
 
 [dependencies]
+sqlx.workspace = true
 starling-runtime.workspace = true
 starling-proto-fancy.workspace = true
 starling-gateway.workspace = true
