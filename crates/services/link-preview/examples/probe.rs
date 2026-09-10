@@ -32,6 +32,7 @@ use tracing::info;
 use image as _;
 use prost as _;
 use serde_json as _;
+use starling_imaging as _;
 use starling_outbound as _;
 use starling_runtime as _;
 use tonic as _;

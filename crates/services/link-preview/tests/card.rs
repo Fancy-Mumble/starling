@@ -21,6 +21,7 @@
 // what the composition under test is made of.
 use prost as _;
 use serde_json as _;
+use starling_imaging as _;
 use starling_runtime as _;
 use tonic as _;
 use tracing as _;

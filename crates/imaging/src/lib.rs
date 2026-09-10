@@ -1,23 +1,31 @@
-//! Turning the picture a page points at into the small one that travels.
+//! Shrinking a picture to something worth sending.
 //!
-//! # Why the server shrinks it at all
+//! # Why a crate of its own
 //!
-//! The bytes go to every client that asks about the message, so the size of a
-//! preview image is paid once per viewer, on a control connection that is also
-//! carrying the conversation. An `og:image` is a social card sized for a
-//! full-width unfurl - a megabyte and 1200 pixels wide is ordinary - and none
-//! of that is visible in a card the width of a chat bubble. Shrinking here is
-//! what makes carrying the image at all affordable, and carrying it is what
-//! keeps the viewer's address away from the origin.
+//! Two services shrink pictures and neither may link the other
+//! (`docs/ARCHITECTURE.md` §4): `link-preview` shrinks the `og:image` a page
+//! points at, and `files` shrinks an uploaded picture so a chat transcript can
+//! show a thumbnail without carrying the original. The shared piece therefore
+//! has to sit below both, and it can only do that if it drags nothing down
+//! with it — so this depends on `image` and on nothing else. Deciding *what*
+//! to fetch, and whether it is safe to, stays in the service that fetches.
+//!
+//! # Why the server shrinks at all
+//!
+//! The bytes go to every client that renders the message, so the size is paid
+//! once per viewer on a connection that is also carrying the conversation. A
+//! social card sized for a full-width unfurl — a megabyte and 1200 pixels
+//! wide is ordinary — has none of that visible in a chat bubble, and a photo
+//! straight off a phone is worse. Shrinking is what makes showing it at all
+//! affordable.
 //!
 //! # Decoding is the dangerous part
 //!
-//! This is the one place in the service that runs a decoder over bytes a
-//! stranger chose, so the size is checked *before* the decode rather than
-//! after: an image is a compressed description of a pixel buffer, and a small
-//! file may describe an enormous one. `image` reads the header on its own, so
-//! the dimensions are known while the pixels are still a promise.
-
+//! This runs a decoder over bytes a stranger chose, so the size is checked
+//! *before* the decode rather than after: an image is a compressed description
+//! of a pixel buffer, and a small file may describe an enormous one. `image`
+//! reads the header on its own, so the dimensions are known while the pixels
+//! are still a promise.
 use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, ImageReader};

@@ -20,7 +20,14 @@ pub mod parse;
 pub mod quota;
 pub mod slug;
 pub mod structured;
-pub mod thumbnail;
+/// The picture shrinker, re-exported so callers of this service keep the
+/// path they had when it lived here.
+pub use starling_imaging as thumbnail;
+
+// The fixtures in `tests/card.rs` encode the pictures they then shrink; the
+// library itself only ever decodes, through `starling_imaging`.
+#[cfg(test)]
+use image as _;
 
 use std::sync::Arc;
 use std::time::Duration;

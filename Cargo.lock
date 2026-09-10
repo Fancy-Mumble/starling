@@ -3875,12 +3875,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-imaging"
+version = "0.2.16"
+dependencies = [
+ "image",
+ "tracing",
+]
+
+[[package]]
 name = "starling-link-preview"
 version = "0.2.3"
 dependencies = [
  "image",
  "prost",
  "serde_json",
+ "starling-imaging",
  "starling-outbound",
  "starling-proto-fancy",
  "starling-runtime",

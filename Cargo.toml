@@ -10,6 +10,9 @@ members = [
     "crates/crypto",
     # The one HTTP client that talks to hosts we do not own, guard included.
     "crates/outbound",
+    # Shrinking a picture, for the two services that both need to and may not
+    # link each other.
+    "crates/imaging",
 
     # The media plane: one broadcaster in, N viewers out. Standalone, because
     # it owns its own runtime and sockets and knows nothing about the control
@@ -91,6 +94,7 @@ starling-proto = { path = "crates/proto/classic" }
 starling-proto-fancy = { path = "crates/proto/fancy" }
 starling-gate = { path = "crates/gate" }
 starling-crypto = { path = "crates/crypto" }
+starling-imaging = { path = "crates/imaging" }
 starling-outbound = { path = "crates/outbound" }
 starling-runtime = { path = "crates/runtime" }
 starling-sfu = { path = "crates/sfu" }

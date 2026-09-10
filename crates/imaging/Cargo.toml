@@ -1,0 +1,23 @@
+[package]
+name = "starling-imaging"
+description = "Shrinking a picture to something worth sending"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Two crates, and deliberately no more. Two services need to shrink a picture
+# and neither may link the other (docs/ARCHITECTURE.md §4), so the shared piece
+# has to sit below both — which it can only do if it drags nothing down with
+# it. `link-preview` also reaches the network through `starling-outbound`; that
+# stays in the service, because deciding what to fetch, and whether it is safe
+# to, is a different question from deciding how small it should be.
+image.workspace = true
+# One line, for the refusal: an image rejected before the decode is the case an
+# operator will want to see in the log rather than infer from a missing card.
+tracing.workspace = true
+
+[lints]
+workspace = true

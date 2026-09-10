@@ -13,8 +13,10 @@ starling-runtime.workspace = true
 # The SSRF-guarded client and its deny list. Shared with `gifs` rather than
 # copied into it, so there is one list of private ranges and not two.
 starling-outbound.workspace = true
+# The picture shrinker. It moved out of this service so `files` could use
+# it too: neither service may link the other (docs/ARCHITECTURE.md §4).
+starling-imaging.workspace = true
 
-image.workspace = true
 prost.workspace = true
 # For the `JSON-LD` a page publishes about itself - see `structured`. A
 # hand-rolled reader over a document a stranger chose is what the HTML scanner
@@ -33,6 +35,10 @@ tracing-subscriber.workspace = true
 # server to fetch from. Dev-only, and checked to stay that way: see the
 # `loopback` feature in `starling-outbound`.
 starling-outbound = { workspace = true, features = ["loopback"] }
+# Only to *build* the pictures the tests shrink. The shipping path reaches
+# the decoder through `starling-imaging`; a fixture needs an encoder, which
+# is a test concern and stays out of the artifact.
+image.workspace = true
 
 [lints]
 workspace = true
