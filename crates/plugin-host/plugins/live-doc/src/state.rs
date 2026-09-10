@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use crate::config::LiveDocConfig;
 use crate::doc::{DocKey, DocMeta, DocRoom};
 use crate::host_facade::HostFacade;
+use crate::host_store;
 use crate::persistence::{
     SharedMember, fetch_shared_with_members, persist_room, record_shared_with, try_seed_room,
 };
@@ -36,6 +37,22 @@ pub struct AppState {
     inner: Arc<AppStateInner>,
 }
 
+/// Which store a document was seeded from, and therefore where it is saved.
+///
+/// Recorded per document rather than decided per call. A server can have both
+/// stores configured, and the two are not kept in step: seeding from one and
+/// saving to the other writes whichever copy was older over whichever was
+/// newer. Nothing about a *probe* can prevent that reliably - a host with
+/// storage that fails transiently is indistinguishable from one without - so
+/// the decision is made once, when a store actually answers, and then kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocStore {
+    /// The server's own object and name store, through the plugin host.
+    Host,
+    /// The file-server plugin, over HTTP.
+    Plugin,
+}
+
 #[derive(Debug)]
 struct AppStateInner {
     cfg: Arc<LiveDocConfig>,
@@ -55,6 +72,12 @@ struct AppStateInner {
     /// not configured the legitimate owner would be locked out and the
     /// client would retry the handshake forever.  Keyed by [`DocKey`].
     acls: Mutex<HashMap<DocKey, CachedAcl>>,
+    /// Which store each document belongs to, once one has answered for it.
+    ///
+    /// Outlives the room for the same reason [`AppStateInner::acls`] does: a
+    /// document torn down and reopened must not get a second chance to pick a
+    /// different store, because that is precisely how the older copy wins.
+    stores: Mutex<HashMap<DocKey, DocStore>>,
 }
 
 /// Cached access-control state for a document, retained across room
@@ -112,6 +135,7 @@ impl AppState {
                 rooms: Mutex::new(HashMap::new()),
                 identities: Mutex::new(HashMap::new()),
                 acls: Mutex::new(HashMap::new()),
+                stores: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -182,13 +206,135 @@ impl AppState {
             }
         };
         if needs_seed {
-            try_seed_room(&self.inner.cfg, &self.inner.http_client, &room).await;
+            self.seed_room(&room).await;
             // Overlay the cached ACL so an owner / share grant established
-            // earlier this process survives a teardown even when the
-            // file-server persistence used by `try_seed_room` is absent.
+            // earlier this process survives a teardown even when neither
+            // store answered.
             self.restore_acl(&room).await;
         }
         room
+    }
+
+    /// Which server instance this plugin's storage is scoped to.
+    ///
+    /// The host keys plugin storage by the instance it serves, and this plugin
+    /// is loaded once per host, so there is one answer. Named rather than
+    /// spelled `1` at six call sites.
+    fn storage_scope(&self) -> u32 {
+        1
+    }
+
+    /// Seed a room, from host storage where the host has any.
+    ///
+    /// The host's own store first: it needs no sibling plugin, no admin token
+    /// and no configuration, so a server that has it is already set up. The
+    /// file-server path is tried only when the host has no storage, which is
+    /// what an older server looks like.
+    async fn seed_room(&self, room: &DocRoom) {
+        // A document that has already chosen a store keeps it, whatever either
+        // store says today: re-deciding is how a stale copy gets promoted.
+        if let Some(store) = self.store_of(room.key()).await {
+            match store {
+                DocStore::Host => {
+                    let _ = host_store::try_seed_room(
+                        &self.inner.ctx,
+                        &self.inner.http_client,
+                        self.storage_scope(),
+                        room,
+                    )
+                    .await;
+                }
+                DocStore::Plugin => {
+                    try_seed_room(&self.inner.cfg, &self.inner.http_client, room).await;
+                }
+            }
+            return;
+        }
+
+        if host_store::try_seed_room(
+            &self.inner.ctx,
+            &self.inner.http_client,
+            self.storage_scope(),
+            room,
+        )
+        .await
+        {
+            self.remember_store(room.key(), DocStore::Host).await;
+            return;
+        }
+        try_seed_room(&self.inner.cfg, &self.inner.http_client, room).await;
+        // Only when the plugin is actually configured: without a URL its seed
+        // is a warning and nothing else, and binding the document to a store
+        // that cannot answer would keep it from ever reaching the host.
+        if self.inner.cfg.file_server_url.is_some() {
+            self.remember_store(room.key(), DocStore::Plugin).await;
+        }
+    }
+
+    /// Which store this document belongs to, if one has answered for it.
+    async fn store_of(&self, key: &DocKey) -> Option<DocStore> {
+        self.inner.stores.lock().await.get(key).copied()
+    }
+
+    /// Bind a document to the store that answered for it.
+    ///
+    /// First writer wins: a document that already has a store keeps it, which
+    /// is the whole point of recording one.
+    async fn remember_store(&self, key: &DocKey, store: DocStore) {
+        let _ = self
+            .inner
+            .stores
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_insert(store);
+    }
+
+    /// Persist a room, to host storage where the host has any.
+    ///
+    /// Guarded by `is_persist_safe` before either path, for the reason the
+    /// file-server path documents: a room that never confirmed its state
+    /// against storage would otherwise flush an empty document over a real one.
+    async fn save_room(&self, room: &DocRoom) {
+        if !room.is_persist_safe().await {
+            tracing::warn!("live-doc skipping persist: room state not confirmed against storage");
+            return;
+        }
+        let snapshot = room.encode_snapshot();
+        let meta = room.meta().await;
+        if snapshot.is_empty() && meta.owner_cert_hash.is_empty() {
+            return;
+        }
+        let filename = room.key().as_filename();
+
+        // The store this document was seeded from, and only that one. A save
+        // that fell through to the other store on an error would write this
+        // room's state over a copy it was never compared against.
+        if self.store_of(room.key()).await == Some(DocStore::Plugin) {
+            persist_room(&self.inner.cfg, &self.inner.http_client, room).await;
+            return;
+        }
+
+        match host_store::save(
+            &self.inner.ctx,
+            &self.inner.http_client,
+            self.storage_scope(),
+            &filename,
+            &snapshot,
+            &meta,
+        )
+        .await
+        {
+            Ok(()) => {
+                self.remember_store(room.key(), DocStore::Host).await;
+                room.mark_saved().await;
+            }
+            Err(error) => {
+                // Not marked saved, so the next flush tries again. Falling
+                // through to the plugin here is what this exists to prevent.
+                tracing::warn!(%error, ?filename, "live-doc could not save the document");
+            }
+        }
     }
 
     /// Re-apply a previously cached ACL onto a freshly-created room.
@@ -368,20 +514,31 @@ impl AppState {
     /// Record a share recipient for a document (persists to the
     /// file-server ACL and updates the room's in-memory set).
     pub async fn record_shared_with(&self, room: &DocRoom, identity: &Identity) {
-        record_shared_with(
-            &self.inner.cfg,
-            &self.inner.http_client,
-            room,
-            &identity.cert_hash,
-            identity.user_id,
-            &identity.name,
-        )
-        .await;
+        // The room's own set first, so access works this session whatever the
+        // stores do; then the durable copy.
+        room.add_member(identity.cert_hash.clone()).await;
+        let members: Vec<String> = room.members().await.into_iter().collect();
+        let filename = room.key().as_filename();
+        if let Err(error) =
+            host_store::set_shared_with(&self.inner.ctx, self.storage_scope(), &filename, &members)
+                .await
+        {
+            tracing::debug!(%error, ?filename, "live-doc host storage unavailable; recording the share on the file-server");
+            record_shared_with(
+                &self.inner.cfg,
+                &self.inner.http_client,
+                room,
+                &identity.cert_hash,
+                identity.user_id,
+                &identity.name,
+            )
+            .await;
+        }
     }
 
     /// Persist a single room immediately (used after a metadata change).
     pub async fn persist_room_now(&self, room: &DocRoom) {
-        persist_room(&self.inner.cfg, &self.inner.http_client, room).await;
+        self.save_room(room).await;
     }
 
     /// Fetch the document's shared-with member list (with display names)
@@ -399,7 +556,7 @@ impl AppState {
         };
         for room in rooms {
             if room.needs_persist().await {
-                persist_room(&self.inner.cfg, &self.inner.http_client, &room).await;
+                self.save_room(&room).await;
             }
         }
     }
@@ -412,7 +569,7 @@ impl AppState {
         rooms.clear();
         drop(rooms);
         for room in to_persist {
-            persist_room(&self.inner.cfg, &self.inner.http_client, &room).await;
+            self.save_room(&room).await;
         }
     }
 
@@ -441,7 +598,7 @@ impl AppState {
             // dropped, so the owner / share recipients can reconnect and
             // recreate the room without relying on the file-server.
             self.remember_acl(key, &room).await;
-            persist_room(&self.inner.cfg, &self.inner.http_client, &room).await;
+            self.save_room(&room).await;
             tracing::info!(?key, "live-doc room torn down");
         }
     }
@@ -585,6 +742,79 @@ mod tests {
         assert!(
             !state.session_can_connect(server_id, 4, &key).await,
             "stranger must still be rejected after teardown"
+        );
+    }
+
+    /// A document that has chosen a store keeps it.
+    ///
+    /// The failure this prevents: a server with both stores configured, a
+    /// transient host error at open, a seed from the plugin's older copy, and
+    /// then a save that puts that older state into the host - where it is now
+    /// the newest thing there and the real edit is gone.
+    #[tokio::test]
+    async fn a_document_is_saved_to_the_store_it_was_seeded_from() {
+        let state = test_state();
+        let key = DocKey {
+            server_id: 1,
+            slug: "notes".to_owned(),
+        };
+
+        state.remember_store(&key, DocStore::Plugin).await;
+
+        assert_eq!(state.store_of(&key).await, Some(DocStore::Plugin));
+    }
+
+    #[tokio::test]
+    async fn a_documents_store_is_decided_once_and_not_again() {
+        // Re-deciding is exactly how the older copy gets promoted, so the
+        // second answer is ignored rather than allowed to win.
+        let state = test_state();
+        let key = DocKey {
+            server_id: 1,
+            slug: "notes".to_owned(),
+        };
+
+        state.remember_store(&key, DocStore::Host).await;
+        state.remember_store(&key, DocStore::Plugin).await;
+
+        assert_eq!(state.store_of(&key).await, Some(DocStore::Host));
+    }
+
+    #[tokio::test]
+    async fn a_document_nothing_has_answered_for_has_no_store_yet() {
+        let state = test_state();
+        assert_eq!(
+            state
+                .store_of(&DocKey {
+                    server_id: 1,
+                    slug: "unseen".to_owned(),
+                })
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn one_documents_store_is_not_anothers() {
+        let state = test_state();
+        state
+            .remember_store(
+                &DocKey {
+                    server_id: 1,
+                    slug: "a".to_owned(),
+                },
+                DocStore::Plugin,
+            )
+            .await;
+
+        assert_eq!(
+            state
+                .store_of(&DocKey {
+                    server_id: 1,
+                    slug: "b".to_owned(),
+                })
+                .await,
+            None
         );
     }
 }

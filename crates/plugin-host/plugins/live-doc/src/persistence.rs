@@ -257,7 +257,7 @@ pub async fn record_shared_with(
 }
 
 /// Render the persisted markdown body from a snapshot + metadata.
-fn render_document(snapshot: &[u8], meta: &DocMeta) -> String {
+pub(crate) fn render_document(snapshot: &[u8], meta: &DocMeta) -> String {
     let meta_json = serde_json::to_vec(meta).unwrap_or_default();
     format!(
         "{YJS_MARKER_PREFIX}{}{YJS_MARKER_SUFFIX}\n{META_MARKER_PREFIX}{}{META_MARKER_SUFFIX}\n",
@@ -267,12 +267,12 @@ fn render_document(snapshot: &[u8], meta: &DocMeta) -> String {
 }
 
 /// Extract a Yjs update blob from a markdown file body.
-fn extract_snapshot(body: &str) -> Option<Vec<u8>> {
+pub(crate) fn extract_snapshot(body: &str) -> Option<Vec<u8>> {
     extract_marker(body, YJS_MARKER_PREFIX, YJS_MARKER_SUFFIX).and_then(|b64| B64.decode(b64).ok())
 }
 
 /// Extract document metadata from a markdown file body.
-fn extract_meta(body: &str) -> Option<DocMeta> {
+pub(crate) fn extract_meta(body: &str) -> Option<DocMeta> {
     let b64 = extract_marker(body, META_MARKER_PREFIX, META_MARKER_SUFFIX)?;
     let json = B64.decode(b64).ok()?;
     serde_json::from_slice(&json).ok()

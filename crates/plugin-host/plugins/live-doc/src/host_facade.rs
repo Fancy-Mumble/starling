@@ -9,9 +9,11 @@
 
 use std::fmt::Debug;
 
+use crate::PLUGIN_NAME;
+
 use abi_stable::std_types::{RArc, RNone, ROption, RSlice, RSome, RStr, RString, RVec};
 use mumble_plugin_api::{
-    Permissions, PluginContext_TO, PluginError, PluginMessageOut, PluginResult,
+    Host, ObjectSlot, Permissions, PluginContext_TO, PluginError, PluginMessageOut, PluginResult,
 };
 
 /// Convenience alias used in plugin code.
@@ -51,6 +53,50 @@ pub trait HostFacade: Debug + Send + Sync + 'static {
     /// Routing follows host rules: `target_sessions` first, then
     /// `channel_id` fan-out.
     fn send_plugin_message(&self, args: PluginMessageArgs<'_>) -> FacadeResult<()>;
+
+    /// Open a writable slot for one object in this plugin's namespace.
+    ///
+    /// Returns the key it will be stored under and the URL to `PUT` the bytes
+    /// to. Documents are never public: they are reached through the plugin,
+    /// which decides who may open one.
+    fn object_reserve(&self, server_id: u32, filename: &str, size: u64) -> Option<ObjectSlot> {
+        let _ = (server_id, filename, size);
+        None
+    }
+
+    /// A short-lived signed URL to read one of this plugin's objects.
+    fn object_url(&self, server_id: u32, key: &str) -> Option<String> {
+        let _ = (server_id, key);
+        None
+    }
+
+    /// Point a name at an object, as a new revision.
+    fn name_put(&self, server_id: u32, name: &str, key: &str, keep: u64) -> FacadeResult<u64> {
+        let _ = (server_id, name, key, keep);
+        Err(PluginError::Other(
+            "this host keeps no plugin storage".into(),
+        ))
+    }
+
+    /// The object a name currently answers with.
+    fn name_latest(&self, server_id: u32, name: &str) -> Option<String> {
+        let _ = (server_id, name);
+        None
+    }
+
+    /// Read one key from this plugin's own storage.
+    fn kv_get(&self, server_id: u32, key: &[u8]) -> Option<Vec<u8>> {
+        let _ = (server_id, key);
+        None
+    }
+
+    /// Store one key in this plugin's own storage.
+    fn kv_put(&self, server_id: u32, key: &[u8], value: &[u8]) -> FacadeResult<()> {
+        let _ = (server_id, key, value);
+        Err(PluginError::Other(
+            "this host keeps no plugin storage".into(),
+        ))
+    }
 }
 
 /// Borrow-friendly outbound envelope used by [`HostFacade::send_plugin_message`].
@@ -154,5 +200,37 @@ impl HostFacade for SabiHostCtx {
             PluginResult::ROk(()) => Ok(()),
             PluginResult::RErr(e) => Err(e),
         }
+    }
+
+    fn object_reserve(&self, server_id: u32, filename: &str, size: u64) -> Option<ObjectSlot> {
+        Host::new(&self.inner, PLUGIN_NAME).object_reserve(
+            server_id,
+            filename,
+            "text/markdown",
+            size,
+            false,
+        )
+    }
+
+    fn object_url(&self, server_id: u32, key: &str) -> Option<String> {
+        Host::new(&self.inner, PLUGIN_NAME).object_url(server_id, key)
+    }
+
+    fn name_put(&self, server_id: u32, name: &str, key: &str, keep: u64) -> FacadeResult<u64> {
+        Host::new(&self.inner, PLUGIN_NAME).name_put(server_id, name, key, keep)
+    }
+
+    fn name_latest(&self, server_id: u32, name: &str) -> Option<String> {
+        Host::new(&self.inner, PLUGIN_NAME)
+            .name_latest(server_id, name)
+            .map(|revision| revision.key.into_string())
+    }
+
+    fn kv_get(&self, server_id: u32, key: &[u8]) -> Option<Vec<u8>> {
+        Host::new(&self.inner, PLUGIN_NAME).kv_get(server_id, key)
+    }
+
+    fn kv_put(&self, server_id: u32, key: &[u8], value: &[u8]) -> FacadeResult<()> {
+        Host::new(&self.inner, PLUGIN_NAME).kv_put(server_id, key, value)
     }
 }

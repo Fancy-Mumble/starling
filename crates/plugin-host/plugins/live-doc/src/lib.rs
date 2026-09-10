@@ -24,6 +24,7 @@ pub mod auth;
 pub mod config;
 pub mod doc;
 pub mod host_facade;
+mod host_store;
 pub mod persistence;
 pub mod state;
 pub mod ws;
