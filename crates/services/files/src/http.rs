@@ -825,10 +825,51 @@ async fn upload(
         }
     }
 
+    // Derived after the row is written, never before: the upload has already
+    // succeeded at this point, and a picture the decoder cannot read must not
+    // turn a stored file into a failed one.
+    derive_thumbnail(&service, &key, &pending, written, &path).await;
+
     // Everyone in the channel learns the file exists, which is what makes it a
     // shared file rather than one only the uploader can reach.
     service.announce_share(&key, &pending, written);
     StatusCode::CREATED.into_response()
+}
+
+/// Shrink an uploaded picture and record the result as a sibling object.
+///
+/// Silent when there is nothing to do — a sealed upload the server cannot
+/// read, something that is not a picture, or a decoder that did not recognise
+/// it. Best effort by construction: the caller has already answered CREATED in
+/// every case but this one, and a missing preview is a worse picture rather
+/// than a lost file.
+async fn derive_thumbnail(
+    service: &Arc<FilesService>,
+    key: &str,
+    pending: &crate::Pending,
+    written: u64,
+    source: &Path,
+) {
+    if !crate::thumb::wanted(&pending.content_type, pending.seal.is_some(), written) {
+        return;
+    }
+    let thumb_key = crate::thumb::thumb_key(key);
+    let Some(destination) = object_path(service.objects_dir(), &thumb_key) else {
+        return;
+    };
+    let Some((size, mime)) = crate::thumb::derive(source, &destination).await else {
+        tracing::debug!(key, "no thumbnail could be derived for an uploaded picture");
+        return;
+    };
+    if let Err(error) = service
+        .record_thumbnail(&thumb_key, pending, size, mime, now_ms())
+        .await
+    {
+        // The file is on disk but no row points at it, so nothing will serve
+        // it and nothing will sweep it. Worth a line rather than a silence.
+        tracing::warn!(%error, key = thumb_key, "a derived thumbnail could not be recorded");
+        drop(tokio::fs::remove_file(&destination).await);
+    }
 }
 
 /// Write the body out, sealing it first when the share has a password.

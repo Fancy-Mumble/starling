@@ -17,6 +17,7 @@ pub mod http;
 mod names;
 mod namespace;
 pub mod sign;
+mod thumb;
 mod tickets;
 
 pub use sign::{Signature, sign, verify};
@@ -1913,6 +1914,47 @@ impl FilesService {
         .bind(pending.uploader.account.map(|account| account as i64))
         .bind(pending.uploader.name.clone())
         .bind(pending.uploader.cert.clone())
+        .execute(self.store.pool())
+        .await
+        .map(drop)
+    }
+
+    /// Record a thumbnail derived from an object that has just been stored.
+    ///
+    /// An ordinary row, so the thumbnail downloads through the same signed
+    /// URL, expires with the same sweep and needs no route of its own. It
+    /// inherits the original's channel, owner and visibility, because a
+    /// preview of a file is exactly as private as the file: giving it a
+    /// laxer visibility would publish a readable version of a restricted
+    /// picture.
+    ///
+    /// Never sealed, and it cannot be: a sealed original is one this server
+    /// could not read, and [`crate::thumb::wanted`] refuses those before any
+    /// of this.
+    pub(crate) async fn record_thumbnail(
+        &self,
+        key: &str,
+        original: &Pending,
+        size: u64,
+        content_type: &str,
+        now: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO object              (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms,              public, password_hash, enc_salt, enc_nonce, expires_at_ms,              uploader_account, uploader_name, uploader_cert)              VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
+        )
+        .bind(1_i64)
+        .bind(key)
+        .bind(i64::from(original.channel))
+        .bind(i64::from(original.owner))
+        .bind(format!("{}.thumb", original.filename))
+        .bind(content_type)
+        .bind(size as i64)
+        .bind(now as i64)
+        .bind(i64::from(original.public))
+        .bind(original.share_expires_at_ms.map(|at| at as i64))
+        .bind(original.uploader.account.map(|account| account as i64))
+        .bind(original.uploader.name.clone())
+        .bind(original.uploader.cert.clone())
         .execute(self.store.pool())
         .await
         .map(drop)

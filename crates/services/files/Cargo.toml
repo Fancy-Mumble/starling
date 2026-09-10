@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+# Deriving a preview of an uploaded picture. Shared with `link-preview`,
+# which may not be linked from here (docs/ARCHITECTURE.md §4).
+starling-imaging.workspace = true
 aead-stream.workspace = true
 argon2.workspace = true
 axum.workspace = true

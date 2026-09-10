@@ -3785,6 +3785,7 @@ dependencies = [
  "serde",
  "sha2 0.11.0",
  "sqlx",
+ "starling-imaging",
  "starling-proto-fancy",
  "starling-runtime",
  "subtle",
