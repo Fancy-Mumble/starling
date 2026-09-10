@@ -36,13 +36,15 @@ use std::collections::HashMap;
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::domain::{
-    AccountAck, AccountAction, AccountState, Settings, SettingsUpdate, UserdataEnvelope,
-    account_action, userdata_envelope,
+    AccountAck, AccountAction, AccountState, Record, RecordGet, RecordKeys, RecordList, RecordPut,
+    Settings, SettingsUpdate, UserdataEnvelope, account_action, userdata_envelope,
 };
+use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::userdata::{Account, UpdateRequest};
 use starling_runtime::ids::now_ms;
 use starling_runtime::plane::{Actions, Inbound, to_conn};
 
+use crate::records::{Denied, MAX_RECORD_BYTES};
 use crate::{UserdataService, actor_of, outer_type};
 
 /// How long an unconfirmed enrolment stays valid.
@@ -83,6 +85,42 @@ pub fn is_reserved(key: &str) -> bool {
     key.starts_with(RESERVED_PREFIX)
 }
 
+/// What a guest is told when it asks for records.
+fn guest_refusal() -> Refusal {
+    Refusal {
+        kind: refusal::Kind::Permission as i32,
+        detail: "records are kept per account, and this connection is a guest".to_owned(),
+        retry_after_ms: 0,
+    }
+}
+
+/// What the store refused, as the client is told it.
+///
+/// The ceiling is named in the message, the way `files` names its upload
+/// limit: a client that has just been told "too large" and not how large is a
+/// client whose next attempt is another guess.
+fn denial(denied: Denied, size: usize) -> Refusal {
+    let (kind, detail) = match denied {
+        Denied::TooLarge => (
+            refusal::Kind::Limit,
+            format!("a record may be at most {MAX_RECORD_BYTES} bytes, and this one is {size}"),
+        ),
+        Denied::BadKey => (
+            refusal::Kind::Invalid,
+            "a record key must be between 1 and 190 characters".to_owned(),
+        ),
+        Denied::Storage => (
+            refusal::Kind::Other,
+            "the record could not be stored".to_owned(),
+        ),
+    };
+    Refusal {
+        kind: kind as i32,
+        detail,
+        retry_after_ms: 0,
+    }
+}
+
 impl UserdataService {
     /// A frame on the userdata envelope.
     pub(crate) async fn on_self_service(&self, inbound: &Inbound) -> Actions {
@@ -113,6 +151,21 @@ impl UserdataService {
                 // own account page loading for ever.
                 Some(userdata_envelope::Body::AccountQuery(_)) => {
                     vec![self.state_reply(inbound, AccountState::default())]
+                }
+                // The records are the account's, and a guest has no account to
+                // keep them under. Refused rather than answered empty: a
+                // client told "no such record" would go on to write one and
+                // lose it, and one told nothing at all waits for ever - which
+                // is the bug that sent a registered user a "you aren't
+                // registered" warning on a server that simply had no store.
+                Some(userdata_envelope::Body::RecordGet(get)) => {
+                    vec![self.record_refused(inbound, &get.request_id, &get.key, guest_refusal())]
+                }
+                Some(userdata_envelope::Body::RecordPut(put)) => {
+                    vec![self.record_refused(inbound, &put.request_id, &put.key, guest_refusal())]
+                }
+                Some(userdata_envelope::Body::RecordList(list)) => {
+                    vec![self.keys_refused(inbound, &list.request_id, guest_refusal())]
                 }
                 _ => Actions::new(),
             };
@@ -149,11 +202,22 @@ impl UserdataService {
                 // ones being applied.
                 vec![self.settings_reply(inbound, account)]
             }
+            Some(userdata_envelope::Body::RecordGet(get)) => {
+                vec![self.read_record(inbound, account, get).await]
+            }
+            Some(userdata_envelope::Body::RecordPut(put)) => {
+                vec![self.write_record(inbound, account, put).await]
+            }
+            Some(userdata_envelope::Body::RecordList(list)) => {
+                vec![self.list_records(inbound, account, list).await]
+            }
             // Server to client, or an empty envelope.
             Some(
                 userdata_envelope::Body::Ack(_)
                 | userdata_envelope::Body::Settings(_)
-                | userdata_envelope::Body::Account(_),
+                | userdata_envelope::Body::Account(_)
+                | userdata_envelope::Body::Record(_)
+                | userdata_envelope::Body::RecordKeys(_),
             )
             | None => Actions::new(),
         }
@@ -442,6 +506,9 @@ impl UserdataService {
             return refuse(kind, "the SuperUser account cannot be unregistered");
         }
         self.accounts.delete(inbound.scope, account).await;
+        // The records go with the account. Ids are handed out again, and a
+        // library left behind would open as the next holder's own.
+        self.records.forget_account(inbound.scope, account).await;
         self.record_change(inbound, account, "unregistered");
         ok(kind)
     }
@@ -540,6 +607,155 @@ impl UserdataService {
             outer_type(),
             UserdataEnvelope {
                 body: Some(userdata_envelope::Body::Settings(Settings { values })),
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    /// Answer one record.
+    async fn read_record(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        get: RecordGet,
+    ) -> starling_proto_fancy::control::ServerAction {
+        let stored = self.records.get(inbound.scope, account, &get.key).await;
+        self.record_reply(
+            inbound,
+            Record {
+                request_id: get.request_id,
+                key: get.key,
+                value: stored.as_ref().map(|s| s.value.clone()).unwrap_or_default(),
+                found: stored.is_some(),
+                updated_at_ms: stored.map(|s| s.updated_at_ms).unwrap_or_default(),
+                refused: None,
+            },
+        )
+    }
+
+    /// Store or remove one record, and answer with what now stands.
+    ///
+    /// The value is read back from the store rather than echoed from the
+    /// request: a client's copy should be what the server holds, which is the
+    /// same rule `SettingsUpdate` follows.
+    async fn write_record(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        put: RecordPut,
+    ) -> starling_proto_fancy::control::ServerAction {
+        if put.remove {
+            self.records.remove(inbound.scope, account, &put.key).await;
+            return self.record_reply(
+                inbound,
+                Record {
+                    request_id: put.request_id,
+                    key: put.key,
+                    ..Record::default()
+                },
+            );
+        }
+
+        let size = put.value.len();
+        match self
+            .records
+            .put(inbound.scope, account, &put.key, &put.value)
+            .await
+        {
+            Ok(updated_at_ms) => self.record_reply(
+                inbound,
+                Record {
+                    request_id: put.request_id,
+                    key: put.key,
+                    value: put.value,
+                    found: true,
+                    updated_at_ms,
+                    refused: None,
+                },
+            ),
+            Err(denied) => {
+                self.record_refused(inbound, &put.request_id, &put.key, denial(denied, size))
+            }
+        }
+    }
+
+    /// Answer which records exist under a prefix.
+    async fn list_records(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        list: RecordList,
+    ) -> starling_proto_fancy::control::ServerAction {
+        let keys = self
+            .records
+            .list(inbound.scope, account, &list.prefix)
+            .await;
+        to_conn(
+            inbound.conn,
+            outer_type(),
+            UserdataEnvelope {
+                body: Some(userdata_envelope::Body::RecordKeys(RecordKeys {
+                    request_id: list.request_id,
+                    keys,
+                    refused: None,
+                })),
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    /// Wrap one record for the connection that asked.
+    fn record_reply(
+        &self,
+        inbound: &Inbound,
+        record: Record,
+    ) -> starling_proto_fancy::control::ServerAction {
+        to_conn(
+            inbound.conn,
+            outer_type(),
+            UserdataEnvelope {
+                body: Some(userdata_envelope::Body::Record(record)),
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    /// Say why a record operation did not happen, on the record body so the
+    /// client can match it to the request it made.
+    fn record_refused(
+        &self,
+        inbound: &Inbound,
+        request_id: &str,
+        key: &str,
+        refusal: Refusal,
+    ) -> starling_proto_fancy::control::ServerAction {
+        self.record_reply(
+            inbound,
+            Record {
+                request_id: request_id.to_owned(),
+                key: key.to_owned(),
+                refused: Some(refusal),
+                ..Record::default()
+            },
+        )
+    }
+
+    /// The same, for a listing.
+    fn keys_refused(
+        &self,
+        inbound: &Inbound,
+        request_id: &str,
+        refusal: Refusal,
+    ) -> starling_proto_fancy::control::ServerAction {
+        to_conn(
+            inbound.conn,
+            outer_type(),
+            UserdataEnvelope {
+                body: Some(userdata_envelope::Body::RecordKeys(RecordKeys {
+                    request_id: request_id.to_owned(),
+                    keys: Vec::new(),
+                    refused: Some(refusal),
+                })),
             }
             .encode_to_vec(),
         )
@@ -735,6 +951,7 @@ mod tests {
         )
         .await
         .expect("in-memory database");
+        let records = crate::Records::open(store.clone()).await.expect("records");
         let accounts = crate::Accounts::open(store).await.expect("accounts");
         let account = accounts
             .register(
@@ -762,6 +979,7 @@ mod tests {
                 trail: starling_runtime::trail::Trail::new(nowhere.clone()),
                 enrolling: std::sync::Mutex::default(),
                 settings: starling_runtime::settings::Settings::new(nowhere),
+                records,
             },
             account.id,
         )
@@ -1161,5 +1379,285 @@ mod tests {
             .unregister_self(&inbound(), starling_proto_fancy::identity::SUPERUSER)
             .await;
         assert!(!ack.ok);
+    }
+
+    /// One frame in, one frame out, decoded.
+    ///
+    /// Goes through `on_self_service` rather than the handlers, because the
+    /// guest path is the thing under test in half of these and it is decided
+    /// there: with no session-view to ask, `account_of` finds nobody, which is
+    /// exactly what a guest looks like.
+    async fn as_guest(
+        service: &UserdataService,
+        body: userdata_envelope::Body,
+    ) -> UserdataEnvelope {
+        let mut inbound = inbound();
+        inbound.payload = UserdataEnvelope { body: Some(body) }.encode_to_vec();
+        let actions = service.on_self_service(&inbound).await;
+        let action = actions.into_iter().next().expect("a reply, not silence");
+        let Some(starling_proto_fancy::control::server_action::Action::Send(sent)) = action.action
+        else {
+            panic!("a reply is a send");
+        };
+        UserdataEnvelope::decode(sent.payload.as_slice()).expect("a userdata envelope")
+    }
+
+    /// The record inside a reply.
+    fn as_record(envelope: UserdataEnvelope) -> Record {
+        match envelope.body {
+            Some(userdata_envelope::Body::Record(record)) => record,
+            other => panic!("expected a record, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_written_reads_back_on_the_next_connection() {
+        let (service, account) = service().await;
+
+        let stored = service
+            .write_record(
+                &inbound(),
+                account,
+                RecordPut {
+                    request_id: "1".to_owned(),
+                    key: "livedoc/sidebar".to_owned(),
+                    value: b"{\"sections\":[]}".to_vec(),
+                    remove: false,
+                },
+            )
+            .await;
+        assert!(sent_record(stored).found);
+
+        let read = service
+            .read_record(
+                &inbound(),
+                account,
+                RecordGet {
+                    request_id: "2".to_owned(),
+                    key: "livedoc/sidebar".to_owned(),
+                },
+            )
+            .await;
+        let record = sent_record(read);
+        assert!(record.found);
+        assert_eq!(record.value, b"{\"sections\":[]}");
+        assert_eq!(record.request_id, "2", "the answer names the question");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_is_not_there_is_absent_and_not_refused() {
+        let (service, account) = service().await;
+
+        let record = sent_record(
+            service
+                .read_record(
+                    &inbound(),
+                    account,
+                    RecordGet {
+                        request_id: "1".to_owned(),
+                        key: "nothing".to_owned(),
+                    },
+                )
+                .await,
+        );
+
+        assert!(!record.found);
+        assert!(
+            record.refused.is_none(),
+            "an empty library is a normal first run, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_past_the_ceiling_is_refused_with_the_limit_in_the_message() {
+        let (service, account) = service().await;
+
+        let record = sent_record(
+            service
+                .write_record(
+                    &inbound(),
+                    account,
+                    RecordPut {
+                        request_id: "1".to_owned(),
+                        key: "big".to_owned(),
+                        value: vec![b'x'; MAX_RECORD_BYTES + 1],
+                        remove: false,
+                    },
+                )
+                .await,
+        );
+
+        let refusal = record.refused.expect("a refusal");
+        assert_eq!(refusal.kind, refusal::Kind::Limit as i32);
+        assert!(
+            refusal.detail.contains(&MAX_RECORD_BYTES.to_string()),
+            "a client told only \"too large\" can do nothing but guess again: {}",
+            refusal.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_record_leaves_it_absent() {
+        let (service, account) = service().await;
+        let put = |value: &'static [u8], remove| RecordPut {
+            request_id: "1".to_owned(),
+            key: "k".to_owned(),
+            value: value.to_vec(),
+            remove,
+        };
+
+        let _ = service
+            .write_record(&inbound(), account, put(b"x", false))
+            .await;
+        let removed = sent_record(
+            service
+                .write_record(&inbound(), account, put(b"", true))
+                .await,
+        );
+        assert!(!removed.found);
+
+        let read = sent_record(
+            service
+                .read_record(
+                    &inbound(),
+                    account,
+                    RecordGet {
+                        request_id: "2".to_owned(),
+                        key: "k".to_owned(),
+                    },
+                )
+                .await,
+        );
+        assert!(!read.found);
+    }
+
+    #[tokio::test]
+    async fn a_guest_is_refused_rather_than_left_waiting() {
+        // The bug this whole store exists to end: a client with nowhere to
+        // store its library was told nothing at all, so its sidebar sat
+        // loading, and the client filled the silence by guessing that the user
+        // was not registered.
+        let (service, _) = service().await;
+
+        let record = as_record(
+            as_guest(
+                &service,
+                userdata_envelope::Body::RecordGet(RecordGet {
+                    request_id: "1".to_owned(),
+                    key: "livedoc/sidebar".to_owned(),
+                }),
+            )
+            .await,
+        );
+
+        let refusal = record.refused.expect("a guest hears why");
+        assert_eq!(refusal.kind, refusal::Kind::Permission as i32);
+        assert_eq!(record.request_id, "1");
+    }
+
+    #[tokio::test]
+    async fn a_guest_listing_is_refused_rather_than_answered_empty() {
+        let (service, _) = service().await;
+
+        let envelope = as_guest(
+            &service,
+            userdata_envelope::Body::RecordList(RecordList {
+                request_id: "7".to_owned(),
+                prefix: String::new(),
+            }),
+        )
+        .await;
+
+        match envelope.body {
+            Some(userdata_envelope::Body::RecordKeys(keys)) => {
+                assert_eq!(keys.request_id, "7");
+                assert_eq!(
+                    keys.refused.expect("a refusal").kind,
+                    refusal::Kind::Permission as i32,
+                    "answering an empty list would have the client store into a void"
+                );
+            }
+            other => panic!("expected keys, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guest_put_is_refused_rather_than_silently_dropped() {
+        let (service, _) = service().await;
+
+        let record = as_record(
+            as_guest(
+                &service,
+                userdata_envelope::Body::RecordPut(RecordPut {
+                    request_id: "1".to_owned(),
+                    key: "k".to_owned(),
+                    value: b"x".to_vec(),
+                    remove: false,
+                }),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            record.refused.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_names_the_keys_and_not_their_contents() {
+        let (service, account) = service().await;
+        for key in ["livedoc/sidebar", "livedoc/sources", "calendar"] {
+            let _ = service
+                .write_record(
+                    &inbound(),
+                    account,
+                    RecordPut {
+                        request_id: "1".to_owned(),
+                        key: key.to_owned(),
+                        value: vec![b'x'; 1024],
+                        remove: false,
+                    },
+                )
+                .await;
+        }
+
+        let envelope = sent(
+            service
+                .list_records(
+                    &inbound(),
+                    account,
+                    RecordList {
+                        request_id: "9".to_owned(),
+                        prefix: "livedoc/".to_owned(),
+                    },
+                )
+                .await,
+        );
+
+        match envelope.body {
+            Some(userdata_envelope::Body::RecordKeys(keys)) => {
+                assert_eq!(
+                    keys.keys,
+                    vec!["livedoc/sidebar".to_owned(), "livedoc/sources".to_owned()]
+                );
+                assert!(keys.refused.is_none());
+            }
+            other => panic!("expected keys, got {other:?}"),
+        }
+    }
+
+    /// Decode a reply built by one of the record handlers.
+    fn sent(action: starling_proto_fancy::control::ServerAction) -> UserdataEnvelope {
+        let Some(starling_proto_fancy::control::server_action::Action::Send(sent)) = action.action
+        else {
+            panic!("a reply is a send");
+        };
+        UserdataEnvelope::decode(sent.payload.as_slice()).expect("a userdata envelope")
+    }
+
+    /// The record inside a handler's reply.
+    fn sent_record(action: starling_proto_fancy::control::ServerAction) -> Record {
+        as_record(sent(action))
     }
 }

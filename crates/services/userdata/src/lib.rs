@@ -15,12 +15,14 @@ pub mod ids;
 
 pub mod accounts;
 mod directory;
+pub mod records;
 pub mod secret;
 
 pub mod selfservice;
 
 pub use accounts::{Accounts, Import};
 pub use ids::UserId;
+pub use records::Records;
 pub use secret::{Secret, verify_totp};
 
 use std::sync::Arc;
@@ -140,6 +142,10 @@ pub struct UserdataService {
     /// `user_name_regex`. Held here so [`Serve::run`] has something to keep
     /// live; the copy that answers the question lives in [`Accounts`].
     settings: Settings,
+    /// What each account keeps on the server for itself - a document library,
+    /// a citation list, a calendar. Its own table rather than the settings
+    /// map, for the reasons in [`records`].
+    records: Records,
 }
 
 /// The client on `session`, as an audit actor.
@@ -586,9 +592,12 @@ impl Serve for UserdataService {
         // Subscribed rather than fetched per login: `user_name_regex` is read on
         // every authentication, and a `server-config` round trip on that path
         // would put it in the way of every connect.
-        let accounts = Accounts::open(ctx.storage().await?)
-            .await?
-            .watching(settings.clone());
+        // One database for the service and two schemas inside it, each
+        // recorded by name so the two grow without either knowing the other's
+        // numbering (`storage::migrations`).
+        let store = ctx.storage().await?;
+        let records = Records::open(store.clone()).await?;
+        let accounts = Accounts::open(store).await?.watching(settings.clone());
 
         // Every server instance gets an administrator on its first boot, because
         // a server with no way in is a server that has to be rebuilt. The
@@ -610,6 +619,7 @@ impl Serve for UserdataService {
             resolver: ctx.resolver.clone(),
             enrolling: std::sync::Mutex::default(),
             settings,
+            records,
         }))
     }
 
