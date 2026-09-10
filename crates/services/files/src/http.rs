@@ -804,7 +804,14 @@ async fn upload(
         .record_object(&key, &pending, written, now_ms())
         .await
     {
-        Ok(()) => {}
+        Ok(()) => {
+            // The bytes are down and the row is written, so a name may now
+            // point at them. Never before: a name bound at grant time would
+            // resolve to an upload that failed.
+            if let Some(bind) = &pending.bind {
+                service.bind_finished_upload(1, &key, bind).await;
+            }
+        }
         Err(error) => {
             service.logger.log(
                 LogEvent::error(Category::Admin, "an uploaded object could not be recorded")

@@ -14,6 +14,8 @@
 mod attempts;
 mod crypto;
 pub mod http;
+mod names;
+mod namespace;
 pub mod sign;
 mod tickets;
 
@@ -27,12 +29,17 @@ use std::sync::{Arc, RwLock};
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::files::{
-    Audience, FilesEnvelope, ForgetRequest, Grant, Listing, ManageListing, ManageRequest,
-    ManagedFile, Refused, Share, Storage, UploadRequest, Visibility, files_envelope,
+    Audience, Emote, EmoteForget, EmoteUpload, Emotes, FilesEnvelope, ForgetRequest, Grant,
+    Listing, ManageListing, ManageRequest, ManagedFile, Refused, Share, Storage, UploadRequest,
+    Visibility, files_envelope,
 };
 use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::files::files_server::{Files, FilesServer};
-use starling_proto_fancy::files::{ObjectInfo, SignRequest, SignedUrl, StatRequest, sign_request};
+use starling_proto_fancy::files::{
+    ListNamesRequest, NameListing, NameRequest, NameRevision, NameRevisions, NamedObject,
+    ObjectInfo, PutNameRequest, Reservation, ReserveRequest, RevisionsRequest, SignRequest,
+    SignedUrl, StatRequest, sign_request,
+};
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::config::ByteSize;
@@ -47,6 +54,45 @@ use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use tonic::{Request, Response, Status};
 use zeroize::Zeroizing;
+
+/// Whether `shortcode` is something a client can type between colons.
+///
+/// Letters, digits, `_` and `-`, and at least one of them. Stricter than
+/// `safe_name`, which exists to make a filename a path component and would
+/// happily turn `:-)` into `file`.
+fn is_shortcode(shortcode: &str) -> bool {
+    !shortcode.is_empty()
+        && shortcode
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// An emote's alias and description as one string for the name's `meta`.
+///
+/// A unit separator between the two, which neither an emoji nor a sentence
+/// contains, and no JSON: this is two strings, not a document.
+fn pack_emote_meta(facts: &EmoteFacts) -> String {
+    format!("{}\u{1f}{}", facts.alias_emoji, facts.description)
+}
+
+/// The inverse, tolerant of a name that says nothing.
+fn unpack_emote_meta(meta: Option<&str>) -> (String, String) {
+    meta.and_then(|packed| packed.split_once('\u{1f}'))
+        .map_or_else(
+            || (String::new(), String::new()),
+            |(alias, description)| (alias.to_owned(), description.to_owned()),
+        )
+}
+
+/// One stored revision, as the wire carries it.
+fn revision_of(revision: names::Revision) -> NameRevision {
+    NameRevision {
+        found: true,
+        rev: revision.rev,
+        key: revision.key,
+        created_at_ms: revision.created_at_ms,
+    }
+}
 
 /// A client's filename, reduced to something that can be a path component.
 ///
@@ -120,18 +166,21 @@ const ROOT_CHANNEL: u32 = 0;
 /// is `metadata`'s to know rather than this one's.
 const READ_CHANNEL: Perm = Perm::ENTER;
 
-/// Which channel an object key belongs to.
+/// Which channel an object key belongs to, for a key a client may name.
 ///
 /// The key is minted here as `{channel}/{id}/{name}`, so its first component
 /// is the channel the file was shared in. Read back rather than looked up
-/// because the permission check has to happen before the row is touched, and a
-/// key naming no channel is a key for nothing - answered as channel zero,
-/// which the asker still has to hold permission on.
-fn channel_of(key: &str) -> u32 {
-    key.split('/')
-        .next()
-        .and_then(|first| first.parse().ok())
-        .unwrap_or_default()
+/// because the permission check has to happen before the row is touched.
+///
+/// `None` for a key in one of the lettered namespaces (`u/`, `s/`, `p/`),
+/// which a client frame may not name at all: those are reached through the
+/// account's own surfaces or through the host, and answering one here would
+/// check it against the root channel - a permission every session holds.
+fn client_channel_of(key: &str) -> Option<u32> {
+    match namespace::namespace_of(key) {
+        namespace::Namespace::Channel(channel) => Some(channel),
+        _ => None,
+    }
 }
 
 /// The service whose roster tells this one who is in a channel.
@@ -233,6 +282,9 @@ pub struct FilesService {
     pub(crate) logger: Logger,
     /// Where the bytes live, under the runtime data directory.
     objects_dir: PathBuf,
+    /// Names over objects: what a document or an emote is reached by, and the
+    /// revisions each has accumulated. See `names`.
+    names: names::Names,
     /// Grants minted but not yet spent, keyed by object key.
     pending: RwLock<HashMap<String, Pending>>,
     /// Tickets minted for password shares and not yet redeemed.
@@ -398,6 +450,168 @@ impl Files for FilesRpc {
         }))
     }
 
+    async fn reserve(
+        &self,
+        request: Request<ReserveRequest>,
+    ) -> Result<Response<Reservation>, Status> {
+        let req = request.into_inner();
+        // A lettered namespace only. A channel upload is permission-checked on
+        // the client envelope; a reservation is not checked at all, because
+        // its callers are other services and the namespace they hand over is
+        // what says who may reach the object. One that named a channel would
+        // be a channel share nobody was asked about.
+        if matches!(
+            namespace::namespace_of(&format!("{}/x", req.ns.trim_end_matches('/'))),
+            namespace::Namespace::Channel(_)
+        ) {
+            return Err(Status::invalid_argument(
+                "a reservation names an account, server or plugin namespace, not a channel",
+            ));
+        }
+        if req.size > self.0.max_upload() {
+            return Err(Status::invalid_argument(format!(
+                "an upload may be at most {} bytes",
+                self.0.max_upload()
+            )));
+        }
+        if !self.0.has_room_for(req.size).await {
+            return Err(Status::resource_exhausted(
+                "this server has no room for more files",
+            ));
+        }
+
+        // The same shape a channel upload mints, for the same reason: a fresh
+        // id rather than the filename, so storing one name twice is two
+        // objects and the second cannot overwrite the first.
+        let key = format!(
+            "{}/{}/{}",
+            req.ns.trim_end_matches('/'),
+            uuid::Uuid::now_v7().simple(),
+            safe_name(&req.filename)
+        );
+        let url = self.0.grant("PUT", &key);
+        self.0.remember_pending(
+            &key,
+            Pending {
+                // Not a channel object. Zero is the root, and the namespace in
+                // the key is what actually decides who may reach this - a
+                // client frame cannot name it at all.
+                channel: 0,
+                owner: 0,
+                filename: safe_name(&req.filename),
+                content_type: req.content_type,
+                size: req.size,
+                public: req.public,
+                expires_at_ms: url.expires_at_ms,
+                share_expires_at_ms: None,
+                uploader: Uploader::default(),
+                password_hash: None,
+                seal: None,
+                bind: None,
+            },
+        );
+        tracing::debug!(ns = %req.ns, key = %key, "reserved an upload slot");
+        Ok(Response::new(Reservation {
+            key,
+            url: url.url,
+            method: url.method,
+            expires_at_ms: url.expires_at_ms,
+        }))
+    }
+
+    async fn put_name(
+        &self,
+        request: Request<PutNameRequest>,
+    ) -> Result<Response<NameRevision>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        let rev = self
+            .0
+            .names
+            .put(scope, &req.ns, &req.name, &req.key, None)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        // Trimming after the write, not before: the new revision has to exist
+        // before anything decides which older ones are surplus, or a `keep` of
+        // one would drop the revision that was about to become the latest.
+        if req.keep > 0 {
+            for orphan in self.0.names.trim(scope, &req.ns, &req.name, req.keep).await {
+                self.0.forget_object(&orphan).await;
+            }
+        }
+        tracing::debug!(ns = %req.ns, name = %req.name, rev, "name stored");
+        Ok(Response::new(NameRevision {
+            found: true,
+            rev,
+            key: req.key,
+            created_at_ms: now_ms(),
+        }))
+    }
+
+    async fn latest_name(
+        &self,
+        request: Request<NameRequest>,
+    ) -> Result<Response<NameRevision>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        Ok(Response::new(
+            self.0
+                .names
+                .latest(scope, &req.ns, &req.name)
+                .await
+                .map_or_else(NameRevision::default, revision_of),
+        ))
+    }
+
+    async fn list_revisions(
+        &self,
+        request: Request<RevisionsRequest>,
+    ) -> Result<Response<NameRevisions>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        let revisions = self
+            .0
+            .names
+            .revisions(scope, &req.ns, &req.name, req.limit)
+            .await;
+        Ok(Response::new(NameRevisions {
+            revisions: revisions.into_iter().map(revision_of).collect(),
+        }))
+    }
+
+    async fn list_names(
+        &self,
+        request: Request<ListNamesRequest>,
+    ) -> Result<Response<NameListing>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        Ok(Response::new(NameListing {
+            names: self
+                .0
+                .names
+                .list(scope, &req.ns)
+                .await
+                .into_iter()
+                .map(|(name, latest)| NamedObject {
+                    name,
+                    latest: Some(revision_of(latest)),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn forget_name(&self, request: Request<NameRequest>) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let scope = req.scope.as_ref().map_or(1, |s| s.instance);
+        // The bytes go with the last name that held them: an object nothing
+        // points at is unreachable, and leaving it is a disk that only grows.
+        for orphan in self.0.names.forget(scope, &req.ns, &req.name).await {
+            self.0.forget_object(&orphan).await;
+        }
+        Ok(Response::new(Ack {}))
+    }
+
     async fn delete(&self, request: Request<StatRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
         let scope = req.scope.as_ref().map_or(1, |s| s.instance);
@@ -453,6 +667,15 @@ impl ClientService for FilesService {
             }
             Some(files_envelope::Body::Forget(request)) => {
                 self.answer_forget(&inbound, request).await
+            }
+            Some(files_envelope::Body::EmoteUpload(upload)) => {
+                self.answer_emote_upload(&inbound, upload).await
+            }
+            Some(files_envelope::Body::EmoteForget(request)) => {
+                self.answer_emote_forget(&inbound, request).await
+            }
+            Some(files_envelope::Body::EmoteQuery(query)) => {
+                self.emote_listing(inbound.scope, &query.request_id).await
             }
             _ => return Actions::new(),
         };
@@ -526,7 +749,13 @@ impl FilesService {
         inbound: &Inbound,
         download: starling_proto_fancy::fancy::files::DownloadRequest,
     ) -> FilesEnvelope {
-        let channel = channel_of(&download.key);
+        let Some(channel) = client_channel_of(&download.key) else {
+            // A key in a namespace no client frame speaks for. Invalid rather
+            // than a refusal, and worded like a key that names nothing:
+            // whether an account or a plugin holds an object is not something
+            // to confirm to whoever went looking.
+            return refused(&download.request_id, refusal::Kind::Invalid, "no such file");
+        };
         if !self.allows(inbound, channel, READ_CHANNEL).await {
             return refused(
                 &download.request_id,
@@ -624,6 +853,11 @@ impl FilesService {
 
     /// Remove one stored file, if it is the caller's or they may remove others'.
     async fn answer_forget(&self, inbound: &Inbound, request: ForgetRequest) -> FilesEnvelope {
+        if client_channel_of(&request.key).is_none() {
+            // Not the caller's to remove, and not theirs to learn about. Said
+            // the same way a key that names nothing is said.
+            return refused(&request.request_id, refusal::Kind::Invalid, "no such file");
+        }
         let Some(owner) = self.owner_of(&request.key).await else {
             // Absent rather than refused: a key that names nothing is not a
             // permission question, and answering it as one would say which
@@ -656,6 +890,194 @@ impl FilesService {
                 storage: None,
             })),
         }
+    }
+
+    /// Grant an upload slot for one emote, if the session may manage them.
+    ///
+    /// The image lands in `s/emotes/` and the shortcode becomes its name, so
+    /// replacing an emote keeps the shortcode and swaps what it points at.
+    /// Only one revision is kept: the previous image is unreachable the moment
+    /// the name moves, and an emoji has no history worth a disk.
+    async fn answer_emote_upload(&self, inbound: &Inbound, upload: EmoteUpload) -> FilesEnvelope {
+        if !self
+            .allows(inbound, ROOT_CHANNEL, Perm::MANAGE_EMOTES)
+            .await
+        {
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Permission,
+                "you may not manage this server's emotes",
+            );
+        }
+        // Validated rather than sanitised: `safe_name` answers `"file"` for a
+        // name it reduced to nothing, and an emote called `:file:` because
+        // somebody typed `:-)` is a surprise, not a fix.
+        if !is_shortcode(&upload.shortcode) {
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Invalid,
+                "a shortcode is letters, digits, `_` and `-`, and at least one of them",
+            );
+        }
+        let shortcode = upload.shortcode.clone();
+        if upload.size > self.max_upload() {
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Limit,
+                &format!("the limit is {} bytes", self.max_upload()),
+            );
+        }
+        if !self.has_room_for(upload.size).await {
+            return refused(
+                &upload.request_id,
+                refusal::Kind::Limit,
+                "this server has no room for more files",
+            );
+        }
+
+        let key = format!(
+            "srv/emotes/{}/{}",
+            uuid::Uuid::now_v7().simple(),
+            safe_name(&upload.filename)
+        );
+        let url = self.grant("PUT", &key);
+        self.remember_pending(
+            &key,
+            Pending {
+                channel: ROOT_CHANNEL,
+                owner: inbound.session,
+                filename: safe_name(&upload.filename),
+                content_type: upload.content_type,
+                size: upload.size,
+                // An `<img>` cannot sign a request, so an emote nobody can
+                // fetch without a signature is an emote nobody can see.
+                public: true,
+                expires_at_ms: url.expires_at_ms,
+                share_expires_at_ms: None,
+                uploader: Uploader {
+                    account: self.roster.account_of(inbound.session),
+                    name: self.roster.name_of(inbound.session),
+                    cert: self.roster.cert_of(inbound.session),
+                },
+                password_hash: None,
+                seal: None,
+                bind: Some(Bind {
+                    ns: "srv/emotes".to_owned(),
+                    name: shortcode,
+                    keep: 1,
+                    emote: Some(EmoteFacts {
+                        alias_emoji: upload.alias_emoji,
+                        description: upload.description,
+                    }),
+                }),
+            },
+        );
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Grant(Grant {
+                request_id: upload.request_id,
+                url: url.url,
+                method: url.method,
+                expires_at_ms: url.expires_at_ms,
+                key,
+                share_url: String::new(),
+                share_expires_at_ms: 0,
+            })),
+        }
+    }
+
+    /// Remove one emote, image and all.
+    async fn answer_emote_forget(&self, inbound: &Inbound, request: EmoteForget) -> FilesEnvelope {
+        if !self
+            .allows(inbound, ROOT_CHANNEL, Perm::MANAGE_EMOTES)
+            .await
+        {
+            return refused(
+                &request.request_id,
+                refusal::Kind::Permission,
+                "you may not manage this server's emotes",
+            );
+        }
+        let shortcode = safe_name(&request.shortcode);
+        for orphan in self
+            .names
+            .forget(inbound.scope, "srv/emotes", &shortcode)
+            .await
+        {
+            self.forget_object(&orphan).await;
+        }
+        self.logger.log(
+            LogEvent::notice(Category::Admin, "an emote was removed")
+                .with("shortcode", shortcode)
+                .with("session", inbound.session),
+        );
+        // Everyone, not only the asker: the point of pushing the set is that
+        // a deleted emote stops rendering for people who never asked.
+        self.broadcast_emotes(inbound.scope).await;
+        self.emote_listing(inbound.scope, &request.request_id).await
+    }
+
+    /// Every emote this server has, as the clients see them.
+    async fn emote_listing(&self, scope: u32, request_id: &str) -> FilesEnvelope {
+        let mut emotes = Vec::new();
+        for (shortcode, latest) in self.names.list(scope, "srv/emotes").await {
+            let (alias_emoji, description) = unpack_emote_meta(latest.meta.as_deref());
+            emotes.push(Emote {
+                shortcode,
+                url: self.share_url(&latest.key),
+                alias_emoji,
+                description,
+                created_at_ms: latest.created_at_ms,
+            });
+        }
+        FilesEnvelope {
+            body: Some(files_envelope::Body::Emotes(Emotes {
+                request_id: request_id.to_owned(),
+                emotes,
+            })),
+        }
+    }
+
+    /// Bind the name a finished upload asked for, and tell everyone if the set
+    /// of emotes changed.
+    pub(crate) async fn bind_finished_upload(&self, scope: u32, key: &str, bind: &Bind) {
+        let meta = bind.emote.as_ref().map(pack_emote_meta);
+        if let Err(error) = self
+            .names
+            .put(scope, &bind.ns, &bind.name, key, meta.as_deref())
+            .await
+        {
+            tracing::warn!(%error, key, "could not name a finished upload");
+            return;
+        }
+        if bind.keep > 0 {
+            for orphan in self
+                .names
+                .trim(scope, &bind.ns, &bind.name, bind.keep)
+                .await
+            {
+                self.forget_object(&orphan).await;
+            }
+        }
+        if bind.emote.is_some() {
+            self.broadcast_emotes(scope).await;
+        }
+    }
+
+    /// Send the emote set to everyone connected.
+    ///
+    /// Pushed rather than polled: a client that never asks still has to stop
+    /// showing an emote somebody deleted.
+    async fn broadcast_emotes(&self, scope: u32) {
+        let envelope = self.emote_listing(scope, "").await;
+        let sessions = self.roster.sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        self.fanout.push(to_sessions(
+            sessions,
+            ServiceKind::Files.outer_type(),
+            envelope.encode_to_vec(),
+        ));
     }
 
     /// Whether this session administers the server.
@@ -710,6 +1132,7 @@ impl FilesService {
                      uploader_name, uploader_cert FROM object WHERE server_id = ? \
                      AND ((? IS NOT NULL AND uploader_account = ?) \
                           OR (? IS NOT NULL AND uploader_cert = ?)) \
+                     AND k NOT LIKE 'u/%' AND k NOT LIKE 'srv/%' AND k NOT LIKE 'p/%' \
                      ORDER BY created_at_ms DESC LIMIT ?",
                 )
                 .bind(1_i64)
@@ -859,6 +1282,9 @@ impl Serve for FilesService {
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         let store = ctx.storage().await?;
         store.migrate(SCHEMA).await?;
+        // The same database, a second schema chain: one connection pool for
+        // the service, and two sets of migrations recorded by name.
+        let names = names::Names::open(store.clone()).await?;
         let service = ctx.service();
         let (public_url, ttl_ms, max_upload) = Self::settings(&service);
         Ok(Arc::new(Self {
@@ -870,6 +1296,7 @@ impl Serve for FilesService {
             fanout: Fanout::default(),
             logger: ctx.logger.clone(),
             objects_dir: ctx.config.runtime.data_dir.join("files"),
+            names,
             pending: RwLock::new(HashMap::new()),
             tickets: tickets::Tickets::default(),
             attempts: attempts::Attempts::default(),
@@ -1058,6 +1485,33 @@ pub(crate) struct Pending {
     /// this one upload and then gone, while these two have to outlive it in
     /// the row so a later reader can derive the key again from the password.
     pub(crate) seal: Option<Seal>,
+    /// A name to point at this object once the bytes have actually arrived.
+    ///
+    /// Bound on completion rather than at grant time, because a name written
+    /// first would - if the upload then failed - resolve to bytes that never
+    /// came, and the emote would render as a broken image for everybody. The
+    /// other order leaves an unreferenced object, which the collector takes.
+    pub(crate) bind: Option<Bind>,
+}
+
+/// What to name a finished upload, and how much history to keep.
+#[derive(Debug, Clone)]
+pub(crate) struct Bind {
+    /// The namespace, without a trailing separator.
+    pub(crate) ns: String,
+    /// The name inside it.
+    pub(crate) name: String,
+    /// Revisions to keep; `1` for an emote, whose history is waste.
+    pub(crate) keep: u64,
+    /// What to say about it once it is stored, for the broadcast.
+    pub(crate) emote: Option<EmoteFacts>,
+}
+
+/// The parts of an emote that are not the image.
+#[derive(Debug, Clone)]
+pub(crate) struct EmoteFacts {
+    pub(crate) alias_emoji: String,
+    pub(crate) description: String,
 }
 
 /// Who shared a file, as something still true after they disconnect.
@@ -1287,6 +1741,9 @@ impl FilesService {
                 },
                 password_hash,
                 seal,
+                // A channel upload names nothing: its key is how it is
+                // reached, and the listing is what finds it.
+                bind: None,
             },
         );
         Ok(FilesEnvelope {
@@ -1500,13 +1957,18 @@ impl FilesService {
         // make the server read its whole table on request.
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query(
+            // `k LIKE '{channel}/%'` as well as `channel_id`: an emote or a
+            // plugin's document carries channel 0, and without the key check
+            // every one of them listed as a file shared in the root.
             "SELECT k, owner, filename, size, created_at_ms, public, password_hash, \
              expires_at_ms FROM object WHERE server_id = ? AND channel_id = ? \
+             AND k LIKE ? \
              AND (expires_at_ms IS NULL OR expires_at_ms > ?) \
              ORDER BY created_at_ms DESC LIMIT ?",
         )
         .bind(1_i64)
         .bind(i64::from(channel))
+        .bind(format!("{channel}/%"))
         .bind(now_ms() as i64)
         .bind(i64::from(limit))
         .fetch_all(self.store.pool())
@@ -1732,6 +2194,9 @@ mod tests {
         .await
         .expect("in-memory database");
         store.migrate(SCHEMA).await.expect("schema");
+        let names = names::Names::open(store.clone())
+            .await
+            .expect("the name schema");
         Arc::new(FilesService {
             store,
             secret: b"test-secret".to_vec(),
@@ -1741,6 +2206,7 @@ mod tests {
             fanout: Fanout::default(),
             logger: Logger::null(),
             objects_dir: std::env::temp_dir().join("starling-files-test"),
+            names,
             pending: RwLock::new(HashMap::new()),
             tickets: tickets::Tickets::default(),
             attempts: attempts::Attempts::default(),
@@ -3050,6 +3516,7 @@ mod tests {
             uploader: Uploader::default(),
             password_hash: None,
             seal: None,
+            bind: None,
         };
         service
             .record_object("3/abc/notes.pdf", &pending, 84, now_ms())
@@ -3084,6 +3551,7 @@ mod tests {
             uploader: Uploader::default(),
             password_hash: None,
             seal: None,
+            bind: None,
         };
         // One well past the horizon, one just made.
         service
@@ -3122,6 +3590,7 @@ mod tests {
             uploader: Uploader::default(),
             password_hash: None,
             seal: None,
+            bind: None,
         };
         service
             .record_object("3/keep/keep.bin", &pending, 10, 0)
@@ -3137,5 +3606,493 @@ mod tests {
         // table on request.
         let service = service().await;
         assert!(service.listing(3, u32::MAX).await.len() <= 200);
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_reach_a_plugins_objects_by_naming_one() {
+        // Without the namespace check, `p/…` parses as no channel number at
+        // all, falls back to channel zero, and is then checked against a
+        // permission on the root that every session holds - so a client that
+        // guessed a live document's key could read it.
+        let service = service_holding(Perm::ENTER | Perm::SHARE_FILES).await;
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Download(starling_proto_fancy::fancy::files::DownloadRequest {
+                request_id: "d1".to_owned(),
+                key: "p/fancy-live-doc/018f/notes.md".to_owned(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Invalid as i32,
+            "and told as an unknown key rather than a forbidden one, which              would confirm the object exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_reach_another_accounts_objects() {
+        let service = service_holding(Perm::ENTER | Perm::SHARE_FILES).await;
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Download(starling_proto_fancy::fancy::files::DownloadRequest {
+                request_id: "d1".to_owned(),
+                key: "u/42/library.json".to_owned(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Invalid as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_remove_an_object_outside_the_channel_namespace() {
+        // The operator permission for removing other people's files is held
+        // here, so only the namespace check stands between it and a plugin's
+        // documents.
+        let service = service_holding(Perm::WRITE | Perm::RESET_USER_CONTENT).await;
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::Forget(ForgetRequest {
+                request_id: "f1".to_owned(),
+                key: "p/fancy-live-doc/018f/notes.md".to_owned(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Invalid as i32
+        );
+    }
+
+    /// The whole plugin object path, as live-doc will walk it: reserve a slot,
+    /// move the bytes, point a name at the key, read the name back.
+    #[tokio::test]
+    async fn a_plugin_stores_a_document_and_reads_it_back_by_name() {
+        let service = service().await;
+        let rpc = FilesRpc(Arc::clone(&service));
+
+        let reservation = rpc
+            .reserve(Request::new(ReserveRequest {
+                scope: None,
+                ns: "p/fancy-live-doc".to_owned(),
+                filename: "notes.md".to_owned(),
+                content_type: "text/markdown".to_owned(),
+                size: 64,
+                public: false,
+            }))
+            .await
+            .expect("a reservation")
+            .into_inner();
+        assert!(
+            reservation.key.starts_with("p/fancy-live-doc/"),
+            "the slot is minted inside the namespace that asked: {}",
+            reservation.key
+        );
+
+        let uri = reservation
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("the granted URL points at this service");
+        let (status, _, _) = call(&service, "PUT", uri, None, None, b"# notes".to_vec()).await;
+        assert_eq!(
+            status, 201,
+            "the reservation is what the data plane accepts"
+        );
+
+        let put = rpc
+            .put_name(Request::new(PutNameRequest {
+                scope: None,
+                ns: "p/fancy-live-doc".to_owned(),
+                name: "notes".to_owned(),
+                key: reservation.key.clone(),
+                keep: 0,
+            }))
+            .await
+            .expect("a revision")
+            .into_inner();
+        assert_eq!(put.rev, 1);
+
+        let latest = rpc
+            .latest_name(Request::new(NameRequest {
+                scope: None,
+                ns: "p/fancy-live-doc".to_owned(),
+                name: "notes".to_owned(),
+            }))
+            .await
+            .expect("a name")
+            .into_inner();
+        assert!(latest.found);
+        assert_eq!(latest.key, reservation.key);
+
+        // And the bytes are actually there, under the key the name gave.
+        let signed = rpc
+            .sign(Request::new(SignRequest {
+                scope: None,
+                actor: None,
+                op: sign_request::Op::Get as i32,
+                key: latest.key.clone(),
+                content_type: String::new(),
+                max_bytes: 0,
+            }))
+            .await
+            .expect("a signed url")
+            .into_inner();
+        let uri = signed
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("the granted URL points at this service");
+        let (status, _, body) = call(&service, "GET", uri, None, None, Vec::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"# notes");
+    }
+
+    #[tokio::test]
+    async fn an_upload_with_no_reservation_is_refused_even_with_a_valid_signature() {
+        // `Sign` alone does not open a slot, which is what stops a grant that
+        // was already spent - or minted before a restart - from being replayed.
+        let service = service().await;
+        let rpc = FilesRpc(Arc::clone(&service));
+        let signed = rpc
+            .sign(Request::new(SignRequest {
+                scope: None,
+                actor: None,
+                op: sign_request::Op::Put as i32,
+                key: "p/fancy-live-doc/018f/notes.md".to_owned(),
+                content_type: String::new(),
+                max_bytes: 8,
+            }))
+            .await
+            .expect("a signed url")
+            .into_inner();
+
+        let uri = signed
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("the granted URL points at this service");
+        let (status, _, _) = call(&service, "PUT", uri, None, None, b"nope".to_vec()).await;
+
+        assert_eq!(status, 409, "no pending record, so no upload");
+    }
+
+    #[tokio::test]
+    async fn keeping_one_revision_drops_the_bytes_the_old_one_held() {
+        // What an emote wants: the history is not the point, and the old
+        // object is waste that nothing can reach.
+        let service = service().await;
+        let rpc = FilesRpc(Arc::clone(&service));
+
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let reservation = rpc
+                .reserve(Request::new(ReserveRequest {
+                    scope: None,
+                    ns: "srv/emotes".to_owned(),
+                    filename: "blobfish.png".to_owned(),
+                    content_type: "image/png".to_owned(),
+                    size: 8,
+                    public: true,
+                }))
+                .await
+                .expect("a reservation")
+                .into_inner();
+            let uri = reservation
+                .url
+                .strip_prefix("https://files.example.org")
+                .expect("the granted URL points at this service");
+            let _ = call(&service, "PUT", uri, None, None, b"png".to_vec()).await;
+            let _ = rpc
+                .put_name(Request::new(PutNameRequest {
+                    scope: None,
+                    ns: "srv/emotes".to_owned(),
+                    name: "blobfish".to_owned(),
+                    key: reservation.key.clone(),
+                    keep: 1,
+                }))
+                .await
+                .expect("a revision");
+            keys.push(reservation.key);
+        }
+
+        let stat = rpc
+            .stat(Request::new(StatRequest {
+                scope: None,
+                actor: None,
+                key: keys[0].clone(),
+            }))
+            .await
+            .expect("a stat")
+            .into_inner();
+        assert!(
+            !stat.exists,
+            "the superseded object is gone, not left on the disk for ever"
+        );
+
+        let latest = rpc
+            .latest_name(Request::new(NameRequest {
+                scope: None,
+                ns: "srv/emotes".to_owned(),
+                name: "blobfish".to_owned(),
+            }))
+            .await
+            .expect("a name")
+            .into_inner();
+        assert_eq!(latest.key, keys[1], "and the name answers with the new one");
+    }
+
+    /// Upload one emote the whole way: ask, `PUT`, and read the listing back.
+    async fn upload_emote(
+        service: &Arc<FilesService>,
+        shortcode: &str,
+        bytes: &[u8],
+    ) -> FilesEnvelope {
+        let envelope = ask_body(
+            service,
+            files_envelope::Body::EmoteUpload(EmoteUpload {
+                request_id: "e1".to_owned(),
+                shortcode: shortcode.to_owned(),
+                filename: format!("{shortcode}.png"),
+                content_type: "image/png".to_owned(),
+                size: bytes.len() as u64,
+                alias_emoji: "🐟".to_owned(),
+                description: "a fish".to_owned(),
+            }),
+        )
+        .await;
+        let Some(files_envelope::Body::Grant(grant)) = envelope.body else {
+            return envelope;
+        };
+        let uri = grant
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("the granted URL points at this service");
+        let (status, _, _) = call(service, "PUT", uri, None, None, bytes.to_vec()).await;
+        assert_eq!(status, 201, "the emote's bytes are stored");
+        ask_body(
+            service,
+            files_envelope::Body::EmoteQuery(starling_proto_fancy::fancy::files::EmoteQuery {
+                request_id: "q1".to_owned(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_emote_is_listed_with_a_link_that_needs_no_signature() {
+        // An `<img>` cannot sign a request, so an emote only works if its URL
+        // is fetchable as it stands.
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+
+        let envelope = upload_emote(&service, "blobfish", b"png-bytes").await;
+
+        let Some(files_envelope::Body::Emotes(emotes)) = envelope.body else {
+            panic!("expected a listing, got {:?}", envelope.body);
+        };
+        assert_eq!(emotes.emotes.len(), 1);
+        let emote = &emotes.emotes[0];
+        assert_eq!(emote.shortcode, "blobfish");
+        assert_eq!(
+            emote.alias_emoji, "🐟",
+            "what to show where the image cannot be"
+        );
+        assert_eq!(emote.description, "a fish");
+
+        let uri = emote
+            .url
+            .strip_prefix("https://files.example.org")
+            .expect("a link on this server");
+        let (status, _, body) = call(&service, "GET", uri, None, None, Vec::new()).await;
+        assert_eq!(status, 200, "and it opens with no signature at all");
+        assert_eq!(body, b"png-bytes");
+    }
+
+    #[tokio::test]
+    async fn a_session_without_the_permission_cannot_add_an_emote() {
+        let service = service_holding(Perm::ENTER | Perm::SHARE_FILES).await;
+
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::EmoteUpload(EmoteUpload {
+                request_id: "e1".to_owned(),
+                shortcode: "blobfish".to_owned(),
+                filename: "blobfish.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                size: 9,
+                alias_emoji: String::new(),
+                description: String::new(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_emote_keeps_its_shortcode_and_drops_the_old_image() {
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        let first = upload_emote(&service, "blobfish", b"old-bytes").await;
+        let Some(files_envelope::Body::Emotes(listing)) = first.body else {
+            panic!("expected a listing");
+        };
+        let old_url = listing.emotes[0].url.clone();
+
+        let second = upload_emote(&service, "blobfish", b"new-bytes").await;
+
+        let Some(files_envelope::Body::Emotes(listing)) = second.body else {
+            panic!("expected a listing");
+        };
+        assert_eq!(listing.emotes.len(), 1, "one shortcode, not two");
+        assert_ne!(listing.emotes[0].url, old_url, "pointing at the new image");
+
+        let uri = old_url
+            .strip_prefix("https://files.example.org")
+            .expect("a link on this server");
+        let (status, _, _) = call(&service, "GET", uri, None, None, Vec::new()).await;
+        assert_eq!(
+            status, 404,
+            "the superseded image is gone: nothing can reach it, so keeping it is only disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_an_emote_takes_it_out_of_the_listing() {
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        let _ = upload_emote(&service, "blobfish", b"png-bytes").await;
+
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::EmoteForget(EmoteForget {
+                request_id: "f1".to_owned(),
+                shortcode: "blobfish".to_owned(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Emotes(emotes)) = envelope.body else {
+            panic!("expected a listing, got {:?}", envelope.body);
+        };
+        assert!(emotes.emotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_without_the_permission_cannot_remove_an_emote() {
+        let service = service_holding(Perm::ENTER).await;
+
+        let envelope = ask_body(
+            &service,
+            files_envelope::Body::EmoteForget(EmoteForget {
+                request_id: "f1".to_owned(),
+                shortcode: "blobfish".to_owned(),
+            }),
+        )
+        .await;
+
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a refusal").kind,
+            refusal::Kind::Permission as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emote_does_not_appear_as_a_file_shared_in_the_root_channel() {
+        // Every reserved object carries channel 0, so before the key check a
+        // channel-0 listing showed every emote and every plugin document as a
+        // shared file.
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        let _ = upload_emote(&service, "blobfish", b"png-bytes").await;
+
+        let listed = service.listing(0, 50).await;
+
+        assert!(
+            listed.is_empty(),
+            "the emote is not a file anyone shared: {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emote_is_not_among_its_uploaders_shared_files() {
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        let _ = upload_emote(&service, "blobfish", b"png-bytes").await;
+
+        let envelope = manage(&service, Audience::Mine).await;
+
+        let Some(files_envelope::Body::Managed(listing)) = envelope.body else {
+            panic!("expected a managed listing");
+        };
+        assert!(listing.files.is_empty(), "{:?}", listing.files);
+    }
+
+    #[tokio::test]
+    async fn replacing_an_emotes_image_keeps_its_description() {
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        let _ = upload_emote(&service, "blobfish", b"old").await;
+
+        let envelope = upload_emote(&service, "blobfish", b"new").await;
+
+        let Some(files_envelope::Body::Emotes(listing)) = envelope.body else {
+            panic!("expected a listing");
+        };
+        assert_eq!(listing.emotes[0].description, "a fish");
+        assert_eq!(listing.emotes[0].alias_emoji, "🐟");
+    }
+
+    #[test]
+    fn a_shortcode_is_letters_digits_and_two_punctuation_marks() {
+        assert!(is_shortcode("blobfish"));
+        assert!(is_shortcode("blob_fish-2"));
+        assert!(!is_shortcode(""), "nothing is not a name");
+        assert!(
+            !is_shortcode(":-)"),
+            "which safe_name would have called `file`"
+        );
+        assert!(
+            !is_shortcode("blob fish"),
+            "a space cannot sit between colons"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reservation_cannot_name_a_channel() {
+        // The reservation path is not permission-checked - its callers are
+        // services - so the namespace is the only thing keeping it from
+        // minting a channel share behind the client envelope's back.
+        let service = service().await;
+        let rpc = FilesRpc(Arc::clone(&service));
+
+        let refused = rpc
+            .reserve(Request::new(ReserveRequest {
+                scope: None,
+                ns: "3".to_owned(),
+                filename: "x.bin".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                size: 1,
+                public: false,
+            }))
+            .await;
+
+        assert!(refused.is_err());
     }
 }
