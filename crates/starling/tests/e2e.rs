@@ -1166,15 +1166,24 @@ async fn send_server_managed(
 }
 
 #[tokio::test]
-async fn a_late_joiner_reads_a_server_managed_channels_whole_archive() {
+async fn a_server_managed_archive_reaches_a_late_joiner_and_not_the_disk() {
     use starling_proto_fancy::perm::Perm;
 
-    // The reason the mode exists. Every other persistent mode is end-to-end, so
-    // somebody arriving after the conversation needs a key from a member who
-    // was already there; here the server holds it, so the archive is readable
-    // the moment they can enter the channel. Asserted through a second client
-    // that was not connected when the message was sent, because "a late joiner"
-    // is the whole claim and a sender reading its own message proves nothing.
+    // The two claims the mode makes, against one deployment.
+    //
+    // The first is the reason it exists: every other persistent mode is
+    // end-to-end, so somebody arriving after the conversation needs a key from
+    // a member who was already there. Here the server holds it, so the archive
+    // is readable as soon as they can enter. Asserted through a client that was
+    // not connected when the message was sent, because a sender reading its own
+    // message proves nothing.
+    //
+    // The second is what "sealed at rest" has to mean to be worth saying: the
+    // plaintext appears in none of the files the deployment wrote.
+    //
+    // One deployment rather than two on purpose. The suite's Windows flake is
+    // suspected to be `free_port` racing when several deployments start at
+    // once, so a new test that needs no second server should not start one.
     let data_dir = TempDir::new("pchat-server-managed");
     let deployment = Deployment::start(data_dir.path()).await;
     let channel = create_pchat_channel(&deployment, "minutes", PCHAT_SERVER_MANAGED).await;
@@ -1233,42 +1242,15 @@ async fn a_late_joiner_reads_a_server_managed_channels_whole_archive() {
     assert_eq!(page.messages.len(), 1, "the archive holds what was said");
     assert_eq!(
         page.messages[0].ciphertext, SAID,
-        "sealed on the way in and opened on the way out, so a reader who was          never handed a key still reads it"
+        "sealed on the way in and opened on the way out, so a reader who was \
+         never handed a key still reads it"
     );
     assert_eq!(page.total_stored, 1, "the first page carries the count");
 
     deployment.stop().await;
-}
-
-#[tokio::test]
-async fn a_server_managed_message_is_not_on_disk_in_the_clear() {
-    use starling_proto_fancy::perm::Perm;
-
-    // The other half of the mode's claim, and the one a unit test cannot make
-    // about a real deployment: what is actually written to the database file.
-    let data_dir = TempDir::new("pchat-at-rest");
-    let deployment = Deployment::start(data_dir.path()).await;
-    let channel = create_pchat_channel(&deployment, "minutes", PCHAT_SERVER_MANAGED).await;
-
-    const SAID: &[u8] = b"quarterly numbers before they are public";
-    let mut alice = Client::connect(deployment.port).await;
-    let (alice_session, _) = handshake_epoch1(&mut alice, "alice").await;
-    deployment
-        .wait_until_permitted(alice_session, channel, Perm::TEXT_MESSAGE.bits())
-        .await;
-    let ack = send_server_managed(
-        &mut alice,
-        channel,
-        "01234567-89ab-7def-8123-000000000002",
-        SAID,
-    )
-    .await;
-    assert_eq!(ack.status, fancy::pchat::ack::Status::Stored as i32);
-
-    deployment.stop().await;
 
     // Every byte the server left behind, whatever it called the files.
-    let mut found = false;
+    let mut looked_at = 0_usize;
     let mut stack = vec![data_dir.path().to_path_buf()];
     while let Some(path) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&path) else {
@@ -1279,7 +1261,7 @@ async fn a_server_managed_message_is_not_on_disk_in_the_clear() {
             if path.is_dir() {
                 stack.push(path);
             } else if let Ok(bytes) = std::fs::read(&path) {
-                found = true;
+                looked_at += 1;
                 assert!(
                     !bytes.windows(SAID.len()).any(|window| window == SAID),
                     "{} holds the plaintext; a stolen backup would read it",
@@ -1288,7 +1270,10 @@ async fn a_server_managed_message_is_not_on_disk_in_the_clear() {
             }
         }
     }
-    assert!(found, "the deployment wrote something to look through");
+    assert!(
+        looked_at > 0,
+        "the deployment wrote something to look through"
+    );
 }
 
 #[tokio::test]
