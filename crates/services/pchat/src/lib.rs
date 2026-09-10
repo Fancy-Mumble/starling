@@ -539,17 +539,28 @@ impl PchatService {
                 .map(wire_id)
                 .unwrap_or_default()
         });
+        // A row this server sealed is opened here, and one that will not open is
+        // left out of the page. Dropped rather than served: a message whose
+        // bytes this server cannot vouch for is not history, and handing back a
+        // blob the client will fail to decode looks to a reader exactly like a
+        // corrupt archive.
+        //
+        // Counted, because the silent version of this is the worst failure the
+        // mode has. An operator who restored a database without its key, or
+        // moved one between servers, sees history that is simply *empty* -- and
+        // an empty page is what an empty channel looks like too. One line per
+        // fetch rather than one per row: a thousand-row scroll-back under a
+        // wrong key should say so once, not a thousand times.
+        let mut unopened = 0_usize;
         let messages = rows
             .into_iter()
             .take(limit as usize)
-            // A row this server sealed is opened here, and one that will not
-            // open is left out of the page. Dropped rather than served: a
-            // message whose bytes this server cannot vouch for is not history,
-            // and handing back a blob the client will fail to decode looks to
-            // a reader exactly like a corrupt archive with no explanation.
-            .filter_map(|row| {
-                let ciphertext = self.open_stored(scope, request.channel, &row)?;
-                Some((row, ciphertext))
+            .filter_map(|row| match self.open_stored(scope, request.channel, &row) {
+                Some(ciphertext) => Some((row, ciphertext)),
+                None => {
+                    unopened += 1;
+                    None
+                }
             })
             .map(|(row, ciphertext)| Message {
                 message_id: wire_id(&row),
@@ -567,6 +578,15 @@ impl PchatService {
                 protocol: row.try_get::<i64, _>("protocol").unwrap_or_default() as i32,
             })
             .collect();
+
+        if unopened > 0 {
+            tracing::error!(
+                channel = request.channel,
+                unopened,
+                have_key = self.data_key.is_some(),
+                "left sealed rows out of a page: the at-rest key does not open                  them, so this channel's history will read as short or empty"
+            );
+        }
 
         FetchResponse {
             channel: request.channel,
