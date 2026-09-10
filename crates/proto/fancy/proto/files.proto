@@ -12,6 +12,26 @@ service Files {
   rpc Sign(SignRequest) returns (SignedUrl);
   rpc Stat(StatRequest) returns (ObjectInfo);
   rpc Delete(StatRequest) returns (starling.common.v1.Ack);
+
+  // Names over objects. A key is minted by the server and never reused; a name
+  // is chosen by its owner and points at whichever object currently answers
+  // for it, so a document that is edited keeps one name and gains a revision.
+  // docs/STORAGE-UNIFICATION.md D3.
+  //
+  // Internal only: the namespace decides who may reach a name, and that
+  // decision is made by the caller - the plugin host for `p/`, the account
+  // surfaces for `u/`. Nothing on a client's own envelope reaches these.
+  // Open a writable slot in a namespace: mints a key, registers the upload
+  // and hands back a signed PUT URL. `Sign` alone is not enough - the data
+  // plane refuses an upload it has no pending record for, which is what stops
+  // a spent or restarted grant from being replayed.
+  rpc Reserve(ReserveRequest) returns (Reservation);
+
+  rpc PutName(PutNameRequest) returns (NameRevision);
+  rpc LatestName(NameRequest) returns (NameRevision);
+  rpc ListRevisions(RevisionsRequest) returns (NameRevisions);
+  rpc ListNames(ListNamesRequest) returns (NameListing);
+  rpc ForgetName(NameRequest) returns (starling.common.v1.Ack);
 }
 
 message SignRequest {
@@ -45,4 +65,84 @@ message ObjectInfo {
   string content_type = 3;
   uint64 created_at_ms = 4;
   bytes sha256 = 5;
+}
+
+// Point a name at an object, as a new revision.
+message PutNameRequest {
+  starling.common.v1.Scope scope = 1;
+  // The namespace, without a trailing separator: `p/fancy-live-doc`,
+  // `s/emotes`, `u/42`.
+  string ns = 2;
+  string name = 3;
+  // The object this revision answers with.
+  string key = 4;
+  // How many revisions to keep afterwards. `0` keeps every one; `1` is what an
+  // emote wants, where the history is not the point and the old bytes are
+  // waste. Objects left pointed at by nothing are removed.
+  uint64 keep = 5;
+}
+
+message NameRequest {
+  starling.common.v1.Scope scope = 1;
+  string ns = 2;
+  string name = 3;
+}
+
+message RevisionsRequest {
+  starling.common.v1.Scope scope = 1;
+  string ns = 2;
+  string name = 3;
+  uint32 limit = 4;
+}
+
+message ListNamesRequest {
+  starling.common.v1.Scope scope = 1;
+  string ns = 2;
+}
+
+// One revision of a name. `found` false is a name nothing has been stored
+// under, which is the ordinary answer for a document being opened for the
+// first time.
+message NameRevision {
+  bool found = 1;
+  uint64 rev = 2;
+  string key = 3;
+  uint64 created_at_ms = 4;
+}
+
+message NameRevisions {
+  repeated NameRevision revisions = 1;
+}
+
+message NamedObject {
+  string name = 1;
+  NameRevision latest = 2;
+}
+
+message NameListing {
+  repeated NamedObject names = 1;
+}
+
+// Open a writable slot for one object.
+message ReserveRequest {
+  starling.common.v1.Scope scope = 1;
+  // The namespace to mint into, without a trailing separator.
+  string ns = 2;
+  // The name as its owner knows it. The stored key is derived from it and a
+  // fresh id, so two uploads of one filename are two objects.
+  string filename = 3;
+  string content_type = 4;
+  // The ceiling this slot is signed for. An upload past it is cut off.
+  uint64 size = 5;
+  // Whether the object may be fetched by link with no signature. Emotes must
+  // be - an `<img>` cannot sign a request - and a document must not.
+  bool public = 6;
+}
+
+message Reservation {
+  // The key the object will be stored under.
+  string key = 1;
+  string url = 2;
+  string method = 3;
+  uint64 expires_at_ms = 4;
 }
