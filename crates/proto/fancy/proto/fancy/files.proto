@@ -62,6 +62,13 @@ message ManagedFile {
   bytes uploader_cert = 13;
   // Whether that person is connected right now, so a dashboard can say so.
   bool uploader_online = 14;
+  // The sibling object holding a small preview of this one, or empty where
+  // the server derived none: a sealed upload it cannot read, something that
+  // is not a picture, or a format its decoder did not recognise.
+  //
+  // A key rather than a URL, because a URL for it would expire on its own
+  // schedule; the client signs for it the way it signs for any other object.
+  string thumb_key = 15;
 }
 
 // What the server holds, for the header of an operator's view.
@@ -165,6 +172,13 @@ message Share {
   string share_url = 9;
   // When this share stops answering, or `0` for never.
   uint64 expires_at_ms = 10;
+  // The sibling object holding a small preview of this one, or empty where
+  // the server derived none: a sealed upload it cannot read, something that
+  // is not a picture, or a format its decoder did not recognise.
+  //
+  // A key rather than a URL, because a URL for it would expire on its own
+  // schedule; the client signs for it the way it signs for any other object.
+  string thumb_key = 11;
 }
 
 message ListRequest {

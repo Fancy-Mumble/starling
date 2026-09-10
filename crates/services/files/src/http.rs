@@ -828,11 +828,13 @@ async fn upload(
     // Derived after the row is written, never before: the upload has already
     // succeeded at this point, and a picture the decoder cannot read must not
     // turn a stored file into a failed one.
-    derive_thumbnail(&service, &key, &pending, written, &path).await;
+    let thumb_key = derive_thumbnail(&service, &key, &pending, written, &path).await;
 
     // Everyone in the channel learns the file exists, which is what makes it a
-    // shared file rather than one only the uploader can reach.
-    service.announce_share(&key, &pending, written);
+    // shared file rather than one only the uploader can reach. The preview
+    // travels with the announcement so a transcript can render it without
+    // asking a second question.
+    service.announce_share(&key, &pending, written, thumb_key);
     StatusCode::CREATED.into_response()
 }
 
@@ -849,27 +851,29 @@ async fn derive_thumbnail(
     pending: &crate::Pending,
     written: u64,
     source: &Path,
-) {
+) -> String {
     if !crate::thumb::wanted(&pending.content_type, pending.seal.is_some(), written) {
-        return;
+        return String::new();
     }
     let thumb_key = crate::thumb::thumb_key(key);
     let Some(destination) = object_path(service.objects_dir(), &thumb_key) else {
-        return;
+        return String::new();
     };
     let Some((size, mime)) = crate::thumb::derive(source, &destination).await else {
         tracing::debug!(key, "no thumbnail could be derived for an uploaded picture");
-        return;
+        return String::new();
     };
     if let Err(error) = service
-        .record_thumbnail(&thumb_key, pending, size, mime, now_ms())
+        .record_thumbnail(&thumb_key, key, pending, size, mime, now_ms())
         .await
     {
         // The file is on disk but no row points at it, so nothing will serve
         // it and nothing will sweep it. Worth a line rather than a silence.
         tracing::warn!(%error, key = thumb_key, "a derived thumbnail could not be recorded");
         drop(tokio::fs::remove_file(&destination).await);
+        return String::new();
     }
+    thumb_key
 }
 
 /// Write the body out, sealing it first when the share has a password.

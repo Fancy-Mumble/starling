@@ -259,7 +259,34 @@ const SCHEMA: &[Migration<'static>] = &[
         "0006_object_read",
         &["ALTER TABLE object ADD COLUMN downloaded_at_ms BIGINT NULL"],
     ),
+    Migration::new(
+        // Whether a derived preview sits beside this object.
+        //
+        // On the original's row rather than inferred from the thumbnail's,
+        // so a listing answers "is there a preview" for free. The alternative
+        // was a second query per page, or a `LIKE` scan over every key in the
+        // channel, to learn something one bit already says.
+        //
+        // Not backfilled: objects uploaded before this have no preview, which
+        // is exactly what `0` means.
+        "0007_object_thumb",
+        &["ALTER TABLE object ADD COLUMN has_thumb INTEGER NOT NULL DEFAULT 0"],
+    ),
 ];
+
+/// The preview key a listing row should report, or empty when there is none.
+///
+/// Read off `has_thumb` rather than guessed from the content type: a picture
+/// whose format the decoder did not recognise has no preview, and naming one
+/// that does not exist shows the reader a broken image.
+fn thumb_key_of(row: &sqlx::any::AnyRow, key: &str) -> String {
+    use sqlx::Row as _;
+
+    if row.try_get::<i64, _>("has_thumb").unwrap_or_default() == 0 {
+        return String::new();
+    }
+    thumb::thumb_key(key)
+}
 
 /// The service.
 #[derive(Debug)]
@@ -1130,10 +1157,11 @@ impl FilesService {
                     sqlx::query(
                     "SELECT k, channel_id, filename, content_type, size, created_at_ms, public, \
                      password_hash, expires_at_ms, downloaded_at_ms, uploader_account, \
-                     uploader_name, uploader_cert FROM object WHERE server_id = ? \
+                     uploader_name, uploader_cert, has_thumb FROM object WHERE server_id = ? \
                      AND ((? IS NOT NULL AND uploader_account = ?) \
                           OR (? IS NOT NULL AND uploader_cert = ?)) \
                      AND k NOT LIKE 'u/%' AND k NOT LIKE 'srv/%' AND k NOT LIKE 'p/%' \
+                     AND k NOT LIKE '%.thumb' \
                      ORDER BY created_at_ms DESC LIMIT ?",
                 )
                 .bind(1_i64)
@@ -1148,7 +1176,8 @@ impl FilesService {
                 None => sqlx::query(
                     "SELECT k, channel_id, filename, content_type, size, created_at_ms, public, \
                      password_hash, expires_at_ms, downloaded_at_ms, uploader_account, \
-                     uploader_name, uploader_cert FROM object WHERE server_id = ? \
+                     uploader_name, uploader_cert, has_thumb FROM object WHERE server_id = ? \
+                     AND k NOT LIKE '%.thumb' \
                      ORDER BY created_at_ms DESC LIMIT ?",
                 )
                 .bind(1_i64)
@@ -1175,6 +1204,7 @@ impl FilesService {
                     .map(|account| account as u64);
                 let cert: Option<Vec<u8>> = row.try_get("uploader_cert").ok().flatten();
                 ManagedFile {
+                    thumb_key: thumb_key_of(row, &key),
                     channel: row.try_get::<i64, _>("channel_id").unwrap_or_default() as u32,
                     filename: row.try_get("filename").unwrap_or_default(),
                     content_type: row.try_get("content_type").unwrap_or_default(),
@@ -1934,6 +1964,7 @@ impl FilesService {
     pub(crate) async fn record_thumbnail(
         &self,
         key: &str,
+        original_key: &str,
         original: &Pending,
         size: u64,
         content_type: &str,
@@ -1957,17 +1988,35 @@ impl FilesService {
         .bind(original.uploader.cert.clone())
         .execute(self.store.pool())
         .await
-        .map(drop)
+        .map(drop)?;
+
+        // The bit the listings read. Written after the row, so a failure
+        // leaves an unreferenced thumbnail rather than a promise of one that
+        // is not there -- the first wastes a little disk, the second shows the
+        // reader a broken picture.
+        sqlx::query("UPDATE object SET has_thumb = 1 WHERE server_id = ? AND k = ?")
+            .bind(1_i64)
+            .bind(original_key)
+            .execute(self.store.pool())
+            .await
+            .map(drop)
     }
 
     /// Tell the channel a file has arrived.
     ///
     /// This is what makes an upload *shared*. Without it the uploader holds a
     /// URL nobody else has heard of, which is a private file with extra steps.
-    pub(crate) fn announce_share(&self, key: &str, pending: &Pending, size: u64) {
+    pub(crate) fn announce_share(
+        &self,
+        key: &str,
+        pending: &Pending,
+        size: u64,
+        thumb_key: String,
+    ) {
         let share = FilesEnvelope {
             body: Some(files_envelope::Body::Share(Share {
                 key: key.to_owned(),
+                thumb_key,
                 channel: pending.channel,
                 owner: pending.owner,
                 filename: pending.filename.clone(),
@@ -2003,8 +2052,9 @@ impl FilesService {
             // plugin's document carries channel 0, and without the key check
             // every one of them listed as a file shared in the root.
             "SELECT k, owner, filename, size, created_at_ms, public, password_hash, \
-             expires_at_ms FROM object WHERE server_id = ? AND channel_id = ? \
+             expires_at_ms, has_thumb FROM object WHERE server_id = ? AND channel_id = ? \
              AND k LIKE ? \
+             AND k NOT LIKE '%.thumb' \
              AND (expires_at_ms IS NULL OR expires_at_ms > ?) \
              ORDER BY created_at_ms DESC LIMIT ?",
         )
@@ -2028,6 +2078,7 @@ impl FilesService {
                     .is_some();
                 Share {
                     channel,
+                    thumb_key: thumb_key_of(row, &key),
                     owner: row.try_get::<i64, _>("owner").unwrap_or_default() as u32,
                     filename: row.try_get("filename").unwrap_or_default(),
                     size: row.try_get::<i64, _>("size").unwrap_or_default() as u64,
