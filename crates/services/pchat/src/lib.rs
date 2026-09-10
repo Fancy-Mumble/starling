@@ -872,23 +872,29 @@ impl PchatService {
 
     /// Why this message may not be stored in its channel, if it may not.
     ///
-    /// A message must declare the mode its channel is configured for. Until
-    /// this check existed the archive decision was made from the protocol the
-    /// *message* named, so a client could mislabel its own message and have it
-    /// archived anyway. That was survivable while every mode was end-to-end and
-    /// the stored bytes were opaque either way. It is not survivable now that
-    /// one mode means "the server holds the key": without this, a client could
-    /// ask this server to keep a readable copy of a conversation whose members
-    /// were told it could not.
+    /// Only one claim can hurt: a message saying it is server-managed, in a
+    /// channel that is not. Believing that would have this server keep a
+    /// readable copy of a conversation whose members were told it could not.
+    /// Every other mode is end-to-end, so the server cannot read those bytes
+    /// whatever the message claims and a mislabel costs it nothing to store.
+    ///
+    /// Checking agreement in *both* directions was the first cut and it was
+    /// wrong twice over: it refused a message sealed under a channel's previous
+    /// mode -- the case `fancy/pchat.proto` says must keep working, which is
+    /// why `Protocol` is per message rather than per channel -- and it broke
+    /// the relay e2e, where a message rides a channel the tree calls plain.
     ///
     /// Separate from [`Self::on_message`] so the decision can be read, and
     /// tested, without a live `permissions` to get past first.
     fn mode_refusal(&self, message: &Message) -> Option<&'static str> {
         let protocol = u32::try_from(message.protocol).unwrap_or_default();
-        if self.modes.accepts(message.channel, protocol) {
+        if self
+            .modes
+            .may_store(message.channel, protocol, Protocol::ServerManaged as u32)
+        {
             return None;
         }
-        Some("the message does not declare the protocol this channel runs")
+        Some("this channel is not configured to let the server hold its history")
     }
 
     /// Store a message and relay it to its channel.
@@ -1268,10 +1274,10 @@ mod tests {
             fanout: Fanout::default(),
             permit: Permit::new(resolver),
             roster: Arc::new(Roster::new()),
-            // Cold, so `accepts` refuses anything but the unspecified
-            // protocol. The storage tests below call `store_message`/`fetch`
-            // directly and never reach it; `service_with_modes` is what a test
-            // that goes through `on_message` under a real mode uses.
+            // Cold, so a message claiming the server-managed mode is refused
+            // and every end-to-end mode is stored -- the asymmetry `may_store`
+            // exists for. The storage tests below call `store_message`/`fetch`
+            // directly and never reach it.
             modes: Arc::new(ChannelModes::new()),
             data_key: Some(DataKey::from_bytes([9; 32], 1)),
             limits: Limits::new(),
@@ -2071,43 +2077,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_message_mislabelling_its_channels_mode_is_refused() {
-        // What makes a server-managed channel trustworthy: without this a
-        // client could ask this server to keep a readable copy of a
+    async fn plaintext_into_an_end_to_end_channel_is_refused() {
+        // What makes a server-managed channel's claim worth anything: without
+        // this a client could ask the server to keep a readable copy of a
         // conversation whose members were told it could not.
-        let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
-        let refusal = service.mode_refusal(&Message {
-            protocol: Protocol::ServerManaged as i32,
-            ..message(4, b"plaintext")
-        });
-        assert!(refusal.is_some(), "plaintext into an end-to-end channel");
-    }
-
-    #[tokio::test]
-    async fn a_message_declaring_its_channels_mode_is_kept() {
         let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
         assert!(
             service
                 .mode_refusal(&Message {
-                    protocol: Protocol::FancyV1FullArchive as i32,
-                    ..message(4, b"sealed")
+                    protocol: Protocol::ServerManaged as i32,
+                    ..message(4, b"plaintext")
+                })
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_into_the_channel_configured_for_it_is_kept() {
+        let service = service_with_modes(4, Protocol::ServerManaged as u32).await;
+        assert!(
+            service
+                .mode_refusal(&Message {
+                    protocol: Protocol::ServerManaged as i32,
+                    ..message(4, b"plaintext")
                 })
                 .is_none()
         );
     }
 
     #[tokio::test]
+    async fn a_mislabelled_end_to_end_message_is_still_kept() {
+        // The other direction is not this check's business: the server cannot
+        // read any of these whatever the message claims. Refusing them lost
+        // messages whenever a channel's mode changed under a sitting member,
+        // which is exactly the case `fancy/pchat.proto` says must keep working
+        // where it explains why `Protocol` is per message rather than per
+        // channel. It also broke the relay e2e outright.
+        let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
+        for protocol in [Protocol::SignalV1, Protocol::FancyV1PostJoin] {
+            assert!(
+                service
+                    .mode_refusal(&Message {
+                        protocol: protocol as i32,
+                        ..message(4, b"sealed")
+                    })
+                    .is_none(),
+                "{protocol:?} must still land"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_client_too_old_to_declare_a_protocol_is_still_served() {
-        // Zero is what every shipping client sends. Refusing it would have
-        // broken all of them the day this check landed.
+        // Zero is what every shipping client sends.
         let service = service_with_modes(4, Protocol::FancyV1FullArchive as u32).await;
         assert!(service.mode_refusal(&message(4, b"sealed")).is_none());
     }
 
     #[tokio::test]
-    async fn a_channel_no_mode_is_known_for_stores_nothing_under_a_mode() {
-        // The write-side fail-closed. A metadata restart must not be a window
-        // in which a client can pick which archive its message lands in.
+    async fn a_channel_no_mode_is_known_for_refuses_only_the_readable_one() {
+        // A cold table. The end-to-end modes still flow, because withholding
+        // them protects nothing; the readable one does not, because storing it
+        // under a guess cannot be undone.
         let service = service_with_members().await;
         assert!(
             service
@@ -2116,6 +2147,14 @@ mod tests {
                     ..message(4, b"plaintext")
                 })
                 .is_some()
+        );
+        assert!(
+            service
+                .mode_refusal(&Message {
+                    protocol: Protocol::FancyV1FullArchive as i32,
+                    ..message(4, b"sealed")
+                })
+                .is_none()
         );
     }
 

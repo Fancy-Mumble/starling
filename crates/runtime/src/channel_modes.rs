@@ -95,21 +95,32 @@ impl ChannelModes {
 
     /// Whether a message declaring `protocol` may be stored for `channel`.
     ///
-    /// The write-side fail-closed. A message must declare the mode its channel
-    /// is configured for, so that the archive's contents match what the channel
-    /// promised its members, and an unknown channel refuses everything but the
-    /// plain mode, which stores nothing here anyway.
+    /// **Asymmetric, deliberately.** The question is not "does the client agree
+    /// with the channel" but "would believing the client make this server store
+    /// something readable that it should not". Only one direction can:
     ///
-    /// Zero is accepted against any channel because it is what a client too old
-    /// to set the field sends, and refusing those would break every existing
-    /// client the moment this check landed. Such a message is archived under
-    /// the channel's own mode, which is the same thing that happened before.
+    /// - A message claiming `plaintext` must be in a channel configured for it,
+    ///   and in a channel this table cannot describe yet the answer is no. That
+    ///   is the whole of the new risk: without it, any client could ask the
+    ///   server to keep a readable copy of a conversation whose members were
+    ///   told it could not.
+    /// - Every other mode is end-to-end. The server cannot read those bytes
+    ///   whatever the message claims, so a mislabel costs it nothing to store.
+    ///
+    /// Requiring agreement in both directions was the first cut and it was
+    /// wrong: a channel's mode can change while messages sealed under the old
+    /// one are still in flight -- `fancy/pchat.proto` says so where it explains
+    /// why `Protocol` is per message rather than per channel -- and a sitting
+    /// member who has not yet seen the new mode would have had their messages
+    /// refused. Silently, from their point of view. A rule that loses messages
+    /// during a routine setting change is worse than the mislabel it prevents,
+    /// and the mislabel it prevented was already documented as tolerable.
     #[must_use]
-    pub fn accepts(&self, channel: u32, protocol: u32) -> bool {
-        if protocol == 0 {
+    pub fn may_store(&self, channel: u32, protocol: u32, plaintext: u32) -> bool {
+        if protocol != plaintext {
             return true;
         }
-        self.get(channel) == Some(protocol)
+        self.get(channel) == Some(plaintext)
     }
 
     /// Fold one tree event in.
@@ -239,7 +250,10 @@ mod tests {
         // under a guess cannot be undone.
         let modes = ChannelModes::new();
         assert!(!modes.is_persistent(4), "a read must not withhold");
-        assert!(!modes.accepts(4, 2), "a write must not guess");
+        assert!(
+            !modes.may_store(4, 3, 3),
+            "a plaintext write must not guess at a channel nobody has described"
+        );
     }
 
     #[test]
@@ -272,31 +286,58 @@ mod tests {
         assert_eq!(modes.get(4), None);
     }
 
-    #[test]
-    fn a_message_must_declare_the_mode_its_channel_runs() {
-        let modes = ChannelModes::new();
-        let _ = modes.apply(snapshot(vec![channel(4, 2), channel(9, 3)]));
+    /// The wire number of the one mode the server can read.
+    const PLAINTEXT: u32 = 3;
 
-        assert!(modes.accepts(4, 2), "the channel's own mode");
+    #[test]
+    fn plaintext_is_refused_unless_the_channel_is_configured_for_it() {
+        // The one direction that matters: believing a client here would have
+        // this server keep a readable copy of a conversation whose members were
+        // told it could not.
+        let modes = ChannelModes::new();
+        let _ = modes.apply(snapshot(vec![channel(4, 2), channel(9, PLAINTEXT)]));
+
         assert!(
-            !modes.accepts(4, 3),
-            "server-managed into an end-to-end channel is how a client would \
-             ask this server to store plaintext members were promised it \
-             could not read"
+            !modes.may_store(4, PLAINTEXT, PLAINTEXT),
+            "not this channel"
+        );
+        assert!(modes.may_store(9, PLAINTEXT, PLAINTEXT), "but this one");
+    }
+
+    #[test]
+    fn a_mislabelled_end_to_end_message_is_still_stored() {
+        // The other direction costs nothing: the server cannot read any of
+        // these whatever the message claims, so refusing would only lose
+        // messages during a mode change without protecting anything.
+        let modes = ChannelModes::new();
+        let _ = modes.apply(snapshot(vec![channel(4, 2)]));
+
+        assert!(
+            modes.may_store(4, 4, PLAINTEXT),
+            "signal into a full archive"
         );
         assert!(
-            !modes.accepts(9, 2),
-            "and the mislabel in the other direction"
+            modes.may_store(4, 0, PLAINTEXT),
+            "and a client declaring none"
         );
     }
 
     #[test]
-    fn a_client_that_declares_nothing_is_still_served() {
-        // Zero is what a client too old to set the field sends. Refusing it
-        // would have broken every shipping client the day this landed.
+    fn a_message_in_flight_across_a_mode_change_is_not_lost() {
+        // The regression the first cut of this rule caused: a sitting member
+        // who has not yet seen the new mode goes on sending under the old one,
+        // and `fancy/pchat.proto` says those stay valid -- it is why `Protocol`
+        // is per message rather than per channel.
         let modes = ChannelModes::new();
         let _ = modes.apply(snapshot(vec![channel(4, 2)]));
-        assert!(modes.accepts(4, 0));
+        let _ = modes.apply(TreeEvent {
+            event: Some(tree_event::Event::Upsert(channel(4, 4))),
+        });
+
+        assert!(
+            modes.may_store(4, 2, PLAINTEXT),
+            "a message sealed under the old mode still lands"
+        );
     }
 
     #[test]
