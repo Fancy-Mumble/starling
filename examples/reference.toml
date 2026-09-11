@@ -441,6 +441,25 @@ max_upload = "512MiB"
 # How long one render may take, end to end. The `render` service applies the
 # lower of this and its own ceiling.
 # preview_browser_timeout_ms = "20000"
+# What a walked URL resolves to, kept so the next person to ask is not a second
+# walk. This is what makes rejoining a channel cheap: history comes back, every
+# message asks for its links again, and none of them changed while the person
+# was away. Without it a channel holding fifty links costs fifty walks per join
+# per member - and on the headless rung, fifty browser renders.
+# A card is believed for hours (default 6), because the page behind it rarely
+# changes in that window. A failure is believed for minutes (default 5), which
+# is long enough to stop a crowd retrying a host that is down and short enough
+# that one bad afternoon does not cost a link its card for the rest of the day.
+# preview_cache_ttl_ms = "21600000"
+# preview_cache_error_ttl_ms = "300000"
+# How much is kept, bounded two ways because one of them does not bound
+# anything on its own: cards carry a thumbnail and an icon, so the same number
+# of entries can be a few megabytes or a few hundred. The soonest to expire
+# goes first, and an entry that alone exceeds the budget is never stored.
+# Setting either to zero switches the cache off; URLs being walked at the same
+# moment are still folded into one walk, which costs no memory.
+# preview_cache_entries = "4096"
+# preview_cache_max_bytes = "67108864"
 #
 # [services.render.options]
 # The browser `link-preview` escalates to, and nothing else dials it. Inert

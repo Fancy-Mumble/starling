@@ -19,9 +19,14 @@
 //! token taken from somebody who would have got a preview for it.
 //!
 //! The shape is `gifs`'s [`Quota`](../../gifs/src/quota.rs) without the cache
-//! and the coalescer - there is nothing to cache here, because the *page* is
-//! what a render produces and two people pasting the same link seconds apart is
-//! rare enough not to build for.
+//! and the coalescer, which live in [`cache`](crate::cache) instead. They are
+//! not here because they do not belong to the browser: this module bounds the
+//! *expensive rung*, and a card is worth keeping whichever rung produced it.
+//!
+//! They were not anywhere at all until then, on the argument that "two people
+//! pasting the same link seconds apart is rare enough not to build for". That
+//! is true of a paste and false of a rejoin, which is the case that actually
+//! repeats - see the note on [`cache`](crate::cache).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

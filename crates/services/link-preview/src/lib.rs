@@ -12,6 +12,7 @@
 //! link each other, and a second copy of that deny list is a second list to
 //! keep in step with this one.
 
+pub mod cache;
 pub mod classify;
 pub mod climb;
 pub mod ladder;
@@ -45,14 +46,17 @@ use tracing_subscriber as _;
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::feature::{
-    LinkPreviewEnvelope, Preview, PreviewError, PreviewRequest, link_preview_envelope, preview,
+    LinkPreviewEnvelope, Preview, PreviewError, link_preview_envelope, preview,
 };
 use starling_proto_fancy::types::ServiceKind;
+use starling_runtime::config::ServiceConfig;
+use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::ratelimit::Rate;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 
+use crate::cache::{Answer, Cache, Key, Waiter};
 use crate::climb::{Climb, Reached, Renderer};
 use crate::ladder::{Cooldowns, Ladder, Memory, Rung};
 use crate::quota::{Limit, Quota};
@@ -66,6 +70,10 @@ pub struct LinkPreviewService {
     /// last time and what a person may spend of the browser. Cloned into every
     /// walk; see [`climb`].
     climb: Climb,
+    /// What each URL resolved to last time, and which URLs are being walked
+    /// right now. See [`cache`] for why a service that once had nothing worth
+    /// caching turned out to have the opposite problem.
+    cache: Arc<Cache>,
 }
 
 impl ClientService for LinkPreviewService {
@@ -93,31 +101,78 @@ impl ClientService for LinkPreviewService {
         // One answer per URL, and the caps are per request: a message with
         // forty links is forty fetches, and a client that sends one is not
         // doing anything a client is not allowed to do.
+        let now = now_ms();
         let mut actions = Actions::new();
         for url in &request.urls {
-            match vet(url) {
-                Err(refusal) => {
-                    actions.push(self.refuse(&inbound, &request.request_id, url, refusal));
-                }
-                Ok(()) => {
-                    // The fetch happens off this handler and the answer arrives
-                    // through the fanout. A preview is a request to a host
-                    // somebody else chose: it takes as long as that host takes,
-                    // and awaiting it here would hold this connection's frame
-                    // handler for seconds while a stranger's server decides.
-                    self.spawn_fetch(
-                        inbound.conn,
-                        inbound.session,
-                        PreviewRequest {
-                            request_id: request.request_id.clone(),
-                            urls: vec![url.clone()],
-                        },
-                    );
-                }
+            if let Err(refusal) = vet(url) {
+                actions.push(self.refuse(&inbound, &request.request_id, url, refusal));
+                continue;
             }
+            let key = Key::new(url);
+            // A link somebody already walked is answered from here, in this
+            // handler, without a socket. This is the layer that makes rejoining
+            // a channel free: history comes back, every message asks for its
+            // links again, and none of them changed while the person was away.
+            if let Some(answer) = self.cache.get(&key, now) {
+                actions.push(to_conn(
+                    inbound.conn,
+                    outer,
+                    LinkPreviewEnvelope {
+                        body: Some(answer.stamp(&request.request_id, url)),
+                    }
+                    .encode_to_vec(),
+                ));
+                continue;
+            }
+            // And a link being walked *right now* is one walk for everybody
+            // waiting on it. The cache cannot help a crowd that arrives
+            // together - twenty people reconnecting after a restart ask inside
+            // the same second, and none of those fetches has returned yet.
+            let waiter = Waiter {
+                conn: inbound.conn,
+                request_id: request.request_id.clone(),
+                url: url.clone(),
+            };
+            if !self.cache.begin(&key, waiter) {
+                continue;
+            }
+            // The fetch happens off this handler and the answer arrives
+            // through the fanout. A preview is a request to a host
+            // somebody else chose: it takes as long as that host takes,
+            // and awaiting it here would hold this connection's frame
+            // handler for seconds while a stranger's server decides.
+            self.spawn_fetch(inbound.session, key, url.clone());
         }
         actions
     }
+}
+
+/// What a walk is worth keeping, and for how long.
+///
+/// A card is believed for hours because the page behind it rarely changes in
+/// that window, and re-walking it is what [`cache`] exists to stop. A failure
+/// is believed for minutes: long enough to stop a crowd retrying a host that is
+/// down, short enough that one bad afternoon does not cost a link its card for
+/// the rest of the day.
+///
+/// Both sizes are capped, because one of them bounds nothing on its own: a card
+/// carries a thumbnail and an icon, so the same entry count can be a few
+/// megabytes or a few hundred.
+fn cache_from(service: &ServiceConfig) -> Cache {
+    Cache::new(
+        service
+            .option::<u64>("preview_cache_ttl_ms")
+            .map_or(Duration::from_secs(6 * 3600), Duration::from_millis),
+        service
+            .option::<u64>("preview_cache_error_ttl_ms")
+            .map_or(Duration::from_secs(300), Duration::from_millis),
+        service
+            .option::<usize>("preview_cache_entries")
+            .unwrap_or(4096),
+        service
+            .option::<usize>("preview_cache_max_bytes")
+            .unwrap_or(64 * 1024 * 1024),
+    )
 }
 
 impl LinkPreviewService {
@@ -176,14 +231,19 @@ impl LinkPreviewService {
     /// hold this connection's frame handler for seconds while a stranger's
     /// server decides - now several times over, since a walk may ask more than
     /// once.
-    fn spawn_fetch(&self, conn: u64, session: u32, request: PreviewRequest) {
+    /// Every waiter registered against this URL is answered, not just the
+    /// caller that started the walk, and the answer is kept for the next one.
+    fn spawn_fetch(&self, session: u32, key: Key, url: String) {
         let climb = self.climb.clone();
         let fanout = self.fanout.clone();
         let logger = self.logger.clone();
+        let cache = Arc::clone(&self.cache);
         let outer = ServiceKind::LinkPreview.outer_type();
         drop(tokio::spawn(async move {
-            let url = request.urls.first().cloned().unwrap_or_default();
-            let body = match climb.walk(&url, session).await {
+            // The request id is left empty all the way down: what a walk
+            // produces belongs to the URL rather than to whoever happened to
+            // ask first, and every waiter's own id is stamped on at the end.
+            let answer = match climb.walk(&url, session).await {
                 Reached::Page { page, rung } => {
                     // The picture is fetched as whoever fetched the page: an
                     // `og:image` behind the same wall answers the same client.
@@ -193,9 +253,7 @@ impl LinkPreviewService {
                     // rung stops at `</head>`, so what it holds below that is
                     // not a document, it is a truncation.
                     let rendered = rung == Rung::Headless;
-                    link_preview_envelope::Body::Preview(
-                        of_page(&fetcher, request.request_id, page, rendered).await,
-                    )
+                    Answer::card(of_page(&fetcher, String::new(), page, rendered).await)
                 }
                 // A card with no page behind it: an embed endpoint answered
                 // directly, or the URL was read for its own title. It still
@@ -204,9 +262,7 @@ impl LinkPreviewService {
                 // came from.
                 Reached::Card { card, url, rung } => {
                     let fetcher = climb.fetcher_for(rung);
-                    link_preview_envelope::Body::Preview(
-                        of_card(&fetcher, request.request_id, &url, *card, None).await,
-                    )
+                    Answer::card(of_card(&fetcher, String::new(), &url, *card, None).await)
                 }
                 // Not a page, which for a link somebody pasted usually means
                 // it is a picture: the host said so in its `content-type`,
@@ -216,8 +272,8 @@ impl LinkPreviewService {
                 // and the picture becomes its own card.
                 Reached::NotAPage => {
                     let fetcher = climb.fetcher_for(climb.ladder.cheapest());
-                    match of_media(&fetcher, &request.request_id, &url).await {
-                        Some(preview) => link_preview_envelope::Body::Preview(preview),
+                    match of_media(&fetcher, "", &url).await {
+                        Some(preview) => Answer::card(preview),
                         None => {
                             // The second half of the same diagnosis: the host
                             // said "not a page", and it was not a picture
@@ -227,10 +283,7 @@ impl LinkPreviewService {
                                 %url,
                                 "link preview: not a page, and not a picture either"
                             );
-                            link_preview_envelope::Body::Error(PreviewError {
-                                request_id: request.request_id,
-                                reason: format!("{url}: {}", FetchError::NotHtml.reason()),
-                            })
+                            Answer::Failed(FetchError::NotHtml.reason().to_owned())
                         }
                     }
                 }
@@ -250,17 +303,27 @@ impl LinkPreviewService {
                         );
                     }
                     tracing::debug!(url = %url, reason, "link preview failed");
-                    link_preview_envelope::Body::Error(PreviewError {
-                        request_id: request.request_id,
-                        reason: format!("{url}: {reason}"),
-                    })
+                    Answer::Failed(reason)
                 }
             };
-            fanout.push(to_conn(
-                conn,
-                outer,
-                LinkPreviewEnvelope { body: Some(body) }.encode_to_vec(),
-            ));
+            // Taken unconditionally, success or failure: an entry left in the
+            // in-flight map is a URL that never walks again, because every
+            // later caller attaches to a walk that is not running.
+            let waiting = cache.finish(&key);
+            cache.store(&key, &answer, now_ms());
+            for waiter in &waiting {
+                fanout.push(to_conn(
+                    waiter.conn,
+                    outer,
+                    LinkPreviewEnvelope {
+                        // Their own id and their own spelling of the URL: a
+                        // walk started by one client answers several, and each
+                        // matches the reply against what it sent.
+                        body: Some(answer.stamp(&waiter.request_id, &waiter.url)),
+                    }
+                    .encode_to_vec(),
+                ));
+            }
         }));
     }
 }
@@ -675,7 +738,7 @@ impl Serve for LinkPreviewService {
                     .option::<u32>("preview_browser_server_burst")
                     .unwrap_or(10),
             },
-            starling_runtime::ids::now_ms(),
+            now_ms(),
         );
         // Dialled only if the operator put the browser on the ladder. A
         // renderer nobody asked for is a service dialled for nothing.
@@ -693,6 +756,7 @@ impl Serve for LinkPreviewService {
         Ok(Arc::new(Self {
             fanout: Fanout::default(),
             logger: ctx.logger,
+            cache: Arc::new(cache_from(&service)),
             climb: Climb {
                 fetcher: Fetcher::new(limits),
                 ladder,
@@ -729,6 +793,160 @@ mod tests {
         // The port and any credentials belong to the connection, not to the
         // label a reader is shown.
         assert_eq!(host_of("http://user:pw@example.org:8080/a"), "example.org");
+    }
+
+    /// A service whose ladder reaches nothing, so `frame` cannot fetch.
+    ///
+    /// That is the point: every assertion below is about what happens *without*
+    /// a walk, and a ladder that could reach a host would make "no fetch" and
+    /// "a fetch that failed" the same observation.
+    fn service(cache: Cache) -> LinkPreviewService {
+        LinkPreviewService {
+            fanout: Fanout::default(),
+            logger: Logger::null(),
+            climb: Climb {
+                fetcher: Fetcher::new(Limits::default()),
+                ladder: Ladder::parse(""),
+                memory: Arc::new(Memory::new(Cooldowns::default(), 16)),
+                quota: Arc::new(Quota::new(
+                    Limit::every(60.0, 1),
+                    Limit::every(60.0, 1),
+                    now_ms(),
+                )),
+                honest: Arc::from(ladder::HONEST_USER_AGENT),
+                renderer: None,
+            },
+            cache: Arc::new(cache),
+        }
+    }
+
+    /// A request for one URL, as it arrives off the wire.
+    fn ask(conn: u64, request_id: &str, url: &str) -> Inbound {
+        Inbound {
+            conn,
+            session: 1,
+            type_id: ServiceKind::LinkPreview.outer_type(),
+            payload: LinkPreviewEnvelope {
+                body: Some(link_preview_envelope::Body::Request(
+                    starling_proto_fancy::fancy::feature::PreviewRequest {
+                        request_id: request_id.to_owned(),
+                        urls: vec![url.to_owned()],
+                    },
+                )),
+            }
+            .encode_to_vec(),
+            gateway: String::new(),
+            scope: 1,
+        }
+    }
+
+    /// The card an action carries, or `None` where it carries a refusal.
+    fn card_in(action: &starling_proto_fancy::control::ServerAction) -> Option<Preview> {
+        let payload = match action.action.as_ref()? {
+            starling_proto_fancy::control::server_action::Action::Send(send) => &send.payload,
+            _ => return None,
+        };
+        match LinkPreviewEnvelope::decode(payload.as_slice()).ok()?.body? {
+            link_preview_envelope::Body::Preview(card) => Some(card),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_already_walked_is_answered_without_a_fetch() {
+        // The whole point of the cache, and the case the module exists for: a
+        // rejoin asks about the same links again, and none of them changed.
+        // The ladder here reaches nothing, so a card coming back at all proves
+        // it came from the cache.
+        let cache = Cache::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            8,
+            1 << 20,
+        );
+        cache.store(
+            &Key::new("https://example.org/article"),
+            &Answer::card(Preview {
+                url: "https://example.org/article".to_owned(),
+                title: "An Article".to_owned(),
+                ..Preview::default()
+            }),
+            now_ms(),
+        );
+        let service = service(cache);
+
+        let actions = service
+            .frame(ask(1, "message-one", "https://example.org/article"))
+            .await;
+
+        let card = actions
+            .iter()
+            .find_map(card_in)
+            .expect("the card comes straight back from the handler");
+        assert_eq!(card.title, "An Article");
+        // Stamped with *this* caller's id, not whoever's walk filled the cache.
+        assert_eq!(card.request_id, "message-one");
+    }
+
+    #[tokio::test]
+    async fn a_second_asker_attaches_to_the_walk_already_running() {
+        // Twenty people reconnecting after a restart ask for the same history's
+        // links inside the same second. The cache cannot help them - none of
+        // those fetches has returned - so the coalescer has to.
+        let cache = Cache::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            8,
+            1 << 20,
+        );
+        let service = service(cache);
+
+        let first = service
+            .frame(ask(1, "message-one", "https://example.org/article"))
+            .await;
+        assert!(first.is_empty(), "the first caller goes off to walk");
+
+        let second = service
+            .frame(ask(2, "message-two", "https://example.org/article"))
+            .await;
+        assert!(second.is_empty(), "and the second waits on that same walk");
+
+        // Both are recorded against the one walk, which is what makes them one
+        // fetch and two answers.
+        let waiting = service
+            .cache
+            .finish(&Key::new("https://example.org/article"));
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(waiting[0].conn, 1);
+        assert_eq!(waiting[1].conn, 2);
+        // Each carries its own correlation id and its own spelling of the URL.
+        assert_eq!(waiting[1].request_id, "message-two");
+        assert_eq!(waiting[1].url, "https://example.org/article");
+    }
+
+    #[tokio::test]
+    async fn a_refused_address_is_never_cached() {
+        // `vet` rejects without a fetch, so there is no cost to save - and an
+        // entry here would be a way for the deny list to go stale.
+        let cache = Cache::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            8,
+            1 << 20,
+        );
+        let service = service(cache);
+
+        let actions = service
+            .frame(ask(
+                1,
+                "message-one",
+                "http://169.254.169.254/latest/meta-data/",
+            ))
+            .await;
+
+        assert_eq!(actions.len(), 1, "the refusal goes straight back");
+        assert!(card_in(&actions[0]).is_none(), "and it is not a card");
+        assert!(service.cache.is_empty());
     }
 
     #[test]
