@@ -63,6 +63,9 @@ image_message_length = 131072
 allow_html = true
 # Days of chat history kept before it is deleted.
 log_days = 31
+# Past avatars and comments the audit log keeps per user, for moderators.
+# 0 keeps none. Avatars are stored shrunk to 128px, comments compressed.
+profile_history = 0
 
 # Channels ------------------------------------------------------------------
 

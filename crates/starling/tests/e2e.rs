@@ -5188,3 +5188,168 @@ async fn a_scheduled_message_can_be_cancelled_and_then_never_arrives() {
 
     deployment.stop().await;
 }
+
+/// A profile change is kept, for an admin to look back at.
+///
+/// The whole path: the user's own `UserState` through `session-lifecycle`, the
+/// trail into `audit`, the copy kept beside the chain and trimmed to
+/// `profile_history`, and an admin reading it back over the client channel.
+#[tokio::test]
+async fn an_admin_reads_back_a_comment_the_profile_history_kept() {
+    use starling_proto_fancy::fancy::feature::{
+        AuditEnvelope, Query, SnapshotQuery, Verify, audit_envelope,
+    };
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+    use starling_proto_fancy::types::ServiceKind;
+
+    let data_dir = TempDir::new("profile-history");
+    let deployment = Deployment::start_with(data_dir.path(), |config| {
+        assert!(
+            !config.instances.is_empty(),
+            "a deployment serves an instance"
+        );
+        for instance in &mut config.instances {
+            instance.settings.profile_history = Some(2);
+        }
+    })
+    .await;
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let session = handshake_fancy(&mut alice, "alice").await;
+    deployment
+        .wait_until_permitted(session, 0, Perm::WRITE.bits())
+        .await;
+
+    for comment in ["first", "second", "third"] {
+        alice
+            .send(
+                9,
+                &tcp::UserState {
+                    comment: Some(format!("<b>{comment}</b>")),
+                    ..tcp::UserState::default()
+                },
+            )
+            .await;
+        // The trail is spawned, so two changes sent back to back may reach
+        // `audit` out of order; spacing them keeps "newest" meaning "last sent".
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let outer = ServiceKind::Audit.outer_type();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let records = loop {
+        alice
+            .send(
+                outer,
+                &AuditEnvelope {
+                    body: Some(audit_envelope::Body::Query(Query {
+                        category: "audit.profile".to_owned(),
+                        query_id: "profile".to_owned(),
+                        ..Query::default()
+                    })),
+                },
+            )
+            .await;
+        let page = loop {
+            let (type_id, payload) = alice.recv().await;
+            if type_id != outer {
+                continue;
+            }
+            if let Some(audit_envelope::Body::Page(page)) =
+                AuditEnvelope::decode(payload.as_slice())
+                    .expect("an envelope")
+                    .body
+            {
+                break page;
+            }
+        };
+        if page.records.len() >= 3 {
+            break page.records;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the comment changes never reached the audit log: {:?}",
+            page.records
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(records.iter().all(|r| r.action == "comment changed"));
+    assert_eq!(
+        records.iter().map(|r| r.has_snapshot).collect::<Vec<_>>(),
+        vec![true, true, false],
+        "two copies kept, the oldest trimmed: {records:?}"
+    );
+    assert!(records[0].detail.contains("snapshot sha256:"));
+
+    let mut snapshot_of = async |id: &str| {
+        alice
+            .send(
+                outer,
+                &AuditEnvelope {
+                    body: Some(audit_envelope::Body::SnapshotQuery(SnapshotQuery {
+                        entry_id: id.to_owned(),
+                        query_id: id.to_owned(),
+                    })),
+                },
+            )
+            .await;
+        loop {
+            let (type_id, payload) = alice.recv().await;
+            if type_id != outer {
+                continue;
+            }
+            if let Some(audit_envelope::Body::Snapshot(snapshot)) =
+                AuditEnvelope::decode(payload.as_slice())
+                    .expect("an envelope")
+                    .body
+                && snapshot.query_id == id
+            {
+                break snapshot;
+            }
+        }
+    };
+    let newest = snapshot_of(&records[0].id).await;
+    assert!(newest.found);
+    assert_eq!(newest.kind, "comment");
+    assert_eq!(newest.body, b"<b>third</b>");
+    let oldest = snapshot_of(&records[2].id).await;
+    assert!(!oldest.found, "a trimmed copy is reported gone, not served");
+
+    alice
+        .send(
+            outer,
+            &AuditEnvelope {
+                body: Some(audit_envelope::Body::Verify(Verify {
+                    query_id: "verify".to_owned(),
+                })),
+            },
+        )
+        .await;
+    let verified = loop {
+        let (type_id, payload) = alice.recv().await;
+        if type_id != outer {
+            continue;
+        }
+        if let Some(audit_envelope::Body::VerifyResult(result)) =
+            AuditEnvelope::decode(payload.as_slice())
+                .expect("an envelope")
+                .body
+        {
+            break result;
+        }
+    };
+    assert!(verified.intact, "kept copies must verify: {verified:?}");
+
+    deployment.stop().await;
+}

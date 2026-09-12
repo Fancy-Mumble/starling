@@ -122,6 +122,8 @@ pub fn defaults(instance: u32) -> Snapshot {
         // what upstream compiles, so it is what a server migrating from it gets.
         channel_name_regex: CHANNEL_NAME_PATTERN.to_owned(),
         user_name_regex: USER_NAME_PATTERN.to_owned(),
+        // Off: keeping what people used to look like is an operator's choice.
+        profile_history: 0,
         extra: HashMap::new(),
     }
 }
@@ -366,6 +368,7 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "users_per_channel" => count(&mut snapshot.users_per_channel),
             "default_channel" => count(&mut snapshot.default_channel),
             "remember_channel_duration" => count(&mut snapshot.remember_channel_duration),
+            "profile_history" => count(&mut snapshot.profile_history),
             "message_limit" => count(&mut snapshot.message_limit),
             "message_burst" => count(&mut snapshot.message_burst),
             "plugin_message_limit" => count(&mut snapshot.plugin_message_limit),
@@ -426,6 +429,7 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Value {
         "listeners_per_channel": snapshot.listeners_per_channel,
         "listeners_per_user": snapshot.listeners_per_user,
         "log_days": snapshot.log_days,
+        "profile_history": snapshot.profile_history,
         "message_limit": snapshot.message_limit,
         "message_burst": snapshot.message_burst,
         "plugin_message_limit": snapshot.plugin_message_limit,

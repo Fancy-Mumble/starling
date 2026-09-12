@@ -229,6 +229,9 @@ message Snapshot {
   // restriction, which is how an operator turns the rule off.
   string channel_name_regex = 41;
   string user_name_regex = 42;
+  // How many past avatars and comments `audit` keeps per user. Zero, the
+  // default, records none. Avatars are kept shrunk and comments compressed.
+  uint32 profile_history = 43;
 }
 
 // -- Greeting -----------------------------------------------------------------

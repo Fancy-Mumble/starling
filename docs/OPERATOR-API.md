@@ -381,7 +381,7 @@ back to email.
 Settable: `welcome_text`, `password`, `max_users`, `max_bandwidth`,
 `text_message_length`, `image_message_length`, `channel_nesting_limit`,
 `channel_count_limit`, `listeners_per_channel`, `listeners_per_user`,
-`log_days`, `users_per_channel`, `default_channel`, `remember_channel`,
+`log_days`, `profile_history`, `users_per_channel`, `default_channel`, `remember_channel`,
 `remember_channel_duration`, `message_limit`, `message_burst`,
 `plugin_message_limit`, `plugin_message_burst`, `allow_html`,
 `allow_recording`, `broadcast_listener_volume_adjustments`, `cert_required`,

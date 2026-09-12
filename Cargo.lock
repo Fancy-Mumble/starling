@@ -3700,14 +3700,17 @@ dependencies = [
 name = "starling-audit"
 version = "0.2.1"
 dependencies = [
+ "image",
  "prost",
  "sha2 0.11.0",
  "sqlx",
+ "starling-imaging",
  "starling-proto-fancy",
  "starling-runtime",
  "tokio",
  "tonic",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

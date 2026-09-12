@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+# The profile history: an avatar is kept shrunk and a comment compressed.
+starling-imaging.workspace = true
+zstd.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 
@@ -22,6 +25,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# An encoder, to hand the avatar path a real picture.
+image.workspace = true
 
 [lints]
 workspace = true

@@ -64,6 +64,8 @@ pub mod category {
     pub const ACL: &str = "audit.acl";
     /// A server setting changed.
     pub const CONFIG: &str = "audit.config";
+    /// A user's avatar or comment changed, or a moderator reset it.
+    pub const PROFILE: &str = "audit.profile";
 
     /// Every category, for the client's filter list.
     ///
@@ -79,6 +81,7 @@ pub mod category {
         BAN,
         ACL,
         CONFIG,
+        PROFILE,
     ];
 }
 
@@ -135,6 +138,20 @@ impl Record {
     #[must_use]
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.entry.detail = detail.into();
+        self
+    }
+
+    /// A copy of the avatar or comment this entry is about.
+    ///
+    /// `audit` decides what to keep of it: a shrunk avatar or a compressed
+    /// comment, pruned to the newest `profile_history` per `subject`.
+    #[must_use]
+    pub fn attach(mut self, kind: &str, subject: impl Into<String>, body: Vec<u8>) -> Self {
+        self.entry.attachment = Some(starling_proto_fancy::audit::Attachment {
+            kind: kind.to_owned(),
+            subject: subject.into(),
+            body,
+        });
         self
     }
 

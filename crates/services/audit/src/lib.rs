@@ -10,16 +10,19 @@
 //! already uses (`docs/STORAGE.md` L5). What is deliberately *not* copied is
 //! its own database file per plugin: one database, one pool, one backup.
 
+mod snapshot;
+
 use std::sync::Arc;
 
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use starling_proto_fancy::audit::audit_server::{Audit, AuditServer};
 use starling_proto_fancy::audit::{
-    Entry, EntryPage, QueryRequest, RecordResult, VerifyRequest, VerifyResult,
+    Attachment, Entry, EntryPage, QueryRequest, RecordResult, VerifyRequest, VerifyResult,
 };
 use starling_proto_fancy::fancy::feature::{
-    AuditEnvelope, AuditRecord, Config, Page, VerifyResult as VerifyResultMsg, audit_envelope,
+    AuditEnvelope, AuditRecord, Config, Page, ProfileSnapshot, SnapshotQuery,
+    VerifyResult as VerifyResultMsg, audit_envelope,
 };
 use starling_proto_fancy::fancy::wire::PageInfo;
 use starling_proto_fancy::perm::Perm;
@@ -34,10 +37,11 @@ use starling_runtime::trail;
 use tonic::{Request, Response, Status};
 
 /// The schema, with the indexes the three query shapes actually use.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
-    "0001_audit",
-    &[
-        "CREATE TABLE IF NOT EXISTS server_audit (\
+const SCHEMA: &[Migration<'static>] = &[
+    Migration::new(
+        "0001_audit",
+        &[
+            "CREATE TABLE IF NOT EXISTS server_audit (\
              server_id BIGINT NOT NULL, id BLOB NOT NULL, at_ms BIGINT NOT NULL, \
              category VARCHAR(64) NOT NULL, action VARCHAR(64) NOT NULL, \
              actor VARCHAR(190) NOT NULL, target_account BIGINT NOT NULL, \
@@ -45,11 +49,27 @@ const SCHEMA: &[Migration<'static>] = &[Migration::new(
              expires_at_ms BIGINT NULL, event_offset BIGINT NULL, \
              prev_hash BLOB NOT NULL, entry_hash BLOB NOT NULL, \
              PRIMARY KEY (server_id, id))",
-        "CREATE INDEX IF NOT EXISTS ix_audit_server_ts ON server_audit(server_id, at_ms)",
-        "CREATE INDEX IF NOT EXISTS ix_audit_target ON server_audit(server_id, target_account, at_ms)",
-        "CREATE INDEX IF NOT EXISTS ix_audit_expiry ON server_audit(server_id, expires_at_ms)",
-    ],
-)];
+            "CREATE INDEX IF NOT EXISTS ix_audit_server_ts ON server_audit(server_id, at_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_audit_target ON server_audit(server_id, target_account, at_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_audit_expiry ON server_audit(server_id, expires_at_ms)",
+        ],
+    ),
+    Migration::new(
+        // The profile history, beside the chain rather than in it: a copy is
+        // pruned per user long before retention reaches its entry, and the entry's
+        // detail carries the copy's digest so a swapped copy still fails `verify`.
+        "0002_profile_snapshot",
+        &[
+            "CREATE TABLE IF NOT EXISTS audit_profile_snapshot (\
+             server_id BIGINT NOT NULL, entry_id BLOB NOT NULL, \
+             subject VARCHAR(190) NOT NULL, kind VARCHAR(16) NOT NULL, \
+             mime VARCHAR(64) NOT NULL, encoding VARCHAR(16) NOT NULL, \
+             original_size BIGINT NOT NULL, content_hash BLOB NOT NULL, \
+             body BLOB NOT NULL, PRIMARY KEY (server_id, entry_id))",
+            "CREATE INDEX IF NOT EXISTS ix_profile_subject ON audit_profile_snapshot(server_id, subject, kind)",
+        ],
+    ),
+];
 
 /// The service.
 #[derive(Debug)]
@@ -66,6 +86,12 @@ pub struct AuditService {
     /// every login and every moderation action, kept for ever, on a server
     /// whose operator had written down how long they wanted to keep it.
     settings: starling_runtime::Settings,
+    /// Held from reading the chain's head to writing the entry after it.
+    ///
+    /// `Trail` sends every record on its own task, so records do arrive
+    /// together, and without this two of them chain onto the same head and
+    /// `verify` reports the second as tampering.
+    chain: tokio::sync::Mutex<()>,
 }
 
 /// How often expired entries are swept.
@@ -201,22 +227,240 @@ impl AuditService {
         }
     }
 
+    /// Drop copies whose entry is gone, and trim every user to
+    /// `profile_history`. Returns how many went.
+    ///
+    /// Retention deletes entries without knowing about copies, and trimming
+    /// here as well as on each write is what makes a lowered setting reach
+    /// users who never change their profile again. Zero stops recording but
+    /// deletes nothing.
+    pub async fn sweep_snapshots(&self, scope: u32) -> u64 {
+        use sqlx::Row as _;
+        let mut removed = sqlx::query(
+            "DELETE FROM audit_profile_snapshot WHERE server_id = ? AND NOT EXISTS \
+             (SELECT 1 FROM server_audit a WHERE a.server_id = audit_profile_snapshot.server_id \
+              AND a.id = audit_profile_snapshot.entry_id)",
+        )
+        .bind(i64::from(scope))
+        .execute(self.store.pool())
+        .await
+        .map_or(0, |done| done.rows_affected());
+
+        let keep = self.settings.get(scope).profile_history;
+        if keep > 0 {
+            let crowded = sqlx::query(
+                "SELECT subject, kind FROM audit_profile_snapshot WHERE server_id = ? \
+                 GROUP BY subject, kind HAVING count(*) > ?",
+            )
+            .bind(i64::from(scope))
+            .bind(i64::from(keep))
+            .fetch_all(self.store.pool())
+            .await
+            .unwrap_or_default();
+            for row in crowded {
+                let subject: String = row.try_get("subject").unwrap_or_default();
+                let kind: String = row.try_get("kind").unwrap_or_default();
+                removed += self.prune(scope, &subject, &kind, keep).await;
+            }
+        }
+        removed
+    }
+
+    /// Keep only the newest `keep` copies of one user's `kind`. Returns how
+    /// many went.
+    async fn prune(&self, scope: u32, subject: &str, kind: &str, keep: u32) -> u64 {
+        use sqlx::Row as _;
+        if keep == 0 {
+            return 0;
+        }
+        let oldest_kept = sqlx::query(
+            "SELECT entry_id FROM audit_profile_snapshot \
+             WHERE server_id = ? AND subject = ? AND kind = ? \
+             ORDER BY entry_id DESC LIMIT 1 OFFSET ?",
+        )
+        .bind(i64::from(scope))
+        .bind(subject)
+        .bind(kind)
+        .bind(i64::from(keep - 1))
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<Vec<u8>, _>("entry_id").ok());
+        let Some(oldest_kept) = oldest_kept else {
+            return 0;
+        };
+        sqlx::query(
+            "DELETE FROM audit_profile_snapshot \
+             WHERE server_id = ? AND subject = ? AND kind = ? AND entry_id < ?",
+        )
+        .bind(i64::from(scope))
+        .bind(subject)
+        .bind(kind)
+        .bind(oldest_kept)
+        .execute(self.store.pool())
+        .await
+        .map_or(0, |done| done.rows_affected())
+    }
+
+    /// The copy an attachment would be kept as, when `profile_history` is on.
+    fn pack(
+        &self,
+        scope: u32,
+        attachment: Option<Attachment>,
+    ) -> Option<(Attachment, snapshot::Packed)> {
+        let attachment = attachment?;
+        if self.settings.get(scope).profile_history == 0 {
+            return None;
+        }
+        let packed = snapshot::pack(&attachment.kind, &attachment.body);
+        if packed.is_none() {
+            tracing::debug!(scope, kind = %attachment.kind, "a profile change had nothing worth keeping");
+        }
+        packed.map(|packed| (attachment, packed))
+    }
+
+    /// Whether the newest copy of this user's `kind` is already this content.
+    ///
+    /// A guest's client sends its avatar again on every connect, and a history
+    /// of the same picture is no history.
+    async fn unchanged(
+        &self,
+        scope: u32,
+        attachment: &Attachment,
+        packed: &snapshot::Packed,
+    ) -> bool {
+        use sqlx::Row as _;
+        sqlx::query(
+            "SELECT content_hash FROM audit_profile_snapshot \
+             WHERE server_id = ? AND subject = ? AND kind = ? ORDER BY entry_id DESC LIMIT 1",
+        )
+        .bind(i64::from(scope))
+        .bind(&attachment.subject)
+        .bind(&attachment.kind)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<Vec<u8>, _>("content_hash").ok())
+        .is_some_and(|newest| newest == packed.content_hash)
+    }
+
+    /// Store the copy for the entry `entry_id`, then trim that user's history.
+    async fn keep(
+        &self,
+        scope: u32,
+        entry_id: &[u8],
+        attachment: &Attachment,
+        packed: &snapshot::Packed,
+    ) {
+        let stored = sqlx::query(
+            "INSERT INTO audit_profile_snapshot (server_id, entry_id, subject, kind, mime, \
+                 encoding, original_size, content_hash, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(i64::from(scope))
+        .bind(entry_id)
+        .bind(&attachment.subject)
+        .bind(&attachment.kind)
+        .bind(&packed.mime)
+        .bind(packed.encoding)
+        .bind(attachment.body.len() as i64)
+        .bind(packed.content_hash.as_slice())
+        .bind(packed.body.as_slice())
+        .execute(self.store.pool())
+        .await;
+        if let Err(error) = stored {
+            tracing::warn!(%error, scope, "a profile snapshot was not kept");
+            return;
+        }
+        let keep = self.settings.get(scope).profile_history;
+        let _ = self
+            .prune(scope, &attachment.subject, &attachment.kind, keep)
+            .await;
+    }
+
+    /// One kept copy, decoded.
+    async fn snapshot(&self, scope: u32, entry_id: &[u8]) -> Option<ProfileSnapshot> {
+        use sqlx::Row as _;
+        if entry_id.is_empty() {
+            return None;
+        }
+        let row = sqlx::query(
+            "SELECT kind, mime, encoding, original_size, body FROM audit_profile_snapshot \
+             WHERE server_id = ? AND entry_id = ?",
+        )
+        .bind(i64::from(scope))
+        .bind(entry_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()??;
+        let stored: Vec<u8> = row.try_get("body").ok()?;
+        let encoding: String = row.try_get("encoding").ok()?;
+        let stored_size = stored.len() as u64;
+        Some(ProfileSnapshot {
+            found: true,
+            kind: row.try_get("kind").ok()?,
+            mime: row.try_get("mime").ok()?,
+            original_size: row
+                .try_get::<i64, _>("original_size")
+                .unwrap_or_default()
+                .unsigned_abs(),
+            stored_size,
+            body: snapshot::unpack(&encoding, stored)?,
+            ..ProfileSnapshot::default()
+        })
+    }
+
+    /// The first kept copy whose bytes no longer match the digest its entry
+    /// chained.
+    async fn first_swapped_snapshot(&self, scope: u32) -> Option<Vec<u8>> {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            "SELECT s.entry_id, s.body, a.detail FROM audit_profile_snapshot s \
+             JOIN server_audit a ON a.server_id = s.server_id AND a.id = s.entry_id \
+             WHERE s.server_id = ? ORDER BY s.entry_id ASC",
+        )
+        .bind(i64::from(scope))
+        .fetch_all(self.store.pool())
+        .await
+        .unwrap_or_default();
+        rows.into_iter().find_map(|row| {
+            let body: Vec<u8> = row.try_get("body").unwrap_or_default();
+            let detail: String = row.try_get("detail").unwrap_or_default();
+            (!snapshot::matches(&detail, &body))
+                .then(|| row.try_get::<Vec<u8>, _>("entry_id").unwrap_or_default())
+        })
+    }
+
     /// One sweep per interval, across every server instance, until aborted.
     async fn sweep_forever(self: Arc<Self>, scopes: Vec<u32>) {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
             for scope in &scopes {
                 let _ = self.sweep(*scope, now_ms()).await;
+                let _ = self.sweep_snapshots(*scope).await;
             }
         }
     }
 
-    /// Append one entry.
+    /// Append one entry, and keep a copy of what it is about when it has one.
     async fn record(&self, scope: u32, mut entry: Entry) -> RecordResult {
         if entry.at_ms == 0 {
             entry.at_ms = now_ms();
         }
+        let copy = self.pack(scope, entry.attachment.take());
+        if let Some((attachment, packed)) = &copy {
+            if self.unchanged(scope, attachment, packed).await {
+                return RecordResult {
+                    duplicate: true,
+                    ..RecordResult::default()
+                };
+            }
+            entry.detail = snapshot::with_digest(&entry.detail, &packed.digest());
+        }
+
         let id = Uuid7::now();
+        let chain = self.chain.lock().await;
         let previous = self.head(scope).await;
         let hash = chain_hash(&previous, &entry);
 
@@ -240,13 +484,19 @@ impl AuditService {
         .bind(hash.as_slice())
         .execute(self.store.pool())
         .await;
+        drop(chain);
 
         match result {
-            Ok(_) => RecordResult {
-                id: id.to_vec(),
-                entry_hash: hash,
-                duplicate: false,
-            },
+            Ok(_) => {
+                if let Some((attachment, packed)) = &copy {
+                    self.keep(scope, &id.to_vec(), attachment, packed).await;
+                }
+                RecordResult {
+                    id: id.to_vec(),
+                    entry_hash: hash,
+                    duplicate: false,
+                }
+            }
             // A duplicate offset is accepted once and then ignored, which is
             // what makes a producer safe to retry.
             Err(_) => RecordResult {
@@ -276,7 +526,9 @@ impl AuditService {
         // no operator-supplied text reaches the statement as text.
         let mut query = sqlx::QueryBuilder::<sqlx::Any>::new(
             "SELECT id, at_ms, category, action, actor, target_account, target_channel, \
-                    detail, entry_hash FROM server_audit WHERE server_id = ",
+                    detail, entry_hash, (SELECT count(*) FROM audit_profile_snapshot s \
+                    WHERE s.server_id = server_audit.server_id AND s.entry_id = server_audit.id) \
+                    AS snapshots FROM server_audit WHERE server_id = ",
         );
         let _ = query.push_bind(i64::from(scope));
         let _ = query
@@ -330,6 +582,8 @@ impl AuditService {
                 detail: row.try_get("detail").unwrap_or_default(),
                 expires_at_ms: 0,
                 event_offset: None,
+                attachment: None,
+                has_snapshot: row.try_get::<i64, _>("snapshots").unwrap_or_default() > 0,
             });
         }
         EntryPage {
@@ -397,6 +651,27 @@ impl AuditService {
             }
             previous = stored;
             checked += 1;
+        }
+        if let Some(broken_at) = self.first_swapped_snapshot(scope).await {
+            tracing::error!(
+                scope,
+                "a kept profile snapshot does not match its audit entry"
+            );
+            self.logger.log(
+                LogEvent::error(Category::Security, "an audit profile snapshot was altered")
+                    .with("scope", scope)
+                    .with(
+                        "broken_at",
+                        Uuid7::from_slice(&broken_at)
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
+                    ),
+            );
+            return VerifyResult {
+                intact: false,
+                checked,
+                broken_at,
+            };
         }
         tracing::info!(checked, scope, "the audit chain verified intact");
         VerifyResult {
@@ -483,6 +758,9 @@ impl ClientService for AuditService {
             audit_envelope::Body::Verify(verify) => {
                 self.serve_verify(&inbound, &verify, outer).await
             }
+            audit_envelope::Body::SnapshotQuery(query) => {
+                self.serve_snapshot(&inbound, &query, outer).await
+            }
             // The rest are server->client bodies; a client sending one is
             // either confused or probing, and neither deserves an answer.
             _ => Actions::new(),
@@ -548,6 +826,7 @@ impl AuditService {
                         entry_hash: hex(&hash),
                         target_account: entry.target_account,
                         target_channel: entry.target_channel,
+                        has_snapshot: entry.has_snapshot,
                     })
                     .collect(),
             })),
@@ -578,6 +857,27 @@ impl AuditService {
                     .collect(),
                 retention_days: settings.log_days,
                 chain_height: self.height(inbound.scope).await,
+                profile_history: settings.profile_history,
+            })),
+        };
+        vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
+    }
+
+    /// One kept avatar or comment, for the operator looking at its entry.
+    async fn serve_snapshot(
+        &self,
+        inbound: &Inbound,
+        query: &SnapshotQuery,
+        outer: u16,
+    ) -> Actions {
+        let id = Uuid7::parse(&query.entry_id)
+            .map(Uuid7::to_vec)
+            .unwrap_or_default();
+        let reply = AuditEnvelope {
+            body: Some(audit_envelope::Body::Snapshot(ProfileSnapshot {
+                entry_id: query.entry_id.clone(),
+                query_id: query.query_id.clone(),
+                ..self.snapshot(inbound.scope, &id).await.unwrap_or_default()
             })),
         };
         vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
@@ -623,6 +923,7 @@ impl Serve for AuditService {
             logger: ctx.logger.clone(),
             permit: Permit::new(ctx.resolver.clone()),
             settings,
+            chain: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -664,6 +965,11 @@ mod tests {
 
     /// The same service, with `log_days` pinned to `days`.
     async fn service_keeping(days: u32) -> Arc<AuditService> {
+        service_with(days, 0).await
+    }
+
+    /// The same service, with `log_days` and `profile_history` pinned.
+    async fn service_with(days: u32, history: u32) -> Arc<AuditService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
@@ -695,9 +1001,11 @@ mod tests {
                 resolver,
                 starling_proto_fancy::serverconfig::Snapshot {
                     log_days: days,
+                    profile_history: history,
                     ..starling_runtime::settings::defaults(1)
                 },
             ),
+            chain: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -969,5 +1277,142 @@ mod tests {
             .await;
         assert_eq!(service.sweep(1, now).await, 1);
         assert_eq!(held(&service).await, 0);
+    }
+
+    /// A profile change for `subject`, carrying `comment`.
+    fn comment_change(subject: &str, comment: &str) -> Entry {
+        Entry {
+            category: trail::category::PROFILE.to_owned(),
+            detail: subject.to_owned(),
+            attachment: Some(Attachment {
+                kind: snapshot::COMMENT.to_owned(),
+                subject: subject.to_owned(),
+                body: comment.as_bytes().to_vec(),
+            }),
+            ..entry("comment changed")
+        }
+    }
+
+    async fn snapshots(service: &AuditService) -> i64 {
+        use sqlx::Row as _;
+        sqlx::query("SELECT count(*) AS n FROM audit_profile_snapshot")
+            .fetch_one(service.store.pool())
+            .await
+            .expect("counts")
+            .try_get("n")
+            .expect("a count")
+    }
+
+    #[tokio::test]
+    async fn no_copy_is_kept_while_profile_history_is_off() {
+        let service = service_with(31, 0).await;
+        let recorded = service
+            .record(1, comment_change("account:7", "hello"))
+            .await;
+        assert!(!recorded.duplicate, "the change itself is still recorded");
+        assert_eq!(snapshots(&service).await, 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_copies_survive_per_user() {
+        let service = service_with(31, 2).await;
+        let mut ids = Vec::new();
+        for comment in ["one", "two", "three", "four"] {
+            ids.push(
+                service
+                    .record(1, comment_change("account:7", comment))
+                    .await
+                    .id,
+            );
+        }
+        let _ = service
+            .record(1, comment_change("account:8", "other"))
+            .await;
+        assert_eq!(snapshots(&service).await, 3, "two for 7, one for 8");
+
+        assert!(service.snapshot(1, &ids[1]).await.is_none(), "pruned");
+        let newest = service.snapshot(1, &ids[3]).await.expect("kept");
+        assert_eq!(newest.body, b"four");
+        assert_eq!(newest.kind, snapshot::COMMENT);
+
+        let page = service
+            .query(
+                1,
+                &QueryRequest {
+                    limit: 10,
+                    ..QueryRequest::default()
+                },
+            )
+            .await;
+        let flagged = page
+            .entries
+            .iter()
+            .filter(|entry| entry.has_snapshot)
+            .count();
+        assert_eq!(flagged, 3, "the query says which entries still have a copy");
+    }
+
+    #[tokio::test]
+    async fn the_same_content_sent_again_is_not_a_new_entry() {
+        let service = service_with(31, 5).await;
+        let _ = service.record(1, comment_change("guest:bob", "same")).await;
+        let again = service.record(1, comment_change("guest:bob", "same")).await;
+        assert!(again.duplicate);
+        assert_eq!(service.height(1).await, 1);
+        let _ = service
+            .record(1, comment_change("guest:bob", "changed"))
+            .await;
+        assert_eq!(service.height(1).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_swapped_copy_fails_verify_at_its_entry() {
+        let service = service_with(31, 5).await;
+        let id = service
+            .record(1, comment_change("account:7", "the original"))
+            .await
+            .id;
+        assert!(service.verify(1).await.intact);
+
+        let _ = sqlx::query("UPDATE audit_profile_snapshot SET body = ?, encoding = 'identity'")
+            .bind(b"words they never wrote".as_slice())
+            .execute(service.store.pool())
+            .await;
+        let result = service.verify(1).await;
+        assert!(!result.intact);
+        assert_eq!(result.broken_at, id);
+    }
+
+    #[tokio::test]
+    async fn a_copy_goes_with_its_entry() {
+        let service = service_with(31, 5).await;
+        let _ = service
+            .record(1, comment_change("account:7", "hello"))
+            .await;
+        let _ = sqlx::query("DELETE FROM server_audit")
+            .execute(service.store.pool())
+            .await;
+        assert_eq!(service.sweep_snapshots(1).await, 1);
+        assert_eq!(snapshots(&service).await, 0);
+    }
+
+    #[tokio::test]
+    async fn records_arriving_together_still_chain() {
+        // `Trail` spawns every record, so they race; without the chain lock two
+        // of them link onto the same head and the log reads as tampered.
+        let service = service().await;
+        let mut tasks = Vec::new();
+        for n in 0..20 {
+            let service = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                let _ = service.record(1, entry(&format!("action {n}"))).await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("records");
+        }
+        let result = service.verify(1).await;
+        assert!(result.intact, "{result:?}");
+        assert_eq!(result.checked, 20);
     }
 }

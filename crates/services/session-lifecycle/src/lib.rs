@@ -1511,6 +1511,16 @@ impl SessionLifecycleService {
                 .with("comment", cleared_comment)
                 .with("texture", cleared_texture),
         );
+        // A moderator taking somebody's profile down is a moderator action,
+        // recorded whether or not `profile_history` keeps copies.
+        for (cleared, action) in [
+            (cleared_comment, "comment reset"),
+            (cleared_texture, "avatar reset"),
+        ] {
+            if cleared {
+                self.audit(inbound, trail::category::PROFILE, action, &target);
+            }
+        }
         self.handshake
             .announce_changed(&self.connections, target.conn)
             .await;
@@ -1628,6 +1638,7 @@ impl SessionLifecycleService {
         // also every self-mute toggle, and a round trip on that path would be
         // a gRPC call per keypress on a push-to-mute binding.
         let limits = self.handshake.config(inbound.scope).await;
+        let before = self.connections.get(inbound.conn);
 
         let mut comment_hash = None;
         let mut texture_hash = None;
@@ -1648,10 +1659,74 @@ impl SessionLifecycleService {
                 .await;
         }
 
+        if limits.profile_history > 0
+            && let Some(before) = &before
+        {
+            if let Some(comment) = &state.comment {
+                self.audit_own_content(
+                    inbound,
+                    before,
+                    UserContent::Comment,
+                    comment_hash.as_deref(),
+                    comment.as_bytes(),
+                );
+            }
+            if let Some(texture) = &state.texture {
+                self.audit_own_content(
+                    inbound,
+                    before,
+                    UserContent::Texture,
+                    texture_hash.as_deref(),
+                    texture,
+                );
+            }
+        }
+
         let _ =
             self.connections
                 .set_content(inbound.conn, comment_hash.clone(), texture_hash.clone());
         Ok((comment_hash, texture_hash))
+    }
+
+    /// Record a change to the sender's own avatar or comment, with a copy for
+    /// `audit` to keep.
+    ///
+    /// Only a real change: a client sends its comment again on every connect,
+    /// and the hash the connection already carries is what that is measured
+    /// against.
+    fn audit_own_content(
+        &self,
+        inbound: &Inbound,
+        who: &PendingConnection,
+        what: UserContent,
+        stored: Option<&[u8]>,
+        body: &[u8],
+    ) {
+        let before = match what {
+            UserContent::Comment => &who.comment_hash,
+            UserContent::Texture => &who.texture_hash,
+        };
+        let Some(after) = stored else {
+            return;
+        };
+        if after == before.as_slice() || (body.is_empty() && before.is_empty()) {
+            return;
+        }
+        let action = match (what, body.is_empty()) {
+            (UserContent::Comment, false) => "comment changed",
+            (UserContent::Comment, true) => "comment cleared",
+            (UserContent::Texture, false) => "avatar changed",
+            (UserContent::Texture, true) => "avatar cleared",
+        };
+        let mut record = Record::new(trail::category::PROFILE, action)
+            .actor(session_actor(inbound.session), who.name.clone())
+            .target_account(who.account.unwrap_or_default())
+            .target_channel(who.channel)
+            .detail(who.name.clone());
+        if !body.is_empty() {
+            record = record.attach(what.kind(), profile_subject(who), body.to_vec());
+        }
+        self.trail.record(inbound.scope, record);
     }
 
     /// Store one piece of a user's own content, and return its hash.
@@ -1746,6 +1821,26 @@ impl UserContent {
             Self::Texture => "texture_hash",
         }
     }
+
+    /// What `audit` calls it in the profile history.
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::Texture => "avatar",
+        }
+    }
+}
+
+/// Whose profile history a change belongs to.
+///
+/// The account where there is one, because a name can later belong to somebody
+/// else; a guest has only the name. Not `account.unwrap_or_default()`: account
+/// 0 is the SuperUser.
+fn profile_subject(who: &PendingConnection) -> String {
+    who.account.map_or_else(
+        || format!("guest:{}", who.name),
+        |account| format!("account:{account}"),
+    )
 }
 
 /// Whether `len` exceeds a configured limit.
@@ -2199,6 +2294,24 @@ mod tests {
         assert_eq!(UserContent::Comment.field(), "comment_hash");
         assert_eq!(UserContent::Texture.field(), "texture_hash");
         assert_ne!(UserContent::Comment, UserContent::Texture);
+    }
+
+    #[test]
+    fn a_profile_history_belongs_to_the_account_and_a_guest_to_their_name() {
+        // Account 0 is the SuperUser, so it must not collapse into the guests.
+        let superuser = PendingConnection {
+            account: Some(0),
+            name: "SuperUser".to_owned(),
+            ..PendingConnection::default()
+        };
+        let guest = PendingConnection {
+            account: None,
+            name: "bob".to_owned(),
+            ..PendingConnection::default()
+        };
+        assert_eq!(profile_subject(&superuser), "account:0");
+        assert_eq!(profile_subject(&guest), "guest:bob");
+        assert_eq!(UserContent::Texture.kind(), "avatar");
     }
 
     #[test]

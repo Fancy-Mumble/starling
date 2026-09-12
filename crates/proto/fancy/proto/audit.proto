@@ -31,6 +31,20 @@ message Entry {
   // Set by a producer that may retry: a duplicate offset is accepted once and
   // then ignored, which is what the plugin's partial unique index buys.
   optional uint64 event_offset = 12;
+  // A copy of what an `audit.profile` entry is about. Stored beside the entry,
+  // shrunk or compressed, and never returned by `Query`.
+  Attachment attachment = 13;
+  // On the way out: whether a stored copy is still held for this entry.
+  bool has_snapshot = 14;
+}
+
+message Attachment {
+  // "avatar" or "comment".
+  string kind = 1;
+  // Whose history this is. Only the newest `profile_history` per subject and
+  // kind are kept.
+  string subject = 2;
+  bytes body = 3;
 }
 
 message RecordResult {
