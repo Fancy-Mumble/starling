@@ -435,3 +435,15 @@ codegen-units = 1
 opt-level = 3
 strip = "symbols"
 panic = "abort"
+
+# The password hash is 210,000 rounds of HMAC-SHA256 by design, and unoptimised
+# that is seconds per login. Every deployment under test creates a superuser
+# and every account test hashes, so keep the primitives optimised in dev/test.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.sha1]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
