@@ -108,15 +108,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # starling-proto's build.rs compiles the .proto files via prost.
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
+      # A release binary rather than apt: `apt-get update` alone was three to
+      # four minutes on a bad mirror day, on a job whose compile is two.
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
 
       # fmt, Clippy and the doc checks are platform-portable, so they run once
       # on Linux. Windows compiles the workspace far slower, and re-running them
@@ -187,15 +184,10 @@ jobs:
         with:
           shared-key: plugins
 
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
 
       # Named one by one rather than `--workspace`: this is the list of things
       # that ship as loadable plugins, and it should be a list somebody has to
@@ -265,16 +257,21 @@ jobs:
           shared-key: miri
 
       - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
 
       - name: Miri setup
         run: cargo +nightly miri setup
 
+      # Miri interprets every proptest case, which made the three codec
+      # properties nine of the job's fifteen minutes at the default 256. The
+      # search for a counterexample is the normal test job's; this one is
+      # after UB on the paths a case exercises, and sixteen cases walk them.
       - name: Miri (starling-proto, framing and version encoding)
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: 16
         run: cargo +nightly miri test -p starling-proto --lib
 
       - name: Miri (starling-proto-fancy, envelope, permission and page logic)
@@ -306,9 +303,9 @@ jobs:
           workspaces: fuzz
 
       - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
