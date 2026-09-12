@@ -57,8 +57,9 @@ use starling_runtime::plane::{
     Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
 };
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::shutdown::Shutdown;
 use starling_runtime::storage::{Migration, Store};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tonic::{Request, Response, Status};
 
 pub mod import;
@@ -169,9 +170,47 @@ pub struct ServerConfigService {
     config: Arc<Config>,
     store: Option<Store>,
     fanout: Fanout,
+    /// Ends every `Watch*` stream when the drain starts. A subscription is
+    /// held open by whoever holds it, and on `SIGTERM` that is a service
+    /// draining at the same moment this one is: without this, each watcher
+    /// costs the listener its full grace before being cut off.
+    shutdown: Shutdown,
 }
 
 impl ServerConfigService {
+    /// Feed `updates` for `scope` into a watch stream until its subscriber goes
+    /// away or the drain starts.
+    ///
+    /// The second condition is what lets the service stop: a `Watch*` stream
+    /// ends only when one side ends it, and the subscriber never will while it
+    /// is draining itself. Dropping `tx` ends the stream, which lets the
+    /// connection finish and the listener drain inside its grace rather than
+    /// cutting the connection off at the end of it.
+    fn forward<T: Clone + Send + 'static>(
+        &self,
+        mut updates: broadcast::Receiver<T>,
+        tx: mpsc::Sender<Result<T, Status>>,
+        scope: u32,
+        instance: fn(&T) -> u32,
+    ) {
+        let shutdown = self.shutdown.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    () = shutdown.wait() => return,
+                    received = updates.recv() => received,
+                };
+                let Ok(update) = received else { return };
+                if instance(&update) != scope {
+                    continue;
+                }
+                if tx.send(Ok(update)).await.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
     /// The current snapshot for `scope`, or the shipped defaults.
     pub async fn snapshot(&self, scope: u32) -> Snapshot {
         self.snapshots
@@ -511,22 +550,15 @@ impl ServerConfigRpc for ConfigRpc {
         request: Request<GetRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let scope = scope_of(request.into_inner().scope);
-        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        let (tx, rx) = mpsc::channel(WATCH_BUFFER);
         // Snapshot first, then deltas: a subscriber that connected after a
         // change must not have to ask for the state it missed.
         let _ = tx.send(Ok(self.0.snapshot(scope).await)).await;
 
-        let mut updates = self.0.updates.subscribe();
-        drop(tokio::spawn(async move {
-            while let Ok(snapshot) = updates.recv().await {
-                if snapshot.instance != scope {
-                    continue;
-                }
-                if tx.send(Ok(snapshot)).await.is_err() {
-                    return;
-                }
-            }
-        }));
+        self.0
+            .forward(self.0.updates.subscribe(), tx, scope, |snapshot| {
+                snapshot.instance
+            });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -572,22 +604,15 @@ impl ServerConfigRpc for ConfigRpc {
         request: Request<GetRequest>,
     ) -> Result<Response<Self::WatchLiveryStream>, Status> {
         let scope = scope_of(request.into_inner().scope);
-        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        let (tx, rx) = mpsc::channel(WATCH_BUFFER);
         // Current document first, then changes, as `watch` does: a subscriber
         // that attached after a change must not have to ask for what it missed.
         let _ = tx.send(Ok(self.0.livery(scope).await)).await;
 
-        let mut updates = self.0.livery_updates.subscribe();
-        drop(tokio::spawn(async move {
-            while let Ok(livery) = updates.recv().await {
-                if livery.instance != scope {
-                    continue;
-                }
-                if tx.send(Ok(livery)).await.is_err() {
-                    return;
-                }
-            }
-        }));
+        self.0
+            .forward(self.0.livery_updates.subscribe(), tx, scope, |livery| {
+                livery.instance
+            });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -643,21 +668,14 @@ impl ServerConfigRpc for ConfigRpc {
         request: Request<GetRequest>,
     ) -> Result<Response<Self::WatchGreetingStream>, Status> {
         let scope = scope_of(request.into_inner().scope);
-        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        let (tx, rx) = mpsc::channel(WATCH_BUFFER);
         // Current document first, then changes, as the other watches do.
         let _ = tx.send(Ok(self.0.greeting(scope).await)).await;
 
-        let mut updates = self.0.greeting_updates.subscribe();
-        drop(tokio::spawn(async move {
-            while let Ok(greeting) = updates.recv().await {
-                if greeting.instance != scope {
-                    continue;
-                }
-                if tx.send(Ok(greeting)).await.is_err() {
-                    return;
-                }
-            }
-        }));
+        self.0
+            .forward(self.0.greeting_updates.subscribe(), tx, scope, |greeting| {
+                greeting.instance
+            });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -1142,6 +1160,7 @@ impl Serve for ServerConfigService {
             config: Arc::clone(&ctx.config),
             store,
             fanout: Fanout::default(),
+            shutdown: ctx.shutdown.clone(),
         }))
     }
 
@@ -1321,6 +1340,7 @@ mod tests {
             config,
             store: None,
             fanout: Fanout::default(),
+            shutdown: Shutdown::new(),
         })
     }
 
@@ -1800,7 +1820,7 @@ mod tests {
             ServerConfigService::NAME,
             Arc::new(config),
             starling_runtime::inproc::Broker::new(),
-            starling_runtime::shutdown::Shutdown::new(),
+            Shutdown::new(),
             starling_runtime::log::Logger::null(),
         )
     }
@@ -1984,5 +2004,37 @@ mod tests {
         let reply = ticket_reply(&service().frame(ticket_request(&["not-a-real-scope"])).await);
         assert!(reply.token.is_empty());
         assert!(reply.granted_scopes.is_empty());
+    }
+
+    /// A watch ends when the drain starts, not when its subscriber lets go.
+    ///
+    /// The subscriber is another service draining at the same moment, so it
+    /// never will; left to it, every watch cost the listener its full grace
+    /// on the way down, and a deployment under test paid that on every stop.
+    #[tokio::test]
+    async fn a_watch_ends_on_drain_without_waiting_for_its_subscriber() {
+        use tokio_stream::StreamExt as _;
+
+        let service = service();
+        let rpc = ConfigRpc(Arc::clone(&service));
+        let mut updates = rpc
+            .watch(Request::new(GetRequest {
+                scope: Some(Scope { instance: 1 }),
+            }))
+            .await
+            .expect("a watch is accepted")
+            .into_inner();
+        assert!(
+            matches!(updates.next().await, Some(Ok(_))),
+            "a watch opens with the current snapshot"
+        );
+
+        service.shutdown.drain();
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), updates.next()).await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "the stream did not end on the drain: {ended:?}"
+        );
     }
 }

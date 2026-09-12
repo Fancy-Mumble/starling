@@ -297,11 +297,18 @@ impl Serve for RenderService {
         tonic::service::Routes::default().add_service(RenderServer::new(RenderRpc(self)))
     }
 
-    async fn run(self: Arc<Self>, _ctx: ServiceContext) -> Result<(), ServiceError> {
+    async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let guarded = self.proxy.lock().await.take();
         if let Some(guarded) = guarded {
             tracing::debug!(address = %self.proxy_address, "the render guard is listening");
-            guarded.serve().await;
+            // The guard serves until it is dropped, so the drain has to be
+            // what drops it: left to run, this task was cut off at the end of
+            // its grace on every stop, and a deployment under test stops once
+            // per test.
+            tokio::select! {
+                () = ctx.shutdown.wait() => {}
+                () = guarded.serve() => {}
+            }
         }
         Ok(())
     }

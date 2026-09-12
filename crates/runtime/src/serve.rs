@@ -361,11 +361,19 @@ pub async fn run<S: Serve>(ctx: ServiceContext) -> Result<(), ServiceError> {
     // answered. Reported as this service failing, which is what the abort
     // would have made it.
     let mut panicked = None;
-    if ctx.shutdown.is_draining()
-        && let Ok(Err(joined)) = tokio::time::timeout(LETTING_GO, &mut background.0).await
-        && joined.is_panic()
-    {
-        panicked = Some(panic_message(joined));
+    if ctx.shutdown.is_draining() {
+        match tokio::time::timeout(LETTING_GO, &mut background.0).await {
+            Ok(Err(joined)) if joined.is_panic() => panicked = Some(panic_message(joined)),
+            Ok(_) => {}
+            // Named, like a held connection is: a `run` that does not return
+            // on the drain costs every stop of this service the whole moment,
+            // and nothing else says which one.
+            Err(_) => tracing::warn!(
+                service = %ctx.name,
+                grace = ?LETTING_GO,
+                "the background task did not let go on the drain; aborting it"
+            ),
+        }
     }
     background.0.abort();
     if let Some(message) = panicked {
