@@ -511,14 +511,15 @@ impl AppState {
         }
     }
 
-    /// Record a share recipient for a document (persists to the
-    /// file-server ACL and updates the room's in-memory set).
+    /// Record a share recipient for a document: in host storage, or in the
+    /// file-server ACL when the host keeps nothing, and in the room's
+    /// in-memory set either way.
     pub async fn record_shared_with(&self, room: &DocRoom, identity: &Identity) {
         // The room's own set first, so access works this session whatever the
         // stores do; then the durable copy.
         room.add_member(identity.cert_hash.clone()).await;
-        let members: Vec<String> = room.members().await.into_iter().collect();
         let filename = room.key().as_filename();
+        let members = self.share_list_with(room, identity, &filename).await;
         if let Err(error) =
             host_store::set_shared_with(&self.inner.ctx, self.storage_scope(), &filename, &members)
                 .await
@@ -541,10 +542,81 @@ impl AppState {
         self.save_room(room).await;
     }
 
-    /// Fetch the document's shared-with member list (with display names)
-    /// for surfacing to clients.
+    /// The share list to store once `identity` has been added to `room`.
+    ///
+    /// Rebuilt from the room's set rather than appended to, so the stored list
+    /// is exactly the set access is checked against. Each member keeps the name
+    /// stored for it, because that is the name captured when the grant was made.
+    async fn share_list_with(
+        &self,
+        room: &DocRoom,
+        identity: &Identity,
+        filename: &str,
+    ) -> Vec<SharedMember> {
+        let stored = host_store::shared_with(&self.inner.ctx, self.storage_scope(), filename)
+            .await
+            .unwrap_or_default();
+        let mut certs: Vec<String> = room.members().await.into_iter().collect();
+        certs.sort_unstable();
+        let mut members = Vec::with_capacity(certs.len());
+        for cert_hash in certs {
+            let member = if cert_hash == identity.cert_hash {
+                shared_member(identity)
+            } else {
+                let known = stored
+                    .iter()
+                    .find(|member| member.cert_hash == cert_hash)
+                    .cloned()
+                    .unwrap_or(SharedMember {
+                        cert_hash,
+                        user_id: -1,
+                        display_name: String::new(),
+                    });
+                self.resolve_member(room.key().server_id, known).await
+            };
+            members.push(member);
+        }
+        members
+    }
+
+    /// Name a member stored without one, from a session connected under the
+    /// same certificate.
+    ///
+    /// Lists written before names were stored hold only cert hashes, and the
+    /// plugin API has no lookup by certificate, so a member who is not
+    /// connected stays unnamed rather than unlisted.
+    async fn resolve_member(&self, server_id: ServerId, member: SharedMember) -> SharedMember {
+        if !member.display_name.is_empty() {
+            return member;
+        }
+        let identities = self.inner.identities.lock().await;
+        let connected = identities
+            .iter()
+            .find(|((server, _), identity)| {
+                *server == server_id && identity.cert_hash == member.cert_hash
+            })
+            .map(|(_, identity)| shared_member(identity));
+        drop(identities);
+        connected.unwrap_or(member)
+    }
+
+    /// The document's share list, with display names, for surfacing to
+    /// clients.
+    ///
+    /// Host storage first, because `record_shared_with` writes there first;
+    /// the file-server is asked only when the host holds no list.
     pub async fn shared_with_members(&self, room: &DocRoom) -> Vec<SharedMember> {
-        fetch_shared_with_members(&self.inner.cfg, &self.inner.http_client, room).await
+        let filename = room.key().as_filename();
+        let Some(stored) =
+            host_store::shared_with(&self.inner.ctx, self.storage_scope(), &filename).await
+        else {
+            return fetch_shared_with_members(&self.inner.cfg, &self.inner.http_client, room).await;
+        };
+        let mut members = Vec::with_capacity(stored.len());
+        for member in stored {
+            members.push(self.resolve_member(room.key().server_id, member).await);
+        }
+        members
     }
 
     /// Persist every room that has changed since its last flush.  Driven
@@ -604,6 +676,15 @@ impl AppState {
     }
 }
 
+/// A share recipient as stored and shown, from the identity it connected with.
+fn shared_member(identity: &Identity) -> SharedMember {
+    SharedMember {
+        cert_hash: identity.cert_hash.clone(),
+        user_id: identity.user_id,
+        display_name: identity.name.clone(),
+    }
+}
+
 fn generate_secret() -> Vec<u8> {
     use rand::Rng;
     let mut buf = vec![0u8; 32];
@@ -648,9 +729,62 @@ mod tests {
         }
     }
 
+    /// Host stub whose plugin key-value storage answers, shared between
+    /// `AppState`s so one can write what another reads back, as a restart
+    /// would.
+    #[derive(Debug, Default)]
+    struct KvCtx {
+        kv: std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl KvCtx {
+        /// Store a share list exactly as an earlier build left it.
+        fn put_share_list(&self, key: &DocKey, value: &[u8]) {
+            let stored = format!("shared-with/{}", key.as_filename()).into_bytes();
+            let _ = self.kv.lock().unwrap().insert(stored, value.to_vec());
+        }
+    }
+
+    impl HostFacade for KvCtx {
+        fn send_plugin_data(&self, a: u32, b: u32, c: &str, d: &[u8]) -> FacadeResult<()> {
+            AllowCtx.send_plugin_data(a, b, c, d)
+        }
+        fn is_session_active(&self, a: u32, b: u32) -> bool {
+            AllowCtx.is_session_active(a, b)
+        }
+        fn user_has_channel_access(&self, a: u32, b: u32, c: u32) -> bool {
+            AllowCtx.user_has_channel_access(a, b, c)
+        }
+        fn has_permission(&self, a: u32, b: u32, c: u32, perm: Permissions) -> bool {
+            AllowCtx.has_permission(a, b, c, perm)
+        }
+        fn get_config(&self, key: &str) -> Option<String> {
+            AllowCtx.get_config(key)
+        }
+        fn send_plugin_message(&self, args: PluginMessageArgs<'_>) -> FacadeResult<()> {
+            AllowCtx.send_plugin_message(args)
+        }
+        fn kv_get(&self, _: u32, key: &[u8]) -> Option<Vec<u8>> {
+            self.kv.lock().unwrap().get(key).cloned()
+        }
+        fn kv_put(&self, _: u32, key: &[u8], value: &[u8]) -> FacadeResult<()> {
+            let mut kv = self
+                .kv
+                .lock()
+                .map_err(|_| mumble_plugin_api::PluginError::Other("poisoned".into()))?;
+            let _ = kv.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+    }
+
     /// Build state with the file-server intentionally *unconfigured*, so
     /// the tests prove access survives a teardown without it.
     fn test_state() -> AppState {
+        state_on(Arc::new(AllowCtx))
+    }
+
+    /// The same unconfigured file-server, on a host of the test's choosing.
+    fn state_on(ctx: Arc<dyn HostFacade>) -> AppState {
         let cfg = LiveDocConfig {
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             public_url: None,
@@ -663,7 +797,7 @@ mod tests {
             file_server_admin_token: None,
             port: 0,
         };
-        AppState::new(Arc::new(cfg), Arc::new(AllowCtx))
+        AppState::new(Arc::new(cfg), ctx)
     }
 
     fn ident(cert: &str, session: i64) -> Identity {
@@ -672,6 +806,112 @@ mod tests {
             user_id: session,
             name: format!("user-{session}"),
         }
+    }
+
+    fn member(cert: &str, user_id: i64, name: &str) -> SharedMember {
+        SharedMember {
+            cert_hash: cert.to_owned(),
+            user_id,
+            display_name: name.to_owned(),
+        }
+    }
+
+    fn shared_key() -> DocKey {
+        DocKey {
+            server_id: 1,
+            slug: "shared-notes".to_owned(),
+        }
+    }
+
+    /// The reported bug: with documents in host storage, the share list was
+    /// stored as bare cert hashes and read back only from the file-server, so
+    /// "shared with" showed nobody although the members could still open the
+    /// document. It must list them by name, before and after a restart.
+    #[tokio::test]
+    async fn a_share_in_host_storage_is_listed_by_name_across_a_restart() {
+        let host = Arc::new(KvCtx::default());
+        let before = state_on(host.clone());
+        let room = DocRoom::new(shared_key());
+
+        before
+            .record_shared_with(&room, &ident("friend-cert", 3))
+            .await;
+
+        let friend = member("friend-cert", 3, "user-3");
+        assert_eq!(
+            before.shared_with_members(&room).await,
+            vec![friend.clone()],
+            "listed before a restart"
+        );
+        // A new process: nobody connected, and a room with nothing in memory.
+        let after = state_on(host);
+        assert_eq!(
+            after.shared_with_members(&DocRoom::new(shared_key())).await,
+            vec![friend],
+            "listed after a restart"
+        );
+    }
+
+    /// A second share rewrites the stored list, and must keep the name of a
+    /// member who has since disconnected.
+    #[tokio::test]
+    async fn recording_a_share_keeps_the_names_already_stored() {
+        let host = Arc::new(KvCtx::default());
+        let state = state_on(host.clone());
+        let room = DocRoom::new(shared_key());
+
+        state.record_shared_with(&room, &ident("a-cert", 3)).await;
+        state.record_shared_with(&room, &ident("b-cert", 4)).await;
+
+        assert_eq!(
+            state_on(host)
+                .shared_with_members(&DocRoom::new(shared_key()))
+                .await,
+            vec![member("a-cert", 3, "user-3"), member("b-cert", 4, "user-4")]
+        );
+    }
+
+    /// Lists stored before names were hold bare cert hashes. Every member is
+    /// still listed, named when a session is connected under that cert.
+    #[tokio::test]
+    async fn a_cert_only_share_list_still_lists_its_members() {
+        let host = Arc::new(KvCtx::default());
+        host.put_share_list(&shared_key(), br#"["friend-cert","absent-cert"]"#);
+        let state = state_on(host);
+        state.set_identity(1, 3, ident("friend-cert", 3)).await;
+
+        assert_eq!(
+            state.shared_with_members(&DocRoom::new(shared_key())).await,
+            vec![
+                member("friend-cert", 3, "user-3"),
+                member("absent-cert", -1, ""),
+            ]
+        );
+    }
+
+    /// Sharing on top of a cert-only list upgrades it in place: the existing
+    /// members stay, and are named where their sessions are connected.
+    #[tokio::test]
+    async fn sharing_over_a_cert_only_list_keeps_its_members() {
+        let host = Arc::new(KvCtx::default());
+        host.put_share_list(&shared_key(), br#"["old-cert"]"#);
+        let state = state_on(host.clone());
+        state.set_identity(1, 5, ident("old-cert", 5)).await;
+        // What seeding from that list leaves in the room.
+        let room = DocRoom::new(shared_key());
+        room.add_member("old-cert".to_owned()).await;
+
+        state.record_shared_with(&room, &ident("new-cert", 6)).await;
+
+        assert_eq!(
+            state_on(host)
+                .shared_with_members(&DocRoom::new(shared_key()))
+                .await,
+            vec![
+                member("new-cert", 6, "user-6"),
+                member("old-cert", 5, "user-5")
+            ]
+        );
     }
 
     /// The reported bug: an owner edits a doc, the room is torn down after

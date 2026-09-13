@@ -24,7 +24,7 @@ use crate::config::LiveDocConfig;
 use crate::doc::{DocMeta, DocRoom};
 
 /// One member a document is shared with, as surfaced to clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedMember {
     /// Recipient's stable cert hash.
     pub cert_hash: String,

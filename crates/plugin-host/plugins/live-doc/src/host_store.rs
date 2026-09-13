@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::doc::{DocMeta, DocRoom};
 use crate::host_facade::HostFacade;
-use crate::persistence::{extract_meta, extract_snapshot, render_document};
+use crate::persistence::{SharedMember, extract_meta, extract_snapshot, render_document};
 
 /// Which key one document's share list lives under.
 ///
@@ -126,27 +126,60 @@ pub(crate) async fn save(
         .map_err(|error| format!("naming the document failed: {error}"))
 }
 
+/// One entry of a stored share list, in either format it has been written in.
+///
+/// The first host-storage builds kept bare cert hashes, which grant access but
+/// cannot be shown to anyone. Those values are still in servers' storage, so
+/// they decode as a member whose name and user id are unknown.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredMember {
+    Full(SharedMember),
+    CertOnly(String),
+}
+
+/// Decode a stored share list, whichever format it was written in.
+fn decode_shared_with(stored: &[u8]) -> Option<Vec<SharedMember>> {
+    let entries: Vec<StoredMember> = serde_json::from_slice(stored).ok()?;
+    let members = entries
+        .into_iter()
+        .map(|entry| match entry {
+            StoredMember::Full(member) => member,
+            StoredMember::CertOnly(cert_hash) => SharedMember {
+                cert_hash,
+                user_id: -1,
+                display_name: String::new(),
+            },
+        })
+        .collect();
+    Some(members)
+}
+
 /// The share list for one document, as this plugin stored it.
 pub(crate) async fn shared_with(
     ctx: &Arc<dyn HostFacade>,
     server_id: u32,
     filename: &str,
-) -> Option<Vec<String>> {
+) -> Option<Vec<SharedMember>> {
     let ctx = Arc::clone(ctx);
     let key = shared_key(filename);
     let stored = tokio::task::spawn_blocking(move || ctx.kv_get(server_id, &key))
         .await
         .ok()
         .flatten()?;
-    serde_json::from_slice(&stored).ok()
+    decode_shared_with(&stored)
 }
 
 /// Replace the share list for one document.
+///
+/// Whole members rather than cert hashes: this key is the only copy of the
+/// list on a server without the file-server plugin, so it must carry what the
+/// "shared with" view shows as well as what access is checked against.
 pub(crate) async fn set_shared_with(
     ctx: &Arc<dyn HostFacade>,
     server_id: u32,
     filename: &str,
-    members: &[String],
+    members: &[SharedMember],
 ) -> Result<(), String> {
     let value = serde_json::to_vec(members).map_err(|error| error.to_string())?;
     let ctx = Arc::clone(ctx);
@@ -190,7 +223,7 @@ pub(crate) async fn try_seed_room(
             }
             if let Some(members) = shared_with(ctx, server_id, &filename).await {
                 for member in members {
-                    room.add_member(member).await;
+                    room.add_member(member.cert_hash).await;
                 }
             }
             room.mark_persist_safe().await;
@@ -228,6 +261,8 @@ mod tests {
         named: Mutex<Option<String>>,
         /// Whether the host has storage at all.
         has_storage: bool,
+        /// Where `object_url` sends a read; a port nothing listens on if unset.
+        read_url: Option<String>,
         kv: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     }
 
@@ -302,8 +337,11 @@ mod tests {
 
         fn object_url(&self, _server_id: u32, _key: &str) -> Option<String> {
             self.note("object_url");
-            self.has_storage
-                .then(|| "http://127.0.0.1:1/read".to_owned())
+            self.has_storage.then(|| {
+                self.read_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:1/read".to_owned())
+            })
         }
 
         fn name_put(
@@ -414,15 +452,74 @@ mod tests {
         );
     }
 
+    fn member(cert: &str, user_id: i64, name: &str) -> SharedMember {
+        SharedMember {
+            cert_hash: cert.to_owned(),
+            user_id,
+            display_name: name.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn a_share_list_reads_back_as_it_was_written() {
         let fake = Fake::with_storage();
         let ctx: Arc<dyn HostFacade> = fake.clone();
-        let members = vec!["aa".to_owned(), "bb".to_owned()];
+        let members = vec![member("aa", 3, "Alice"), member("bb", -1, "guest")];
 
         set_shared_with(&ctx, 1, "notes", &members).await.unwrap();
 
         assert_eq!(shared_with(&ctx, 1, "notes").await, Some(members));
+    }
+
+    #[test]
+    fn a_share_list_of_bare_cert_hashes_still_decodes() {
+        // What the first host-storage builds wrote. Failing to decode it would
+        // lock every recipient of an older share out after an upgrade.
+        assert_eq!(
+            decode_shared_with(br#"["aa","bb"]"#),
+            Some(vec![member("aa", -1, ""), member("bb", -1, "")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seeded_room_admits_members_from_either_share_list_format() {
+        // Access must not depend on which format the list was stored in.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = render_document(&[0, 0], &DocMeta::default());
+        let router = axum::Router::new().route(
+            "/read",
+            axum::routing::get(move || std::future::ready(body.clone())),
+        );
+        drop(tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        }));
+        let named = serde_json::to_vec(&[member("friend-cert", 3, "Friend")]).unwrap();
+
+        for (slug, stored) in [("legacy", br#"["friend-cert"]"#.to_vec()), ("named", named)] {
+            let fake = Arc::new(Fake {
+                named: Mutex::new(Some("p/fancy-live-doc/018f/notes.md".to_owned())),
+                has_storage: true,
+                read_url: Some(format!("http://{addr}/read")),
+                kv: Mutex::new(vec![(
+                    format!("shared-with/live-doc-1-{slug}.md").into_bytes(),
+                    stored,
+                )]),
+                ..Fake::default()
+            });
+            let ctx: Arc<dyn HostFacade> = fake;
+            let room = DocRoom::new(crate::doc::DocKey {
+                server_id: 1,
+                slug: slug.to_owned(),
+            });
+
+            assert!(try_seed_room(&ctx, &reqwest::Client::new(), 1, &room).await);
+            assert_eq!(
+                room.members().await,
+                std::collections::HashSet::from(["friend-cert".to_owned()]),
+                "{slug}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -438,7 +535,7 @@ mod tests {
         let fake = Fake::with_storage();
         let ctx: Arc<dyn HostFacade> = fake.clone();
 
-        set_shared_with(&ctx, 1, "notes", &["aa".to_owned()])
+        set_shared_with(&ctx, 1, "notes", &[member("aa", 3, "Alice")])
             .await
             .unwrap();
 
