@@ -787,10 +787,27 @@ async fn upload(
         );
     };
 
-    let written = match drain_body(body, &mut file, &pending, &temporary).await {
-        Ok(written) => written,
+    let drained = match drain_body(body, &mut file, &pending, &temporary).await {
+        Ok(drained) => drained,
         Err(response) => return response,
     };
+    let written = drained.written;
+    // Refused rather than stored with a note: the uploader's own digest says
+    // these are not the bytes it sent, and announcing them to the channel would
+    // share a corrupted file under a name that promises the real one. The
+    // grant is spent either way, so a retry asks for a new one.
+    if pending
+        .sha256
+        .is_some_and(|declared| declared != drained.plain_sha256)
+    {
+        tracing::info!(key, "an upload did not match the sha256 it declared");
+        return abandon(
+            &temporary,
+            StatusCode::BAD_REQUEST,
+            "the bytes do not match the sha256 this upload declared",
+        )
+        .await;
+    }
     if file.flush().await.is_err() || tokio::fs::rename(&temporary, &path).await.is_err() {
         return abandon(
             &temporary,
@@ -801,7 +818,7 @@ async fn upload(
     }
 
     match service
-        .record_object(&key, &pending, written, now_ms())
+        .record_object(&key, &pending, written, &drained.stored_sha256, now_ms())
         .await
     {
         Ok(()) => {
@@ -859,12 +876,12 @@ async fn derive_thumbnail(
     let Some(destination) = object_path(service.objects_dir(), &thumb_key) else {
         return String::new();
     };
-    let Some((size, mime)) = crate::thumb::derive(source, &destination).await else {
+    let Some(derived) = crate::thumb::derive(source, &destination).await else {
         tracing::debug!(key, "no thumbnail could be derived for an uploaded picture");
         return String::new();
     };
     if let Err(error) = service
-        .record_thumbnail(&thumb_key, key, pending, size, mime, now_ms())
+        .record_thumbnail(&thumb_key, key, pending, &derived, now_ms())
         .await
     {
         // The file is on disk but no row points at it, so nothing will serve
@@ -876,12 +893,27 @@ async fn derive_thumbnail(
     thumb_key
 }
 
+/// What a drained body amounted to.
+struct Drained {
+    /// The count of plain bytes.
+    written: u64,
+    /// The digest of the bytes as the uploader sent them, which is what a
+    /// digest it declared was computed over.
+    plain_sha256: [u8; 32],
+    /// The digest of the bytes as stored, which is what the row records.
+    ///
+    /// The same as the plain one except for a sealed object, where it is the
+    /// ciphertext's. A plaintext digest at rest would let anyone holding the
+    /// database confirm a guess at a password share's contents.
+    stored_sha256: [u8; 32],
+}
+
 /// Write the body out, sealing it first when the share has a password.
 ///
-/// Answers with the count of *plain* bytes, which is what the grant's ceiling
-/// was about and what the row records: ciphertext is longer than its plaintext
-/// by one tag per chunk, and a size the reader could not reconcile with the
-/// file they downloaded would be worse than no size at all.
+/// Counts *plain* bytes, which is what the grant's ceiling was about and what
+/// the row records: ciphertext is longer than its plaintext by one tag per
+/// chunk, and a size the reader could not reconcile with the file they
+/// downloaded would be worse than no size at all.
 ///
 /// A sealed object is built here rather than encrypted afterwards so the
 /// plaintext never lands in the object directory at all, not even for the
@@ -891,11 +923,15 @@ async fn drain_body(
     file: &mut tokio::fs::File,
     pending: &crate::Pending,
     temporary: &Path,
-) -> Result<u64, Response> {
+) -> Result<Drained, Response> {
+    use sha2::Digest as _;
+
     let mut sealer = pending
         .seal
         .as_ref()
         .map(|seal| crate::crypto::Sealer::new(&seal.key, &seal.nonce));
+    let mut plain = sha2::Sha256::new();
+    let mut stored = sealer.as_ref().map(|_| sha2::Sha256::new());
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
 
@@ -919,6 +955,7 @@ async fn drain_body(
             )
             .await);
         }
+        plain.update(&chunk);
         let outgoing = match sealer.as_mut() {
             Some(sealer) => match sealer.update(&chunk) {
                 Ok(sealed) => bytes::Bytes::from(sealed),
@@ -926,6 +963,9 @@ async fn drain_body(
             },
             None => chunk,
         };
+        if let Some(stored) = stored.as_mut() {
+            stored.update(&outgoing);
+        }
         if !outgoing.is_empty() && file.write_all(&outgoing).await.is_err() {
             return Err(store_failed(temporary).await);
         }
@@ -935,11 +975,19 @@ async fn drain_body(
         let Ok(tail) = sealer.finish() else {
             return Err(store_failed(temporary).await);
         };
+        if let Some(stored) = stored.as_mut() {
+            stored.update(&tail);
+        }
         if file.write_all(&tail).await.is_err() {
             return Err(store_failed(temporary).await);
         }
     }
-    Ok(written)
+    let plain_sha256: [u8; 32] = plain.finalize().into();
+    Ok(Drained {
+        written,
+        plain_sha256,
+        stored_sha256: stored.map_or(plain_sha256, |stored| stored.finalize().into()),
+    })
 }
 
 /// The one answer every way of failing to write the object gives.

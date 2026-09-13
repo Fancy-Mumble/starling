@@ -64,6 +64,9 @@ message ObjectInfo {
   uint64 size = 2;
   string content_type = 3;
   uint64 created_at_ms = 4;
+  // The SHA-256 of the bytes the object holds, computed by this server as they
+  // arrived: the plaintext for an ordinary object, the ciphertext for a
+  // password share. Empty for an object stored before digests were kept.
   bytes sha256 = 5;
 }
 

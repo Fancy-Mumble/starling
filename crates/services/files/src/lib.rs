@@ -272,6 +272,17 @@ const SCHEMA: &[Migration<'static>] = &[
         "0007_object_thumb",
         &["ALTER TABLE object ADD COLUMN has_thumb INTEGER NOT NULL DEFAULT 0"],
     ),
+    Migration::new(
+        // The connection that carried the uploading session.
+        //
+        // `owner` alone cannot say whether the session holding that number now
+        // is the one that shared the file: numbers are recycled within a
+        // process and restart from one with it. The connection, checked
+        // together with the uploader columns, can. Null on older rows, which
+        // then match on the person alone.
+        "0008_object_owner_conn",
+        &["ALTER TABLE object ADD COLUMN owner_conn BIGINT NULL"],
+    ),
 ];
 
 /// The preview key a listing row should report, or empty when there is none.
@@ -526,6 +537,8 @@ impl Files for FilesRpc {
                 // client frame cannot name it at all.
                 channel: 0,
                 owner: 0,
+                owner_conn: None,
+                sha256: None,
                 filename: safe_name(&req.filename),
                 content_type: req.content_type,
                 size: req.size,
@@ -974,6 +987,8 @@ impl FilesService {
             Pending {
                 channel: ROOT_CHANNEL,
                 owner: inbound.session,
+                owner_conn: self.roster.conn_of(inbound.session),
+                sha256: None,
                 filename: safe_name(&upload.filename),
                 content_type: upload.content_type,
                 size: upload.size,
@@ -1275,7 +1290,44 @@ impl FilesService {
     }
 }
 
+/// Who shared an object, as its row records them.
+#[derive(Debug)]
+struct Sharer {
+    /// The session id at the time, which may belong to somebody else now.
+    session: u32,
+    /// The connection carrying it, or `None` on a row from before that was kept.
+    conn: Option<u64>,
+    uploader: Uploader,
+}
+
+/// The sharer columns of one object row.
+fn sharer_of(row: &sqlx::any::AnyRow) -> Sharer {
+    use sqlx::Row as _;
+    Sharer {
+        session: row.try_get::<i64, _>("owner").unwrap_or_default() as u32,
+        conn: row
+            .try_get::<Option<i64>, _>("owner_conn")
+            .ok()
+            .flatten()
+            .map(|conn| conn as u64),
+        uploader: Uploader {
+            account: row
+                .try_get::<Option<i64>, _>("uploader_account")
+                .ok()
+                .flatten()
+                .map(|account| account as u64),
+            name: row.try_get("uploader_name").ok().flatten(),
+            cert: row.try_get("uploader_cert").ok().flatten(),
+        },
+    }
+}
+
 impl Uploader {
+    /// Whether this names somebody beyond a display name.
+    fn durable(&self) -> bool {
+        self.account.is_some() || self.cert.is_some()
+    }
+
     /// Whether these two describe the same person.
     ///
     /// An account first, because it survives a new certificate; the
@@ -1366,6 +1418,9 @@ impl Serve for FilesService {
         let departures = tokio::spawn(
             Arc::clone(&self).forget_departed(self.roster.departures(), ctx.shutdown.clone()),
         );
+        // After the departures subscription, so a session that leaves while
+        // the roster warms is caught by one or the other.
+        let sweep = tokio::spawn(Arc::clone(&self).sweep_once_warm(ctx.shutdown.clone()));
         let listener = self.spawn_data_plane(&ctx).await;
 
         let mut configs = ctx.live.subscribe();
@@ -1386,6 +1441,7 @@ impl Serve for FilesService {
         follower.abort();
         collector.abort();
         departures.abort();
+        sweep.abort();
         if let Some(listener) = listener {
             listener.abort();
         }
@@ -1458,9 +1514,9 @@ impl FilesService {
                 gone = departures.recv() => match gone {
                     Ok(session) => self.forget_session(session).await,
                     // Lagged: some departures were missed, and the sessions
-                    // they named are unknowable now. The sweeper is what
-                    // eventually collects those, so this keeps listening
-                    // rather than giving up on the ones still to come.
+                    // they named are unknowable now. The sweep at the next
+                    // start collects those, so this keeps listening rather
+                    // than giving up on the ones still to come.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -1497,6 +1553,12 @@ impl FilesService {
 pub(crate) struct Pending {
     pub(crate) channel: u32,
     pub(crate) owner: u32,
+    /// The connection carrying `owner` when the upload was granted, so a later
+    /// holder of the same session number is not mistaken for the uploader.
+    pub(crate) owner_conn: Option<u64>,
+    /// The digest the uploader declared for the bytes, checked when they
+    /// arrive. `None` where it declared none.
+    pub(crate) sha256: Option<[u8; 32]>,
     pub(crate) filename: String,
     pub(crate) content_type: String,
     /// The ceiling this grant was signed for, in bytes.
@@ -1696,10 +1758,11 @@ impl FilesService {
 
     /// Turn one upload request into the grant that answers it.
     ///
-    /// `Err` is the sentence to refuse with. Only one thing is refused here -
-    /// a password share with no password - and it is refused rather than
-    /// quietly downgraded to a public one, because the difference between
-    /// those two is the whole of what the uploader asked for.
+    /// `Err` is the sentence to refuse with. A password share with no password
+    /// is refused rather than quietly downgraded to a public one, because the
+    /// difference between those two is the whole of what the uploader asked
+    /// for. A digest that is not a SHA-256 is refused before a byte moves,
+    /// because no upload could ever match it.
     fn prepare_upload(
         &self,
         upload: &UploadRequest,
@@ -1710,6 +1773,14 @@ impl FilesService {
         if visibility == Visibility::Password && password.is_empty() {
             return Err("a password share needs a password".to_owned());
         }
+        let sha256 = if upload.sha256.is_empty() {
+            None
+        } else {
+            Some(
+                <[u8; 32]>::try_from(upload.sha256.as_slice())
+                    .map_err(|_| "a sha256 is 32 bytes".to_owned())?,
+            )
+        };
 
         // Sealed before the bytes exist, so the data plane has only cheap work
         // to do once they start arriving: Argon2id twice here, nothing there.
@@ -1759,6 +1830,8 @@ impl FilesService {
             Pending {
                 channel: upload.channel,
                 owner: session,
+                owner_conn: self.roster.conn_of(session),
+                sha256,
                 filename: upload.filename.clone(),
                 content_type: upload.content_type.clone(),
                 size: upload.size,
@@ -1872,34 +1945,141 @@ impl FilesService {
 
     /// Drop everything a session shared, because the session is gone.
     ///
-    /// Only where the operator asked for it. The owner is the session id, so
-    /// this is exactly the set that id can still be matched against - once the
-    /// id is reused by somebody else it would mean a different person, which
-    /// is why it happens on the disconnect rather than later.
+    /// Only where the operator asked for it. The number may already belong to
+    /// somebody else by the time the departure is read, so a row whose session
+    /// is still held by the connection and person that shared it stays.
     async fn forget_session(&self, session: u32) {
-        use sqlx::Row as _;
         if !self.delete_on_disconnect.load(Ordering::Relaxed) {
             return;
         }
-        let rows = sqlx::query("SELECT k FROM object WHERE server_id = ? AND owner = ?")
-            .bind(1_i64)
-            .bind(i64::from(session))
-            .fetch_all(self.store.pool())
-            .await
-            .unwrap_or_default();
-        for row in &rows {
-            let key: String = row.try_get("k").unwrap_or_default();
-            if !key.is_empty() {
-                self.forget_object(&key).await;
-            }
-        }
-        if !rows.is_empty() {
+        let forgotten = self.forget_unheld(Some(session)).await;
+        if forgotten > 0 {
             tracing::debug!(
                 session,
-                count = rows.len(),
+                count = forgotten,
                 "a session's shares went with it"
             );
         }
+    }
+
+    /// Drop the shares of every session that has already gone.
+    ///
+    /// Run once the roster is warm after a start, because no departure is ever
+    /// announced for a session that ended with the previous process. Where
+    /// only this service restarted, the sessions are still connected and keep
+    /// their files.
+    ///
+    /// Never on a cold roster: that reads as nobody connected, and would
+    /// delete every share on the server.
+    pub(crate) async fn sweep_departed(&self) -> usize {
+        if !self.delete_on_disconnect.load(Ordering::Relaxed) || !self.roster.is_warm() {
+            return 0;
+        }
+        let forgotten = self.forget_unheld(None).await;
+        if forgotten > 0 {
+            tracing::info!(
+                count = forgotten,
+                "shares of sessions that ended before this start were removed"
+            );
+        }
+        forgotten
+    }
+
+    /// Wait for the roster to warm up, then sweep once.
+    async fn sweep_once_warm(self: Arc<Self>, shutdown: starling_runtime::shutdown::Shutdown) {
+        while !self.roster.is_warm() {
+            tokio::select! {
+                () = shutdown.wait() => return,
+                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+        }
+        let _swept = self.sweep_departed().await;
+    }
+
+    /// Remove the channel shares, of one session number or of all, whose
+    /// sharing session is no longer connected. Answers how many went.
+    ///
+    /// Channel keys only. An emote outlives the operator who added it, and a
+    /// reservation belongs to a service rather than to a session.
+    async fn forget_unheld(&self, session: Option<u32>) -> usize {
+        use sqlx::Row as _;
+        let rows =
+            match session {
+                Some(session) => sqlx::query(
+                    "SELECT k, owner, owner_conn, uploader_account, uploader_name, uploader_cert \
+                     FROM object WHERE server_id = ? AND owner = ?",
+                )
+                .bind(1_i64)
+                .bind(i64::from(session))
+                .fetch_all(self.store.pool())
+                .await,
+                None => sqlx::query(
+                    "SELECT k, owner, owner_conn, uploader_account, uploader_name, uploader_cert \
+                     FROM object WHERE server_id = ? AND owner <> 0",
+                )
+                .bind(1_i64)
+                .fetch_all(self.store.pool())
+                .await,
+            }
+            .unwrap_or_default();
+
+        let mut forgotten = 0;
+        for row in &rows {
+            let key: String = row.try_get("k").unwrap_or_default();
+            if client_channel_of(&key).is_none() || self.held_by(&sharer_of(row)).is_some() {
+                continue;
+            }
+            self.forget_object(&key).await;
+            forgotten += 1;
+        }
+        forgotten
+    }
+
+    /// The session still carrying the connection that shared an object.
+    ///
+    /// The connection and the person must both match. A session number is
+    /// recycled, and a connection id starts again from one with its gateway,
+    /// so after a restart either alone can name a stranger. A row from before
+    /// connections were recorded matches on the person alone.
+    fn held_by(&self, sharer: &Sharer) -> Option<u32> {
+        let conn = self.roster.conn_of(sharer.session)?;
+        if sharer.conn.is_some_and(|recorded| recorded != conn) {
+            return None;
+        }
+        let now = self.identity_of(sharer.session);
+        // A guest with neither an account nor a certificate has only a name,
+        // which can only keep a row here, never grant anything.
+        let same = if sharer.uploader.durable() || now.durable() {
+            sharer.uploader.matches(&now)
+        } else {
+            sharer.uploader.name == now.name
+        };
+        same.then_some(sharer.session)
+    }
+
+    /// The session to name as a share's owner: the one that shared it if it is
+    /// still connected, otherwise any session the same person holds, otherwise
+    /// `0`.
+    fn owner_now(
+        &self,
+        sharer: &Sharer,
+        online: &std::cell::OnceCell<Vec<(u32, Uploader)>>,
+    ) -> u32 {
+        self.held_by(sharer)
+            .or_else(|| {
+                online
+                    .get_or_init(|| {
+                        self.roster
+                            .sessions()
+                            .into_iter()
+                            .map(|session| (session, self.identity_of(session)))
+                            .collect()
+                    })
+                    .iter()
+                    .find(|(_, who)| who.matches(&sharer.uploader))
+                    .map(|(session, _)| *session)
+            })
+            .unwrap_or_default()
     }
 
     /// The stored content type, for a download's `Content-Type`.
@@ -1914,27 +2094,32 @@ impl FilesService {
     }
 
     /// Record an object that has finished uploading.
+    ///
+    /// `sha256` is the digest of the bytes as stored, computed as they arrived.
     pub(crate) async fn record_object(
         &self,
         key: &str,
         pending: &Pending,
         size: u64,
+        sha256: &[u8; 32],
         now: u64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO object \
-             (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms, \
-             public, password_hash, enc_salt, enc_nonce, expires_at_ms, \
+             (server_id, k, channel_id, owner, owner_conn, filename, content_type, size, sha256, \
+             created_at_ms, public, password_hash, enc_salt, enc_nonce, expires_at_ms, \
              uploader_account, uploader_name, uploader_cert) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(1_i64)
         .bind(key)
         .bind(i64::from(pending.channel))
         .bind(i64::from(pending.owner))
+        .bind(pending.owner_conn.map(|conn| conn as i64))
         .bind(&pending.filename)
         .bind(&pending.content_type)
         .bind(size as i64)
+        .bind(sha256.to_vec())
         .bind(now as i64)
         .bind(i64::from(pending.public))
         .bind(pending.password_hash.clone())
@@ -1966,20 +2151,25 @@ impl FilesService {
         key: &str,
         original_key: &str,
         original: &Pending,
-        size: u64,
-        content_type: &str,
+        thumb: &thumb::Derived,
         now: u64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO object              (server_id, k, channel_id, owner, filename, content_type, size, sha256, created_at_ms,              public, password_hash, enc_salt, enc_nonce, expires_at_ms,              uploader_account, uploader_name, uploader_cert)              VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
+            "INSERT INTO object \
+             (server_id, k, channel_id, owner, owner_conn, filename, content_type, size, sha256, \
+             created_at_ms, public, password_hash, enc_salt, enc_nonce, expires_at_ms, \
+             uploader_account, uploader_name, uploader_cert) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
         )
         .bind(1_i64)
         .bind(key)
         .bind(i64::from(original.channel))
         .bind(i64::from(original.owner))
+        .bind(original.owner_conn.map(|conn| conn as i64))
         .bind(format!("{}.thumb", original.filename))
-        .bind(content_type)
-        .bind(size as i64)
+        .bind(thumb.mime)
+        .bind(thumb.size as i64)
+        .bind(thumb.sha256.to_vec())
         .bind(now as i64)
         .bind(i64::from(original.public))
         .bind(original.share_expires_at_ms.map(|at| at as i64))
@@ -2013,12 +2203,25 @@ impl FilesService {
         size: u64,
         thumb_key: String,
     ) {
+        // Resolved like a listing's, not copied from the grant: the uploader
+        // may have left while the bytes were still arriving.
+        let owner = self.owner_now(
+            &Sharer {
+                session: pending.owner,
+                conn: pending.owner_conn,
+                uploader: pending.uploader.clone(),
+            },
+            &std::cell::OnceCell::new(),
+        );
         let share = FilesEnvelope {
             body: Some(files_envelope::Body::Share(Share {
                 key: key.to_owned(),
                 thumb_key,
                 channel: pending.channel,
-                owner: pending.owner,
+                owner,
+                uploader_account: pending.uploader.account.unwrap_or_default(),
+                uploader_name: pending.uploader.name.clone().unwrap_or_default(),
+                uploader_cert: pending.uploader.cert.clone().unwrap_or_default(),
                 filename: pending.filename.clone(),
                 size,
                 shared_at_ms: now_ms(),
@@ -2051,7 +2254,8 @@ impl FilesService {
             // `k LIKE '{channel}/%'` as well as `channel_id`: an emote or a
             // plugin's document carries channel 0, and without the key check
             // every one of them listed as a file shared in the root.
-            "SELECT k, owner, filename, size, created_at_ms, public, password_hash, \
+            "SELECT k, owner, owner_conn, uploader_account, uploader_name, uploader_cert, \
+             filename, size, created_at_ms, public, password_hash, \
              expires_at_ms, has_thumb FROM object WHERE server_id = ? AND channel_id = ? \
              AND k LIKE ? \
              AND k NOT LIKE '%.thumb' \
@@ -2067,6 +2271,7 @@ impl FilesService {
         .await
         .unwrap_or_default();
 
+        let online = std::cell::OnceCell::new();
         rows.iter()
             .map(|row| {
                 let key: String = row.try_get("k").unwrap_or_default();
@@ -2076,10 +2281,14 @@ impl FilesService {
                     .ok()
                     .flatten()
                     .is_some();
+                let sharer = sharer_of(row);
                 Share {
                     channel,
                     thumb_key: thumb_key_of(row, &key),
-                    owner: row.try_get::<i64, _>("owner").unwrap_or_default() as u32,
+                    owner: self.owner_now(&sharer, &online),
+                    uploader_account: sharer.uploader.account.unwrap_or_default(),
+                    uploader_name: sharer.uploader.name.unwrap_or_default(),
+                    uploader_cert: sharer.uploader.cert.unwrap_or_default(),
                     filename: row.try_get("filename").unwrap_or_default(),
                     size: row.try_get::<i64, _>("size").unwrap_or_default() as u64,
                     shared_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
@@ -2277,7 +2486,7 @@ mod tests {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let store = Store::open(
@@ -2286,6 +2495,11 @@ mod tests {
         )
         .await
         .expect("in-memory database");
+        service_on(store, held).await
+    }
+
+    /// A service over an existing database, as a restarted process finds it.
+    async fn service_on(store: Store, held: Perm) -> Arc<FilesService> {
         store.migrate(SCHEMA).await.expect("schema");
         let names = names::Names::open(store.clone())
             .await
@@ -3435,13 +3649,22 @@ mod tests {
 
     /// Ask for an upload the way a client does, and read back what it is told.
     async fn ask(service: &Arc<FilesService>, upload: UploadRequest) -> FilesEnvelope {
+        ask_as(service, 7, upload).await
+    }
+
+    /// The same, from a session of the test's choosing.
+    async fn ask_as(
+        service: &Arc<FilesService>,
+        session: u32,
+        upload: UploadRequest,
+    ) -> FilesEnvelope {
         let envelope = FilesEnvelope {
             body: Some(files_envelope::Body::Upload(upload)),
         };
         let actions = service
             .frame(Inbound {
                 conn: 1,
-                session: 7,
+                session,
                 type_id: ServiceKind::Files.outer_type(),
                 payload: envelope.encode_to_vec(),
                 gateway: String::new(),
@@ -3600,6 +3823,8 @@ mod tests {
         let pending = Pending {
             channel: 3,
             owner: 7,
+            owner_conn: None,
+            sha256: None,
             filename: "notes.pdf".to_owned(),
             content_type: "application/pdf".to_owned(),
             size: 100,
@@ -3612,7 +3837,7 @@ mod tests {
             bind: None,
         };
         service
-            .record_object("3/abc/notes.pdf", &pending, 84, now_ms())
+            .record_object("3/abc/notes.pdf", &pending, 84, &[0; 32], now_ms())
             .await
             .expect("recorded");
 
@@ -3635,6 +3860,8 @@ mod tests {
         let pending = Pending {
             channel: 3,
             owner: 7,
+            owner_conn: None,
+            sha256: None,
             filename: "old.bin".to_owned(),
             content_type: "application/octet-stream".to_owned(),
             size: 10,
@@ -3648,11 +3875,11 @@ mod tests {
         };
         // One well past the horizon, one just made.
         service
-            .record_object("3/old/old.bin", &pending, 10, now_ms() - 100_000)
+            .record_object("3/old/old.bin", &pending, 10, &[0; 32], now_ms() - 100_000)
             .await
             .expect("recorded");
         service
-            .record_object("3/new/new.bin", &pending, 10, now_ms())
+            .record_object("3/new/new.bin", &pending, 10, &[0; 32], now_ms())
             .await
             .expect("recorded");
 
@@ -3674,6 +3901,8 @@ mod tests {
         let pending = Pending {
             channel: 3,
             owner: 7,
+            owner_conn: None,
+            sha256: None,
             filename: "keep.bin".to_owned(),
             content_type: "application/octet-stream".to_owned(),
             size: 10,
@@ -3686,7 +3915,7 @@ mod tests {
             bind: None,
         };
         service
-            .record_object("3/keep/keep.bin", &pending, 10, 0)
+            .record_object("3/keep/keep.bin", &pending, 10, &[0; 32], 0)
             .await
             .expect("recorded");
         assert_eq!(service.collect_expired(0).await, 0);
@@ -4187,5 +4416,250 @@ mod tests {
             .await;
 
         assert!(refused.is_err());
+    }
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    }
+
+    /// What `Stat` answers for `key`.
+    async fn stat_of(service: &Arc<FilesService>, key: &str) -> ObjectInfo {
+        FilesRpc(Arc::clone(service))
+            .stat(Request::new(StatRequest {
+                key: key.to_owned(),
+                ..StatRequest::default()
+            }))
+            .await
+            .expect("stat answers")
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn an_upload_records_the_sha256_of_the_bytes_that_arrived() {
+        // The column existed from the first schema and every insert wrote
+        // null into it, so `Stat` never answered with a digest.
+        let service = service().await;
+        let grant = grant_for(&service, upload_as(Visibility::Session, "", 11)).await;
+        assert_eq!(put_through(&service, &grant, b"hello world").await, 201);
+
+        assert_eq!(
+            stat_of(&service, &grant.key).await.sha256,
+            sha256(b"hello world").to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_contradicts_its_declared_sha256_is_refused_and_not_stored() {
+        let service = service().await;
+        let lying = UploadRequest {
+            sha256: sha256(b"something else").to_vec(),
+            ..upload_as(Visibility::Session, "", 11)
+        };
+        let grant = grant_for(&service, lying).await;
+        assert_eq!(put_through(&service, &grant, b"hello world").await, 400);
+        assert!(!stat_of(&service, &grant.key).await.exists, "no row");
+        assert!(service.listing(4, 50).await.is_empty(), "nothing listed");
+        assert!(
+            http::object_path(service.objects_dir(), &grant.key).is_some_and(|path| !path.exists()),
+            "and no bytes"
+        );
+
+        let honest = UploadRequest {
+            sha256: sha256(b"hello world").to_vec(),
+            ..upload_as(Visibility::Session, "", 11)
+        };
+        let grant = grant_for(&service, honest).await;
+        assert_eq!(put_through(&service, &grant, b"hello world").await, 201);
+    }
+
+    #[tokio::test]
+    async fn a_sha256_of_the_wrong_length_is_refused_before_a_byte_moves() {
+        let service = service().await;
+        let envelope = ask(
+            &service,
+            UploadRequest {
+                sha256: vec![0; 20],
+                ..upload_as(Visibility::Session, "", 11)
+            },
+        )
+        .await;
+        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
+            panic!("expected a refusal, got {:?}", envelope.body);
+        };
+        assert_eq!(
+            refused.refusal.expect("a reason").kind,
+            refusal::Kind::Invalid as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_share_records_the_digest_of_its_ciphertext_not_its_plaintext() {
+        // A plaintext digest at rest would let anyone holding the database
+        // confirm a guess at what a password share contains. The uploader's
+        // declared digest is still checked, against the plaintext it hashed.
+        let service = service().await;
+        let upload = UploadRequest {
+            sha256: sha256(b"hello world").to_vec(),
+            ..upload_as(Visibility::Password, "hunter2", 11)
+        };
+        let grant = grant_for(&service, upload).await;
+        assert_eq!(put_through(&service, &grant, b"hello world").await, 201);
+
+        let sealed =
+            std::fs::read(http::object_path(service.objects_dir(), &grant.key).expect("a path"))
+                .expect("the sealed bytes");
+        let recorded = stat_of(&service, &grant.key).await.sha256;
+        assert_eq!(recorded, sha256(&sealed).to_vec());
+        assert_ne!(recorded, sha256(b"hello world").to_vec());
+    }
+
+    /// One connected session, as `session-view` describes it.
+    fn session_of(
+        session: u32,
+        conn: u64,
+        account: Option<u64>,
+        name: &str,
+        cert: &[u8],
+    ) -> starling_proto_fancy::sessionview::Session {
+        starling_proto_fancy::sessionview::Session {
+            session,
+            conn,
+            account: account.unwrap_or_default(),
+            registered: account.is_some(),
+            name: name.to_owned(),
+            cert_hash: cert.to_vec(),
+            channel: 4,
+            ..Default::default()
+        }
+    }
+
+    fn alice() -> starling_proto_fancy::sessionview::Session {
+        session_of(7, 100, Some(42), "alice", &[0xA1; 20])
+    }
+
+    /// Somebody else, on alice's session and connection numbers, as a restart
+    /// hands them out again.
+    fn bob() -> starling_proto_fancy::sessionview::Session {
+        session_of(7, 100, Some(43), "bob", &[0xB0; 20])
+    }
+
+    /// A guest with a certificate, on a session of her own.
+    fn carol() -> starling_proto_fancy::sessionview::Session {
+        session_of(5, 200, None, "carol", &[0xC0; 20])
+    }
+
+    #[tokio::test]
+    async fn a_listing_names_the_uploader_and_not_whoever_holds_their_old_session() {
+        // The row's session id was sent as the owner, so once the number was
+        // recycled, or handed out again after a restart, a file was attributed
+        // to whoever held it.
+        let service = service().await;
+        service.roster.replace(vec![alice()]);
+        let grant = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &grant, b"hi").await, 201);
+        assert_eq!(service.listing(4, 50).await[0].owner, 7);
+
+        service.roster.replace(vec![bob()]);
+        let listed = service.listing(4, 50).await.remove(0);
+        assert_eq!(listed.owner, 0, "alice is gone, and bob is not alice");
+        assert_eq!(listed.uploader_name, "alice");
+        assert_eq!(listed.uploader_account, 42);
+        assert_eq!(listed.uploader_cert, vec![0xA1; 20]);
+
+        service.roster.replace(vec![
+            bob(),
+            session_of(3, 101, Some(42), "alice", &[0xA1; 20]),
+        ]);
+        assert_eq!(
+            service.listing(4, 50).await[0].owner,
+            3,
+            "she is found again on the session she holds now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_departure_does_not_take_the_next_holders_files() {
+        // A departure is read after the roster has moved on, and by then the
+        // number may belong to somebody who has just shared something.
+        let service = service().await;
+        service.delete_on_disconnect.store(true, Ordering::Relaxed);
+        service.roster.replace(vec![alice()]);
+        let hers = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &hers, b"hi").await, 201);
+
+        service
+            .roster
+            .replace(vec![session_of(7, 101, Some(43), "bob", &[0xB0; 20])]);
+        let his = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &his, b"yo").await, 201);
+
+        service.forget_session(7).await;
+        let left: Vec<String> = service
+            .listing(4, 50)
+            .await
+            .into_iter()
+            .map(|share| share.key)
+            .collect();
+        assert_eq!(left, vec![his.key], "alice's file went and bob's stayed");
+    }
+
+    #[tokio::test]
+    async fn a_restart_removes_the_shares_of_sessions_that_ended_with_it() {
+        // No departure is announced for a session that ended with the previous
+        // process, so these files stayed for good, or went when a stranger
+        // holding the same number disconnected.
+        let before = service().await;
+        before.roster.replace(vec![alice(), carol()]);
+        let hers = grant_for(&before, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&before, &hers, b"hi").await, 201);
+        let Some(files_envelope::Body::Grant(carols)) =
+            ask_as(&before, 5, upload_as(Visibility::Session, "", 2))
+                .await
+                .body
+        else {
+            panic!("carol is granted an upload");
+        };
+        assert_eq!(put_through(&before, &carols, b"yo").await, 201);
+
+        let after = service_on(before.store.clone(), everything()).await;
+        after.delete_on_disconnect.store(true, Ordering::Relaxed);
+        assert_eq!(
+            after.sweep_departed().await,
+            0,
+            "a cold roster is not an empty server"
+        );
+        assert_eq!(after.listing(4, 50).await.len(), 2);
+
+        // Bob holds alice's old numbers. Carol is still connected, as she is
+        // where only this service restarted.
+        after.roster.replace(vec![bob(), carol()]);
+        assert_eq!(after.sweep_departed().await, 1);
+        let left = after.listing(4, 50).await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key, carols.key);
+        assert_eq!(left[0].owner, 5);
+    }
+
+    #[tokio::test]
+    async fn an_emote_does_not_leave_with_the_operator_who_added_it() {
+        // Its name would go on pointing at bytes that were gone, and every
+        // client would render a broken image.
+        let service = service_holding(Perm::MANAGE_EMOTES | Perm::ENTER).await;
+        service.delete_on_disconnect.store(true, Ordering::Relaxed);
+        let Some(files_envelope::Body::Emotes(emotes)) =
+            upload_emote(&service, "blobfish", b"png-bytes").await.body
+        else {
+            panic!("the emote is stored");
+        };
+
+        // `upload_emote` asks as session 2.
+        service.forget_session(2).await;
+
+        let key = emotes.emotes[0]
+            .url
+            .strip_prefix("https://files.example.org/s/")
+            .expect("a link on this server");
+        assert!(stat_of(&service, key).await.exists);
     }
 }

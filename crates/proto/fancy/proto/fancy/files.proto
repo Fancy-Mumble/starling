@@ -117,6 +117,12 @@ message UploadRequest {
   string filename = 3;
   string content_type = 4;
   uint64 size = 5;
+  // The SHA-256 of the bytes about to be uploaded, or empty.
+  //
+  // Optional: the server hashes whatever arrives either way. When set it must
+  // be 32 bytes, and a `PUT` whose bytes hash to anything else is refused with
+  // `400` and nothing is stored, because a transfer that contradicts the
+  // uploader's own digest is a corrupted one, not a file to share.
   bytes sha256 = 6;
   Visibility visibility = 7;
   // How long the share should last, in seconds. `0` means it never expires,
@@ -160,6 +166,9 @@ message Grant {
 message Share {
   string key = 1;
   uint32 channel = 2;
+  // The session of whoever shared it while they are connected, and `0` while
+  // they are not. Resolved each time the message is built: session ids are
+  // recycled, so a stored one would name whoever holds that number now.
   uint32 owner = 3;
   string filename = 4;
   uint64 size = 5;
@@ -179,6 +188,12 @@ message Share {
   // A key rather than a URL, because a URL for it would expire on its own
   // schedule; the client signs for it the way it signs for any other object.
   string thumb_key = 11;
+  // Who shared it, in terms that outlive their connection, as `ManagedFile`
+  // carries them. `uploader_account` is `0` for a guest, and `uploader_cert`
+  // empty for a client that presented none.
+  uint64 uploader_account = 12;
+  string uploader_name = 13;
+  bytes uploader_cert = 14;
 }
 
 message ListRequest {

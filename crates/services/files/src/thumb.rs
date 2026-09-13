@@ -61,14 +61,24 @@ pub(crate) fn wanted(content_type: &str, sealed: bool, size: u64) -> bool {
             .is_some_and(|primary| is_image_type(primary.trim()))
 }
 
+/// A thumbnail that was written, as its row records it.
+#[derive(Debug)]
+pub(crate) struct Derived {
+    pub(crate) size: u64,
+    pub(crate) mime: &'static str,
+    pub(crate) sha256: [u8; 32],
+}
+
 /// Read `source`, shrink it, and write the result beside it.
 ///
-/// Returns the size and content type of what it wrote, or `None` when there is
-/// no thumbnail to be had — an unreadable file, a format the decoder does not
-/// know, or a picture already smaller than the box. A failure here is never an
-/// upload failure: the bytes are down and the row is written, and a missing
-/// preview is a worse picture rather than a lost file.
-pub(crate) async fn derive(source: &Path, destination: &Path) -> Option<(u64, &'static str)> {
+/// Returns what it wrote, or `None` when there is no thumbnail to be had — an
+/// unreadable file, a format the decoder does not know, or a picture already
+/// smaller than the box. A failure here is never an upload failure: the bytes
+/// are down and the row is written, and a missing preview is a worse picture
+/// rather than a lost file.
+pub(crate) async fn derive(source: &Path, destination: &Path) -> Option<Derived> {
+    use sha2::Digest as _;
+
     let bytes = tokio::fs::read(source).await.ok()?;
     // The decode and re-encode is CPU work on a runtime that is otherwise
     // carrying conversations, so it does not run on the reactor.
@@ -76,9 +86,12 @@ pub(crate) async fn derive(source: &Path, destination: &Path) -> Option<(u64, &'
         tokio::task::spawn_blocking(move || starling_imaging::shrink(&bytes, EDGE, MAX_PIXELS))
             .await
             .ok()??;
-    let size = shrunk.bytes.len() as u64;
     tokio::fs::write(destination, &shrunk.bytes).await.ok()?;
-    Some((size, shrunk.mime))
+    Some(Derived {
+        size: shrunk.bytes.len() as u64,
+        mime: shrunk.mime,
+        sha256: sha2::Sha256::digest(&shrunk.bytes).into(),
+    })
 }
 
 /// Whether a media type names a picture, whatever case the header used.
