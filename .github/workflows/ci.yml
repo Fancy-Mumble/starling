@@ -14,6 +14,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Line tables only: a failing test still names its file and line, and the
+  # test binaries link in a third of the time. Full debuginfo was most of a
+  # four-minute stall on Windows while fifty of them linked.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # ----------------------------------------------------------------

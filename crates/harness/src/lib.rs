@@ -737,7 +737,10 @@ impl Deployment {
             .into_iter()
             .filter(|event| event.severity >= Severity::Error)
             .filter(|event| !allowed.contains(&event.message.as_str()))
-            .map(|event| format!("{:?}/{}", event.category, event.message))
+            // With the fields: "service failed to start" on its own says
+            // neither which service nor why, and on a Windows runner that
+            // was the whole of what a failed run had to say.
+            .map(|event| format!("{:?}/{} {:?}", event.category, event.message, event.fields))
             .collect();
 
         // Ordered by how much each says about what went wrong: a panic names
