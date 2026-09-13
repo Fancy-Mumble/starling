@@ -4227,6 +4227,8 @@ name = "starling-social"
 version = "0.2.0"
 dependencies = [
  "prost",
+ "sqlx",
+ "starling-proto",
  "starling-proto-fancy",
  "starling-runtime",
  "tokio",

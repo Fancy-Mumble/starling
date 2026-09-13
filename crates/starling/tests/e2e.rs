@@ -5067,6 +5067,62 @@ async fn a_poll_and_its_vote_carry_the_identity_and_the_channel_the_server_resol
 }
 
 #[tokio::test]
+async fn a_vote_on_a_poll_created_before_a_restart_is_still_relayed() {
+    // Polls lived only in `social`'s memory: the card survived a restart in
+    // chat history, and every vote on it after one was dropped without a word.
+    let data_dir = TempDir::new("poll-restart");
+    let mut deployment = Deployment::start(data_dir.path()).await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let _alice_session = handshake_fancy(&mut alice, "alice").await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = handshake_fancy(&mut bob, "bob").await;
+
+    alice
+        .send(
+            SOCIAL,
+            &social(fancy::social::social_envelope::Body::Poll(
+                fancy::social::Poll {
+                    poll_id: "p-restart".to_owned(),
+                    channel: 0,
+                    question: "still there?".to_owned(),
+                    options: vec!["yes".to_owned(), "no".to_owned()],
+                    ..fancy::social::Poll::default()
+                },
+            )),
+        )
+        .await;
+    for client in [&mut alice, &mut bob] {
+        let fancy::social::social_envelope::Body::Poll(_) = next_social(client).await else {
+            panic!("expected the poll");
+        };
+    }
+
+    deployment.restart("social").await;
+
+    bob.send(
+        SOCIAL,
+        &social(fancy::social::social_envelope::Body::Vote(
+            fancy::social::PollVote {
+                poll_id: "p-restart".to_owned(),
+                options: vec![0],
+                ..fancy::social::PollVote::default()
+            },
+        )),
+    )
+    .await;
+    for (who, client) in [("alice", &mut alice), ("bob", &mut bob)] {
+        let fancy::social::social_envelope::Body::Vote(vote) = next_social(client).await else {
+            panic!("{who} was sent something other than the vote");
+        };
+        assert_eq!(vote.voter, bob_session, "{who}");
+        assert_eq!(vote.options, vec![0], "{who}");
+    }
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
 async fn a_scheduled_message_is_stored_timed_and_delivered_to_the_channel() {
     // The whole path the `scheduled-messages` suite drives, minus the panel:
     // an ack that says it was accepted, the timer, and the message arriving as

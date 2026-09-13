@@ -8,8 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# `PermissionDenied`, the one refusal the canon has for a vote.
+starling-proto.workspace = true
 starling-proto-fancy.workspace = true
 starling-runtime.workspace = true
+sqlx.workspace = true
+# The retention sweep, and the lock that serialises a poll write with its read.
+tokio.workspace = true
 
 prost.workspace = true
 tonic.workspace = true

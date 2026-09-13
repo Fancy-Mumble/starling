@@ -37,6 +37,16 @@
 //! the server can do: reject a vote in a closed poll, hold a voter to one
 //! ballot, and route a vote whose message carries no channel of its own.
 //!
+//! # Polls are stored; memory is only a cache
+//!
+//! Polls and ballots lived only in memory until 2026-09-13. The poll card
+//! outlives a restart in chat history, so every vote on it after one was
+//! dropped, and the [`MAX_POLLS`] eviction did the same to older polls without
+//! a restart. Both are now rows, written before the relay and loaded on a cache
+//! miss, so an evicted poll is still votable. They are kept for
+//! [`POLL_RETENTION_MS`] after the poll closes, or after it was created when it
+//! never does, and then swept.
+//!
 //! [`Send`]: starling_proto_fancy::control::Send
 
 use std::collections::HashMap;
@@ -51,9 +61,12 @@ use starling_proto_fancy::fancy::social::{
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::permit::Permit;
-use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
+use starling_runtime::plane::{
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+};
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::storage::{Migration, Store};
 
 /// Longest stroke accepted, in points.
 ///
@@ -83,12 +96,59 @@ pub const MAX_POLL_TEXT_BYTES: usize = 512;
 /// Both are `UUID`s from the client and both end up as `HashMap` keys.
 pub const MAX_ID_BYTES: usize = 64;
 
-/// How many polls are remembered per server instance.
+/// How many polls are cached in memory, across every server instance.
 ///
-/// The oldest is evicted past this. A poll nobody can vote in any more is a
-/// display artefact the clients already hold; keeping every poll a server has
-/// ever seen would be an unbounded map fed by clients.
+/// The oldest is evicted past this. Eviction forgets nothing: the poll is still
+/// in storage and a vote on it loads it back.
 pub const MAX_POLLS: usize = 512;
+
+/// Milliseconds in a day.
+const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// How long a poll and its ballots are kept, in milliseconds: 90 days.
+///
+/// Counted from when the poll closes, or from its creation when it has no
+/// deadline. A deadline further out than this is clamped to it, because
+/// `closes_at_ms` is the peer's to choose and must not pin a row forever. Past
+/// this a vote on the card is refused as a poll the server no longer has.
+pub const POLL_RETENTION_MS: u64 = 90 * DAY_MS;
+
+/// How often expired polls are swept.
+///
+/// Hourly, because retention is measured in days.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// Upstream `PermissionDenied`.
+const PERMISSION_DENIED: u16 = 12;
+
+/// The schema. Both tables carry the poll's expiry, so the sweep is one
+/// indexed `DELETE` each (`docs/STORAGE.md` D4).
+///
+/// The poll and a ballot's options are stored as their encoded canon messages:
+/// neither is ever queried by its fields, and the message is already the
+/// schema the client and the relay agree on.
+const SCHEMA: &[Migration<'static>] = &[Migration::new(
+    "0001_social_poll",
+    &[
+        "CREATE TABLE IF NOT EXISTS social_poll (\
+             server_id BIGINT NOT NULL, poll_id VARCHAR(64) NOT NULL, \
+             poll BLOB NOT NULL, created_at_ms BIGINT NOT NULL, \
+             expires_at_ms BIGINT NOT NULL, \
+             PRIMARY KEY (server_id, poll_id))",
+        "CREATE INDEX IF NOT EXISTS ix_social_poll_expiry \
+             ON social_poll(server_id, expires_at_ms)",
+        // `voter` is the certificate hash where there is one: a session id is
+        // recycled, so a ballot keyed on it would belong to a stranger after
+        // a restart.
+        "CREATE TABLE IF NOT EXISTS social_poll_ballot (\
+             server_id BIGINT NOT NULL, poll_id VARCHAR(64) NOT NULL, \
+             voter VARCHAR(128) NOT NULL, options BLOB NOT NULL, \
+             expires_at_ms BIGINT NOT NULL, \
+             PRIMARY KEY (server_id, poll_id, voter))",
+        "CREATE INDEX IF NOT EXISTS ix_social_poll_ballot_expiry \
+             ON social_poll_ballot(server_id, expires_at_ms)",
+    ],
+)];
 
 /// The readiness gate that stays closed until the roster has a snapshot.
 ///
@@ -103,7 +163,24 @@ const VIEW_GATE: &str = "session-view";
 #[derive(Debug, Clone)]
 struct PollRecord {
     poll: Poll,
-    ballots: HashMap<u32, Vec<u32>>,
+    /// Keyed by [`SocialService::voter_key`].
+    ballots: HashMap<String, Vec<u32>>,
+    expires_at_ms: u64,
+}
+
+/// What became of a vote.
+#[derive(Debug, PartialEq)]
+enum Ballot {
+    /// Counted, and to be relayed as this.
+    Counted(PollVote),
+    /// No such poll, or one past its retention.
+    Unknown,
+    /// The poll has closed.
+    Closed,
+    /// No option the poll has, which no client sends.
+    Empty,
+    /// Storage could not answer; already logged.
+    Failed,
 }
 
 impl PollRecord {
@@ -113,9 +190,12 @@ impl PollRecord {
         // Sorted, so a tally is the same list whichever order the ballots
         // happen to hash into. Addition commutes; the lint is about the two
         // runs of one server disagreeing about anything derived from order.
-        let mut voters: Vec<&u32> = self.ballots.keys().collect();
+        let mut voters: Vec<&String> = self.ballots.keys().collect();
         voters.sort_unstable();
-        for chosen in voters.iter().filter_map(|voter| self.ballots.get(voter)) {
+        for chosen in voters
+            .iter()
+            .filter_map(|voter| self.ballots.get(voter.as_str()))
+        {
             for option in chosen {
                 if let Some(tally) = tallies.get_mut(*option as usize) {
                     *tally += 1;
@@ -154,6 +234,80 @@ impl Polls {
             }
         }
     }
+
+    /// Keep only the polls `keep` accepts.
+    fn retain(&mut self, mut keep: impl FnMut(&PollRecord) -> bool) {
+        self.by_id.retain(|_, record| keep(record));
+        let by_id = &self.by_id;
+        self.order.retain(|key| by_id.contains_key(key));
+    }
+}
+
+/// When a poll created at `now_ms` stops being kept. See [`POLL_RETENTION_MS`].
+fn poll_expiry(poll: &Poll, now_ms: u64) -> u64 {
+    let latest_close = now_ms.saturating_add(POLL_RETENTION_MS);
+    let anchor = if poll.closes_at_ms > now_ms {
+        poll.closes_at_ms.min(latest_close)
+    } else {
+        now_ms
+    };
+    anchor.saturating_add(POLL_RETENTION_MS)
+}
+
+/// Apply `vote` from `voter` to `record`, in memory.
+fn apply_vote(
+    record: &mut PollRecord,
+    vote: &PollVote,
+    voter: u32,
+    voter_key: &str,
+    now_ms: u64,
+) -> Ballot {
+    if record.closed_at(now_ms) {
+        return Ballot::Closed;
+    }
+    let options = record.poll.options.len() as u32;
+    let mut chosen: Vec<u32> = vote
+        .options
+        .iter()
+        .copied()
+        .filter(|option| *option < options)
+        .collect();
+    chosen.dedup();
+    if !record.poll.multiple {
+        chosen.truncate(1);
+    }
+    if chosen.is_empty() {
+        return Ballot::Empty;
+    }
+
+    // Replaces rather than adds: one voter, one ballot, which is also what
+    // the client's own store does with a second vote from one session.
+    let _ = record.ballots.insert(voter_key.to_owned(), chosen.clone());
+    Ballot::Counted(PollVote {
+        poll_id: vote.poll_id.clone(),
+        options: chosen,
+        voter,
+        channel: record.poll.channel,
+    })
+}
+
+/// Tell a voter their vote was not counted.
+///
+/// `PermissionDenied` of type `Text` is the only refusal the canon has. It
+/// names no channel on purpose: the client reverts a permanent listen on the
+/// channel of any denial that carries one.
+fn refuse_vote(inbound: &Inbound, reason: &str) -> Actions {
+    let denied = starling_proto::proto::tcp::PermissionDenied {
+        session: Some(inbound.session),
+        reason: Some(reason.to_owned()),
+        r#type: Some(starling_proto::proto::tcp::permission_denied::DenyType::Text as i32),
+        ..starling_proto::proto::tcp::PermissionDenied::default()
+    };
+    vec![to_conn(
+        inbound.conn,
+        PERMISSION_DENIED,
+        denied.encode_to_vec(),
+    )]
 }
 
 /// One watch-together session, and the connections behind its participants.
@@ -174,7 +328,12 @@ struct WatchRecord {
 /// The service.
 #[derive(Debug)]
 pub struct SocialService {
+    /// The durable record of every poll; [`Self::polls`] caches it.
+    store: Store,
     polls: Mutex<Polls>,
+    /// Held across a poll's read, change and write, so two votes cannot
+    /// interleave between the cache and storage and leave them disagreeing.
+    poll_writes: tokio::sync::Mutex<()>,
     watches: Mutex<HashMap<String, WatchRecord>>,
     /// Who is in which channel, so a relay can be addressed at one.
     roster: Arc<Roster>,
@@ -240,9 +399,11 @@ impl SocialService {
     /// Record a poll, or refuse it.
     ///
     /// Refusal is silent by design: every rejection here is a peer sending
-    /// something no client produces, and the canon has no refusal message to
-    /// answer with.
-    fn create(&self, scope: u32, mut poll: Poll, creator: u32) -> Option<Poll> {
+    /// something no client produces.
+    ///
+    /// A poll id seen before replaces that poll and clears its ballots, as it
+    /// always has in memory; storage now does the same.
+    async fn create(&self, scope: u32, mut poll: Poll, creator: u32, now_ms: u64) -> Option<Poll> {
         if poll.poll_id.is_empty() || poll.poll_id.len() > MAX_ID_BYTES {
             return None;
         }
@@ -258,7 +419,14 @@ impl SocialService {
         let record = PollRecord {
             poll: poll.clone(),
             ballots: HashMap::new(),
+            expires_at_ms: poll_expiry(&poll, now_ms),
         };
+        let _serial = self.poll_writes.lock().await;
+        // Relayed and cached even when the write fails: the poll still works
+        // until a restart, which is no worse than before it was stored.
+        if let Err(error) = self.write_poll(scope, &record, now_ms).await {
+            tracing::error!(%error, scope, poll = %poll.poll_id, "could not store a poll");
+        }
         self.polls
             .lock()
             .ok()?
@@ -266,44 +434,293 @@ impl SocialService {
         Some(poll)
     }
 
-    /// Apply a vote, returning it as it should be relayed.
+    /// Apply a vote, and say what became of it.
     ///
-    /// The returned vote is the *normalised* one: the voter stamped, the
-    /// poll's channel filled in (the canon vote carries none, and the client
-    /// needs one to route the vote to its card), out-of-range options dropped
-    /// and a single-choice poll held to one option. Relaying the peer's own
-    /// bytes instead would let one client show a tally another never counts.
-    fn vote(&self, scope: u32, vote: &PollVote, voter: u32, now_ms: u64) -> Option<PollVote> {
-        let mut polls = self.polls.lock().ok()?;
-        let record = polls.by_id.get_mut(&(scope, vote.poll_id.clone()))?;
-        if record.closed_at(now_ms) {
-            return None;
+    /// A counted vote is the *normalised* one: the voter stamped, the poll's
+    /// channel filled in (the canon vote carries none, and the client needs
+    /// one to route the vote to its card), out-of-range options dropped and a
+    /// single-choice poll held to one option. Relaying the peer's own bytes
+    /// instead would let one client show a tally another never counts.
+    async fn vote(&self, scope: u32, vote: &PollVote, voter: u32, now_ms: u64) -> Ballot {
+        let key = (scope, vote.poll_id.clone());
+        let _serial = self.poll_writes.lock().await;
+        if !self.cached(&key, now_ms) {
+            match self.load(scope, &vote.poll_id, now_ms).await {
+                Ok(Some(record)) => {
+                    if let Ok(mut polls) = self.polls.lock() {
+                        polls.insert(key.clone(), record);
+                    }
+                }
+                Ok(None) => return Ballot::Unknown,
+                Err(error) => {
+                    tracing::error!(%error, scope, poll = %vote.poll_id, "could not load a poll");
+                    return Ballot::Failed;
+                }
+            }
         }
 
-        let options = record.poll.options.len() as u32;
-        let mut chosen: Vec<u32> = vote
-            .options
-            .iter()
-            .copied()
-            .filter(|option| *option < options)
-            .collect();
-        chosen.dedup();
-        if !record.poll.multiple {
-            chosen.truncate(1);
+        let voter_key = self.voter_key(voter);
+        let (ballot, expires_at_ms) = {
+            let Ok(mut polls) = self.polls.lock() else {
+                return Ballot::Failed;
+            };
+            let Some(record) = polls.by_id.get_mut(&key) else {
+                return Ballot::Unknown;
+            };
+            (
+                apply_vote(record, vote, voter, &voter_key, now_ms),
+                record.expires_at_ms,
+            )
+        };
+        if let Ballot::Counted(counted) = &ballot {
+            let written = self
+                .write_ballot(scope, counted, &voter_key, expires_at_ms)
+                .await;
+            if let Err(error) = written {
+                tracing::error!(%error, scope, poll = %vote.poll_id, "could not store a ballot");
+            }
         }
-        if chosen.is_empty() {
-            return None;
-        }
+        ballot
+    }
 
-        // Replaces rather than adds: one voter, one ballot, which is also what
-        // the client's own store does with a second vote from one session.
-        let _ = record.ballots.insert(voter, chosen.clone());
-        Some(PollVote {
-            poll_id: vote.poll_id.clone(),
-            options: chosen,
-            voter,
-            channel: record.poll.channel,
-        })
+    /// Whether `key` is cached and still inside its retention.
+    fn cached(&self, key: &(u32, String), now_ms: u64) -> bool {
+        self.polls
+            .lock()
+            .ok()
+            .and_then(|polls| {
+                polls
+                    .by_id
+                    .get(key)
+                    .map(|record| record.expires_at_ms > now_ms)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Who a ballot belongs to: the certificate hash, or the session for a
+    /// peer that presented none.
+    ///
+    /// The certificate is what makes a ballot the same person's after they
+    /// reconnect or the server restarts. A guest has nothing durable, so their
+    /// ballot is only as good as the session id it was cast from.
+    fn voter_key(&self, session: u32) -> String {
+        match self.roster.cert_of(session) {
+            Some(cert) if !cert.is_empty() => {
+                cert.iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+            _ => format!("session:{session}"),
+        }
+    }
+
+    /// Store `record` as the whole of its poll, replacing any earlier ballots.
+    async fn write_poll(
+        &self,
+        scope: u32,
+        record: &PollRecord,
+        now_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool().begin().await?;
+        let _ = sqlx::query(
+            "INSERT INTO social_poll (server_id, poll_id, poll, created_at_ms, expires_at_ms) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (server_id, poll_id) DO UPDATE SET poll = excluded.poll, \
+             created_at_ms = excluded.created_at_ms, expires_at_ms = excluded.expires_at_ms",
+        )
+        .bind(i64::from(scope))
+        .bind(&record.poll.poll_id)
+        .bind(record.poll.encode_to_vec())
+        .bind(now_ms as i64)
+        .bind(record.expires_at_ms as i64)
+        .execute(&mut *tx)
+        .await?;
+        let _ = sqlx::query("DELETE FROM social_poll_ballot WHERE server_id = ? AND poll_id = ?")
+            .bind(i64::from(scope))
+            .bind(&record.poll.poll_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+
+    /// Store one voter's ballot, replacing their earlier one.
+    async fn write_ballot(
+        &self,
+        scope: u32,
+        vote: &PollVote,
+        voter_key: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        let options = PollVote {
+            options: vote.options.clone(),
+            ..PollVote::default()
+        };
+        sqlx::query(
+            "INSERT INTO social_poll_ballot (server_id, poll_id, voter, options, expires_at_ms) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (server_id, poll_id, voter) DO UPDATE SET options = excluded.options",
+        )
+        .bind(i64::from(scope))
+        .bind(&vote.poll_id)
+        .bind(voter_key)
+        .bind(options.encode_to_vec())
+        .bind(expires_at_ms as i64)
+        .execute(self.store.pool())
+        .await
+        .map(|_| ())
+    }
+
+    /// A poll and its ballots from storage, unless it is gone or expired.
+    async fn load(
+        &self,
+        scope: u32,
+        poll_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<PollRecord>, sqlx::Error> {
+        use sqlx::Row as _;
+
+        let Some(row) = sqlx::query(
+            "SELECT poll, expires_at_ms FROM social_poll \
+             WHERE server_id = ? AND poll_id = ? AND expires_at_ms > ?",
+        )
+        .bind(i64::from(scope))
+        .bind(poll_id)
+        .bind(now_ms as i64)
+        .fetch_optional(self.store.pool())
+        .await?
+        else {
+            return Ok(None);
+        };
+        let bytes: Vec<u8> = row.try_get("poll")?;
+        let Ok(poll) = Poll::decode(bytes.as_slice()) else {
+            tracing::warn!(scope, poll = poll_id, "a stored poll does not decode");
+            return Ok(None);
+        };
+        let expires_at_ms = row.try_get::<i64, _>("expires_at_ms")? as u64;
+
+        let rows = sqlx::query(
+            "SELECT voter, options FROM social_poll_ballot WHERE server_id = ? AND poll_id = ?",
+        )
+        .bind(i64::from(scope))
+        .bind(poll_id)
+        .fetch_all(self.store.pool())
+        .await?;
+        let mut ballots = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let voter: String = row.try_get("voter")?;
+            let options: Vec<u8> = row.try_get("options")?;
+            if let Ok(ballot) = PollVote::decode(options.as_slice()) {
+                let _ = ballots.insert(voter, ballot.options);
+            }
+        }
+        Ok(Some(PollRecord {
+            poll,
+            ballots,
+            expires_at_ms,
+        }))
+    }
+
+    /// Delete every poll and ballot in `scope` past its retention, and drop
+    /// them from the cache. Returns how many polls went.
+    async fn sweep(&self, scope: u32, now_ms: u64) -> u64 {
+        let result: Result<u64, sqlx::Error> = async {
+            let mut tx = self.store.pool().begin().await?;
+            let _ = sqlx::query(
+                "DELETE FROM social_poll_ballot WHERE server_id = ? AND expires_at_ms <= ?",
+            )
+            .bind(i64::from(scope))
+            .bind(now_ms as i64)
+            .execute(&mut *tx)
+            .await?;
+            let polls =
+                sqlx::query("DELETE FROM social_poll WHERE server_id = ? AND expires_at_ms <= ?")
+                    .bind(i64::from(scope))
+                    .bind(now_ms as i64)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            tx.commit().await?;
+            Ok(polls)
+        }
+        .await;
+        if let Ok(mut cache) = self.polls.lock() {
+            cache.retain(|record| record.expires_at_ms > now_ms);
+        }
+        match result {
+            Ok(swept) => swept,
+            Err(error) => {
+                // Reported rather than swallowed: a retention sweep that has
+                // stopped working looks exactly like one with nothing to do.
+                tracing::error!(%error, scope, "the poll retention sweep failed");
+                0
+            }
+        }
+    }
+
+    /// One sweep per interval, across every server instance, until aborted.
+    async fn sweep_forever(self: Arc<Self>, scopes: Vec<u32>) {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            for scope in &scopes {
+                let swept = self.sweep(*scope, starling_runtime::ids::now_ms()).await;
+                if swept > 0 {
+                    tracing::debug!(scope, polls = swept, "expired polls deleted");
+                }
+            }
+        }
+    }
+
+    /// Record a poll and relay it to its channel, creator included, so
+    /// everyone holds the server-stamped poll rather than two versions of it.
+    async fn on_poll(&self, inbound: &Inbound, poll: Poll) -> Actions {
+        let channel = poll.channel;
+        let now_ms = starling_runtime::ids::now_ms();
+        let Some(stamped) = self
+            .create(inbound.scope, poll, inbound.session, now_ms)
+            .await
+        else {
+            return Actions::new();
+        };
+        let sessions = self.channel_including(channel);
+        Self::relay(sessions, social_envelope::Body::Poll(stamped))
+    }
+
+    /// Count a vote and relay it, or tell the voter why it was not counted.
+    async fn on_vote(&self, inbound: &Inbound, vote: &PollVote) -> Actions {
+        let now_ms = starling_runtime::ids::now_ms();
+        match self
+            .vote(inbound.scope, vote, inbound.session, now_ms)
+            .await
+        {
+            Ballot::Counted(stamped) => {
+                let sessions = self.channel_including(stamped.channel);
+                Self::relay(sessions, social_envelope::Body::Vote(stamped))
+            }
+            Ballot::Unknown => {
+                tracing::info!(
+                    session = inbound.session,
+                    scope = inbound.scope,
+                    poll = %vote.poll_id,
+                    "vote refused: no such poll, or it is past its retention"
+                );
+                refuse_vote(inbound, "That poll no longer exists on this server.")
+            }
+            Ballot::Closed => {
+                tracing::debug!(
+                    session = inbound.session,
+                    poll = %vote.poll_id,
+                    "vote refused: the poll has closed"
+                );
+                refuse_vote(inbound, "That poll has closed.")
+            }
+            Ballot::Empty => {
+                tracing::debug!(
+                    session = inbound.session,
+                    poll = %vote.poll_id,
+                    "vote dropped: it names no option the poll has"
+                );
+                Actions::new()
+            }
+            Ballot::Failed => Actions::new(),
+        }
     }
 
     /// The tally, for a caller that wants the server's own count.
@@ -311,7 +728,8 @@ impl SocialService {
     /// Not on the wire: no shipped client reads [`PollState`], and a message
     /// nobody decodes is bytes on every vote for nothing. It is the answer a
     /// query would return the day the canon grows one, and it is what the
-    /// tests assert on.
+    /// tests assert on. Reads the cache only, so a poll not voted on since a
+    /// restart or an eviction answers `None`.
     #[must_use]
     pub fn state(&self, scope: u32, poll_id: &str, now_ms: u64) -> Option<PollState> {
         let polls = self.polls.lock().ok()?;
@@ -573,28 +991,8 @@ impl ClientService for SocialService {
                 );
                 Self::relay(sessions, social_envelope::Body::Receipt(receipt))
             }
-            // Including the creator, so everyone in the channel holds the
-            // server-stamped poll rather than two versions of it.
-            Some(social_envelope::Body::Poll(poll)) => {
-                let channel = poll.channel;
-                let Some(stamped) = self.create(inbound.scope, poll, inbound.session) else {
-                    return Actions::new();
-                };
-                let sessions = self.channel_including(channel);
-                Self::relay(sessions, social_envelope::Body::Poll(stamped))
-            }
-            Some(social_envelope::Body::Vote(vote)) => {
-                let Some(stamped) = self.vote(
-                    inbound.scope,
-                    &vote,
-                    inbound.session,
-                    starling_runtime::ids::now_ms(),
-                ) else {
-                    return Actions::new();
-                };
-                let sessions = self.channel_including(stamped.channel);
-                Self::relay(sessions, social_envelope::Body::Vote(stamped))
-            }
+            Some(social_envelope::Body::Poll(poll)) => self.on_poll(&inbound, poll).await,
+            Some(social_envelope::Body::Vote(vote)) => self.on_vote(&inbound, &vote).await,
             Some(social_envelope::Body::Watch(sync)) => {
                 let Some(state) = self.watch(&sync, inbound.session, inbound.conn) else {
                     return Actions::new();
@@ -628,8 +1026,12 @@ impl Serve for SocialService {
 
     async fn build(ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
         ctx.health.gate(VIEW_GATE);
+        let store = ctx.storage().await?;
+        store.migrate(SCHEMA).await?;
         Ok(Arc::new(Self {
+            store,
             polls: Mutex::new(Polls::default()),
+            poll_writes: tokio::sync::Mutex::new(()),
             watches: Mutex::new(HashMap::new()),
             roster: Arc::new(Roster::new()),
             // No declared ceiling: nothing caps the number of watch sessions a
@@ -644,7 +1046,9 @@ impl Serve for SocialService {
 
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
         let follower = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, VIEW_GATE);
+        let sweeper = tokio::spawn(Arc::clone(&self).sweep_forever(ctx.instances()));
         ctx.shutdown.wait().await;
+        sweeper.abort();
         follower.abort();
         Ok(())
     }
@@ -667,11 +1071,34 @@ mod tests {
     /// The channel Alice and Bob are both in.
     const CHANNEL: u32 = 4;
 
+    /// An empty in-memory database with the schema applied. Named uniquely per
+    /// call: `cache=shared` makes same-named in-memory databases visible to
+    /// every connection that names them.
+    async fn memory_store() -> Store {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let store = Store::open(
+            &format!("sqlite:file:social-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        store.migrate(SCHEMA).await.expect("schema");
+        store
+    }
+
     /// A service whose roster holds `sessions`, all in [`CHANNEL`].
     ///
     /// The roster is warm, because a cold one addresses nobody and every
     /// assertion below would pass vacuously.
-    fn service(sessions: &[u32]) -> Arc<SocialService> {
+    async fn service(sessions: &[u32]) -> Arc<SocialService> {
+        on_store(memory_store().await, sessions)
+    }
+
+    /// As [`service`], on `store`: a second call on the same store is the
+    /// service after a restart, with nothing in memory.
+    fn on_store(store: Store, sessions: &[u32]) -> Arc<SocialService> {
         let roster = Roster::new();
         roster.replace(
             sessions
@@ -684,7 +1111,9 @@ mod tests {
                 .collect(),
         );
         Arc::new(SocialService {
+            store,
             polls: Mutex::new(Polls::default()),
+            poll_writes: tokio::sync::Mutex::new(()),
             watches: Mutex::new(HashMap::new()),
             watches_gauge: starling_runtime::pressure::Pressure::new().gauge("watches", 0),
             roster: Arc::new(roster),
@@ -751,7 +1180,7 @@ mod tests {
     async fn a_typing_indicator_carries_the_actor_the_server_resolved() {
         // The client cannot fill this in and leaves it 0; a shipped client
         // drops an indicator whose actor is 0, so the feature did nothing.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let envelope = SocialEnvelope {
             body: Some(social_envelope::Body::Typing(Typing {
                 channel: CHANNEL,
@@ -776,7 +1205,7 @@ mod tests {
         // reader collapses into one, exactly as reactions did. The timestamp
         // orders watermark updates at the receiver, so it has to come from
         // the one clock every receiver shares.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         service.roster.upsert(&Session {
             session: 7,
             channel: CHANNEL,
@@ -819,7 +1248,7 @@ mod tests {
     async fn a_relay_never_reaches_a_channel_the_sender_is_not_in() {
         // The bug this whole file changed shape for: an unaddressed Send goes
         // to every authenticated client on the server.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let envelope = SocialEnvelope {
             body: Some(social_envelope::Body::Typing(Typing {
                 channel: CHANNEL + 1,
@@ -837,7 +1266,7 @@ mod tests {
     async fn a_poll_is_relayed_to_its_channel_including_its_creator() {
         // murmur relays to the sender too, so everyone holds one
         // server-stamped poll rather than two versions of it.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let actions = service.frame(frame(7, &poll("p1", false))).await;
         let (sessions, relayed) = sent(&actions);
 
@@ -852,7 +1281,7 @@ mod tests {
     async fn a_vote_is_relayed_with_the_channel_the_poll_was_created_in() {
         // The vote message carries no channel of its own, and the client drops
         // one it cannot route, so the server fills it in from the poll.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let _ = service.frame(frame(7, &poll("p1", false))).await;
 
         let ballot = SocialEnvelope {
@@ -878,21 +1307,12 @@ mod tests {
     #[tokio::test]
     async fn a_single_choice_poll_counts_one_vote_even_when_several_are_sent() {
         // Otherwise "single choice" is a label rather than a rule.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let _ = service.frame(frame(7, &poll("p1", false))).await;
-        let vote = service
-            .vote(
-                SCOPE,
-                &PollVote {
-                    poll_id: "p1".to_owned(),
-                    options: vec![0, 1],
-                    voter: 0,
-                    channel: 0,
-                },
-                8,
-                0,
-            )
-            .expect("a vote applies");
+        let Ballot::Counted(vote) = service.vote(SCOPE, &ballot("p1", vec![0, 1]), 8, 0).await
+        else {
+            panic!("a vote applies");
+        };
         assert_eq!(vote.options, vec![0]);
         let state = service.state(SCOPE, "p1", 0).expect("the poll is held");
         assert_eq!(state.tallies, vec![1, 0]);
@@ -902,22 +1322,13 @@ mod tests {
     async fn a_second_ballot_replaces_the_first_rather_than_adding_to_it() {
         // A running total cannot be un-counted, which is why ballots are kept
         // per voter.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let _ = service.frame(frame(7, &poll("p1", false))).await;
         for option in [0_u32, 1] {
-            let _ = service
-                .vote(
-                    SCOPE,
-                    &PollVote {
-                        poll_id: "p1".to_owned(),
-                        options: vec![option],
-                        voter: 0,
-                        channel: 0,
-                    },
-                    8,
-                    0,
-                )
-                .expect("a vote applies");
+            assert!(matches!(
+                service.vote(SCOPE, &ballot("p1", vec![option]), 8, 0).await,
+                Ballot::Counted(_)
+            ));
         }
         let state = service.state(SCOPE, "p1", 0).expect("the poll is held");
         assert_eq!(state.tallies, vec![0, 1], "one voter, one ballot");
@@ -925,26 +1336,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_vote_in_a_closed_poll_is_refused() {
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let mut envelope = poll("p1", false);
         if let Some(social_envelope::Body::Poll(ref mut poll)) = envelope.body {
             poll.closes_at_ms = 1_000;
         }
         let _ = service.frame(frame(7, &envelope)).await;
-        assert!(
-            service
-                .vote(
-                    SCOPE,
-                    &PollVote {
-                        poll_id: "p1".to_owned(),
-                        options: vec![0],
-                        voter: 0,
-                        channel: 0,
-                    },
-                    8,
-                    2_000
-                )
-                .is_none(),
+        assert_eq!(
+            service.vote(SCOPE, &ballot("p1", vec![0]), 8, 2_000).await,
+            Ballot::Closed,
             "a closed poll takes no more votes"
         );
     }
@@ -952,22 +1352,11 @@ mod tests {
     #[tokio::test]
     async fn a_vote_for_an_option_that_does_not_exist_is_dropped() {
         // The tally is indexed by the option number a peer sends.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let _ = service.frame(frame(7, &poll("p1", true))).await;
-        assert!(
-            service
-                .vote(
-                    SCOPE,
-                    &PollVote {
-                        poll_id: "p1".to_owned(),
-                        options: vec![99],
-                        voter: 0,
-                        channel: 0,
-                    },
-                    8,
-                    0
-                )
-                .is_none()
+        assert_eq!(
+            service.vote(SCOPE, &ballot("p1", vec![99]), 8, 0).await,
+            Ballot::Empty
         );
     }
 
@@ -975,7 +1364,7 @@ mod tests {
     async fn a_reaction_without_the_enter_permission_reaches_nobody() {
         // The `permissions` service is unreachable in these tests, and an
         // unreachable check denies. murmur gates reactions the same way.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let envelope = SocialEnvelope {
             body: Some(social_envelope::Body::Reaction(Reaction {
                 channel: CHANNEL,
@@ -996,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_host_may_drive_a_watch_session() {
         // A viewer's position would drag everyone back to their buffer.
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let start = WatchSync {
             session_id: "w1".to_owned(),
             channel: CHANNEL,
@@ -1025,7 +1414,7 @@ mod tests {
     /// Defect 8: `social` never implemented `closed`.
     #[tokio::test]
     async fn a_disconnect_takes_every_watch_that_connection_minted() {
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
 
         // One client, a hundred ids it made up. The map is keyed by this
         // string, so this is the whole of the attack: no permission is needed
@@ -1060,7 +1449,7 @@ mod tests {
     /// Defect 8: a viewer leaving is not the same event as a host leaving.
     #[tokio::test]
     async fn a_viewer_disconnecting_leaves_the_session_up_without_them() {
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let start = WatchSync {
             session_id: "w1".to_owned(),
             channel: CHANNEL,
@@ -1104,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stroke_from_a_peer_is_bounded_before_it_is_relayed() {
-        let service = service(&[7, 8]);
+        let service = service(&[7, 8]).await;
         let envelope = SocialEnvelope {
             body: Some(social_envelope::Body::Stroke(DrawStroke {
                 channel: CHANNEL,
@@ -1135,6 +1524,7 @@ mod tests {
                 PollRecord {
                     poll: Poll::default(),
                     ballots: HashMap::new(),
+                    expires_at_ms: u64::MAX,
                 },
             );
         }
@@ -1143,5 +1533,150 @@ mod tests {
             !polls.by_id.contains_key(&(SCOPE, "0".to_owned())),
             "the oldest poll is the one that goes"
         );
+    }
+
+    fn ballot(id: &str, options: Vec<u32>) -> PollVote {
+        PollVote {
+            poll_id: id.to_owned(),
+            options,
+            voter: 0,
+            channel: 0,
+        }
+    }
+
+    fn vote_frame(id: &str, option: u32) -> SocialEnvelope {
+        SocialEnvelope {
+            body: Some(social_envelope::Body::Vote(ballot(id, vec![option]))),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poll_and_its_ballots_survive_a_restart() {
+        // The card is still in chat history after a restart, so a vote on it
+        // has to find the poll and every ballot cast before.
+        let store = memory_store().await;
+        let before = on_store(store.clone(), &[7, 8]);
+        let _ = before.frame(frame(7, &poll("p1", false))).await;
+        let _ = sent(&before.frame(frame(8, &vote_frame("p1", 1))).await);
+
+        let after = on_store(store, &[7, 8]);
+        let actions = after.frame(frame(7, &vote_frame("p1", 0))).await;
+        let (sessions, relayed) = sent(&actions);
+        assert_eq!(sessions, vec![7, 8]);
+        let Some(social_envelope::Body::Vote(vote)) = relayed.body else {
+            panic!("expected the vote itself");
+        };
+        assert_eq!(
+            vote.channel, CHANNEL,
+            "the channel comes from the stored poll"
+        );
+        assert_eq!(
+            after.state(SCOPE, "p1", 0).expect("loaded").tallies,
+            vec![1, 1],
+            "the ballot cast before the restart still counts"
+        );
+
+        // And the voter from before is still held to one ballot.
+        let _ = sent(&after.frame(frame(8, &vote_frame("p1", 0))).await);
+        assert_eq!(
+            after.state(SCOPE, "p1", 0).expect("held").tallies,
+            vec![2, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_poll_stays_closed_after_a_restart() {
+        let store = memory_store().await;
+        let now = starling_runtime::ids::now_ms();
+        let mut envelope = poll("p1", false);
+        if let Some(social_envelope::Body::Poll(ref mut poll)) = envelope.body {
+            poll.closes_at_ms = now + 1_000;
+        }
+        let _ = on_store(store.clone(), &[7, 8])
+            .frame(frame(7, &envelope))
+            .await;
+
+        let after = on_store(store, &[7, 8]);
+        assert_eq!(
+            after
+                .vote(SCOPE, &ballot("p1", vec![0]), 8, now + 2_000)
+                .await,
+            Ballot::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_evicted_from_the_cache_is_still_votable() {
+        // Eviction bounds memory; it used to forget the poll as well.
+        let service = service(&[7, 8]).await;
+        for id in 0..=MAX_POLLS {
+            let _ = service.frame(frame(7, &poll(&id.to_string(), false))).await;
+        }
+        assert!(
+            service.state(SCOPE, "0", 0).is_none(),
+            "evicted from memory"
+        );
+        let (_, relayed) = sent(&service.frame(frame(8, &vote_frame("0", 1))).await);
+        assert!(matches!(relayed.body, Some(social_envelope::Body::Vote(_))));
+    }
+
+    #[tokio::test]
+    async fn a_vote_on_a_poll_the_server_does_not_have_is_refused_to_the_voter() {
+        // It was dropped without a word, which looks like a relay that lost it.
+        let service = service(&[7, 8]).await;
+        let actions = service.frame(frame(8, &vote_frame("nope", 0))).await;
+        assert_eq!(actions.len(), 1, "one refusal, and no relay");
+        let Some(server_action::Action::Send(send)) = &actions[0].action else {
+            panic!("expected a Send");
+        };
+        assert_eq!(send.conns, vec![1], "to the voter's connection only");
+        assert!(send.sessions.is_empty());
+        let denied = starling_proto::proto::tcp::PermissionDenied::decode(send.payload.as_slice())
+            .expect("a PermissionDenied");
+        assert_eq!(
+            denied.r#type,
+            Some(starling_proto::proto::tcp::permission_denied::DenyType::Text as i32)
+        );
+        assert_eq!(
+            denied.channel_id, None,
+            "a channel would make the client drop its listen there"
+        );
+        assert!(denied.reason.is_some_and(|reason| !reason.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn the_sweep_forgets_a_poll_past_its_retention() {
+        let store = memory_store().await;
+        let service = on_store(store.clone(), &[7, 8]);
+        let Some(social_envelope::Body::Poll(created)) = poll("p1", false).body else {
+            panic!("a poll");
+        };
+        let _ = service.create(SCOPE, created, 7, 0).await.expect("created");
+        let _ = service.vote(SCOPE, &ballot("p1", vec![0]), 8, 0).await;
+
+        assert_eq!(service.sweep(SCOPE, POLL_RETENTION_MS - 1).await, 0);
+        assert_eq!(service.sweep(SCOPE, POLL_RETENTION_MS).await, 1);
+        assert!(
+            service.state(SCOPE, "p1", 0).is_none(),
+            "gone from the cache"
+        );
+        assert_eq!(
+            on_store(store, &[7, 8])
+                .vote(SCOPE, &ballot("p1", vec![0]), 8, POLL_RETENTION_MS)
+                .await,
+            Ballot::Unknown,
+            "and from storage"
+        );
+    }
+
+    #[test]
+    fn a_far_off_deadline_cannot_keep_a_poll_forever() {
+        let poll = Poll {
+            closes_at_ms: u64::MAX,
+            ..Poll::default()
+        };
+        assert_eq!(poll_expiry(&poll, 0), 2 * POLL_RETENTION_MS);
+        let open = Poll::default();
+        assert_eq!(poll_expiry(&open, 5), 5 + POLL_RETENTION_MS);
     }
 }
