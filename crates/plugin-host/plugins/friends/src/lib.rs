@@ -13,6 +13,12 @@
 //! Guests / unregistered targets get no channel - the client then falls back to
 //! a classic (non-persisted) direct message. The host and server ascribe no
 //! meaning to "friends"; only this plugin does.
+//!
+//! A self-notepad may ask for another protocol. Find-or-create is by name, so
+//! the protocol is part of the name: `__dm:<id>+fancy` (`fancy_v1_full_archive`)
+//! and `__dm:<id>+server` (`server_managed`) sit beside the `signal_v1`
+//! `__dm:<id>`. Friend pairs always get `signal_v1`, so both peers resolve one
+//! room.
 #![allow(
     unreachable_pub,
     reason = "internal cdylib: modules are private; cross-module items use `pub` for ergonomics, not as a library API"
@@ -33,12 +39,19 @@ const PLUGIN_NAME: &str = "fancy-friends";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Client -> plugin: open (create-or-find) the DM room for a friend pair.
-/// Payload `{ "targetUserId": <i64> }`; omit (or send self) for a self-notepad.
+/// Payload `{ "targetUserId": <i64>, "protocol": <string> }`; omit the target
+/// (or send self) for a self-notepad. `protocol` (`"signal_v1"` by default,
+/// `"fancy_v1_full_archive"`, `"server_managed"`) is read for a self-notepad
+/// only; an unknown one gets no channel.
 const MSG_OPEN: &str = "friends.open";
 /// Plugin -> client: the channel hosting a friend chat.
 /// Payload `{ "peerUserId": <i64>, "channelId": <u32> }`.
 const MSG_ROOM: &str = "friends.room";
 
+/// `fancy_v1_full_archive` persistent-chat protocol selector (`fancy/pchat.proto`).
+const PCHAT_FANCY_V1_FULL_ARCHIVE: u32 = 2;
+/// `server_managed` persistent-chat protocol selector: the server holds the key.
+const PCHAT_SERVER_MANAGED: u32 = 3;
 /// `signal_v1` persistent-chat protocol selector (Signal sender-key group E2E).
 const PCHAT_SIGNAL_V1: u32 = 4;
 /// No expiry: friend chats persist until explicitly removed.
@@ -79,6 +92,27 @@ fn dm_channel_name(a: i64, b: i64) -> String {
     }
 }
 
+/// The room name and protocol for `(a, b)`, or `None` for a protocol this
+/// plugin does not provision.
+///
+/// `requested` is honoured only for a self-notepad: a friend pair must resolve
+/// to one room from either side, whatever each client asked for. The suffix
+/// comes after the ids because clients read the peer id off the name.
+fn dm_room(a: i64, b: i64, requested: Option<&str>) -> Option<(String, u32)> {
+    let base = dm_channel_name(a, b);
+    if a != b {
+        return Some((base, PCHAT_SIGNAL_V1));
+    }
+    match requested {
+        None | Some("signal_v1") => Some((base, PCHAT_SIGNAL_V1)),
+        Some("fancy_v1_full_archive") => {
+            Some((format!("{base}+fancy"), PCHAT_FANCY_V1_FULL_ARCHIVE))
+        }
+        Some("server_managed") => Some((format!("{base}+server"), PCHAT_SERVER_MANAGED)),
+        Some(_) => None,
+    }
+}
+
 /// Online sessions of any registered user in `uids` on `server_id`.
 fn sessions_for_uids(state: &State, server_id: ServerId, uids: &[i64]) -> Vec<SessionId> {
     state
@@ -114,17 +148,18 @@ fn send_to(
 }
 
 impl FriendsPlugin {
-    /// Find-or-create the detached `signal_v1` DM channel for `(a, b)` (or self
-    /// when `a == b`). Returns the channel id, or `None` if the host could not
-    /// create it (older server without the detached/create callbacks).
+    /// Find-or-create the detached DM channel `name` for `(a, b)` (or self when
+    /// `a == b`), running `protocol`. Returns the channel id, or `None` if the
+    /// host could not create it (older server without the detached/create
+    /// callbacks).
     fn ensure_dm_channel(
         &self,
         ctx: &PluginContext_TO<RArc<()>>,
         server_id: ServerId,
-        a: i64,
-        b: i64,
+        (a, b): (i64, i64),
+        name: &str,
+        protocol: u32,
     ) -> Option<u32> {
-        let name = dm_channel_name(a, b);
         let invitees: Vec<u32> = if a == b {
             vec![a as u32]
         } else {
@@ -133,11 +168,11 @@ impl FriendsPlugin {
         ctx.create_channel(
             server_id,
             ROOT_CHANNEL_ID,
-            RStr::from_str(&name),
+            RStr::from_str(name),
             false, // hidden (detached is already tree-invisible; invitee ACLs gate access)
             false, // registered_can_manage
             true,  // detached
-            PCHAT_SIGNAL_V1,
+            protocol,
             EXPIRY_NONE,
             0,
             RSlice::from_slice(&invitees),
@@ -154,6 +189,7 @@ impl FriendsPlugin {
             return;
         };
         let target = v.get("targetUserId").and_then(serde_json::Value::as_i64);
+        let protocol = v.get("protocol").and_then(serde_json::Value::as_str);
 
         let sender_uid = {
             lock(&self.state)
@@ -174,7 +210,18 @@ impl FriendsPlugin {
             None => sender_uid, // self-notepad
         };
 
-        let Some(cid) = self.ensure_dm_channel(ctx, server_id, sender_uid, peer_uid) else {
+        // An unknown protocol is refused rather than defaulted: a client that
+        // asked for a mode must not be handed a room that runs another.
+        let Some((name, pchat_protocol)) = dm_room(sender_uid, peer_uid, protocol) else {
+            return;
+        };
+        let Some(cid) = self.ensure_dm_channel(
+            ctx,
+            server_id,
+            (sender_uid, peer_uid),
+            &name,
+            pchat_protocol,
+        ) else {
             return;
         };
         // Belt-and-braces: the invitee ACLs already admit both at creation, but
@@ -234,7 +281,8 @@ impl MumblePlugin for FriendsPlugin {
     fn info_json(&self) -> RString {
         PluginInfo {
             description: "Backs friend direct messages (and a self-notepad) with detached, \
-                          end-to-end-encrypted, persisted signal channels between registered users."
+                          persisted channels between registered users: signal end-to-end \
+                          encryption, or a protocol the notepad chooses."
                 .to_owned(),
             author: Some("Fancy Mumble Developers".to_owned()),
             homepage: None,
@@ -293,12 +341,53 @@ mumble_plugin_api::fancy_export_plugin!(FriendsPlugin::new);
 
 #[cfg(test)]
 mod tests {
-    use super::dm_channel_name;
+    use super::{
+        PCHAT_FANCY_V1_FULL_ARCHIVE, PCHAT_SERVER_MANAGED, PCHAT_SIGNAL_V1, dm_channel_name,
+        dm_room,
+    };
 
     #[test]
     fn dm_name_is_order_independent_for_a_pair() {
         assert_eq!(dm_channel_name(7, 3), "__dm:3-7");
         assert_eq!(dm_channel_name(3, 7), "__dm:3-7");
+    }
+
+    #[test]
+    fn a_notepad_with_no_protocol_keeps_its_signal_room() {
+        // Existing notepads were created under this name; renaming it would
+        // strand them.
+        let signal = Some(("__dm:5".to_owned(), PCHAT_SIGNAL_V1));
+        assert_eq!(dm_room(5, 5, None), signal);
+        assert_eq!(dm_room(5, 5, Some("signal_v1")), signal);
+    }
+
+    #[test]
+    fn a_notepad_protocol_picks_its_own_room_after_the_id() {
+        assert_eq!(
+            dm_room(5, 5, Some("fancy_v1_full_archive")),
+            Some(("__dm:5+fancy".to_owned(), PCHAT_FANCY_V1_FULL_ARCHIVE))
+        );
+        assert_eq!(
+            dm_room(5, 5, Some("server_managed")),
+            Some(("__dm:5+server".to_owned(), PCHAT_SERVER_MANAGED))
+        );
+    }
+
+    #[test]
+    fn an_unknown_notepad_protocol_gets_no_room() {
+        assert_eq!(dm_room(5, 5, Some("plaintext")), None);
+    }
+
+    #[test]
+    fn a_friend_pair_ignores_the_requested_protocol() {
+        // Both peers must land in one room whatever either client asked for.
+        for requested in [None, Some("server_managed"), Some("plaintext")] {
+            assert_eq!(
+                dm_room(7, 3, requested),
+                Some(("__dm:3-7".to_owned(), PCHAT_SIGNAL_V1)),
+                "{requested:?}"
+            );
+        }
     }
 
     #[test]
