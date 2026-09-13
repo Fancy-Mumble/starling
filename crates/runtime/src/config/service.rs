@@ -156,6 +156,10 @@ pub struct StorageConfig {
     /// Pool size. In-memory SQLite is capped to one automatically (five
     /// connections to `:memory:` are five different databases).
     pub max_connections: u32,
+    /// Whether a commit is flushed before it is acknowledged. `full` by
+    /// default; `relaxed` risks the last commits through a power cut and
+    /// nothing through a process crash.
+    pub durability: crate::storage::Durability,
 }
 
 impl Default for StorageConfig {
@@ -163,6 +167,7 @@ impl Default for StorageConfig {
         Self {
             url: String::new(),
             max_connections: crate::storage::DEFAULT_MAX_CONNECTIONS,
+            durability: crate::storage::Durability::Full,
         }
     }
 }

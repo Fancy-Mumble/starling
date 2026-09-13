@@ -87,6 +87,15 @@ pub trait SqlDialect: std::fmt::Debug + Send + Sync {
     fn connect_pragmas(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// Statements that trade durability for speed, run after
+    /// [`Self::connect_pragmas`] when the store is opened relaxed.
+    ///
+    /// Empty for the server backends: a database with its own process and its
+    /// own fsync policy is not this configuration's to weaken.
+    fn relaxed_pragmas(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Which backend a store is talking to.
@@ -189,11 +198,30 @@ impl SqlDialect for Dialect {
     fn connect_pragmas(&self) -> &'static [&'static str] {
         self.behaviour().connect_pragmas()
     }
+
+    fn relaxed_pragmas(&self) -> &'static [&'static str] {
+        self.behaviour().relaxed_pragmas()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every method on the enum forwards, and a defaulted one is how that
+    /// stops being true: the trait's own `&[]` is a valid answer, so a
+    /// forward left out here is a setting that goes quietly missing.
+    #[test]
+    fn the_enum_forwards_pragmas_rather_than_answering_for_itself() {
+        assert_eq!(
+            Dialect::Sqlite(Sqlite).relaxed_pragmas(),
+            Sqlite.relaxed_pragmas()
+        );
+        assert_eq!(
+            Dialect::Sqlite(Sqlite).connect_pragmas(),
+            Sqlite.connect_pragmas()
+        );
+    }
 
     /// Every backend, for properties that must hold across all of them.
     fn all() -> Vec<Dialect> {

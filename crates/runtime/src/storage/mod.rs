@@ -20,7 +20,7 @@ pub mod dialect;
 mod kv;
 mod migrations;
 
-pub use backend::{Backend, DEFAULT_MAX_CONNECTIONS};
+pub use backend::{Backend, DEFAULT_MAX_CONNECTIONS, Durability};
 pub use dialect::{Dialect, SqlDialect};
 pub use kv::{KvOp, KvStore};
 pub use migrations::Migration;
@@ -62,8 +62,21 @@ impl Store {
     ///
     /// [`StoreError::Backend`] if the database cannot be opened.
     pub async fn open(url: &str, max_connections: u32) -> Result<Self, StoreError> {
+        Self::open_with(url, max_connections, Durability::Full).await
+    }
+
+    /// The same, at `durability`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the database cannot be opened.
+    pub async fn open_with(
+        url: &str,
+        max_connections: u32,
+        durability: Durability,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
-            backend: Backend::connect(url, max_connections).await?,
+            backend: Backend::connect_with(url, max_connections, durability).await?,
         })
     }
 

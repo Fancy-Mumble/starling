@@ -69,6 +69,14 @@ impl SqlDialect for Sqlite {
             "PRAGMA busy_timeout = 5000",
         ]
     }
+
+    fn relaxed_pragmas(&self) -> &'static [&'static str] {
+        // `NORMAL` under WAL, which is the only mode this server opens. The
+        // WAL itself is still written and still replayed, so a crashed process
+        // loses nothing; what is given up is the flush that makes the last
+        // commits survive the machine losing power.
+        &["PRAGMA synchronous = NORMAL"]
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +101,17 @@ mod tests {
         assert_eq!(
             Sqlite.connect_pragmas().first().copied(),
             Some("PRAGMA foreign_keys = ON")
+        );
+    }
+
+    #[test]
+    fn relaxing_durability_is_the_flush_and_not_the_journal() {
+        // `NORMAL` and not `OFF`: the difference is whether a crashed *process*
+        // can corrupt the database, which no deployment and no test may risk.
+        assert_eq!(
+            Sqlite.relaxed_pragmas(),
+            ["PRAGMA synchronous = NORMAL"],
+            "relaxed durability must not touch the journal or the lock"
         );
     }
 

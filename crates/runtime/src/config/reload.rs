@@ -611,6 +611,7 @@ mod tests {
             .storage = Some(crate::config::StorageConfig {
             url: "postgres://starling:hunter2@db/starling_pchat".to_owned(),
             max_connections: 16,
+            ..Default::default()
         });
         assert!(
             !flatten(&config)

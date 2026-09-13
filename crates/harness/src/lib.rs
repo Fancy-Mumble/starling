@@ -58,6 +58,7 @@ use starling_runtime::inproc::Broker;
 use starling_runtime::log::{LogRuntime, LogSpec, Severity};
 use starling_runtime::serve::{ServiceError, context};
 use starling_runtime::shutdown::Shutdown;
+use starling_runtime::storage::Durability;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -197,6 +198,15 @@ impl Deployment {
         let mut config = Config::with_defaults(data_dir);
         config.runtime.all_in_one = true;
         config.runtime.data_dir = data_dir.to_path_buf();
+        // Twenty services, each with its own SQLite file under `data_dir`, and
+        // every commit a test waits on is a flush to the disk under the
+        // runner. That flush buys a deployment whose data directory is deleted
+        // when the test ends exactly nothing, and on a Windows runner it was
+        // most of the wall time of the suite. The database is still consistent
+        // through a crash, which is what a restart test asserts.
+        for service in config.services.values_mut() {
+            service.storage.get_or_insert_default().durability = Durability::Relaxed;
+        }
         config.gateway.listen_tcp = format!("127.0.0.1:{port}");
         // Voice binds a *real* UDP socket, and the shipped default is the fixed
         // 0.0.0.0:64738 every Mumble server wants. In a test that makes two

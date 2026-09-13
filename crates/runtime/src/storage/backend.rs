@@ -35,6 +35,7 @@
 use std::time::Duration;
 
 use crate::storage::StoreError;
+use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 
@@ -49,6 +50,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many connections to keep when nothing is configured.
 ///
+/// How much a write is worth waiting for.
+///
+/// SQLite's default flushes to disk on every commit, which is what makes a
+/// commit survive the machine losing power. Under WAL, relaxing it keeps the
+/// database consistent through a process crash and risks only the last commits
+/// through a power cut - the trade a single node makes deliberately, and the
+/// one a test makes because its data is deleted when it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Every commit is flushed before it is acknowledged. The default.
+    #[default]
+    Full,
+    /// Commits are acknowledged before the flush reaches the platter.
+    Relaxed,
+}
+
 /// The one default behind `services.*.storage.max_connections`, so a service
 /// with no `[storage]` block and one with an empty block get the same pool.
 /// Generous for a service whose concurrency is bounded by the handshake path
@@ -74,6 +92,19 @@ impl Backend {
     /// [`StoreError::Backend`] if the scheme is unsupported or the database
     /// cannot be reached within `CONNECT_TIMEOUT`.
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self, StoreError> {
+        Self::connect_with(url, max_connections, Durability::Full).await
+    }
+
+    /// The same, at `durability`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the database cannot be opened.
+    pub async fn connect_with(
+        url: &str,
+        max_connections: u32,
+        durability: Durability,
+    ) -> Result<Self, StoreError> {
         // `Any` resolves a scheme to a driver through a registry that starts
         // empty. Without this every connection fails with "no driver found",
         // including for schemes that are compiled in.
@@ -81,6 +112,12 @@ impl Backend {
 
         let dialect = Dialect::from_url(url)?;
         let pragmas = dialect.connect_pragmas();
+        /// Nothing to relax, as a named constant so both arms have one type.
+        const KEEP: &[&str] = &[];
+        let relaxed = match durability {
+            Durability::Full => KEEP,
+            Durability::Relaxed => dialect.relaxed_pragmas(),
+        };
 
         let pool = AnyPoolOptions::new()
             .max_connections(pool_size(url, max_connections))
@@ -91,7 +128,7 @@ impl Backend {
             // connection the pool handed out would decide the behaviour.
             .after_connect(move |connection, _meta| {
                 Box::pin(async move {
-                    for pragma in pragmas {
+                    for pragma in pragmas.iter().chain(relaxed) {
                         let _ = sqlx::query(*pragma).execute(&mut *connection).await?;
                     }
                     Ok(())
@@ -291,6 +328,40 @@ mod tests {
         }
 
         drop(backend);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File-backed, like the WAL test above and for the same reason: this is a
+    /// setting about writing to a disk, and an in-memory database has none.
+    #[tokio::test]
+    async fn durability_is_relaxed_only_when_it_is_asked_for() {
+        let dir = std::env::temp_dir().join(format!("starling-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // 2 is FULL, SQLite's default; 1 is NORMAL.
+        for (durability, expected) in [(Durability::Full, 2), (Durability::Relaxed, 1)] {
+            let path = dir.join(format!("{durability:?}.db"));
+            let backend = Backend::connect_with(
+                &format!("sqlite:{}?mode=rwc", path.display()),
+                DEFAULT_MAX_CONNECTIONS,
+                durability,
+            )
+            .await
+            .expect("connect");
+
+            // Every pooled connection, like the pragmas above: a flush policy
+            // armed on one of eight is a durability that depends on which
+            // connection the pool happened to hand out.
+            for _ in 0..DEFAULT_MAX_CONNECTIONS + 2 {
+                let (level,): (i64,) = sqlx::query_as("PRAGMA synchronous")
+                    .fetch_one(backend.pool())
+                    .await
+                    .expect("read synchronous");
+                assert_eq!(level, expected, "a pooled connection under {durability:?}");
+            }
+            drop(backend);
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -134,15 +134,20 @@ impl ServiceContext {
     ///
     /// [`StoreError`] when the database cannot be opened or migrated.
     pub async fn storage(&self) -> Result<Store, StoreError> {
-        let service = self.service();
-        let (url, max_connections) = match service.storage {
-            Some(storage) if !storage.url.is_empty() => (storage.url, storage.max_connections),
-            _ => (
+        let storage = self.service().storage.unwrap_or_default();
+        // Read before the URL decides anything: durability is a property of
+        // how this service writes, not of where it was pointed, so a block
+        // that sets only this one still gets it.
+        let durability = storage.durability;
+        let (url, max_connections) = if storage.url.is_empty() {
+            (
                 self.default_storage_url(),
                 crate::storage::DEFAULT_MAX_CONNECTIONS,
-            ),
+            )
+        } else {
+            (storage.url, storage.max_connections)
         };
-        Store::open(&url, max_connections).await
+        Store::open_with(&url, max_connections, durability).await
     }
 
     fn default_storage_url(&self) -> String {
@@ -665,6 +670,48 @@ fn load_config() -> Result<(Config, Option<std::path::PathBuf>), ConfigError> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The durability a `[services.<name>.storage]` block asks for reaches the
+    /// pool whether or not a URL is written beside it.
+    ///
+    /// That block is usually written to move a service onto another engine, so
+    /// the settings in it used to be read only when it carried a URL: a block
+    /// naming nothing else fell through to the defaults and was ignored.
+    #[tokio::test]
+    async fn a_storage_block_is_read_even_when_it_names_no_url() {
+        let dir = std::env::temp_dir().join(format!("starling-durability-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = Config::with_defaults(&dir);
+        config.runtime.data_dir = dir.clone();
+        config
+            .services
+            .get_mut("pchat")
+            .expect("pchat ships in the defaults")
+            .storage
+            .get_or_insert_default()
+            .durability = crate::storage::Durability::Relaxed;
+        let config = Arc::new(config);
+
+        // 1 is NORMAL; 2 is FULL, which is what a service nobody configured
+        // must still get.
+        for (service, expected) in [("pchat", 1), ("userdata", 2)] {
+            let ctx = context(
+                service,
+                Arc::clone(&config),
+                Broker::new(),
+                Shutdown::new(),
+                Logger::null(),
+            );
+            let store = ctx.storage().await.expect("a database");
+            let (level,): (i64,) = sqlx::query_as("PRAGMA synchronous")
+                .fetch_one(store.pool())
+                .await
+                .expect("read synchronous");
+            assert_eq!(level, expected, "{service} opened at the wrong durability");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A service whose background task fails a fixed number of times.
     struct Flaky {

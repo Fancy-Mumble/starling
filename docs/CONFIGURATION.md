@@ -521,6 +521,13 @@ url = "sqlite:///var/lib/starling/userdata.db"
 In-memory SQLite is capped to one connection regardless: five connections to
 `:memory:` are five different databases.
 
+`durability` defaults to `full`, where every commit is flushed before it is
+acknowledged. `relaxed` gives up that flush, so a power cut can lose the last
+commits; a process crash still cannot corrupt the database, because the
+write-ahead log is written and replayed either way. SQLite only, and the trade
+a single node makes deliberately. The test harness sets it for deployments
+whose data directory is deleted when the test ends.
+
 ## The persistent-chat at-rest key
 
 A channel set to `SERVER_MANAGED` is the one persistent-chat mode that is **not**

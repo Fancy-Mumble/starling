@@ -356,6 +356,10 @@ max_upload = "512MiB"
 # Pool size. In-memory SQLite is capped to one automatically, because five
 # connections to `:memory:` are five different databases.
 # max_connections = 8
+# Whether a commit is flushed before it is acknowledged. `full` is the default
+# and survives a power cut. `relaxed` gives up that flush: a power cut loses the
+# last commits, a process crash still loses nothing. SQLite only.
+# durability = "full"
 
 # [services.<name>.options] -- string settings a service adds without a runtime
 # release. The ones in use today:
