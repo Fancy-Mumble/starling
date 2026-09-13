@@ -525,19 +525,28 @@ async fn supervise<S: Serve>(service: Arc<S>, ctx: ServiceContext) -> Result<(),
 ///
 /// Every attempt is logged, so a genuinely wrong configuration still says so
 /// five times before the service gives up rather than disappearing quietly.
+/// Only the attempt that gives up is an error: one that is retried and then
+/// succeeds - a SQLite pool that timed out on a loaded Windows runner - is a
+/// warning, not a failure.
 async fn build_with_retry<S: Serve>(ctx: &ServiceContext) -> Result<Arc<S>, ServiceError> {
     let mut backoff = RESTART_BACKOFF;
     for attempt in 0..=MAX_RESTARTS {
         match S::build(ctx.clone()).await {
             Ok(service) => return Ok(service),
             Err(error) => {
-                ctx.logger.log(
+                let gave_up = attempt == MAX_RESTARTS;
+                let event = if gave_up {
                     LogEvent::error(Category::Server, "service failed to start")
+                } else {
+                    LogEvent::warning(Category::Server, "service failed to start")
+                };
+                ctx.logger.log(
+                    event
                         .with("service", ctx.name.clone())
                         .with("error", error.to_string())
                         .with("attempt", u64::from(attempt)),
                 );
-                if attempt == MAX_RESTARTS {
+                if gave_up {
                     return Err(error);
                 }
             }
@@ -746,6 +755,62 @@ mod tests {
             ctx.shutdown.wait().await;
             Ok(())
         }
+    }
+
+    /// A service whose first `build` fails and whose second succeeds.
+    struct BuildsSecondTime;
+
+    static BUILD_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    impl Serve for BuildsSecondTime {
+        const NAME: &'static str = "builds-second-time";
+
+        async fn build(_ctx: ServiceContext) -> Result<Arc<Self>, ServiceError> {
+            if BUILD_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                return Err(ServiceError::service(
+                    "pool timed out while waiting for an open connection",
+                ));
+            }
+            Ok(Arc::new(Self))
+        }
+
+        fn routes(self: Arc<Self>) -> Routes {
+            Routes::default()
+        }
+
+        async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+            ctx.shutdown.wait().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_recovers_on_retry_warns_rather_than_errors() {
+        // The harness fails a test on any logged error, so one SQLite pool that
+        // timed out on a loaded Windows runner and then opened failed the run.
+        let (logger, _shutdown) = Logger::disabled();
+        let ctx = context(
+            "builds-second-time",
+            Arc::new(Config::with_defaults(Path::new("/run/starling"))),
+            Broker::new(),
+            Shutdown::new(),
+            logger.clone(),
+        );
+
+        let built = build_with_retry::<BuildsSecondTime>(&ctx).await;
+
+        assert!(built.is_ok(), "the second attempt must be the service");
+        let counts = logger.counts();
+        assert_eq!(
+            counts[Severity::Warning as usize],
+            1,
+            "the retried attempt is still reported"
+        );
+        assert_eq!(
+            counts[Severity::Error as usize],
+            0,
+            "a start that recovered is not an error"
+        );
     }
 
     #[tokio::test(start_paused = true)]
