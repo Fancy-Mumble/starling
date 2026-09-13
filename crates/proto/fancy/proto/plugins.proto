@@ -31,10 +31,29 @@ message Plugin {
   bool enabled = 4;
   bool wasm = 5;
   repeated string capabilities = 6;
+  // Where its binary is on the server's disk.
+  string path = 7;
+  // What the plugin says about itself, as JSON; see `PluginDescriptor.info_json`.
+  string info_json = 8;
+  // Where an installed binary came from (`marketplace:<id>@<version>`); empty
+  // for one an operator placed in `plugins_dir`.
+  string source = 9;
+  // Milliseconds since the epoch; 0 when it was not installed through the host.
+  uint64 installed_at_ms = 10;
+  // Ships with the server; uninstall refuses it.
+  bool builtin = 11;
+  // Why it could not be loaded; empty when it loaded.
+  string load_error = 12;
 }
 
 message PluginList {
   repeated Plugin plugins = 1;
+  // Where an install writes; empty when none is configured, which refuses every
+  // install.
+  string plugins_dir = 2;
+  // The plugin ABI this host loads, so a caller can rule out a build before
+  // asking for it.
+  uint32 host_abi_version = 3;
 }
 
 message EnableRequest {
@@ -52,6 +71,14 @@ message InstallRequest {
   // on the control plane.
   string source_key = 4;
   bytes sha256 = 5;
+  // A marketplace install instead of a files key: the server fetches this
+  // manifest and the artifact for its own platform, and checks both digests.
+  string manifest_url = 6;
+  string marketplace_id = 7;
+  // Empty accepts whatever version the manifest names.
+  string version = 8;
+  // Hex SHA-256 the manifest must hash to: the bytes the admin reviewed.
+  string manifest_sha256 = 9;
 }
 
 message UninstallRequest {

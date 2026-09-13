@@ -31,11 +31,12 @@
 
 mod bridge;
 mod events;
+mod marketplace;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use prost::Message as _;
-use starling_plugin_host::{Host, PluginMessageInArgs};
+use starling_plugin_host::{Host, InstallRequest as HostInstall, PluginMessageInArgs};
 use starling_proto_fancy::common::Ack;
 use starling_proto_fancy::fancy::feature::{
     AdminResult, PluginDescriptor, PluginsEnvelope, Registry, plugins_envelope,
@@ -124,11 +125,15 @@ pub struct PluginsService {
 }
 
 impl PluginsService {
-    /// Every plugin the host knows about, as the admin surface sees them.
-    async fn list(&self) -> Vec<Plugin> {
-        let listed = self.host.with(|host| host.list_plugins().0).await;
-        listed
-            .unwrap_or_default()
+    /// Every plugin the host knows about, as the admin surface sees them, and
+    /// the directory an install writes to.
+    async fn inventory(&self) -> (Vec<Plugin>, Option<String>) {
+        let (listed, plugins_dir) = self
+            .host
+            .with(|host| host.list_plugins())
+            .await
+            .unwrap_or_default();
+        let plugins = listed
             .into_iter()
             .map(|info| Plugin {
                 id: info.plugin_name.clone(),
@@ -137,8 +142,99 @@ impl PluginsService {
                 enabled: info.enabled,
                 wasm: info.kind == "wasm",
                 capabilities: Vec::new(),
+                path: info.path,
+                info_json: info.info_json,
+                source: info.source.unwrap_or_default(),
+                installed_at_ms: info.installed_at.unwrap_or_default(),
+                builtin: info.builtin,
+                load_error: info.load_error.unwrap_or_default(),
             })
-            .collect()
+            .collect();
+        (plugins, plugins_dir)
+    }
+
+    async fn list(&self) -> Vec<Plugin> {
+        self.inventory().await.0
+    }
+
+    /// Fetch a marketplace plugin, check it, and hand it to the host, which
+    /// loads it disabled.
+    async fn install_from_marketplace(&self, req: InstallRequest) -> Result<PluginResult, Status> {
+        let refused = |refused: String| PluginResult {
+            applied: false,
+            refused,
+            plugin: None,
+        };
+        let marketplace_id = if req.marketplace_id.is_empty() {
+            req.id.as_str()
+        } else {
+            req.marketplace_id.as_str()
+        };
+        if marketplace_id.is_empty() {
+            return Ok(refused(
+                "a marketplace install needs the plugin's marketplace id".to_owned(),
+            ));
+        }
+        let wanted = marketplace::Wanted {
+            marketplace_id,
+            version: Some(&req.version),
+            manifest_url: &req.manifest_url,
+            manifest_sha256: Some(&req.manifest_sha256),
+        };
+        let fetched = match marketplace::fetch(&wanted).await {
+            Ok(fetched) => fetched,
+            Err(reason) => {
+                tracing::warn!(%marketplace_id, manifest = %req.manifest_url, %reason, "marketplace install refused");
+                return Ok(refused(reason));
+            }
+        };
+
+        let source = format!("marketplace:{marketplace_id}@{}", fetched.version);
+        let installed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        let outcome = {
+            let source = source.clone();
+            self.host
+                .with(move |host| {
+                    host.install_plugin(&HostInstall {
+                        file_name: &fetched.file_name,
+                        bytes: &fetched.bytes,
+                        // The archive was checked against the manifest; the
+                        // binary inside it has no digest of its own to hold.
+                        sha256: None,
+                        source: &source,
+                        installed_at_ms,
+                    })
+                })
+                .await
+        };
+        let Some(outcome) = outcome else {
+            return Err(Status::internal("the plugin host is unavailable"));
+        };
+        let name = match outcome {
+            Ok(name) => name,
+            Err(reason) => return Ok(refused(reason)),
+        };
+
+        tracing::info!(plugin = %name, %source, "plugin installed");
+        self.logger.log(
+            LogEvent::notice(Category::Plugin, "plugin installed")
+                .with("plugin", name.clone())
+                .with("source", source),
+        );
+        let plugin = self
+            .list()
+            .await
+            .into_iter()
+            .find(|plugin| plugin.id == name);
+        Ok(PluginResult {
+            applied: true,
+            refused: String::new(),
+            plugin,
+        })
     }
 
     /// What a client is told is loaded.
@@ -241,8 +337,11 @@ impl Plugins for PluginsRpc {
         &self,
         _request: Request<starling_proto_fancy::common::Scope>,
     ) -> Result<Response<PluginList>, Status> {
+        let (plugins, plugins_dir) = self.0.inventory().await;
         Ok(Response::new(PluginList {
-            plugins: self.0.list().await,
+            plugins,
+            plugins_dir: plugins_dir.unwrap_or_default(),
+            host_abi_version: starling_plugin_host::api::PLUGIN_ABI_VERSION,
         }))
     }
 
@@ -304,13 +403,20 @@ impl Plugins for PluginsRpc {
         request: Request<InstallRequest>,
     ) -> Result<Response<PluginResult>, Status> {
         let req = request.into_inner();
-        // The binary is fetched from the files service by key, never carried
-        // inline: a plugin binary on the control plane would head-of-line block
-        // every control message behind it.
+        if !req.manifest_url.is_empty() {
+            return self
+                .0
+                .install_from_marketplace(req)
+                .await
+                .map(Response::new);
+        }
+        // Otherwise the binary is fetched from the files service by key, never
+        // carried inline: a plugin binary on the control plane would
+        // head-of-line block every control message behind it.
         if req.source_key.is_empty() {
             return Ok(Response::new(PluginResult {
                 applied: false,
-                refused: "an install needs a source key".to_owned(),
+                refused: "an install needs a marketplace manifest URL or a source key".to_owned(),
                 plugin: None,
             }));
         }

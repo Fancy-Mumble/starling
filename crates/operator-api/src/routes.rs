@@ -65,6 +65,13 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         // watch a user misbehave and do nothing about them.
         .route("/v1/bans", get(list_bans).post(create_ban))
         .route("/v1/bans/{id}", delete(remove_ban))
+        // What the C++ server carried as plugin-admin messages on the control
+        // channel. A connected admin reaches these through a session ticket.
+        .route("/v1/plugins", get(list_plugins).post(install_plugin))
+        .route(
+            "/v1/plugins/{id}",
+            patch(set_plugin_enabled).delete(uninstall_plugin),
+        )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/livery", get(get_livery).post(set_livery))
         .route("/v1/greeting", get(get_greeting).post(set_greeting))
@@ -2731,6 +2738,169 @@ async fn preview_livery(
 struct PreviewQuery {
     #[serde(default)]
     mode: String,
+}
+
+/// One plugin, as JSON. Empty strings and a zero time are the proto's "none".
+fn plugin_json(plugin: starling_proto_fancy::plugins::Plugin) -> serde_json::Value {
+    serde_json::json!({
+        "id": plugin.id,
+        "name": plugin.name,
+        "version": plugin.version,
+        "enabled": plugin.enabled,
+        "wasm": plugin.wasm,
+        "path": plugin.path,
+        "info_json": plugin.info_json,
+        "source": (!plugin.source.is_empty()).then_some(plugin.source),
+        "installed_at_ms": (plugin.installed_at_ms != 0).then_some(plugin.installed_at_ms),
+        "builtin": plugin.builtin,
+        "load_error": (!plugin.load_error.is_empty()).then_some(plugin.load_error),
+    })
+}
+
+async fn list_plugins(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::plugins::plugins_client::PluginsClient;
+
+    let _ = admit(&api, &headers, "plugins:read", "GET /v1/plugins").await?;
+    let list = PluginsClient::new(dial(&api, "plugins")?)
+        .list(Scope { instance: 1 })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+    Ok(Json(serde_json::json!({
+        "plugins": list.plugins.into_iter().map(plugin_json).collect::<Vec<_>>(),
+        "plugins_dir": (!list.plugins_dir.is_empty()).then_some(list.plugins_dir),
+        "host_abi_version": list.host_abi_version,
+    })))
+}
+
+/// A marketplace install, as the marketplace describes the plugin.
+#[derive(Debug, Deserialize)]
+struct NewPlugin {
+    marketplace_id: String,
+    /// Empty accepts whatever version the manifest names.
+    #[serde(default)]
+    version: String,
+    manifest_url: String,
+    /// Hex SHA-256 of the manifest the caller reviewed.
+    #[serde(default)]
+    expected_sha256: String,
+}
+
+/// Install a plugin from its marketplace manifest. It arrives disabled.
+async fn install_plugin(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Json(new): Json<NewPlugin>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::plugins::InstallRequest;
+    use starling_proto_fancy::plugins::plugins_client::PluginsClient;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "plugins:write",
+        &format!("POST /v1/plugins {}", new.marketplace_id),
+    )
+    .await?;
+    if new.marketplace_id.trim().is_empty() {
+        return Err(refuse(StatusCode::BAD_REQUEST, "marketplace_id is empty"));
+    }
+    if !new.manifest_url.starts_with("https://") && !new.manifest_url.starts_with("http://") {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "manifest_url must be an http(s) URL",
+        ));
+    }
+    let result = PluginsClient::new(dial(&api, "plugins")?)
+        .install(InstallRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "plugins:write"),
+            id: new.marketplace_id.clone(),
+            manifest_url: new.manifest_url,
+            marketplace_id: new.marketplace_id,
+            version: new.version,
+            manifest_sha256: new.expected_sha256,
+            ..InstallRequest::default()
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+    if !result.applied {
+        return Err(refuse(StatusCode::CONFLICT, &result.refused));
+    }
+    Ok(Json(serde_json::json!({
+        "plugin": result.plugin.map(plugin_json),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginEnabled {
+    enabled: bool,
+}
+
+async fn set_plugin_enabled(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<PluginEnabled>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::plugins::EnableRequest;
+    use starling_proto_fancy::plugins::plugins_client::PluginsClient;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "plugins:write",
+        &format!("PATCH /v1/plugins/{id}"),
+    )
+    .await?;
+    let result = PluginsClient::new(dial(&api, "plugins")?)
+        .enable(EnableRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "plugins:write"),
+            id,
+            enabled: patch.enabled,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+    if !result.applied {
+        return Err(refuse(StatusCode::CONFLICT, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn uninstall_plugin(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::plugins::UninstallRequest;
+    use starling_proto_fancy::plugins::plugins_client::PluginsClient;
+
+    let subject = admit(
+        &api,
+        &headers,
+        "plugins:write",
+        &format!("DELETE /v1/plugins/{id}"),
+    )
+    .await?;
+    let result = PluginsClient::new(dial(&api, "plugins")?)
+        .uninstall(UninstallRequest {
+            scope: scope(),
+            actor: operator_actor(subject, "plugins:write"),
+            id,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner();
+    if !result.applied {
+        return Err(refuse(StatusCode::CONFLICT, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Who the caller is, which is the cheapest way to check a credential works.

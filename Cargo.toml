@@ -273,6 +273,10 @@ jsonwebtoken = { version = "9", default-features = false }
 # `rustls`, not the platform stack: the runtime image is distroless-ish and has
 # no system OpenSSL to link against.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# Marketplace plugin artifacts ship as tar.gz (Linux, macOS) and zip (Windows).
+flate2 = "1"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # Drives the WebSocket end of live-doc's own tests.
 tokio-tungstenite = "0.30"
 # Property tests. `proptest` rather than `quickcheck`: it shrinks failures to a

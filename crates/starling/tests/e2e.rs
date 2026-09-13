@@ -186,6 +186,77 @@ async fn a_client_without_write_is_told_the_livery_change_was_refused() {
     deployment.stop().await;
 }
 
+/// A ticket for server plugin administration, minted from the session.
+///
+/// The client's plugin marketplace reaches `/v1/plugins` with this ticket, so a
+/// session holding `Write` on the root has to be granted both scopes, and one
+/// without it neither.
+#[tokio::test]
+async fn only_an_admin_session_is_granted_a_plugins_ticket() {
+    use starling_proto_fancy::fancy::domain::{
+        OperatorTicketReply, OperatorTicketRequest, ServerConfigEnvelope, server_config_envelope,
+    };
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+    use starling_proto_fancy::types::ServiceKind;
+
+    async fn ticket(client: &mut Client) -> OperatorTicketReply {
+        let outer = ServiceKind::ServerConfig.outer_type();
+        client
+            .send(
+                outer,
+                &ServerConfigEnvelope {
+                    body: Some(server_config_envelope::Body::TicketRequest(
+                        OperatorTicketRequest {
+                            scopes: vec!["plugins:read".to_owned(), "plugins:write".to_owned()],
+                        },
+                    )),
+                },
+            )
+            .await;
+        loop {
+            let (type_id, payload) = client.recv().await;
+            if type_id != outer {
+                continue;
+            }
+            let envelope = ServerConfigEnvelope::decode(payload.as_slice()).expect("an envelope");
+            if let Some(server_config_envelope::Body::TicketReply(reply)) = envelope.body {
+                break reply;
+            }
+        }
+    }
+
+    let data_dir = TempDir::new("plugins-ticket");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // The default ACL gives `all` no Write at the root.
+    let mut mallory = Client::connect(deployment.port).await;
+    let _ = handshake_fancy(&mut mallory, "mallory").await;
+    let refused = ticket(&mut mallory).await;
+    assert!(refused.token.is_empty());
+    assert!(refused.granted_scopes.is_empty());
+    assert!(!refused.denied_reason.is_empty());
+
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    let mut alice = Client::connect(deployment.port).await;
+    let session = handshake_fancy(&mut alice, "alice").await;
+    deployment
+        .wait_until_permitted(session, 0, Perm::WRITE.bits())
+        .await;
+    let granted = ticket(&mut alice).await;
+    assert!(!granted.token.is_empty());
+    assert_eq!(granted.granted_scopes, ["plugins:read", "plugins:write"]);
+
+    deployment.stop().await;
+}
+
 /// An admin reading and changing the settings over the connection they have.
 ///
 /// The other half of 1013, and for a long time the half that did nothing: the

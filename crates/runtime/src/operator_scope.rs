@@ -65,6 +65,17 @@ const TABLE: &[Grant] = &[
         scope: "moderation:read",
         permission: Perm::BAN,
     },
+    // Starling has no plugin administration on the control channel. The C++
+    // server did, and gated every message of it on `Write` on the root channel
+    // (`msgFancyPluginAdmin*` in its `Messages.cpp`), so that is the check.
+    Grant {
+        scope: "plugins:read",
+        permission: Perm::WRITE,
+    },
+    Grant {
+        scope: "plugins:write",
+        permission: Perm::WRITE,
+    },
 ];
 
 /// Every scope in `requested` this session may be granted, checked against

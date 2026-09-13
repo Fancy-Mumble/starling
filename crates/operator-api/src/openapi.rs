@@ -74,6 +74,30 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
     ),
     ("/v1/bans/{id}", "delete", "Lift a ban", "moderation:write"),
     (
+        "/v1/plugins",
+        "get",
+        "Every plugin the host knows, loaded or not, with the install directory and host plugin ABI",
+        "plugins:read",
+    ),
+    (
+        "/v1/plugins",
+        "post",
+        "Install from a marketplace manifest; the server fetches and checks the build, and the plugin arrives disabled",
+        "plugins:write",
+    ),
+    (
+        "/v1/plugins/{id}",
+        "patch",
+        "Enable or disable a plugin",
+        "plugins:write",
+    ),
+    (
+        "/v1/plugins/{id}",
+        "delete",
+        "Unload a plugin and delete its binary",
+        "plugins:write",
+    ),
+    (
         "/v1/channels",
         "get",
         "The channel tree, unfiltered by any viewer's permissions",

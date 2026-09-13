@@ -25,6 +25,13 @@ prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+# A marketplace install: the manifest and artifact over HTTP, then unpacked.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

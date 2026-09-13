@@ -74,6 +74,8 @@ match, so `userdata:*` covers `userdata:read`.
 | `permissions:write` | replace an ACL, grant temporary group membership |
 | `moderation:read` | list bans |
 | `moderation:write` | ban, unban, kick |
+| `plugins:read` | list server plugins |
+| `plugins:write` | install, enable, disable, uninstall server plugins |
 | `session-view:read` | list sessions, subscribe to `/v1/events` |
 | `session:write` | move, mute, deafen, suppress, promote a live session |
 | `server-config:read` | read settings, read `/v1/health` |
@@ -354,6 +356,27 @@ operator their id was wrong.
 
 The list omits `address`, `prefix_len` and `cert_hash`; a ban's match criteria
 cannot currently be read back through this API.
+
+### Plugins
+
+| Route | Scope | Answer |
+|---|---|---|
+| `GET /v1/plugins` | `plugins:read` | `{plugins: [{id, name, version, enabled, wasm, path, info_json, source, installed_at_ms, builtin, load_error}], plugins_dir, host_abi_version}` |
+| `POST /v1/plugins` | `plugins:write` | `{plugin}` |
+| `PATCH /v1/plugins/{id}` | `plugins:write` | `204`; body `{enabled}` |
+| `DELETE /v1/plugins/{id}` | `plugins:write` | `204` |
+
+An install takes `{marketplace_id, manifest_url, version?, expected_sha256?}`.
+The server fetches the manifest, refuses it if it does not hash to
+`expected_sha256` or names another plugin, version or plugin ABI, then fetches
+the build for its own platform (a WASM build when there is no native one),
+checks it against the manifest's digest and loads it **disabled**; enabling it
+is a separate `PATCH`. It needs `plugins_dir` set. A refusal is `409` with the
+reason.
+
+Both scopes need `Write` on the root channel when minted as a session ticket,
+the check the C++ server made for plugin administration. Installing is loading
+code into the server.
 
 ### Messages
 
