@@ -17,6 +17,7 @@ use starling_runtime::names::{NameRule, is_user_name};
 use starling_runtime::settings::{Settings, USER_NAME_PATTERN};
 use starling_runtime::storage::{Migration, Store, StoreError};
 
+use crate::records::MAX_KEY_LEN;
 use crate::secret::{Secret, verify_totp};
 
 /// How many characters a generated SuperUser password has.
@@ -185,6 +186,7 @@ impl Accounts {
         else {
             return;
         };
+        let mut settings = self.load_settings().await;
         let (Ok(mut cache), Ok(mut next)) = (self.cache.lock(), self.next_id.lock()) else {
             return;
         };
@@ -208,7 +210,7 @@ impl Accounts {
                         .ok()
                         .flatten()
                         .is_some(),
-                    settings: HashMap::new(),
+                    settings: settings.remove(&(scope, id)).unwrap_or_default(),
                 },
                 password: row
                     .try_get::<Option<Vec<u8>>, _>("password")
@@ -223,6 +225,31 @@ impl Accounts {
             *next = (*next).max(id + 1);
             let _ = cache.insert((scope, id), record);
         }
+    }
+
+    /// Every stored setting, grouped by the account it belongs to.
+    async fn load_settings(&self) -> HashMap<(u32, u64), HashMap<String, String>> {
+        use sqlx::Row as _;
+        let mut settings: HashMap<(u32, u64), HashMap<String, String>> = HashMap::new();
+        let rows = match sqlx::query("SELECT server_id, account_id, k, v FROM account_setting")
+            .fetch_all(self.store.pool())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "could not load account settings");
+                return settings;
+            }
+        };
+        for row in rows {
+            let scope = row.try_get::<i64, _>("server_id").unwrap_or(1) as u32;
+            let id = row.try_get::<i64, _>("account_id").unwrap_or_default() as u64;
+            let (Ok(key), Ok(value)) = (row.try_get("k"), row.try_get("v")) else {
+                continue;
+            };
+            let _ = settings.entry((scope, id)).or_default().insert(key, value);
+        }
+        settings
     }
 
     /// Read the operator's name rule from `server-config` from now on.
@@ -678,6 +705,13 @@ impl Accounts {
         }
 
         let values = request.values.unwrap_or_default();
+        let settings = request.fields.iter().any(|field| field == "settings");
+        // Refused before anything changes: the column is `VARCHAR(190)`, and a
+        // key past it would fail the whole set's write on a strict backend,
+        // leaving every later change to this account's settings in memory only.
+        if settings && values.settings.keys().any(|key| !setting_key_fits(key)) {
+            return Err(format!("a setting name may be at most {MAX_KEY_LEN} bytes"));
+        }
         for field in &request.fields {
             match field.as_str() {
                 "name" => record.account.name = values.name.clone(),
@@ -692,6 +726,10 @@ impl Accounts {
         }
         record.account.last_active_ms = now_ms();
         self.write(scope, &record).await;
+        if settings {
+            self.write_settings(scope, request.id, &record.account.settings)
+                .await;
+        }
         if let Ok(mut cache) = self.cache.lock() {
             let _ = cache.insert((scope, request.id), record.clone());
         }
@@ -1016,15 +1054,24 @@ impl Accounts {
     }
 
     /// Delete an account.
+    ///
+    /// Its settings go with it. Ids are handed out again after a restart, and
+    /// rows left behind would load as the next holder's preferences.
     pub async fn delete(&self, scope: u32, id: u64) {
         if let Ok(mut cache) = self.cache.lock() {
             let _ = cache.remove(&(scope, id));
         }
-        let _ = sqlx::query("DELETE FROM account WHERE server_id = ? AND id = ?")
-            .bind(i64::from(scope))
-            .bind(id as i64)
-            .execute(self.store.pool())
-            .await;
+        for statement in [
+            "DELETE FROM account WHERE server_id = ? AND id = ?",
+            "DELETE FROM account_setting WHERE server_id = ? AND account_id = ?",
+        ] {
+            let _ = sqlx::query(statement)
+                .bind(i64::from(scope))
+                .bind(id as i64)
+                .execute(self.store.pool())
+                .await
+                .inspect_err(|error| tracing::error!(%error, "could not delete an account"));
+        }
     }
 
     /// A blob by hash.
@@ -1111,6 +1158,50 @@ impl Accounts {
             tracing::error!(%error, "could not persist an account");
         }
     }
+
+    /// Replace one account's stored settings with `settings`, in one
+    /// transaction.
+    ///
+    /// Replaced as a set rather than diffed against the cache, so an unset key
+    /// leaves the table too and a write that raced another cannot leave rows
+    /// neither of them holds.
+    async fn write_settings(&self, scope: u32, id: u64, settings: &HashMap<String, String>) {
+        let result: Result<(), sqlx::Error> = async {
+            let mut tx = self.store.pool().begin().await?;
+            let _ =
+                sqlx::query("DELETE FROM account_setting WHERE server_id = ? AND account_id = ?")
+                    .bind(i64::from(scope))
+                    .bind(id as i64)
+                    .execute(&mut *tx)
+                    .await?;
+            // In key order, so the statements a change produces do not depend
+            // on hash seeding.
+            let ordered: std::collections::BTreeMap<_, _> = settings.iter().collect();
+            for (key, value) in ordered {
+                let _ = sqlx::query(
+                    "INSERT INTO account_setting (server_id, account_id, k, v) VALUES (?, ?, ?, ?) \
+                     ON CONFLICT (server_id, account_id, k) DO UPDATE SET v = excluded.v",
+                )
+                .bind(i64::from(scope))
+                .bind(id as i64)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::error!(%error, account = id, "could not persist account settings");
+        }
+    }
+}
+
+/// Whether `key` fits the `account_setting.k` column.
+#[must_use]
+pub fn setting_key_fits(key: &str) -> bool {
+    key.len() <= MAX_KEY_LEN
 }
 
 /// Move blobs written under the old SHA-256 digest onto their SHA-1 address.
@@ -1214,20 +1305,135 @@ fn outcome(outcome: auth_result::Outcome, account: Option<Account>) -> AuthResul
 mod tests {
     use super::*;
 
-    async fn accounts() -> Accounts {
+    async fn memory_store() -> Store {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let store = Store::open(
+        Store::open(
             &format!("sqlite:file:userdata-test-{id}?mode=memory&cache=shared"),
             1,
         )
         .await
-        .expect("in-memory database");
-        Accounts::open(store).await.expect("schema")
+        .expect("in-memory database")
+    }
+
+    async fn accounts() -> Accounts {
+        Accounts::open(memory_store().await).await.expect("schema")
+    }
+
+    fn settings_update(id: u64, pairs: &[(&str, &str)]) -> UpdateRequest {
+        UpdateRequest {
+            scope: None,
+            actor: None,
+            id,
+            fields: vec!["settings".to_owned()],
+            values: Some(Account {
+                settings: pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..Account::default()
+            }),
+            password: String::new(),
+            current_password: String::new(),
+        }
+    }
+
+    fn named(name: &str) -> Account {
+        Account {
+            name: name.to_owned(),
+            ..Account::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_survive_a_restart_and_an_unset_key_stays_gone() {
+        // A restart is a fresh `Accounts` warmed from the same database; the
+        // store is kept open so the in-memory database outlives the first.
+        let store = memory_store().await;
+        let first = Accounts::open(store.clone()).await.expect("schema");
+        let id = first
+            .register(1, named("ada"), "correct horse")
+            .await
+            .expect("registered")
+            .id;
+        let _ = first
+            .update(1, settings_update(id, &[("theme", "dark"), ("push", "on")]))
+            .await
+            .expect("stored");
+        drop(first);
+
+        let second = Accounts::open(store.clone()).await.expect("schema");
+        let settings = second.by_id(1, id).expect("account").settings;
+        assert_eq!(settings.get("theme").map(String::as_str), Some("dark"));
+        assert_eq!(settings.get("push").map(String::as_str), Some("on"));
+
+        let _ = second
+            .update(1, settings_update(id, &[("push", "on")]))
+            .await
+            .expect("stored");
+        drop(second);
+
+        let third = Accounts::open(store).await.expect("schema");
+        let settings = third.by_id(1, id).expect("account").settings;
+        assert!(
+            !settings.contains_key("theme"),
+            "an unset key must not come back after a restart"
+        );
+        assert_eq!(settings.get("push").map(String::as_str), Some("on"));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_accounts_settings_do_not_pass_to_the_next_holder_of_its_id() {
+        let store = memory_store().await;
+        let first = Accounts::open(store.clone()).await.expect("schema");
+        let id = first
+            .register(1, named("ada"), "correct horse")
+            .await
+            .expect("registered")
+            .id;
+        let _ = first
+            .update(1, settings_update(id, &[("theme", "dark")]))
+            .await
+            .expect("stored");
+        first.delete(1, id).await;
+        drop(first);
+
+        // The id is free again once nothing above it is left to count from.
+        let second = Accounts::open(store.clone()).await.expect("schema");
+        let reused = second
+            .register(1, named("grace"), "battery staple")
+            .await
+            .expect("registered");
+        assert_eq!(reused.id, id, "the test depends on the id being reused");
+        drop(second);
+
+        let third = Accounts::open(store).await.expect("schema");
+        assert!(
+            third.by_id(1, id).expect("account").settings.is_empty(),
+            "the new holder must not load the old account's preferences"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setting_name_too_long_to_store_is_refused_with_nothing_changed() {
+        let accounts = accounts().await;
+        let id = accounts
+            .register(1, named("ada"), "correct horse")
+            .await
+            .expect("registered")
+            .id;
+        let long = "k".repeat(MAX_KEY_LEN + 1);
+        assert!(
+            accounts
+                .update(1, settings_update(id, &[("theme", "dark"), (&long, "x")]))
+                .await
+                .is_err()
+        );
+        assert!(accounts.by_id(1, id).expect("account").settings.is_empty());
     }
 
     fn auth(name: &str, password: &str) -> AuthRequest {

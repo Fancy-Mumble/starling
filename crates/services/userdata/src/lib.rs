@@ -332,7 +332,9 @@ impl UserData for UserdataRpc {
 
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        self.0.accounts.delete(scope_of(req.scope), req.id).await;
+        let scope = scope_of(req.scope);
+        self.0.accounts.delete(scope, req.id).await;
+        self.0.records.forget_account(scope, req.id).await;
         Ok(Response::new(Ack {}))
     }
 

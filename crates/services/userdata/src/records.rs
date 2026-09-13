@@ -11,10 +11,9 @@
 //!   name.
 //! * **Bytes, not strings.** The callers store JSON today and are welcome to
 //!   store anything tomorrow; the server never looks inside.
-//! * **Actually persisted.** `account_setting` has existed since the first
-//!   migration and nothing has ever written a row to it, so account settings
-//!   do not survive a restart. A store whose whole purpose is outliving the
-//!   connection cannot be built the same way, so every write here is a row.
+//! * **Written per key.** Settings are rewritten as a whole set on every change
+//!   (`account_setting`), which is cheap for a handful of preferences and would
+//!   not be for a library. Every write here touches only its own row.
 //!
 //! Not cached. Authentication is the one read that cannot wait
 //! (`docs/STORAGE.md` D1) and this is not it: a record is read when a client

@@ -794,12 +794,26 @@ impl UserdataService {
             );
         }
 
+        // A name too long to store is dropped the same way, so it cannot take
+        // the legitimate preferences sent beside it down with it.
+        let too_long = update
+            .set
+            .keys()
+            .filter(|key| !crate::accounts::setting_key_fits(key))
+            .count();
+        if too_long > 0 {
+            tracing::info!(account, too_long, "dropped settings whose names do not fit");
+        }
+
         for key in update.unset.iter().filter(|key| !is_reserved(key)) {
             let _ = stored.settings.remove(key);
         }
-        stored
-            .settings
-            .extend(update.set.into_iter().filter(|(key, _)| !is_reserved(key)));
+        stored.settings.extend(
+            update
+                .set
+                .into_iter()
+                .filter(|(key, _)| !is_reserved(key) && crate::accounts::setting_key_fits(key)),
+        );
 
         let request = UpdateRequest {
             scope: Some(in_scope(scope)),

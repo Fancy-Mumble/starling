@@ -413,6 +413,8 @@ impl UserdataService {
             .map(|account| account.name)
             .unwrap_or_default();
         self.accounts.delete(inbound.scope, id).await;
+        // The records go with the account, as they do on a self-unregister.
+        self.records.forget_account(inbound.scope, id).await;
 
         self.logger.log(
             LogEvent::notice(Category::Admin, "account unregistered")
