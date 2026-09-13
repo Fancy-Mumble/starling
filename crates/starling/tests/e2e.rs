@@ -5526,3 +5526,133 @@ async fn an_admin_reads_back_a_comment_the_profile_history_kept() {
 
     deployment.stop().await;
 }
+
+/// A channel created by a client still inherits the root's ACL table.
+///
+/// `permissions` learns the shape of the tree from `metadata`'s `watch`
+/// stream, and the client path never published to it: a room made through a
+/// client had no parent on record, so `ancestry` stopped at the room itself
+/// and the walk never reached the root. The administrator whose `Write` comes
+/// from a root entry was then refused on their own new channel, with every
+/// administrative entry missing from its context menu and no ACL anywhere
+/// to point at.
+#[tokio::test]
+async fn a_channel_a_client_creates_inherits_the_root_acl() {
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+
+    let data_dir = TempDir::new("client-made-channel-acl");
+    let deployment = Deployment::start(data_dir.path()).await;
+
+    // The ordinary way a Mumble server's administrators are made: `Write` on
+    // the root, reaching every channel under it.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("ops", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+
+    let mut alice = Client::connect(deployment.port).await;
+    let alice_session = handshake(&mut alice, "alice").await;
+    deployment
+        .add_temporary_group(0, "ops", alice_session)
+        .await;
+
+    // The control: a channel the server made, which `permissions` heard about
+    // through the snapshot.
+    let lobby = deployment.create_channel("Lobby").await;
+    assert!(
+        granted(&mut alice, lobby).await & Perm::WRITE.bits() != 0,
+        "the root's Write must reach a channel that was already there"
+    );
+
+    // The same room, made through the client path instead.
+    alice
+        .send(
+            7,
+            &tcp::ChannelState {
+                parent: Some(0),
+                name: Some("Advanced Lobby".to_owned()),
+                ..tcp::ChannelState::default()
+            },
+        )
+        .await;
+    let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(7))
+        .await
+        .expect("the creation is announced");
+    let made = tcp::ChannelState::decode(payload.as_slice()).expect("well-formed");
+    let advanced = made.channel_id.expect("an id");
+
+    assert!(
+        granted(&mut alice, advanced).await & Perm::WRITE.bits() != 0,
+        "the root's Write must reach a channel a client just created"
+    );
+
+    // And a move through the same path re-parents the walk. The vault
+    // inherits nothing and hands out only the permission to put a channel in
+    // it, so a room that has been moved there evaluates differently from the
+    // moment it arrives.
+    let vault = deployment.create_channel("Vault").await;
+    deployment
+        .set_acl(AclSet {
+            channel: vault,
+            inherit: false,
+            acls: vec![entry("ops", Perm::MAKE_CHANNEL, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    deployment
+        .add_temporary_group(vault, "ops", alice_session)
+        .await;
+    alice
+        .send(
+            7,
+            &tcp::ChannelState {
+                channel_id: Some(advanced),
+                parent: Some(vault),
+                ..tcp::ChannelState::default()
+            },
+        )
+        .await;
+    let moved = loop {
+        let (_, payload) = timeout(FRAME_TIMEOUT, alice.recv_until(7))
+            .await
+            .expect("the move is announced");
+        let state = tcp::ChannelState::decode(payload.as_slice()).expect("well-formed");
+        if state.channel_id == Some(advanced) {
+            break state;
+        }
+    };
+    assert_eq!(moved.parent, Some(vault));
+    assert!(
+        granted(&mut alice, advanced).await & Perm::WRITE.bits() == 0,
+        "a moved channel must be evaluated against where it now is"
+    );
+
+    deployment.stop().await;
+}
+
+/// What the server says this session may do in `channel`.
+async fn granted(client: &mut Client, channel: u32) -> u32 {
+    client
+        .send(
+            20,
+            &tcp::PermissionQuery {
+                channel_id: Some(channel),
+                ..tcp::PermissionQuery::default()
+            },
+        )
+        .await;
+    loop {
+        let (_, payload) = timeout(FRAME_TIMEOUT, client.recv_until(20))
+            .await
+            .expect("a permission query is answered");
+        let reply = tcp::PermissionQuery::decode(payload.as_slice()).expect("well-formed");
+        if reply.channel_id == Some(channel) {
+            return reply.permissions.unwrap_or_default();
+        }
+    }
+}

@@ -1803,6 +1803,21 @@ impl MetadataService {
             self.invite(inbound.scope, channel.id, &state.invitee_user_ids)
                 .await;
         }
+        // The subscribers, not only the clients. `permissions` learns the shape
+        // of the tree from this stream and walks it for every ACL check, so a
+        // room made or moved through a client and announced only to the clients
+        // is a room it evaluates as a root: the administrator whose `Write`
+        // comes from a root entry is refused on it, with no ACL anywhere to
+        // point at as the cause.
+        //
+        // Before the frames rather than after, so nothing the client does with
+        // the channel it has just been told about can be decided against a tree
+        // that does not have it yet.
+        let _ = self.events.send(TreeEvent {
+            event: Some(starling_proto_fancy::metadata::tree_event::Event::Upsert(
+                channel.clone(),
+            )),
+        });
         let recipients = self.announce_to(inbound.scope, channel).await;
         vec![to_sessions(
             recipients,
@@ -2000,6 +2015,14 @@ impl MetadataService {
             CHANNEL_REMOVE,
             remove.encode_to_vec(),
         ));
+        // As on the gRPC path: without it `permissions` keeps the departed
+        // channel's ACL set and its place in the tree for the life of the
+        // process, and the next boot loads the row back.
+        let _ = self.events.send(TreeEvent {
+            event: Some(starling_proto_fancy::metadata::tree_event::Event::Removed(
+                remove.channel_id,
+            )),
+        });
         actions
     }
 }
