@@ -255,7 +255,7 @@ impl PermissionsService {
             let mut events = stream.into_inner();
             loop {
                 match events.message().await {
-                    Ok(Some(event)) => self.apply_tree_event(scope, event),
+                    Ok(Some(event)) => self.apply_tree_event(scope, event).await,
                     Ok(None) => break,
                     // Named, because the silent form of this cost a day once
                     // already: a stream that failed on its opening snapshot
@@ -280,22 +280,88 @@ impl PermissionsService {
     /// `match` with a loop in one arm, inside a `while`, inside a reconnect
     /// `loop`, is four levels of nesting to read past before reaching what the
     /// event actually does.
-    fn apply_tree_event(&self, scope: u32, event: starling_proto_fancy::metadata::TreeEvent) {
+    async fn apply_tree_event(&self, scope: u32, event: starling_proto_fancy::metadata::TreeEvent) {
         use starling_proto_fancy::metadata::tree_event;
 
         match event.event {
             Some(tree_event::Event::Snapshot(tree)) => {
-                for channel in tree.channels {
+                for channel in &tree.channels {
                     self.record_parent(scope, channel.id, channel.parent);
                 }
+                self.reconcile(scope, &tree).await;
             }
             Some(tree_event::Event::Upsert(channel)) => {
                 self.record_parent(scope, channel.id, channel.parent);
             }
             Some(tree_event::Event::Removed(channel)) => {
                 self.acls.forget(scope, channel);
+                self.unstore(scope, channel).await;
             }
             _ => {}
+        }
+    }
+
+    /// Drop the ACLs of channels that were removed while nobody was listening.
+    ///
+    /// A `Removed` sent while this service was down or re-subscribing is never
+    /// seen, so the opening snapshot is the only place to catch up. A snapshot is
+    /// not always the real tree, though: `metadata` serves a root-only boot tree
+    /// when its store is missing or its load failed, and an empty tree for a
+    /// scope it does not know. Pruning against either would delete every
+    /// operator's grant and, worse, every deny.
+    ///
+    /// So only ids **below the highest live id** are pruned. `metadata` allocates
+    /// ids monotonically and never reuses one, so an id under that mark which the
+    /// tree lacks was removed. A degraded tree restarts allocation at 1 and
+    /// leaves nearly every stored id above the mark, a root-only or empty tree
+    /// has no mark at all, and a channel created after the snapshot was taken is
+    /// above it too. The cost is that the newest channels' rows wait for a later
+    /// snapshot.
+    async fn reconcile(&self, scope: u32, tree: &starling_proto_fancy::metadata::Tree) {
+        let live: std::collections::HashSet<u32> =
+            tree.channels.iter().map(|channel| channel.id).collect();
+        if !live.contains(&0) {
+            return;
+        }
+        let Some(highest) = live.iter().copied().max() else {
+            return;
+        };
+        let removed: Vec<u32> = self
+            .acls
+            .channels(scope)
+            .into_iter()
+            .filter(|channel| *channel < highest && !live.contains(channel))
+            .collect();
+        for channel in &removed {
+            self.acls.forget(scope, *channel);
+            self.unstore(scope, *channel).await;
+        }
+        if !removed.is_empty() {
+            tracing::info!(
+                scope,
+                count = removed.len(),
+                "pruned the ACLs of removed channels"
+            );
+        }
+    }
+
+    /// Delete a removed channel's stored ACL set.
+    ///
+    /// Without this the row outlives the channel for good: [`Acls::forget`]
+    /// clears memory only, and the next boot loads the row back.
+    async fn unstore(&self, scope: u32, channel: u32) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let result = sqlx::query("DELETE FROM channel_acl WHERE server_id = ? AND channel_id = ?")
+            .bind(i64::from(scope))
+            .bind(i64::from(channel))
+            .execute(store.pool())
+            .await;
+        // A warning rather than the operator log: the channel is gone either
+        // way, and a row that stays behind is a leak, not a change in policy.
+        if let Err(error) = result {
+            tracing::warn!(%error, channel, "could not delete a removed channel's ACL set");
         }
     }
 
@@ -1127,6 +1193,135 @@ mod tests {
         assert_eq!(loaded.acls.len(), 1, "the entry must come back");
         assert!(!loaded.inherit, "and so must the inherit flag");
         assert_eq!(loaded.acls[0].grant, Perm::MAKE_CHANNEL.bits());
+    }
+
+    /// A service over `store`, as one boot of the process would build it.
+    fn over(store: &Store) -> PermissionsService {
+        let (invalidations, _) = broadcast::channel(8);
+        PermissionsService {
+            acls: Acls::new(),
+            coalescer: Coalescer::new(),
+            invalidations,
+            fanout: Fanout::default(),
+            logger: Logger::null(),
+            resolver: None,
+            store: Some(store.clone()),
+        }
+    }
+
+    async fn migrated(name: &str) -> Store {
+        let store = Store::open(&format!("sqlite:file:{name}?mode=memory&cache=shared"), 1)
+            .await
+            .expect("in-memory database");
+        store.migrate(SCHEMA).await.expect("schema");
+        store
+    }
+
+    /// Set and store a one-entry ACL set on `channel`.
+    async fn stored_at(service: &PermissionsService, channel: u32) {
+        let set = AclSet {
+            channel,
+            acls: vec![AclEntry {
+                apply_here: true,
+                group: Some("all".to_owned()),
+                deny: Perm::ENTER.bits(),
+                ..AclEntry::default()
+            }],
+            ..write_granted_at(channel)
+        };
+        service.acls.set(1, set.clone());
+        service.persist(1, &set).await;
+    }
+
+    fn snapshot(ids: &[u32]) -> starling_proto_fancy::metadata::TreeEvent {
+        use starling_proto_fancy::metadata::{Channel, Tree, TreeEvent, tree_event};
+        TreeEvent {
+            event: Some(tree_event::Event::Snapshot(Tree {
+                version: 1,
+                channels: ids
+                    .iter()
+                    .map(|id| Channel {
+                        id: *id,
+                        parent: (*id != 0).then_some(0),
+                        ..Channel::default()
+                    })
+                    .collect(),
+                members: Vec::new(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_channels_acl_does_not_come_back_after_a_restart() {
+        // `forget` cleared memory only, so the next boot loaded the row back and
+        // every deleted channel's table stayed on disk for good.
+        use starling_proto_fancy::metadata::{TreeEvent, tree_event};
+
+        let store = migrated("acl-removed-restart-test").await;
+        let before = over(&store);
+        stored_at(&before, 7).await;
+        stored_at(&before, 8).await;
+        before
+            .apply_tree_event(
+                1,
+                TreeEvent {
+                    event: Some(tree_event::Event::Removed(7)),
+                },
+            )
+            .await;
+
+        let after = over(&store);
+        after.warm().await;
+        assert!(
+            after.acls.get(1, 7).acls.is_empty(),
+            "the removed channel's set came back"
+        );
+        assert_eq!(
+            after.acls.get(1, 8).acls.len(),
+            1,
+            "a live channel's set must stay"
+        );
+        assert_eq!(import::count(&store, 1).await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_prunes_channels_removed_while_nobody_was_subscribed() {
+        let store = migrated("acl-snapshot-prune-test").await;
+        let service = over(&store);
+        for channel in [0, 3, 5, 9] {
+            stored_at(&service, channel).await;
+        }
+
+        // Channel 3 was removed while the subscription was down.
+        service.apply_tree_event(1, snapshot(&[0, 5, 9])).await;
+
+        assert_eq!(service.acls.channels(1), vec![0, 5, 9]);
+        let after = over(&store);
+        after.warm().await;
+        assert_eq!(
+            after.acls.channels(1),
+            vec![0, 5, 9],
+            "the stored row must go too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_cannot_vouch_for_the_tree_prunes_nothing() {
+        // What `metadata` serves when it knows less than it should: an empty tree
+        // for a scope it does not know, the root-only boot tree when its store
+        // failed, and a restarted id sequence. Each must leave every row alone.
+        let store = migrated("acl-snapshot-guard-test").await;
+        let service = over(&store);
+        for channel in [0, 4, 7] {
+            stored_at(&service, channel).await;
+        }
+
+        for untrusted in [&[][..], &[0], &[0, 2], &[4, 7]] {
+            service.apply_tree_event(1, snapshot(untrusted)).await;
+        }
+
+        assert_eq!(service.acls.channels(1), vec![0, 2, 4, 7]);
+        assert_eq!(import::count(&store, 1).await.expect("count"), 3);
     }
 
     #[test]

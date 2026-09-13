@@ -278,12 +278,13 @@ impl Acls {
             })
     }
 
-    /// Forget a channel that no longer exists.
+    /// Forget a channel that no longer exists, in memory only.
     ///
-    /// Both tables, because a leak here is unbounded: a server that creates and
-    /// deletes temporary channels all day would otherwise accumulate one entry
-    /// per channel for the life of the process. Worse than the memory, a later
-    /// channel reusing the id would inherit the dead one's ACL set.
+    /// Every table, because a leak here is unbounded: a server that creates and
+    /// deletes temporary channels all day would otherwise accumulate entries for
+    /// the life of the process. The stored row is the caller's to delete, or the
+    /// next boot loads it straight back. `metadata` never reuses an id, so a
+    /// stale entry is a leak rather than a grant a new channel could inherit.
     pub fn forget(&self, scope: u32, channel: u32) {
         if let Ok(mut inner) = self.inner.lock() {
             let _ = inner.remove(&(scope, channel));
@@ -291,14 +292,32 @@ impl Acls {
         if let Ok(mut parents) = self.parents.lock() {
             let _ = parents.remove(&(scope, channel));
         }
-        // The third table, for the same reason as the first two: a later
-        // channel reusing this id would otherwise inherit the dead one's
-        // temporary members along with its ACL set.
         if let Ok(mut temporary) = self.temporary.lock() {
             temporary.retain(|(held_scope, held_channel, _), _| {
                 *held_scope != scope || *held_channel != channel
             });
         }
+    }
+
+    /// Every channel in `scope` that any table holds something for, ascending.
+    #[must_use]
+    pub fn channels(&self, scope: u32) -> Vec<u32> {
+        let mut held = std::collections::BTreeSet::new();
+        if let Ok(inner) = self.inner.lock() {
+            held.extend(inner.keys().filter(|key| key.0 == scope).map(|key| key.1));
+        }
+        if let Ok(parents) = self.parents.lock() {
+            held.extend(parents.keys().filter(|key| key.0 == scope).map(|key| key.1));
+        }
+        if let Ok(temporary) = self.temporary.lock() {
+            held.extend(
+                temporary
+                    .keys()
+                    .filter(|key| key.0 == scope)
+                    .map(|key| key.1),
+            );
+        }
+        held.into_iter().collect()
     }
 
     /// Record the tree shape the walk needs.
