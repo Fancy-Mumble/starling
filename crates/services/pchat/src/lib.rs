@@ -705,7 +705,8 @@ struct Relay {
     /// than a message, the client that set it holds no copy until it is told,
     /// and this server is the thing that decides whether the pin is allowed at
     /// all - so the pinner learns the pin took by being sent it, like everybody
-    /// else, rather than by assuming it did.
+    /// else, rather than by assuming it did. A delete echoes for the same
+    /// reason: the server decides it, and the echo is the deleter's answer.
     echoes: bool,
     /// The certificate this body claims for its own sender, when it names one.
     ///
@@ -780,7 +781,17 @@ impl Relay {
                 claims: None,
                 echoes: true,
             }),
-            Body::Delete(delete) => in_channel(delete.channel, Perm::DELETE_MESSAGE),
+            // Echoed for the same reason as a pin: the deleter learns the rows
+            // are gone by being sent its own delete. Reached only from
+            // `on_delete`, which authorises it itself.
+            Body::Delete(delete) => Some(Self {
+                channel: delete.channel,
+                needs: Perm::DELETE_MESSAGE,
+                unicast: None,
+                recipient_cert: None,
+                claims: None,
+                echoes: true,
+            }),
             // Server-to-client answers. A client that sends one is trying to
             // forge somebody else's history or pin list, and the verbatim relay
             // would have passed it on unaltered.
@@ -818,6 +829,9 @@ impl ClientService for PchatService {
             // the old catch-all broadcast every one of these to the whole
             // server.
             Some(pchat_envelope::Body::Ack(_)) => Actions::new(),
+            // Before the relay: a delete removes rows, and its authorisation
+            // depends on who wrote them.
+            Some(body @ pchat_envelope::Body::Delete(_)) => self.on_delete(&inbound, &body).await,
             Some(body) => self.on_relay(&inbound, &body).await,
             None => Actions::new(),
         }
@@ -1199,6 +1213,169 @@ impl PchatService {
             ),
         }
     }
+
+    /// Remove messages from the archive, then tell the channel they are gone.
+    ///
+    /// A delete used to be relayed and nothing more, so every row stayed put
+    /// and came back on the next fetch.
+    async fn on_delete(&self, inbound: &Inbound, body: &pchat_envelope::Body) -> Actions {
+        let (Some(relay), pchat_envelope::Body::Delete(delete)) = (Relay::of(body), body) else {
+            return Actions::new();
+        };
+        if !self.limits.allow(inbound.conn, Op::Manage) || delete.message_ids.is_empty() {
+            return Actions::new();
+        }
+
+        let rows = match self
+            .named_rows(inbound.scope, relay.channel, &delete.message_ids)
+            .await
+        {
+            Ok(rows) => rows,
+            // Not treated as "no rows": that would make every non-author look
+            // like the author of everything it named.
+            Err(error) => {
+                tracing::error!(%error, channel = relay.channel, "could not look up messages to delete");
+                return Actions::new();
+            }
+        };
+        if !self.may_delete(inbound, &relay, &rows).await {
+            return vec![permission_denied(inbound, relay.needs, relay.channel)];
+        }
+        if let Err(error) = self.delete_rows(inbound.scope, relay.channel, &rows).await {
+            // No echo either: the deleter resolves its delete on the echo, and
+            // the rows are still there.
+            tracing::error!(%error, channel = relay.channel, "could not delete messages");
+            return Actions::new();
+        }
+        self.to_channel(
+            inbound,
+            relay.channel,
+            relay.echoes,
+            inbound.payload.clone(),
+        )
+    }
+
+    /// Whether this sender may delete what `rows` names.
+    ///
+    /// `DELETE_MESSAGE` deletes anything. Without it, a member may delete what
+    /// it wrote, judged by the stored certificate rather than the session,
+    /// which is reused. A row with no certificate belongs to nobody, and an id
+    /// naming no row cannot be shown to be the sender's - every `signal_v1`
+    /// message is one - so it needs `DELETE_MESSAGE` too. Otherwise any member
+    /// could relay a delete of anybody's unstored message.
+    async fn may_delete(
+        &self,
+        inbound: &Inbound,
+        relay: &Relay,
+        rows: &[Option<NamedRow>],
+    ) -> bool {
+        if self
+            .permit
+            .allows(inbound, relay.channel, relay.needs.bits())
+            .await
+        {
+            return true;
+        }
+        let Some(mine) = self.roster.cert_of(inbound.session) else {
+            return false;
+        };
+        rows.iter().all(|row| {
+            row.as_ref()
+                .is_some_and(|row| row.sender_cert.as_deref() == Some(mine.as_slice()))
+        }) && self
+            .permit
+            .allows(inbound, relay.channel, Perm::ENTER.bits())
+            .await
+    }
+
+    /// The stored row each of `wire_ids` names in this channel, `None` where
+    /// it names none.
+    ///
+    /// Resolved as [`Self::cursor_of`] does: the sender's id first, then this
+    /// server's uuid7, the only identity of a row written before `client_id`.
+    async fn named_rows(
+        &self,
+        scope: u32,
+        channel: u32,
+        wire_ids: &[String],
+    ) -> Result<Vec<Option<NamedRow>>, sqlx::Error> {
+        use sqlx::Row as _;
+        let mut rows = Vec::with_capacity(wire_ids.len());
+        for wire_id in wire_ids {
+            if wire_id.is_empty() {
+                rows.push(None);
+                continue;
+            }
+            let mut found = sqlx::query(
+                "SELECT id, sender_cert FROM pchat_message \
+                 WHERE server_id = ? AND channel_id = ? AND client_id = ?",
+            )
+            .bind(i64::from(scope))
+            .bind(i64::from(channel))
+            .bind(wire_id.as_str())
+            .fetch_optional(self.store.pool())
+            .await?;
+            if found.is_none()
+                && let Some(legacy) = Uuid7::parse(wire_id)
+            {
+                found = sqlx::query(
+                    "SELECT id, sender_cert FROM pchat_message \
+                     WHERE server_id = ? AND channel_id = ? AND id = ?",
+                )
+                .bind(i64::from(scope))
+                .bind(i64::from(channel))
+                .bind(legacy.to_vec())
+                .fetch_optional(self.store.pool())
+                .await?;
+            }
+            rows.push(match found {
+                Some(row) => Some(NamedRow {
+                    id: row.try_get("id")?,
+                    sender_cert: row
+                        .try_get::<Option<Vec<u8>>, _>("sender_cert")?
+                        .filter(|cert| !cert.is_empty()),
+                }),
+                None => None,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Delete the rows that exist, all or none.
+    ///
+    /// By the uuid7 key, one statement per row, so no backend has to bind a
+    /// list or accept a subquery on the table it deletes from.
+    async fn delete_rows(
+        &self,
+        scope: u32,
+        channel: u32,
+        rows: &[Option<NamedRow>],
+    ) -> Result<(), sqlx::Error> {
+        if rows.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let mut tx = self.store.pool().begin().await?;
+        for row in rows.iter().flatten() {
+            let _ = sqlx::query(
+                "DELETE FROM pchat_message WHERE server_id = ? AND channel_id = ? AND id = ?",
+            )
+            .bind(i64::from(scope))
+            .bind(i64::from(channel))
+            .bind(row.id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+}
+
+/// A stored row a delete named.
+#[derive(Debug)]
+struct NamedRow {
+    /// This server's uuid7 key.
+    id: Vec<u8>,
+    /// Who wrote it, or `None` for a row that does not say.
+    sender_cert: Option<Vec<u8>>,
 }
 
 impl Serve for PchatService {
@@ -2474,8 +2651,290 @@ mod tests {
         assert!(!sessions.contains(&inbound.session));
     }
 
+    /// A `permissions` that grants exactly the bits it holds.
+    ///
+    /// Served in-process, as in `files`: the delete tests are about the gate,
+    /// and the default resolver denies everything, which would pass them on
+    /// the refusal alone.
+    #[derive(Clone)]
+    struct Gate(u32);
+
+    #[tonic::async_trait]
+    impl starling_proto_fancy::permissions::permissions_server::Permissions for Gate {
+        async fn check_session(
+            &self,
+            request: tonic::Request<starling_proto_fancy::permissions::SessionCheckRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::common::Decision>, tonic::Status>
+        {
+            let asked = request.into_inner().permission;
+            Ok(tonic::Response::new(
+                starling_proto_fancy::common::Decision {
+                    allowed: asked & self.0 == asked,
+                    ..Default::default()
+                },
+            ))
+        }
+        async fn effective(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::EffectiveRequest>,
+        ) -> Result<
+            tonic::Response<starling_proto_fancy::permissions::EffectiveResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+        async fn check(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::CheckRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::common::Decision>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("pchat uses check_session"))
+        }
+        async fn get_acl(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::AclRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::permissions::AclSet>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+        async fn set_acl(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::SetAclRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::permissions::AclResult>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+        async fn add_temporary_group(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::TemporaryGroupRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::permissions::AclResult>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+        async fn remove_temporary_group(
+            &self,
+            _: tonic::Request<starling_proto_fancy::permissions::TemporaryGroupRequest>,
+        ) -> Result<tonic::Response<starling_proto_fancy::permissions::AclResult>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+        type WatchInvalidationsStream = std::pin::Pin<
+            Box<
+                dyn tonic::codegen::tokio_stream::Stream<
+                        Item = Result<
+                            starling_proto_fancy::permissions::Invalidation,
+                            tonic::Status,
+                        >,
+                    > + Send,
+            >,
+        >;
+        async fn watch_invalidations(
+            &self,
+            _: tonic::Request<starling_proto_fancy::common::Scope>,
+        ) -> Result<tonic::Response<Self::WatchInvalidationsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by pchat"))
+        }
+    }
+
+    /// The warm-roster service, whose sessions hold exactly `held`.
+    ///
+    /// The stub is spawned per service: each `#[tokio::test]` has its own
+    /// runtime, and a server left on a finished one reads as a denial.
+    async fn service_holding(held: Perm) -> Arc<PchatService> {
+        use starling_proto_fancy::permissions::permissions_server::PermissionsServer;
+        use starling_runtime::transport::{InProcess, Transport as _};
+
+        let broker = starling_runtime::inproc::Broker::new();
+        let incoming = InProcess::new("permissions")
+            .bind(&broker)
+            .await
+            .expect("bind the stub");
+        let gate = Gate(held.bits());
+        drop(tokio::spawn(async move {
+            let _served = tonic::transport::Server::builder()
+                .add_service(PermissionsServer::new(gate))
+                .serve_with_incoming(incoming)
+                .await;
+        }));
+        let mut config =
+            starling_runtime::config::Config::with_defaults(std::path::Path::new("/run/starling"));
+        config.runtime.all_in_one = true;
+        let resolver = starling_runtime::channel::Resolver::new(Arc::new(config), broker);
+
+        let members = service_with_members().await;
+        Arc::new(PchatService {
+            permit: Permit::new(resolver),
+            ..rebuild(&members)
+        })
+    }
+
+    /// A message in channel 4 under the sender's id `id`, written by `cert`.
+    async fn written_by(service: &PchatService, id: &str, cert: &[u8]) -> Kept {
+        service
+            .store_message(
+                1,
+                &Message {
+                    message_id: id.to_owned(),
+                    sender_cert: cert.to_vec(),
+                    ..message(4, b"x")
+                },
+            )
+            .await
+    }
+
+    /// A delete of `ids` in channel 4, from session 7 (`SPEAKER_CERT`).
+    fn delete_of(ids: &[&str]) -> Inbound {
+        frame(pchat_envelope::Body::Delete(Delete {
+            channel: 4,
+            message_ids: ids.iter().map(|&id| id.to_owned()).collect(),
+        }))
+    }
+
+    /// The wire type a `Send` action carries.
+    fn sent_type(action: &ServerAction) -> u32 {
+        match &action.action {
+            Some(starling_proto_fancy::control::server_action::Action::Send(send)) => send.r#type,
+            _ => 0,
+        }
+    }
+
+    const MINE: &str = "8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a";
+
+    #[tokio::test]
+    async fn an_author_deletes_its_own_message_and_hears_it_back() {
+        // Without DELETE_MESSAGE. The delete used to be a relay, so the row
+        // stayed and the message came back on the next fetch.
+        let service = service_holding(Perm::ENTER).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+
+        let actions = service.frame(delete_of(&[MINE])).await;
+
+        assert_eq!(service.count(1, 4).await, 0, "the row is gone");
+        assert_eq!(actions.len(), 1);
+        let (sessions, broadcast) = addressed(&actions[0]);
+        assert!(!broadcast);
+        assert!(
+            sessions.contains(&7),
+            "the echo is the deleter's confirmation: {sessions:?}"
+        );
+        assert!(sessions.contains(&8), "and the channel is told");
+        assert!(matches!(
+            sole_body(&actions),
+            pchat_envelope::Body::Delete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_member_may_not_delete_what_somebody_else_wrote() {
+        // Nor a row that names no author at all: an unattributable row is not
+        // the requester's to claim.
+        for other in [b"somebody-elses-cert".as_slice(), b"".as_slice()] {
+            let service = service_holding(Perm::ENTER).await;
+            let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+            let theirs = "1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d";
+            let _ = written_by(&service, theirs, other).await;
+
+            let actions = service.frame(delete_of(&[MINE, theirs])).await;
+
+            assert_eq!(
+                service.count(1, 4).await,
+                2,
+                "a refused delete deletes nothing, not even the requester's own"
+            );
+            assert_eq!(actions.len(), 1, "refused out loud: {actions:?}");
+            assert_eq!(
+                sent_type(&actions[0]),
+                12,
+                "as PermissionDenied, and to nobody else"
+            );
+            assert!(addressed(&actions[0]).0.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_message_removes_somebody_elses_message() {
+        let service = service_holding(Perm::DELETE_MESSAGE).await;
+        let _ = written_by(&service, MINE, b"somebody-elses-cert").await;
+
+        let actions = service.frame(delete_of(&[MINE])).await;
+
+        assert_eq!(service.count(1, 4).await, 0);
+        assert_eq!(actions.len(), 1);
+        assert!(addressed(&actions[0]).0.contains(&7));
+    }
+
+    #[tokio::test]
+    async fn a_delete_naming_an_unstored_message_needs_the_moderation_bit() {
+        // Every signal_v1 message is unstored, so authorship cannot be shown
+        // for one. Letting it through would relay any member's delete of
+        // anybody's message - alone or tucked in beside one of its own.
+        let unstored = "1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d";
+        for ids in [vec![unstored], vec![MINE, unstored]] {
+            let service = service_holding(Perm::ENTER).await;
+            let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+
+            let actions = service.frame(delete_of(&ids)).await;
+
+            assert_eq!(actions.len(), 1, "refused out loud: {actions:?}");
+            assert_eq!(sent_type(&actions[0]), 12, "as PermissionDenied");
+            assert!(addressed(&actions[0]).0.is_empty(), "and relayed to nobody");
+            assert_eq!(service.count(1, 4).await, 1, "the own row is kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_message_still_relays_a_delete_of_an_unstored_message() {
+        let service = service_holding(Perm::DELETE_MESSAGE).await;
+
+        let actions = service
+            .frame(delete_of(&["1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d"]))
+            .await;
+
+        assert_eq!(actions.len(), 1);
+        let (sessions, _) = addressed(&actions[0]);
+        assert!(
+            sessions.contains(&7) && sessions.contains(&8),
+            "{sessions:?}"
+        );
+        assert!(matches!(
+            sole_body(&actions),
+            pchat_envelope::Body::Delete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_row_older_than_client_ids_is_deleted_by_its_server_id() {
+        // Such a row's only wire identity is the uuid7 this server minted.
+        let service = service_holding(Perm::ENTER).await;
+        let Kept::New(id) = written_by(&service, "", SPEAKER_CERT).await else {
+            panic!("stored");
+        };
+
+        let _ = service.frame(delete_of(&[&id.to_string()])).await;
+
+        assert_eq!(service.count(1, 4).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_message_is_not_served_again() {
+        let service = service_holding(Perm::ENTER).await;
+        let kept = "1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d";
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+        let _ = written_by(&service, kept, SPEAKER_CERT).await;
+
+        let _ = service.frame(delete_of(&[MINE])).await;
+
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        let ids: Vec<_> = page
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec![kept]);
+    }
+
     #[test]
-    fn a_pin_is_the_only_body_that_echoes() {
+    fn a_pin_and_a_delete_are_the_bodies_that_echo() {
         // Left as an assertion rather than a comment because the field is a
         // routing decision: a body that starts echoing by accident hands every
         // sender a copy of what it just sent.
@@ -2493,7 +2952,7 @@ mod tests {
                     channel: 5,
                     message_ids: vec!["m".to_owned()],
                 }),
-                false,
+                true,
             ),
             (
                 pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
