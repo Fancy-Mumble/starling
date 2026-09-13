@@ -5565,7 +5565,9 @@ async fn a_channel_a_client_creates_inherits_the_root_acl() {
     // through the snapshot.
     let lobby = deployment.create_channel("Lobby").await;
     assert!(
-        granted(&mut alice, lobby).await & Perm::WRITE.bits() != 0,
+        granted_until(&mut alice, lobby, |bits| bits & Perm::WRITE.bits() != 0).await
+            & Perm::WRITE.bits()
+            != 0,
         "the root's Write must reach a channel that was already there"
     );
 
@@ -5587,7 +5589,9 @@ async fn a_channel_a_client_creates_inherits_the_root_acl() {
     let advanced = made.channel_id.expect("an id");
 
     assert!(
-        granted(&mut alice, advanced).await & Perm::WRITE.bits() != 0,
+        granted_until(&mut alice, advanced, |bits| bits & Perm::WRITE.bits() != 0).await
+            & Perm::WRITE.bits()
+            != 0,
         "the root's Write must reach a channel a client just created"
     );
 
@@ -5628,31 +5632,45 @@ async fn a_channel_a_client_creates_inherits_the_root_acl() {
     };
     assert_eq!(moved.parent, Some(vault));
     assert!(
-        granted(&mut alice, advanced).await & Perm::WRITE.bits() == 0,
+        granted_until(&mut alice, advanced, |bits| bits & Perm::WRITE.bits() == 0).await
+            & Perm::WRITE.bits()
+            == 0,
         "a moved channel must be evaluated against where it now is"
     );
 
     deployment.stop().await;
 }
 
-/// What the server says this session may do in `channel`.
-async fn granted(client: &mut Client, channel: u32) -> u32 {
-    client
-        .send(
-            20,
-            &tcp::PermissionQuery {
-                channel_id: Some(channel),
-                ..tcp::PermissionQuery::default()
-            },
-        )
-        .await;
+/// What the server says this session may do in `channel`, once `wanted` holds.
+///
+/// Asked again until it does or `FRAME_TIMEOUT` passes, returning the last
+/// answer. `permissions` learns a channel's parent from `metadata`'s watch
+/// stream, so a query sent the instant a channel is made or moved can beat the
+/// event there, and a loaded Windows runner lost that race.
+async fn granted_until(client: &mut Client, channel: u32, wanted: impl Fn(u32) -> bool) -> u32 {
+    let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
     loop {
-        let (_, payload) = timeout(FRAME_TIMEOUT, client.recv_until(20))
-            .await
-            .expect("a permission query is answered");
-        let reply = tcp::PermissionQuery::decode(payload.as_slice()).expect("well-formed");
-        if reply.channel_id == Some(channel) {
-            return reply.permissions.unwrap_or_default();
+        client
+            .send(
+                20,
+                &tcp::PermissionQuery {
+                    channel_id: Some(channel),
+                    ..tcp::PermissionQuery::default()
+                },
+            )
+            .await;
+        let bits = loop {
+            let (_, payload) = timeout(FRAME_TIMEOUT, client.recv_until(20))
+                .await
+                .expect("a permission query is answered");
+            let reply = tcp::PermissionQuery::decode(payload.as_slice()).expect("well-formed");
+            if reply.channel_id == Some(channel) {
+                break reply.permissions.unwrap_or_default();
+            }
+        };
+        if wanted(bits) || tokio::time::Instant::now() >= deadline {
+            return bits;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
