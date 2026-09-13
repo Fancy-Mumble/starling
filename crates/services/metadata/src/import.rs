@@ -101,31 +101,7 @@ pub async fn import(store: &Store, scope: u32, tree: &Tree) -> Result<Written, S
 
     let mut written = Written::default();
     for channel in &tree.channels {
-        let result = sqlx::query(
-            "INSERT INTO channel (server_id, id, parent_id, name, description, position, \
-                 max_users, flags, expiry_mode, expiry_duration_s, created_at_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (server_id, id) DO UPDATE SET \
-                 parent_id = excluded.parent_id, name = excluded.name, \
-                 description = excluded.description, position = excluded.position, \
-                 max_users = excluded.max_users, flags = excluded.flags, \
-                 expiry_mode = excluded.expiry_mode, \
-                 expiry_duration_s = excluded.expiry_duration_s, \
-                 created_at_ms = excluded.created_at_ms",
-        )
-        .bind(i64::from(scope))
-        .bind(i64::from(channel.id))
-        .bind(channel.parent.map(i64::from))
-        .bind(&channel.name)
-        .bind(&channel.description)
-        .bind(i64::from(channel.position))
-        .bind(i64::from(channel.max_users))
-        .bind(i64::from(channel.flags))
-        .bind(i64::from(channel.expiry_mode))
-        .bind(i64::from(channel.expiry_duration_s))
-        .bind(channel.created_at_ms as i64)
-        .execute(store.pool())
-        .await;
+        let result = crate::persist::upsert_channel(store.pool(), scope, channel).await;
         match result {
             Ok(_) => written.channels += 1,
             Err(error) => {

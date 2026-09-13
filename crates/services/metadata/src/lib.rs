@@ -14,6 +14,7 @@
 pub mod channel;
 pub mod ids;
 pub mod import;
+pub mod persist;
 pub mod serialize;
 pub mod tree_actor;
 
@@ -25,6 +26,7 @@ pub use tree_actor::{Creation, ListenRefusal, Listened, Removal, TreeLimits, Tre
 
 use std::sync::Arc;
 
+use crate::persist::Persist;
 use crate::tree_actor::{FLAG_HIDDEN, Relocated, is_detached};
 use prost::Message as _;
 use starling_proto_fancy::common::Ack;
@@ -114,6 +116,20 @@ pub(crate) const SCHEMA: &[Migration<'static>] = &[
              channel_id BIGINT NOT NULL, left_at_ms BIGINT NOT NULL, \
              PRIMARY KEY (server_id, account_id))"],
     ),
+    // The tree had been written only by the murmur import, so this is where
+    // live persistence starts (`persist.rs`). `pchat_protocol` had no column
+    // at all, so an encrypted channel came back as an ordinary one and its
+    // history was unreadable; `channel_sequence` keeps ids from being handed
+    // out twice across a restart.
+    Migration::new(
+        "0004_channel_persistence",
+        &[
+            "ALTER TABLE channel ADD COLUMN pchat_protocol INTEGER NOT NULL DEFAULT 0",
+            "CREATE TABLE IF NOT EXISTS channel_sequence (\
+             server_id BIGINT NOT NULL, next_id BIGINT NOT NULL, \
+             PRIMARY KEY (server_id))",
+        ],
+    ),
 ];
 
 /// How many tree events a subscriber may fall behind.
@@ -155,6 +171,12 @@ pub struct MetadataService {
     /// server with listeners that last exactly one session, the same degradation
     /// a guest gets, rather than a refusal.
     store: Option<Store>,
+    /// Every channel write the tree has made and the store has not yet had.
+    ///
+    /// `None` without a store. Behind a lock rather than taken once, so a `run`
+    /// the supervisor restarts picks the same journal back up instead of
+    /// leaving the tree writing into a channel nobody reads.
+    journal: Option<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Persist>>>,
     /// The operator's `channel_name_regex`, compiled once and re-used.
     ///
     /// Beside `settings` rather than inside it because the two have different
@@ -351,6 +373,12 @@ impl Metadata for MetadataRpc {
     ) -> Result<Response<Self::WatchStream>, Status> {
         let scope = scope_of(request.into_inner().scope);
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_BUFFER);
+        // Subscribed before the snapshot is taken, not after: an event in
+        // between would otherwise be in neither, and a subscriber that missed a
+        // `Removed` keeps whatever it holds for that channel. Subscribing first
+        // can only deliver a change the snapshot already shows, and applying
+        // an upsert or a removal twice is harmless.
+        let mut events = self.0.events.subscribe();
         let _ = tx
             .send(Ok(TreeEvent {
                 event: Some(starling_proto_fancy::metadata::tree_event::Event::Snapshot(
@@ -359,7 +387,6 @@ impl Metadata for MetadataRpc {
             }))
             .await;
 
-        let mut events = self.0.events.subscribe();
         drop(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
                 if tx.send(Ok(event)).await.is_err() {
@@ -823,6 +850,52 @@ impl MetadataService {
             .await;
             self.report_listener_write(result.err(), scope, *channel);
         }
+    }
+
+    /// Store the tree's channel writes until the drain, then whatever is left.
+    ///
+    /// One writer, in the order the tree queued them: two upserts of one
+    /// channel applied out of order would store the older record.
+    async fn write_journal(&self, shutdown: &starling_runtime::shutdown::Shutdown) {
+        let (Some(store), Some(journal)) = (&self.store, &self.journal) else {
+            return;
+        };
+        let mut journal = journal.lock().await;
+        loop {
+            tokio::select! {
+                biased;
+                op = journal.recv() => match op {
+                    Some(op) => self.write_channel(store, &op).await,
+                    None => return,
+                },
+                () = shutdown.wait() => break,
+            }
+        }
+        while let Ok(op) = journal.try_recv() {
+            self.write_channel(store, &op).await;
+        }
+    }
+
+    /// Apply one journal entry, and say so if it would not go in.
+    async fn write_channel(&self, store: &Store, op: &Persist) {
+        let Err(error) = persist::apply(store, op).await else {
+            return;
+        };
+        let (scope, channel) = match op {
+            Persist::Upsert { scope, channel } => (*scope, channel.id),
+            Persist::Remove { scope, channel } => (*scope, *channel),
+            Persist::NextId { scope, .. } => (*scope, 0),
+        };
+        // The tree already holds the change, so nobody was refused anything:
+        // what failed is the change outliving the next restart, and nothing but
+        // this line will say so before that restart does.
+        tracing::error!(%error, scope, channel, "a channel change could not be stored");
+        self.logger.log(
+            LogEvent::error(Category::Channel, "channel change was not persisted")
+                .with("channel", channel)
+                .with("scope", scope)
+                .with("error", error.to_string()),
+        );
     }
 
     /// Say so when a listener write fails, on the operator's own record.
@@ -1938,9 +2011,12 @@ impl Serve for MetadataService {
         ctx.health.gate("tree loaded");
         let trees = Trees::new(&root_names(&ctx));
         let mut store = None;
+        let mut journal = None;
         if let Ok(opened) = ctx.storage().await {
             opened.migrate(SCHEMA).await?;
             trees.load(&opened).await;
+            // After the load, which is not a mutation and so writes nothing.
+            journal = trees.journal().map(tokio::sync::Mutex::new);
             store = Some(opened);
         }
         ctx.health.ready("tree loaded");
@@ -1956,6 +2032,7 @@ impl Serve for MetadataService {
             settings: Settings::new(ctx.resolver.clone()).logging_to(ctx.logger.clone()),
             resolver: ctx.resolver.clone(),
             store,
+            journal,
             channel_names: NameRule::new(),
         }))
     }
@@ -1986,11 +2063,19 @@ impl Serve for MetadataService {
                 }
             }
         });
+        let writer = tokio::spawn({
+            let service = Arc::clone(&self);
+            let shutdown = ctx.shutdown.clone();
+            async move { service.write_journal(&shutdown).await }
+        });
         ctx.shutdown.wait().await;
         sweeper.abort();
         for watcher in watchers {
             watcher.abort();
         }
+        // Awaited rather than aborted: what is still queued at the drain is the
+        // last few channel edits, and aborting would lose exactly those.
+        let _ = writer.await;
         Ok(())
     }
 
@@ -2071,6 +2156,7 @@ mod tests {
             settings: Settings::new(nowhere.clone()),
             resolver: nowhere,
             store: Some(store),
+            journal: None,
             channel_names: NameRule::new(),
         }
     }

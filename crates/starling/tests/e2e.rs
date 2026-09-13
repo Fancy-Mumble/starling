@@ -1118,6 +1118,52 @@ async fn create_pchat_channel(deployment: &Deployment, name: &str, protocol: u32
         .id
 }
 
+#[tokio::test]
+async fn a_channels_persistent_chat_protocol_survives_a_restart() {
+    // An encrypted channel came back from a restart as an ordinary one, and a
+    // client decides end-to-end mode from `pchat_protocol` and nothing else, so
+    // the channel's history became unreadable. The tree had only ever been
+    // written by the murmur import: every live edit, this one included, lasted
+    // exactly until `metadata` next started.
+    let data_dir = TempDir::new("pchat-restart");
+    let mut deployment = Deployment::start(data_dir.path()).await;
+    let encrypted = create_pchat_channel(&deployment, "Encrypted", PCHAT_SIGNAL_V1).await;
+    let managed = create_pchat_channel(&deployment, "Managed", PCHAT_SERVER_MANAGED).await;
+
+    // Restarted rather than stopped: the drain is when the writer stores what
+    // the tree has queued, so this also proves nothing queued is dropped.
+    deployment.restart("metadata").await;
+
+    let tree = {
+        use starling_proto_fancy::metadata::TreeRequest;
+        use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+
+        let transport = deployment
+            .resolver
+            .channel("metadata")
+            .expect("metadata is reachable");
+        MetadataClient::new(transport)
+            .get_tree(TreeRequest { scope: None })
+            .await
+            .expect("the restarted service answers")
+            .into_inner()
+    };
+    let protocol_of = |id: u32| {
+        tree.channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| channel.pchat_protocol)
+    };
+    assert_eq!(
+        protocol_of(encrypted),
+        Some(PCHAT_SIGNAL_V1),
+        "the encrypted channel must come back encrypted"
+    );
+    assert_eq!(protocol_of(managed), Some(PCHAT_SERVER_MANAGED));
+
+    deployment.stop().await;
+}
+
 /// Send one server-managed message, retrying until the mode cache has caught up.
 ///
 /// `pchat` learns a channel's mode from a `metadata` subscription, so a channel

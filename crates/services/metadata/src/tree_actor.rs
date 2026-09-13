@@ -4,16 +4,18 @@
 //! within one, mutation is serialised, which is what makes the order channels
 //! change in a total order rather than a race between callers.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use starling_proto_fancy::metadata::{Channel, ChannelResult, EnterResult, Membership, Tree};
 use starling_proto_fancy::serverconfig::Snapshot;
 use starling_runtime::ids::now_ms;
 use starling_runtime::storage::Store;
+use tokio::sync::mpsc;
 
 use crate::channel::is_full_for;
 use crate::ids::ROOT_CHANNEL;
+use crate::persist::Persist;
 
 pub use starling_proto_fancy::channel::{
     FLAG_DETACHED, FLAG_HIDDEN, FLAG_STRUCTURAL, FLAG_TEMPORARY, is_detached,
@@ -223,12 +225,22 @@ impl Listened {
 #[derive(Debug, Clone, Default)]
 pub struct Trees {
     inner: Arc<Mutex<HashMap<u32, TreeState>>>,
+    /// Where each mutation's writes go, once [`Self::journal`] has been asked.
+    ///
+    /// Filled from inside [`Self::mutate`], under the tree lock, so the writes
+    /// leave in the order the tree applied them and no mutation path, whatever
+    /// called it, can change a channel without it being written down.
+    journal: Arc<OnceLock<mpsc::UnboundedSender<Persist>>>,
 }
 
 #[derive(Debug, Default)]
 struct TreeState {
     version: u64,
     next_id: u32,
+    /// The `next_id` the store last heard, so only a change is journaled.
+    persisted_next_id: u32,
+    /// Channels this mutation changed, created or destroyed. See [`touch`].
+    dirty: BTreeSet<u32>,
     /// What this instance's root channel is called, from configuration.
     ///
     /// Held apart from the channel itself because it outranks whatever the
@@ -266,6 +278,7 @@ impl Trees {
             let mut state = TreeState {
                 version: 1,
                 next_id: 1,
+                persisted_next_id: 1,
                 root_name: name.to_owned(),
                 ..TreeState::default()
             };
@@ -283,24 +296,41 @@ impl Trees {
         }
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            journal: Arc::default(),
         }
     }
 
     /// Load persisted channels over the boot tree.
     ///
-    /// Four queries at boot, independent of channel count, because there are no
-    /// property rows to walk (`docs/STORAGE.md` D2).
+    /// Three queries at boot, independent of channel count, because there are no
+    /// property rows to walk (`docs/STORAGE.md` D2): channels, links, and the id
+    /// sequence.
     pub async fn load(&self, store: &Store) {
         use sqlx::Row as _;
         let Ok(rows) = sqlx::query(
             "SELECT server_id, id, parent_id, name, description, position, max_users, flags, \
-                    expiry_mode, expiry_duration_s, created_at_ms FROM channel",
+                    expiry_mode, expiry_duration_s, created_at_ms, pchat_protocol FROM channel",
         )
         .fetch_all(store.pool())
         .await
         else {
             return;
         };
+        // Read before the lock is taken: it is a std mutex, and holding it
+        // across an await would stall every channel edit behind the database.
+        // Links were written by the import and read by nothing, so every link
+        // was gone after the first restart.
+        let links = sqlx::query(
+            "SELECT server_id, channel_id, linked_id FROM channel_link \
+             ORDER BY server_id, channel_id, linked_id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap_or_default();
+        let sequences = sqlx::query("SELECT server_id, next_id FROM channel_sequence")
+            .fetch_all(store.pool())
+            .await
+            .unwrap_or_default();
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -322,6 +352,7 @@ impl Trees {
                     .try_get::<i64, _>("expiry_duration_s")
                     .unwrap_or_default() as u32,
                 created_at_ms: row.try_get::<i64, _>("created_at_ms").unwrap_or_default() as u64,
+                pchat_protocol: row.try_get::<i64, _>("pchat_protocol").unwrap_or_default() as u32,
                 ..Channel::default()
             };
             // The root keeps the name configuration gave it, whatever the store
@@ -345,6 +376,34 @@ impl Trees {
             state.next_id = state.next_id.max(channel.id + 1);
             let _ = state.channels.insert(channel.id, channel);
         }
+        for row in links {
+            let scope: i64 = row.try_get("server_id").unwrap_or(1);
+            let channel = row.try_get::<i64, _>("channel_id").unwrap_or_default() as u32;
+            let linked = row.try_get::<i64, _>("linked_id").unwrap_or_default() as u32;
+            let Some(state) = inner.get_mut(&(scope as u32)) else {
+                continue;
+            };
+            // A link to a channel that is not there would be announced as an
+            // edge to nothing, on every `ChannelState` for the survivor.
+            if !state.channels.contains_key(&linked) {
+                continue;
+            }
+            if let Some(record) = state.channels.get_mut(&channel)
+                && !record.links.contains(&linked)
+            {
+                record.links.push(linked);
+            }
+        }
+        for row in sequences {
+            let scope: i64 = row.try_get("server_id").unwrap_or(1);
+            let next = row.try_get::<i64, _>("next_id").unwrap_or_default() as u32;
+            if let Some(state) = inner.get_mut(&(scope as u32)) {
+                state.next_id = state.next_id.max(next);
+            }
+        }
+        inner
+            .values_mut()
+            .for_each(|state| state.persisted_next_id = state.next_id);
     }
 
     /// Which of `channels` are temporary, and so must not be written to disk.
@@ -528,6 +587,7 @@ impl Trees {
                 channel.flags |= FLAG_TEMPORARY;
             }
             let _ = state.channels.insert(channel.id, channel.clone());
+            touch(state, channel.id);
             state.version += 1;
             ChannelResult {
                 applied: true,
@@ -622,6 +682,7 @@ impl Trees {
                 }
             }
             let updated = channel.clone();
+            touch(state, id);
             state.version += 1;
             ChannelResult {
                 applied: true,
@@ -656,6 +717,7 @@ impl Trees {
             let doomed = descendants(state, id);
             for victim in &doomed {
                 let _ = state.channels.remove(victim);
+                touch(state, *victim);
             }
             forget_links_to(state, &doomed);
 
@@ -975,9 +1037,51 @@ impl Trees {
     }
 
     fn mutate<T: Default>(&self, scope: u32, write: impl FnOnce(&mut TreeState) -> T) -> T {
-        match self.inner.lock() {
-            Ok(mut inner) => write(inner.entry(scope).or_default()),
-            Err(_) => T::default(),
+        let Ok(mut inner) = self.inner.lock() else {
+            return T::default();
+        };
+        let state = inner.entry(scope).or_default();
+        let result = write(state);
+        self.flush(scope, state);
+        result
+    }
+
+    /// Start journaling every channel write, and hand back where they arrive.
+    ///
+    /// `None` if something already holds the journal: there is one writer, and
+    /// a second would see only half the writes.
+    pub fn journal(&self) -> Option<mpsc::UnboundedReceiver<Persist>> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.journal.set(sender).ok().map(|()| receiver)
+    }
+
+    /// Turn what a mutation touched into writes, in the order it happened.
+    ///
+    /// Decided from the tree as it now stands rather than from what the call
+    /// site did: a channel that exists and is not temporary is written whole,
+    /// anything else is removed. A mutation only has to [`touch`] what it
+    /// changed, and cannot write a partial row.
+    fn flush(&self, scope: u32, state: &mut TreeState) {
+        let dirty = std::mem::take(&mut state.dirty);
+        let Some(journal) = self.journal.get() else {
+            return;
+        };
+        if state.next_id != state.persisted_next_id {
+            state.persisted_next_id = state.next_id;
+            let _ = journal.send(Persist::NextId {
+                scope,
+                next_id: state.next_id,
+            });
+        }
+        for id in dirty {
+            let op = match state.channels.get(&id) {
+                Some(channel) if channel.flags & FLAG_TEMPORARY == 0 => Persist::Upsert {
+                    scope,
+                    channel: channel.clone(),
+                },
+                _ => Persist::Remove { scope, channel: id },
+            };
+            let _ = journal.send(op);
         }
     }
 }
@@ -1053,19 +1157,33 @@ fn can_nest(state: &TreeState, parent: u32, height: u32, limit: u32) -> bool {
     limit == 0 || level_of(state, parent).saturating_add(height) < limit
 }
 
+/// Mark `channel` as changed, so [`Trees::flush`] writes it down or removes it.
+///
+/// Every place that changes a channel record calls this. Missing one is the bug
+/// it exists to prevent, a change that holds only until the next restart, and
+/// `every_mutation_survives_a_restart` is the test that notices.
+fn touch(state: &mut TreeState, channel: u32) {
+    let _ = state.dirty.insert(channel);
+}
+
 /// Record that `from` is linked to `to`, if it is not already.
 fn add_link(state: &mut TreeState, from: u32, to: u32) {
     if let Some(channel) = state.channels.get_mut(&from)
         && !channel.links.contains(&to)
     {
         channel.links.push(to);
+        touch(state, from);
     }
 }
 
 /// Drop the edge from `from` to `to`.
 fn remove_link(state: &mut TreeState, from: u32, to: u32) {
     if let Some(channel) = state.channels.get_mut(&from) {
+        let before = channel.links.len();
         channel.links.retain(|linked| *linked != to);
+        if channel.links.len() != before {
+            touch(state, from);
+        }
     }
 }
 
@@ -1079,10 +1197,17 @@ fn forget_links_to(state: &mut TreeState, gone: &[u32]) {
     // An iterator chain rather than a `for`, as `remove` uses above: nothing
     // here observes the order, and saying so in the shape keeps
     // `iter_over_hash_type` pointed at the loops where order would leak out.
-    state
-        .channels
-        .values_mut()
-        .for_each(|channel| channel.links.retain(|linked| !gone.contains(linked)));
+    let mut changed = Vec::new();
+    state.channels.values_mut().for_each(|channel| {
+        let before = channel.links.len();
+        channel.links.retain(|linked| !gone.contains(linked));
+        if channel.links.len() != before {
+            changed.push(channel.id);
+        }
+    });
+    for id in changed {
+        touch(state, id);
+    }
 }
 
 /// A channel and everything beneath it.
@@ -1227,13 +1352,21 @@ fn evict(state: &mut TreeState, id: u32) -> Vec<Relocated> {
         })
         .collect();
 
-    state
+    let orphans: Vec<u32> = state
         .channels
         .values_mut()
         .filter(|child| child.parent == Some(id))
-        .for_each(|child| child.parent = Some(parent));
+        .map(|child| {
+            child.parent = Some(parent);
+            child.id
+        })
+        .collect();
+    for orphan in orphans {
+        touch(state, orphan);
+    }
 
     let _ = state.channels.remove(&id);
+    touch(state, id);
     let _ = state.last_active_ms.remove(&id);
     forget_links_to(state, &[id]);
     moved
@@ -1258,6 +1391,7 @@ fn collect_temporary(state: &mut TreeState, channel: u32) -> Option<u32> {
         return None;
     }
     let _ = state.channels.remove(&channel);
+    touch(state, channel);
     forget_links_to(state, &[channel]);
     Some(channel)
 }
@@ -2228,5 +2362,197 @@ mod tests {
                 vec![lobby]
             );
         }
+    }
+    async fn stored() -> Store {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let store = Store::open(
+            &format!("sqlite:file:metadata-tree-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("an in-memory database");
+        store.migrate(crate::SCHEMA).await.expect("schema");
+        store
+    }
+
+    /// Apply everything the journal holds, as the service's writer does.
+    async fn drain(journal: &mut mpsc::UnboundedReceiver<Persist>, store: &Store) {
+        while let Ok(op) = journal.try_recv() {
+            crate::persist::apply(store, &op)
+                .await
+                .expect("a journal write");
+        }
+    }
+
+    /// A fresh tree loaded from `store`, which is all a restart is.
+    async fn restarted(store: &Store) -> Trees {
+        let trees = Trees::new(&[(1, "Starling".to_owned())]);
+        trees.load(store).await;
+        trees
+    }
+
+    /// What a restart should come back to, in an order two trees can compare.
+    ///
+    /// Without the root, whose name and creation time come from configuration
+    /// at every start, and without temporary channels, which are never stored.
+    fn durable(trees: &Trees) -> Vec<Channel> {
+        let mut channels: Vec<Channel> = trees
+            .snapshot(1)
+            .channels
+            .into_iter()
+            .filter(|channel| channel.id != 0 && channel.flags & FLAG_TEMPORARY == 0)
+            .map(|mut channel| {
+                channel.links.sort_unstable();
+                channel
+            })
+            .collect();
+        channels.sort_by_key(|channel| channel.id);
+        channels
+    }
+
+    #[tokio::test]
+    async fn every_stored_field_of_a_channel_survives_a_restart() {
+        // Spelled out with no `..Channel::default()`, so a field added to
+        // `metadata.Channel` does not compile here until somebody has decided
+        // whether it is stored. `pchat_protocol` was that field: it reached the
+        // tree and never the table, and every encrypted channel came back from a
+        // restart as an ordinary one, its history unreadable.
+        let store = stored().await;
+        let trees = Trees::new(&[(1, "Starling".to_owned())]);
+        let mut journal = trees.journal().expect("the journal");
+        let other = create(&trees, "Other", 0);
+        let asked = Channel {
+            id: 0,
+            parent: Some(0),
+            name: "Encrypted".to_owned(),
+            description: "a room".to_owned(),
+            // Derived from `description` each time the channel is serialised,
+            // so not stored: a stored copy could only ever disagree with it.
+            description_hash: Vec::new(),
+            position: 7,
+            max_users: 12,
+            flags: FLAG_HIDDEN,
+            links: Vec::new(),
+            expiry_mode: EXPIRY_ABSOLUTE,
+            expiry_duration_s: 86_400,
+            created_at_ms: 0,
+            pchat_protocol: 4,
+        };
+        let id = trees
+            .create(1, Some(asked), Creation::default())
+            .channel
+            .expect("created")
+            .id;
+        assert!(trees.link(1, id, &[other], &[]).applied);
+        drain(&mut journal, &store).await;
+
+        let after = restarted(&store).await;
+        assert_eq!(durable(&after), durable(&trees));
+        assert_eq!(record(&after, id).pchat_protocol, 4);
+    }
+
+    #[tokio::test]
+    async fn every_mutation_survives_a_restart() {
+        // Every path that changes a channel, then a restart. A path that forgot
+        // to `touch` what it changed shows up as a tree that came back different
+        // from the one that went down.
+        let store = stored().await;
+        let trees = Trees::new(&[(1, "Starling".to_owned())]);
+        let mut journal = trees.journal().expect("the journal");
+        let fields = |names: &[&str]| {
+            names
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let a = create(&trees, "A", 0);
+        let b = create(&trees, "B", 0);
+        let child = create(&trees, "Child", a);
+        let doomed = create(&trees, "Doomed", 0);
+        let expiring = trees
+            .create(
+                1,
+                Some(Channel {
+                    name: "Expiring".to_owned(),
+                    parent: Some(0),
+                    expiry_mode: EXPIRY_ABSOLUTE,
+                    expiry_duration_s: 1,
+                    ..Channel::default()
+                }),
+                Creation::default(),
+            )
+            .channel
+            .expect("created")
+            .id;
+        let _orphan = create(&trees, "Under expiring", expiring);
+        let temporary = trees
+            .create(
+                1,
+                named("Temporary", 0),
+                Creation {
+                    temporary: true,
+                    ..Creation::default()
+                },
+            )
+            .channel
+            .expect("created")
+            .id;
+
+        let edit = Channel {
+            name: "B2".to_owned(),
+            pchat_protocol: 2,
+            ..Channel::default()
+        };
+        let edited = trees.update(
+            1,
+            b,
+            Some(edit),
+            &fields(&["name", "pchat_protocol"]),
+            TreeLimits::UNLIMITED,
+        );
+        assert!(edited.applied);
+        let moved = Channel {
+            parent: Some(b),
+            ..Channel::default()
+        };
+        assert!(
+            trees
+                .update(
+                    1,
+                    child,
+                    Some(moved),
+                    &fields(&["parent"]),
+                    TreeLimits::UNLIMITED
+                )
+                .applied
+        );
+        assert!(trees.link(1, a, &[b, doomed], &[]).applied);
+        assert!(trees.link(1, a, &[], &[b]).applied);
+        // Takes `a`'s link to it along, which is a write to `a`.
+        assert!(trees.remove(1, doomed).result.applied);
+        let _ = trees.enter(1, 9, temporary, TreeLimits::UNLIMITED, false);
+        trees.leave(1, 9);
+        // Re-parents its child to the root, which is a write to the child.
+        assert_eq!(
+            trees.reap_expired(1, now_ms() + 5_000).channels,
+            vec![expiring]
+        );
+        drain(&mut journal, &store).await;
+
+        let after = restarted(&store).await;
+        assert_eq!(durable(&after), durable(&trees));
+        assert!(!after.exists(1, doomed) && !after.exists(1, expiring));
+
+        // The highest id ever handed out was the temporary channel's, which was
+        // never stored. Counting from the surviving rows would give it out
+        // again, and with it whatever ACL and history are still keyed by it.
+        let next = create(&after, "After", 0);
+        assert!(
+            next > temporary,
+            "id {next} was already used by {temporary}"
+        );
     }
 }
