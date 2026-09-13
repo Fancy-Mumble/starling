@@ -115,6 +115,20 @@ impl StarlingBridge {
         })
     }
 
+    /// A channel to `service`, dialed inside this bridge's runtime.
+    ///
+    /// Dialing spawns the channel's worker onto the current runtime, and a
+    /// native plugin calls in from threads that have none: its own runtime is a
+    /// separate copy of tokio. Resolving it bare there panics across the FFI
+    /// boundary, which aborts the whole server.
+    fn dial(
+        &self,
+        service: &str,
+    ) -> Result<tonic::transport::Channel, starling_runtime::channel::ChannelError> {
+        let _entered = self.runtime.enter();
+        self.resolver.channel(service)
+    }
+
     /// The host acting on its own behalf.
     ///
     /// Not a session: a plugin creating a channel is the *server* creating it,
@@ -304,7 +318,7 @@ impl HostBridge for StarlingBridge {
     }
 
     fn has_permission(&self, _server_id: u32, session: u32, channel: u32, flags: u32) -> bool {
-        let Ok(transport) = self.resolver.channel("permissions") else {
+        let Ok(transport) = self.dial("permissions") else {
             // Fails closed, the same way `Permit` does. An unreachable ACL
             // engine must never read as a grant.
             tracing::warn!("cannot reach permissions; the check is denied");
@@ -345,7 +359,7 @@ impl HostBridge for StarlingBridge {
     }
 
     fn create_channel(&self, _server_id: u32, spec: &NewChannel<'_>) -> Option<u32> {
-        let Ok(transport) = self.resolver.channel("metadata") else {
+        let Ok(transport) = self.dial("metadata") else {
             tracing::warn!("cannot reach metadata; no channel was created");
             return None;
         };
@@ -460,7 +474,7 @@ impl HostBridge for StarlingBridge {
         size: u64,
         public: bool,
     ) -> Option<(String, String, String, u64)> {
-        let Ok(transport) = self.resolver.channel("files") else {
+        let Ok(transport) = self.dial("files") else {
             tracing::warn!("cannot reach files; plugin storage is unavailable");
             return None;
         };
@@ -501,7 +515,7 @@ impl HostBridge for StarlingBridge {
             );
             return None;
         }
-        let Ok(transport) = self.resolver.channel("files") else {
+        let Ok(transport) = self.dial("files") else {
             tracing::warn!("cannot reach files; plugin storage is unavailable");
             return None;
         };
@@ -536,8 +550,7 @@ impl HostBridge for StarlingBridge {
         keep: u64,
     ) -> Result<u64, String> {
         let transport = self
-            .resolver
-            .channel("files")
+            .dial("files")
             .map_err(|_| "cannot reach the file service".to_owned())?;
         let request = PutNameRequest {
             scope: self.scope(),
@@ -557,7 +570,7 @@ impl HostBridge for StarlingBridge {
     }
 
     fn name_latest(&self, plugin: &str, _server_id: u32, name: &str) -> Option<(u64, String, u64)> {
-        let Ok(transport) = self.resolver.channel("files") else {
+        let Ok(transport) = self.dial("files") else {
             tracing::warn!("cannot reach files; plugin storage is unavailable");
             return None;
         };
@@ -592,7 +605,7 @@ impl HostBridge for StarlingBridge {
         name: &str,
         limit: u32,
     ) -> Vec<(u64, String, u64)> {
-        let Ok(transport) = self.resolver.channel("files") else {
+        let Ok(transport) = self.dial("files") else {
             tracing::warn!("cannot reach files; plugin storage is unavailable");
             return Vec::new();
         };
@@ -622,7 +635,7 @@ impl HostBridge for StarlingBridge {
     }
 
     fn name_list(&self, plugin: &str, _server_id: u32) -> Vec<(String, u64, String, u64)> {
-        let Ok(transport) = self.resolver.channel("files") else {
+        let Ok(transport) = self.dial("files") else {
             tracing::warn!("cannot reach files; plugin storage is unavailable");
             return Vec::new();
         };
@@ -654,8 +667,7 @@ impl HostBridge for StarlingBridge {
 
     fn name_forget(&self, plugin: &str, _server_id: u32, name: &str) -> Result<(), String> {
         let transport = self
-            .resolver
-            .channel("files")
+            .dial("files")
             .map_err(|_| "cannot reach the file service".to_owned())?;
         let request = NameRequest {
             scope: self.scope(),
@@ -683,7 +695,7 @@ enum Access {
 impl StarlingBridge {
     /// Admit or drop one account on a private channel.
     fn access(&self, _server_id: u32, channel: u32, user_id: u32, which: Access) -> bool {
-        let Ok(transport) = self.resolver.channel("metadata") else {
+        let Ok(transport) = self.dial("metadata") else {
             tracing::warn!("cannot reach metadata; channel access is unchanged");
             return false;
         };
@@ -727,6 +739,39 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_outside_the_runtime_can_dial_a_service() {
+        // A native plugin calls back from its own runtime's threads, and that
+        // runtime is a separate copy of tokio, so ours is not current there.
+        // Dialing spawns the channel's worker; done outside the runtime it
+        // panicked across the FFI boundary and aborted the server.
+        let store = starling_runtime::storage::Store::open(
+            "sqlite:file:bridge-dial-test?mode=memory&cache=shared",
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        let bridge = StarlingBridge::new(
+            tokio::runtime::Handle::current(),
+            Resolver::new(
+                Arc::new(starling_runtime::config::Config::with_defaults(
+                    std::path::Path::new("/run/starling"),
+                )),
+                starling_runtime::inproc::Broker::new(),
+            ),
+            Arc::new(Roster::new()),
+            Fanout::default(),
+            store.kv(),
+            1,
+            BTreeMap::new(),
+        );
+        let answer = std::thread::spawn(move || bridge.name_latest("probe", 1, "doc")).join();
+        assert!(
+            answer.is_ok(),
+            "a plugin thread must be able to reach files"
+        );
+    }
 
     #[test]
     fn a_prefix_becomes_a_range_that_holds_exactly_its_own_keys() {
