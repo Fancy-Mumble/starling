@@ -459,8 +459,15 @@ impl AuditService {
             entry.detail = snapshot::with_digest(&entry.detail, &packed.digest());
         }
 
-        let id = Uuid7::now();
         let chain = self.chain.lock().await;
+        // Minted under the lock, not before it. `verify` replays the chain in
+        // `id` order while `record` links it in insertion order, so the two
+        // orders have to be the same one. Minted outside, two records racing
+        // here take their ids in one order and the lock in the other, and the
+        // chain is then permanently broken at the row whose id sorts before
+        // the head it was linked onto - a tampering report for a log nobody
+        // touched.
+        let id = Uuid7::now();
         let previous = self.head(scope).await;
         let hash = chain_hash(&previous, &entry);
 
@@ -1396,23 +1403,40 @@ mod tests {
         assert_eq!(snapshots(&service).await, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn records_arriving_together_still_chain() {
         // `Trail` spawns every record, so they race; without the chain lock two
         // of them link onto the same head and the log reads as tampered.
+        //
+        // **Multi-threaded on purpose.** On the default current-thread runtime
+        // a record runs from its first line to its first pending await without
+        // interruption, so minting the id and queueing for the lock are one
+        // indivisible step and their orders can never disagree. That is why
+        // this test passed while the ids were minted *outside* the lock: the
+        // runtime it ran on could not produce the interleaving production has.
+        // With real worker threads it broke on the first batch of eight.
         let service = service().await;
-        let mut tasks = Vec::new();
-        for n in 0..20 {
-            let service = Arc::clone(&service);
-            tasks.push(tokio::spawn(async move {
-                let _ = service.record(1, entry(&format!("action {n}"))).await;
-            }));
+        for round in 0..20 {
+            burst(&service, 8).await;
+            let result = service.verify(1).await;
+            assert!(result.intact, "round {round}: {result:?}");
         }
+        assert_eq!(service.verify(1).await.checked, 160);
+    }
+
+    /// `count` records into server 1 at once, each on its own task, awaited.
+    async fn burst(service: &Arc<AuditService>, count: u32) {
+        let tasks: Vec<_> = (0..count)
+            .map(|n| spawn_record(Arc::clone(service), n))
+            .collect();
         for task in tasks {
             task.await.expect("records");
         }
-        let result = service.verify(1).await;
-        assert!(result.intact, "{result:?}");
-        assert_eq!(result.checked, 20);
+    }
+
+    fn spawn_record(service: Arc<AuditService>, n: u32) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _ = service.record(1, entry(&format!("action {n}"))).await;
+        })
     }
 }
