@@ -674,6 +674,22 @@ domains, matched on whole labels so `evilklipy.com` does not pass as
 SSRF guard the search path uses, on the URL, on the resolved address, and again
 on every redirect hop.
 
+A grant has two lifetimes, one per rendition. `preview_url` — the thumbnails a
+picker draws — is good for `gif_proxy_ttl_ms`, an hour by default: only the
+picker that asked ever draws it, and a picker opened again searches again and is
+re-signed. `url` — the full size a client *sends* — is good for
+`gif_proxy_send_ttl_ms`, ten years by default, because once sent it lives in
+chat history and is read back for as long as that is; an hour would leave a
+backlog of broken images by the next morning, with no picker left to re-sign
+them. The long one is not a weaker guard: the signature still covers exactly one
+provider URL and the allow-list still applies, so it buys its holder that GIF
+and nothing else. Either expiry counts from when a page is *sent*, not from when
+the provider answered — the page cache holds the provider's own URLs and every
+answer signs afresh, so a page served from an old cache entry never hands out a
+grant that is already close to lapsing. What does end a sent GIF early is the
+server changing underneath it: a new `public_url`, or a deleted
+`gifs-signing.key`, breaks every proxied GIF already in history.
+
 ## 6.4 Internal — nothing on the wire reaches these
 
 ### `health` — the one place that knows how the whole server is

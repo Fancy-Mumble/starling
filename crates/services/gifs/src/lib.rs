@@ -60,8 +60,10 @@ struct ProxyConfig {
     public_url: String,
     /// The domains a signed URL may name.
     domains: Vec<String>,
-    /// How long a signed URL stays good.
+    /// How long a signed `preview_url` stays good.
     ttl: Duration,
+    /// How long a signed `url` stays good. See [`ProxyStamp::send_ttl`].
+    send_ttl: Duration,
     /// Where the listener binds, absent when the operator configured none.
     listen: Option<String>,
 }
@@ -345,7 +347,8 @@ impl GifsService {
             proxy: self.proxy.as_ref().map(|proxy| ProxyStamp {
                 secret: proxy.secret.clone(),
                 public_url: proxy.public_url.clone(),
-                ttl: proxy.ttl,
+                preview_ttl: proxy.ttl,
+                send_ttl: proxy.send_ttl,
             }),
         }
     }
@@ -484,7 +487,20 @@ struct AnswerParts {
 struct ProxyStamp {
     secret: Vec<u8>,
     public_url: String,
-    ttl: Duration,
+    /// How long a picker thumbnail's grant is good for. Short, because a
+    /// thumbnail is only ever drawn by the picker that asked for it, and a
+    /// picker opened again after it lapses searches again and is re-signed.
+    preview_ttl: Duration,
+    /// How long the full-size grant is good for: years rather than an hour.
+    ///
+    /// `url` is the rendition a client *sends*, and once sent it lives in chat
+    /// history and is read back for as long as that history is. A grant that
+    /// lapsed after an hour would turn every GIF in the backlog into a broken
+    /// image by the next morning, with no picker left to re-sign it. The length
+    /// costs nothing worth guarding: the signature covers one provider URL and
+    /// the host allow-list still applies, so a grant that outlives everyone
+    /// buys its holder that one GIF and nothing else.
+    send_ttl: Duration,
 }
 
 impl AnswerParts {
@@ -505,9 +521,10 @@ impl AnswerParts {
                 // Rewritten here rather than at parse time, so the cache holds
                 // the provider's own URLs: a signed URL carries an expiry, and
                 // caching one would serve grants that expire before the page
-                // does.
-                url: self.stamp(&gif.url),
-                preview_url: self.stamp(&gif.preview_url),
+                // does. Stamped here, every answer - from the cache or fresh -
+                // counts its expiry from the moment it is sent.
+                url: self.stamp(&gif.url, |proxy| proxy.send_ttl),
+                preview_url: self.stamp(&gif.preview_url, |proxy| proxy.preview_ttl),
                 width: gif.width,
                 height: gif.height,
                 preview_width: gif.preview_width,
@@ -531,11 +548,12 @@ impl AnswerParts {
         )
     }
 
-    /// `url` as the client should be given it.
-    fn stamp(&self, url: &str) -> String {
+    /// `url` as the client should be given it, signed for as long as `ttl`
+    /// picks when the proxy is on.
+    fn stamp(&self, url: &str, ttl: impl Fn(&ProxyStamp) -> Duration) -> String {
         self.proxy.as_ref().map_or_else(
             || url.to_owned(),
-            |proxy| proxy::proxied(&proxy.public_url, &proxy.secret, url, proxy.ttl),
+            |proxy| proxy::proxied(&proxy.public_url, &proxy.secret, url, ttl(proxy)),
         )
     }
 }
@@ -736,6 +754,12 @@ fn configured_proxy(
         ttl: service
             .option::<u64>("gif_proxy_ttl_ms")
             .map_or(Duration::from_secs(3600), Duration::from_millis),
+        // Ten years: longer than any history anybody keeps, and nowhere near
+        // making `now + ttl` overflow.
+        send_ttl: service.option::<u64>("gif_proxy_send_ttl_ms").map_or(
+            Duration::from_millis(315_360_000_000),
+            Duration::from_millis,
+        ),
         listen: service.listen.clone(),
     }))
 }
@@ -848,6 +872,7 @@ mod tests {
             public_url: "https://chat.example.org/".to_owned(),
             domains: vec!["klipy.com".to_owned()],
             ttl: Duration::from_secs(3600),
+            send_ttl: Duration::from_millis(315_360_000_000),
             listen: None,
         });
         service
@@ -1036,6 +1061,50 @@ mod tests {
             assert!(gif.url.starts_with(&support.media_base), "{}", gif.url);
             assert!(
                 gif.preview_url.starts_with(&support.media_base),
+                "{}",
+                gif.preview_url
+            );
+        }
+    }
+
+    /// The expiry a proxied URL was signed with.
+    fn expiry_of(url: &str) -> u64 {
+        url.split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("expires="))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no expiry in {url}"))
+    }
+
+    #[test]
+    fn a_sent_gif_outlives_the_picker_it_was_chosen_in() {
+        // `url` goes into chat and is read back for as long as the history
+        // is; `preview_url` is only ever drawn by the picker that asked. An
+        // hour on the first is a backlog of broken images by morning.
+        let service = proxying(service(klipy(), generous(), generous()));
+        let before = now_ms();
+        let action =
+            service
+                .answer_parts()
+                .page_action(1, "r1", &Key::new("cat", 1), &provider_page());
+        let after = now_ms();
+        let page = page_in(&action).expect("a page");
+
+        let hour = 3_600_000;
+        let decade = 315_360_000_000;
+        for gif in &page.results {
+            // Counted from when the page was *sent*, not from when the
+            // provider answered: the cache holds the provider's own URLs and
+            // every answer signs afresh, so a page served from a cache nearly
+            // as old as `gif_cache_ttl_ms` still hands out a whole grant.
+            let sent = expiry_of(&gif.url);
+            assert!(
+                (before + decade..=after + decade).contains(&sent),
+                "{}",
+                gif.url
+            );
+            let preview = expiry_of(&gif.preview_url);
+            assert!(
+                (before + hour..=after + hour).contains(&preview),
                 "{}",
                 gif.preview_url
             );

@@ -592,6 +592,12 @@ max_upload = "512MiB"
 # pictures to keep so that a room full of people opening the same page costs one
 # fetch rather than one each.
 # gif_proxy_ttl_ms = "3600000"
+# How long the full-size URL a client *sends* stays good. That one goes into
+# chat and is read back for as long as the history is, so it gets ten years
+# rather than an hour; the thumbnails above keep the short one. The signature
+# still covers one provider URL and the domain list still applies, so a long
+# grant buys its holder that one GIF and nothing else.
+# gif_proxy_send_ttl_ms = "315360000000"
 # gif_media_cache_bytes = "67108864"
 # gif_media_max_bytes = "8388608"
 #
