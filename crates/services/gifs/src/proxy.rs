@@ -179,8 +179,33 @@ pub fn host_is_allowed(url: &str, domains: &[String]) -> bool {
     })
 }
 
-/// Serve one proxied picture.
+/// Serve one proxied picture, readable from any origin.
+///
+/// A client that only *draws* a GIF needs no CORS at all - an `<img>` loads
+/// cross-origin regardless. One that *reads* the bytes does: picking a GIF as
+/// an avatar or banner means a `fetch()` from the client's webview, whose
+/// origin (`tauri://localhost`, `https://tauri.localhost`) is never this
+/// server's, and without the header the browser hands it an opaque failure
+/// instead of the picture. `*` rather than an origin list because there is
+/// nothing to protect by narrowing it: the bytes are public GIFs, the grant is
+/// in the URL rather than in a cookie, and no credentials are involved - which
+/// is also why a plain `GET` like this needs no preflight and there is no
+/// `OPTIONS` route.
+///
+/// On the refusals too, not just the picture: a `403` a script cannot read is
+/// indistinguishable from the network being down, and the client re-signs on
+/// the first but not the second.
 async fn fetch(State(service): State<Arc<GifsService>>, Query(grant): Query<Grant>) -> Response {
+    let mut response = serve(&service, &grant).await;
+    let _ = response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    response
+}
+
+/// The response for one grant, before it is made readable cross-origin.
+async fn serve(service: &GifsService, grant: &Grant) -> Response {
     let Some(secret) = service.proxy_secret() else {
         // The switch is off, so nothing was ever signed with anything.
         return StatusCode::NOT_FOUND.into_response();
@@ -333,6 +358,57 @@ mod tests {
         let allowed = vec!["klipy.com".to_owned()];
         assert!(!host_is_allowed("file:///etc/passwd", &allowed));
         assert!(!host_is_allowed("//cdn.klipy.com/a.webp", &allowed));
+    }
+
+    #[tokio::test]
+    async fn a_webview_can_read_the_picture_and_the_refusal() {
+        // The client `fetch()`es a GIF it is about to make an avatar from, and
+        // its origin is never ours. Without the header both of these reach it
+        // as the same opaque network error.
+        let service = Arc::new(crate::tests::proxying(crate::tests::service(
+            None,
+            crate::tests::generous(),
+            crate::tests::generous(),
+        )));
+        let upstream = "https://static.klipy.com/a.gif";
+        // Held already, so the test never goes near the network.
+        service.store_bytes(upstream, "image/gif", b"GIF89a");
+        let expires = now_ms() + 60_000;
+
+        let good = fetch(
+            State(Arc::clone(&service)),
+            Query(Grant {
+                u: upstream.to_owned(),
+                expires,
+                sig: sign(b"secret", upstream, expires),
+            }),
+        )
+        .await;
+        assert_eq!(good.status(), StatusCode::OK);
+        assert_eq!(
+            good.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(header::HeaderValue::as_bytes),
+            Some(b"*".as_slice())
+        );
+
+        let forged = fetch(
+            State(service),
+            Query(Grant {
+                u: upstream.to_owned(),
+                expires,
+                sig: "00".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            forged
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(header::HeaderValue::as_bytes),
+            Some(b"*".as_slice())
+        );
     }
 
     #[test]

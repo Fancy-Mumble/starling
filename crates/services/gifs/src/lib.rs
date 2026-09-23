@@ -769,8 +769,14 @@ mod tests {
     use super::*;
     use starling_proto_fancy::control::server_action;
 
-    /// A service with the limits a test wants and no proxy.
-    fn service(provider: Option<Provider>, session: Limit, server: Limit) -> GifsService {
+    /// A service with the limits a test wants and no proxy. Crate-visible, as
+    /// are `proxying` and `generous`, so `proxy`'s tests build theirs the same
+    /// way.
+    pub(crate) fn service(
+        provider: Option<Provider>,
+        session: Limit,
+        server: Limit,
+    ) -> GifsService {
         let metrics = starling_runtime::metrics::Metrics::new();
         let counter = |name: &str| metrics.counter(name);
         GifsService {
@@ -865,7 +871,7 @@ mod tests {
     }
 
     /// `service` with the media proxy switched on.
-    fn proxying(mut service: GifsService) -> GifsService {
+    pub(crate) fn proxying(mut service: GifsService) -> GifsService {
         service.proxy = Some(ProxyConfig {
             secret: b"secret".to_vec(),
             // A trailing slash, as an operator will sometimes write it.
@@ -901,7 +907,7 @@ mod tests {
         }
     }
 
-    fn generous() -> Limit {
+    pub(crate) fn generous() -> Limit {
         Limit {
             rate: Rate::per_second(100.0),
             burst: 100,

@@ -690,6 +690,14 @@ grant that is already close to lapsing. What does end a sent GIF early is the
 server changing underneath it: a new `public_url`, or a deleted
 `gifs-signing.key`, breaks every proxied GIF already in history.
 
+Every `/gif` response, refusals included, carries
+`Access-Control-Allow-Origin: *`. Drawing a GIF needs no CORS, but a client that
+reads the bytes — to make one an avatar — does so with `fetch()` from its
+webview's own origin, and without the header gets an opaque failure where the
+picture or the `403` should be. `*` narrows nothing worth narrowing: the bytes
+are public GIFs and the grant travels in the URL, not in a credential. A plain
+`GET` needs no preflight, so there is no `OPTIONS` route.
+
 ## 6.4 Internal — nothing on the wire reaches these
 
 ### `health` — the one place that knows how the whole server is
