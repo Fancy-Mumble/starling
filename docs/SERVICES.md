@@ -643,6 +643,26 @@ client falling back to a key of its own is right. Falling back on `THROTTLED`
 would route around the rate limit using the user's quota, which is the abuse the
 limit exists to stop.
 
+#### Asking before searching
+
+A client sends one `GifSupportQuery` per connection and is told, in a
+`GifSupport`, whether a search would be served (`available`, the `UNAVAILABLE`
+refusal said up front), which provider answers, and `media_base`: the prefix
+every proxied URL in this server's pages starts with, or empty when the media
+proxy is off. It needs the second before drawing anything, because whether the
+picker leaks the viewer's address to the provider's CDN is decided by which of
+the two the thumbnails come from, and finding out from the first page of
+results is finding out after the leak. `media_base` is a prefix rather than a
+bool so a client can hold the server to it: a URL that does not start with it
+was not proxied, and a client that promised its user no contact with the
+provider can decline to load it. The prefix and the URLs come out of one
+function, so they cannot drift.
+
+The answer is built from configuration alone. It charges neither bucket and
+never reaches the provider — it is asked on every connect, and a question the
+config file answers should not cost anybody's search budget. A server too old to
+know the message answers nothing, which a client reads as not available.
+
 #### Why the media proxy is not an open proxy
 
 A URL naming a host to fetch, served by a public endpoint, is an open proxy

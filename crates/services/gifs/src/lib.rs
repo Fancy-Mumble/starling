@@ -38,7 +38,7 @@ use std::time::Duration;
 use prost::Message as _;
 use starling_outbound::{Fetcher, Limits};
 use starling_proto_fancy::fancy::media::{
-    Gif, GifPage, GifQuery, GifRefused, GifsEnvelope, gif_refused, gifs_envelope,
+    Gif, GifPage, GifQuery, GifRefused, GifSupport, GifsEnvelope, gif_refused, gifs_envelope,
 };
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::ids::now_ms;
@@ -138,10 +138,25 @@ impl ClientService for GifsService {
             );
             return Actions::new();
         };
-        let Some(gifs_envelope::Body::Query(query)) = envelope.body else {
-            // A `GifPage` or `GifRefused` from a client is either confused or
-            // newer than this server; there is nothing here that answers one.
-            return Actions::new();
+        let query = match envelope.body {
+            Some(gifs_envelope::Body::Query(query)) => query,
+            Some(gifs_envelope::Body::SupportQuery(asked)) => {
+                // Answered here and now, from configuration alone: no bucket
+                // is charged and the provider is not asked, because nothing
+                // about the answer depends on either. It is asked on every
+                // connect, and charging it would spend a token of everybody's
+                // budget per login on a question the config file answers.
+                return vec![framed(
+                    inbound.conn,
+                    gifs_envelope::Body::Support(self.support(&asked.request_id)),
+                )];
+            }
+            _ => {
+                // A `GifPage`, `GifRefused` or `GifSupport` from a client is
+                // either confused or newer than this server; there is nothing
+                // here that answers one.
+                return Actions::new();
+            }
         };
         self.counters.searches.inc();
 
@@ -326,16 +341,39 @@ impl GifsService {
     fn answer_parts(&self) -> AnswerParts {
         AnswerParts {
             quota: Arc::clone(&self.quota),
-            provider_name: self
-                .provider
-                .as_ref()
-                .map_or("", |provider| provider.kind().as_str())
-                .to_owned(),
+            provider_name: self.provider_name().to_owned(),
             proxy: self.proxy.as_ref().map(|proxy| ProxyStamp {
                 secret: proxy.secret.clone(),
                 public_url: proxy.public_url.clone(),
                 ttl: proxy.ttl,
             }),
+        }
+    }
+
+    /// Which provider answers searches, or `""` when none does.
+    fn provider_name(&self) -> &'static str {
+        self.provider
+            .as_ref()
+            .map_or("", |provider| provider.kind().as_str())
+    }
+
+    /// What this server does for a client, before it has searched for
+    /// anything.
+    ///
+    /// `available` is exactly the condition `search` refuses `UNAVAILABLE` on,
+    /// so the up-front answer and the refusal cannot disagree. `media_base`
+    /// comes from [`proxy::media_base`], the same function every proxied URL
+    /// is built with.
+    fn support(&self, request_id: &str) -> GifSupport {
+        GifSupport {
+            request_id: request_id.to_owned(),
+            available: self.provider.is_some(),
+            media_base: self
+                .proxy
+                .as_ref()
+                .map(|proxy| proxy::media_base(&proxy.public_url))
+                .unwrap_or_default(),
+            provider: self.provider_name().to_owned(),
         }
     }
 
@@ -421,13 +459,15 @@ impl GifsService {
 
 /// A `GifRefused`, framed and addressed.
 fn refusal_action(conn: u64, refused: GifRefused) -> starling_proto_fancy::control::ServerAction {
+    framed(conn, gifs_envelope::Body::Refused(refused))
+}
+
+/// Any answer, framed and addressed to one connection.
+fn framed(conn: u64, body: gifs_envelope::Body) -> starling_proto_fancy::control::ServerAction {
     to_conn(
         conn,
         ServiceKind::Gifs.outer_type(),
-        GifsEnvelope {
-            body: Some(gifs_envelope::Body::Refused(refused)),
-        }
-        .encode_to_vec(),
+        GifsEnvelope { body: Some(body) }.encode_to_vec(),
     )
 }
 
@@ -757,15 +797,81 @@ mod tests {
         }
     }
 
-    /// The refusal in an action, or `None` when it is not one.
-    fn refusal_in(actions: &Actions) -> Option<GifRefused> {
-        let action = actions.first()?;
+    /// What one action says, decoded.
+    fn body_of(
+        action: &starling_proto_fancy::control::ServerAction,
+    ) -> Option<gifs_envelope::Body> {
         let server_action::Action::Send(send) = action.action.as_ref()? else {
             return None;
         };
-        let envelope = GifsEnvelope::decode(send.payload.as_slice()).ok()?;
-        match envelope.body? {
+        GifsEnvelope::decode(send.payload.as_slice()).ok()?.body
+    }
+
+    /// The refusal in an action, or `None` when it is not one.
+    fn refusal_in(actions: &Actions) -> Option<GifRefused> {
+        match body_of(actions.first()?)? {
             gifs_envelope::Body::Refused(refused) => Some(refused),
+            _ => None,
+        }
+    }
+
+    /// The support answer in an action, or `None` when it is not one.
+    fn support_in(actions: &Actions) -> Option<GifSupport> {
+        match body_of(actions.first()?)? {
+            gifs_envelope::Body::Support(support) => Some(support),
+            _ => None,
+        }
+    }
+
+    fn support_query() -> Inbound {
+        let mut inbound = query("", 1);
+        inbound.payload = GifsEnvelope {
+            body: Some(gifs_envelope::Body::SupportQuery(
+                starling_proto_fancy::fancy::media::GifSupportQuery {
+                    request_id: "s1".to_owned(),
+                },
+            )),
+        }
+        .encode_to_vec();
+        inbound
+    }
+
+    fn klipy() -> Option<Provider> {
+        Some(Provider::new(provider::Name::Klipy, "k".to_owned(), 24))
+    }
+
+    /// `service` with the media proxy switched on.
+    fn proxying(mut service: GifsService) -> GifsService {
+        service.proxy = Some(ProxyConfig {
+            secret: b"secret".to_vec(),
+            // A trailing slash, as an operator will sometimes write it.
+            public_url: "https://chat.example.org/".to_owned(),
+            domains: vec!["klipy.com".to_owned()],
+            ttl: Duration::from_secs(3600),
+            listen: None,
+        });
+        service
+    }
+
+    /// A page as the provider might send it.
+    fn provider_page() -> provider::Page {
+        provider::Page {
+            results: (0..3)
+                .map(|n| provider::Gif {
+                    id: n.to_string(),
+                    url: format!("https://static.klipy.com/full/{n}.webp?x=1&y=2"),
+                    preview_url: format!("https://static.klipy.com/tiny/{n}.webp"),
+                    ..provider::Gif::default()
+                })
+                .collect(),
+            has_next: true,
+        }
+    }
+
+    /// The page in an action, or `None` when it is not one.
+    fn page_in(action: &starling_proto_fancy::control::ServerAction) -> Option<GifPage> {
+        match body_of(action)? {
+            gifs_envelope::Body::Page(page) => Some(page),
             _ => None,
         }
     }
@@ -887,5 +993,79 @@ mod tests {
             0,
             "a cache hit must not be charged"
         );
+    }
+
+    #[tokio::test]
+    async fn support_says_whether_a_search_would_be_served() {
+        // The up-front form of the UNAVAILABLE refusal, and it must agree with
+        // it: a client told "available" that is then refused on its first
+        // search has been lied to once per connect.
+        let keyless = service(None, generous(), generous());
+        let support = support_in(&keyless.frame(support_query()).await).expect("an answer");
+        assert_eq!(support.request_id, "s1");
+        assert!(!support.available);
+        assert_eq!(support.provider, "");
+        assert_eq!(
+            support.media_base, "",
+            "no proxy, so the pictures come from the provider's own CDN"
+        );
+
+        let keyed = service(klipy(), generous(), generous());
+        let support = support_in(&keyed.frame(support_query()).await).expect("an answer");
+        assert!(support.available);
+        assert_eq!(support.provider, "klipy");
+        assert_eq!(support.media_base, "");
+    }
+
+    #[tokio::test]
+    async fn the_media_base_is_what_every_proxied_url_starts_with() {
+        // The client refuses to load a URL that does not start with this, so
+        // the answer and the URLs drifting apart would make every GIF on the
+        // server look unproxied.
+        let service = proxying(service(klipy(), generous(), generous()));
+        let support = support_in(&service.frame(support_query()).await).expect("an answer");
+        assert_eq!(support.media_base, "https://chat.example.org/gif?");
+
+        let action =
+            service
+                .answer_parts()
+                .page_action(1, "r1", &Key::new("cat", 1), &provider_page());
+        let page = page_in(&action).expect("a page");
+        assert_eq!(page.results.len(), 3);
+        for gif in &page.results {
+            assert!(gif.url.starts_with(&support.media_base), "{}", gif.url);
+            assert!(
+                gif.preview_url.starts_with(&support.media_base),
+                "{}",
+                gif.preview_url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn asking_what_the_server_supports_costs_nothing() {
+        // Asked on every connect. Charged, a server with a busy lobby would
+        // spend its members' search budget on logins; sent upstream, it would
+        // tell the provider every time somebody connects.
+        let service = service(
+            klipy(),
+            Limit {
+                rate: Rate::per_second(0.0),
+                burst: 1,
+            },
+            Limit {
+                rate: Rate::per_second(0.0),
+                burst: 1,
+            },
+        );
+        for _ in 0..5 {
+            let actions = service.frame(support_query()).await;
+            assert!(support_in(&actions).expect("an answer").available);
+        }
+        assert_eq!(service.counters.searches.get(), 0);
+        assert_eq!(service.counters.upstream.get(), 0);
+        assert_eq!(service.quota.cached_entries(), 0);
+        // The one token each bucket holds is still there.
+        assert!(service.quota.admit(7, now_ms()).is_ok());
     }
 }

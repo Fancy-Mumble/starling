@@ -132,14 +132,25 @@ fn encode(raw: &str) -> String {
     out
 }
 
+/// What every proxied URL starts with, as a `GifSupport` tells a client.
+///
+/// One function for both, because the client uses this prefix to check that a
+/// URL really is proxied before loading it: if the answer and the URLs were
+/// built in two places, the first edit to one of them would make every GIF
+/// look unproxied to a client that trusts the check.
+#[must_use]
+pub fn media_base(public_url: &str) -> String {
+    format!("{}/gif?", public_url.trim_end_matches('/'))
+}
+
 /// The URL a client should be given for `upstream`.
 #[must_use]
 pub fn proxied(public_url: &str, secret: &[u8], upstream: &str, ttl: Duration) -> String {
     let expires = now_ms().saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
     let sig = sign(secret, upstream, expires);
     format!(
-        "{}/gif?u={}&expires={expires}&sig={sig}",
-        public_url.trim_end_matches('/'),
+        "{}u={}&expires={expires}&sig={sig}",
+        media_base(public_url),
         encode(upstream)
     )
 }
