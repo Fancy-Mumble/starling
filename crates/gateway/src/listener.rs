@@ -1112,22 +1112,17 @@ async fn pump_writer(
                     None => &queued,
                 };
 
-                let mut failed = false;
-                for frame in to_write {
-                    if write_frame(&mut writer, frame).await.is_err() {
-                        failed = true;
-                        break;
-                    }
-                }
-                if failed {
+                if write_batch(&mut writer, to_write).await.is_err() {
                     break;
                 }
             }
             () = handle.audio_ready() => {
+                let mut burst = Vec::new();
                 while let Some(frame) = handle.pop_audio() {
-                    if write_frame(&mut writer, &frame).await.is_err() {
-                        return;
-                    }
+                    burst.push(frame);
+                }
+                if write_batch(&mut writer, &burst).await.is_err() {
+                    return;
                 }
             }
             // The connection is ending. Write out what is already queued
@@ -1141,17 +1136,41 @@ async fn pump_writer(
             // so a peer that has stopped reading cannot hold the teardown
             // open by never draining its socket. `finish` bounds it as well.
             () = handle.draining() => {
+                let mut rest = Vec::new();
                 while let Ok(frame) = outbound.try_recv() {
                     handle.control_sent(frame.len());
-                    if write_frame(&mut writer, &frame).await.is_err() {
-                        break;
-                    }
+                    rest.push(frame);
                 }
+                let _ = write_batch(&mut writer, &rest).await;
                 break;
             }
         }
     }
     let _ = writer.shutdown().await;
+}
+
+/// Write a batch of frames, then flush.
+///
+/// The flush is not a formality. The writer is a TLS stream, and rustls writes
+/// sealed records to the socket only until the socket would block; whatever is
+/// left stays in the session's own buffer until the *next* write or a flush.
+/// A frame bigger than the socket's send buffer therefore went out only as far
+/// as the buffer reached, and on a connection with nothing else to say the rest
+/// waited forever. Linux's default buffer swallowed a 200 KiB channel
+/// description whole, which is why this was only ever seen on Windows, whose
+/// default is a fraction of that: the client asked for the description and
+/// never got its end.
+async fn write_batch<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frames: &[Outbound],
+) -> std::io::Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    for frame in frames {
+        write_frame(writer, frame).await?;
+    }
+    writer.flush().await
 }
 
 /// Write one frame, header and payload together.
@@ -1479,6 +1498,64 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    /// A writer that, like rustls with a full socket, takes the bytes and
+    /// holds them: nothing reaches the peer until it is flushed.
+    #[derive(Default)]
+    struct HoldingWriter {
+        held: Vec<u8>,
+        delivered: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for HoldingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.held.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let held = std::mem::take(&mut self.held);
+            self.delivered.extend_from_slice(&held);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_flushed_so_a_large_frame_does_not_wait_for_the_next_one() {
+        // The Windows-only e2e failure: a 200 KiB channel description was
+        // queued, partly written, and the rest sat in the TLS session's buffer
+        // on a connection with nothing else to send, so the client never saw
+        // its end. A batch is only written once it has been flushed.
+        let big = Outbound {
+            prefix: bytes::Bytes::from_static(&[0, 7, 0, 3, 32, 0]),
+            payload: bytes::Bytes::from(vec![b'A'; 200 * 1024]),
+        };
+        let mut writer = HoldingWriter::default();
+        write_batch(&mut writer, std::slice::from_ref(&big))
+            .await
+            .expect("a write");
+        assert!(writer.held.is_empty(), "nothing is left behind the flush");
+        assert_eq!(writer.delivered.len(), big.len());
+
+        // And an empty batch touches nothing.
+        let mut idle = HoldingWriter::default();
+        write_batch(&mut idle, &[]).await.expect("nothing to write");
+        assert!(idle.delivered.is_empty());
     }
 
     #[tokio::test]
