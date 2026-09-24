@@ -28,6 +28,13 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
             "text_message_length" => current.text_message_length = values.text_message_length,
             "image_message_length" => current.image_message_length = values.image_message_length,
             "allow_html" => current.allow_html = values.allow_html,
+            "allow_voice_messages" => current.allow_voice_messages = values.allow_voice_messages,
+            "voice_message_max_seconds" => {
+                current.voice_message_max_seconds = values.voice_message_max_seconds;
+            }
+            "voice_message_max_bytes" => {
+                current.voice_message_max_bytes = values.voice_message_max_bytes;
+            }
             "allow_recording" => current.allow_recording = values.allow_recording,
             "broadcast_listener_volume_adjustments" => {
                 current.broadcast_listener_volume_adjustments =
@@ -323,6 +330,36 @@ const SCHEMA: &[Row] = &[
         secret: false,
         read: |s| s.allow_html.to_string(),
         write: |s, v| set_bool(&mut s.allow_html, v),
+    },
+    Row {
+        key: "allow_voice_messages",
+        kind: Kind::Bool,
+        group: "Voice messages",
+        label: "Allow voice messages",
+        help: "Whether members may record and send voice clips in chat. Deny the Send voice message permission to turn them off for one channel.",
+        secret: false,
+        read: |s| s.allow_voice_messages.to_string(),
+        write: |s, v| set_bool(&mut s.allow_voice_messages, v),
+    },
+    Row {
+        key: "voice_message_max_seconds",
+        kind: Kind::Int,
+        group: "Voice messages",
+        label: "Maximum length",
+        help: "Seconds per clip. The recorder stops itself here. Zero is no limit.",
+        secret: false,
+        read: |s| s.voice_message_max_seconds.to_string(),
+        write: |s, v| set_u32(&mut s.voice_message_max_seconds, v),
+    },
+    Row {
+        key: "voice_message_max_bytes",
+        kind: Kind::Int,
+        group: "Voice messages",
+        label: "Maximum size",
+        help: "Bytes per clip. Zero leaves only the file service's upload limit.",
+        secret: false,
+        read: |s| s.voice_message_max_bytes.to_string(),
+        write: |s, v| set_u32(&mut s.voice_message_max_bytes, v),
     },
     Row {
         key: "channel_nesting_limit",

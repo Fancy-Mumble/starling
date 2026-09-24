@@ -64,6 +64,12 @@ pub struct ServerSettings {
     pub log_days: Option<u32>,
     /// Past avatars and comments the audit log keeps per user. Zero keeps none.
     pub profile_history: Option<u32>,
+    /// Whether members may send recorded voice clips into chat.
+    pub allow_voice_messages: Option<bool>,
+    /// The longest voice clip, in seconds. Zero is no limit.
+    pub voice_message_max_seconds: Option<u32>,
+    /// The largest voice clip, in bytes. Zero leaves only `max_upload`.
+    pub voice_message_max_bytes: Option<u32>,
     /// Sustained messages per second before a client is throttled.
     pub message_limit: Option<u32>,
     /// How many may arrive at once before that rate applies.
@@ -146,6 +152,9 @@ impl ServerSettings {
             cert_required,
             log_days,
             profile_history,
+            allow_voice_messages,
+            voice_message_max_seconds,
+            voice_message_max_bytes,
             message_limit,
             message_burst,
             plugin_message_limit,
@@ -237,6 +246,9 @@ mod tests {
             cert_required: Some(true),
             log_days: Some(1),
             profile_history: Some(1),
+            allow_voice_messages: Some(true),
+            voice_message_max_seconds: Some(1),
+            voice_message_max_bytes: Some(1),
             message_limit: Some(1),
             message_burst: Some(1),
             plugin_message_limit: Some(1),

@@ -124,6 +124,12 @@ pub fn defaults(instance: u32) -> Snapshot {
         user_name_regex: USER_NAME_PATTERN.to_owned(),
         // Off: keeping what people used to look like is an operator's choice.
         profile_history: 0,
+        // On, capped at two minutes and two megabytes: a clip of that length
+        // is about half a megabyte of Opus, so the byte cap only bites on a
+        // client that encodes wastefully.
+        allow_voice_messages: true,
+        voice_message_max_seconds: 120,
+        voice_message_max_bytes: 2 * 1024 * 1024,
         extra: HashMap::new(),
     }
 }
@@ -369,6 +375,8 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "default_channel" => count(&mut snapshot.default_channel),
             "remember_channel_duration" => count(&mut snapshot.remember_channel_duration),
             "profile_history" => count(&mut snapshot.profile_history),
+            "voice_message_max_seconds" => count(&mut snapshot.voice_message_max_seconds),
+            "voice_message_max_bytes" => count(&mut snapshot.voice_message_max_bytes),
             "message_limit" => count(&mut snapshot.message_limit),
             "message_burst" => count(&mut snapshot.message_burst),
             "plugin_message_limit" => count(&mut snapshot.plugin_message_limit),
@@ -381,6 +389,7 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "cert_required" => write_flag(&mut snapshot.cert_required),
             "obfuscate_ips" => write_flag(&mut snapshot.obfuscate_ips),
             "allow_ping" => write_flag(&mut snapshot.allow_ping),
+            "allow_voice_messages" => write_flag(&mut snapshot.allow_voice_messages),
             "remember_channel" => write_flag(&mut snapshot.remember_channel),
             "channel_name_regex" => write_text(&mut snapshot.channel_name_regex),
             "user_name_regex" => write_text(&mut snapshot.user_name_regex),
@@ -430,6 +439,9 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Value {
         "listeners_per_user": snapshot.listeners_per_user,
         "log_days": snapshot.log_days,
         "profile_history": snapshot.profile_history,
+        "allow_voice_messages": snapshot.allow_voice_messages,
+        "voice_message_max_seconds": snapshot.voice_message_max_seconds,
+        "voice_message_max_bytes": snapshot.voice_message_max_bytes,
         "message_limit": snapshot.message_limit,
         "message_burst": snapshot.message_burst,
         "plugin_message_limit": snapshot.plugin_message_limit,

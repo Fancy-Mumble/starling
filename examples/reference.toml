@@ -83,6 +83,13 @@ text_message_length = 5000
 image_message_length = 131072
 # Whether messages may carry markup. Off means plain text everywhere.
 allow_html = true
+# Whether members may send recorded voice clips into chat. Deny the
+# SendVoiceMessage permission to turn them off in one channel.
+allow_voice_messages = true
+# Longest voice clip in seconds. 0 is unlimited.
+voice_message_max_seconds = 120
+# Largest voice clip in bytes. 0 leaves only [services.files] max_upload.
+voice_message_max_bytes = 2097152
 # How deep the channel tree may go.
 channel_nesting_limit = 10
 # How many channels may exist at all.

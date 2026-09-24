@@ -232,6 +232,16 @@ message Snapshot {
   // How many past avatars and comments `audit` keeps per user. Zero, the
   // default, records none. Avatars are kept shrunk and comments compressed.
   uint32 profile_history = 43;
+  // Whether members may send recorded voice clips into chat at all. **On** by
+  // default: a clip is a file share with its own permission bit
+  // (`SendVoiceMessage`), and that bit is what an operator denies per channel.
+  // This is the switch for the whole server.
+  bool allow_voice_messages = 44;
+  // The longest clip, in seconds. Zero is no limit.
+  uint32 voice_message_max_seconds = 45;
+  // The largest clip, in bytes. Zero leaves only the file service's own
+  // `max_upload` in the way.
+  uint32 voice_message_max_bytes = 46;
 }
 
 // -- Greeting -----------------------------------------------------------------
