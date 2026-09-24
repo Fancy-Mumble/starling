@@ -81,6 +81,14 @@ bitflags! {
         /// are exhausted. It is **not** root-only: root-only-ness is decided by
         /// the evaluation code, not the bit value (`ACL.h:50`).
         const SEE_CHANNEL = 0x1000000;
+
+        /// Send a recorded voice clip into the channel's chat (Fancy).
+        ///
+        /// A channel permission in the root-only range for the same reason as
+        /// [`Self::SEE_CHANNEL`]. Separate from [`Self::SHARE_FILES`], though a
+        /// clip travels as a file: a server can want its members leaving voice
+        /// notes without letting any of them upload arbitrary files.
+        const SEND_VOICE_MESSAGE = 0x2000000;
     }
 }
 
@@ -113,7 +121,10 @@ impl Perm {
         .union(Self::SPEAK)
         .union(Self::WHISPER)
         .union(Self::TEXT_MESSAGE)
-        .union(Self::LISTEN);
+        .union(Self::LISTEN)
+        // Granted wherever text is: a voice note is a message, and the whole
+        // server's switch is `allow_voice_messages`, not this bit.
+        .union(Self::SEND_VOICE_MESSAGE);
 
     /// What holding [`Self::WRITE`] in a channel brings with it.
     ///
@@ -135,7 +146,8 @@ impl Perm {
         .union(Self::LISTEN)
         .union(Self::SHARE_FILES)
         .union(Self::SHARE_FILES_PUBLIC)
-        .union(Self::SEE_CHANNEL);
+        .union(Self::SEE_CHANNEL)
+        .union(Self::SEND_VOICE_MESSAGE);
 
     /// What [`Self::WRITE`] on the **root** channel brings with it, on top of
     /// [`Self::IMPLIED_BY_WRITE`].
@@ -189,6 +201,7 @@ mod tests {
         assert_eq!(Perm::KICK.bits(), 0x10000);
         assert_eq!(Perm::READ_REGISTER.bits(), 0x800000);
         assert_eq!(Perm::SEE_CHANNEL.bits(), 0x1000000);
+        assert_eq!(Perm::SEND_VOICE_MESSAGE.bits(), 0x2000000);
     }
 
     #[test]
