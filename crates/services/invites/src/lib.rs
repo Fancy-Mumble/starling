@@ -31,7 +31,7 @@
 //! An invite that admits "five people" and is spent by one person reconnecting
 //! five times is a bug nobody would forgive, so a use is keyed on who presented
 //! it - their certificate, or their name when they have none - and the same
-//! person coming back costs nothing. See [`store`].
+//! person coming back costs nothing. See the `store` module.
 
 pub mod rpc;
 mod store;
