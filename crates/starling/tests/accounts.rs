@@ -371,3 +371,74 @@ async fn a_device_signed_out_from_another_is_disconnected_and_kept_out() {
     deployment.stop().await;
 }
 
+/// The next `TextMessage`, skipping everything else.
+async fn next_text(client: &mut Client) -> tcp::TextMessage {
+    timeout(FRAME_TIMEOUT, async {
+        loop {
+            let (type_id, payload) = client.recv().await;
+            if type_id == 11 {
+                return tcp::TextMessage::decode(payload.as_slice())
+                    .expect("a well-formed TextMessage");
+            }
+        }
+    })
+    .await
+    .expect("a text message arrived")
+}
+
+#[tokio::test]
+async fn a_direct_message_reaches_every_device_on_both_ends() {
+    // A direct message names a *session*, and a person on two devices is two
+    // sessions. Delivered to the one named, it reached whichever device the
+    // sender happened to pick and never the one its recipient was holding;
+    // and the sender's other device never learned what they had said.
+    let data_dir = TempDir::new("dm-devices");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = starling_harness::handshake(&mut bob, "bob").await;
+
+    // Bob writes to the laptop's session; the phone has it too.
+    bob.send(
+        11,
+        &tcp::TextMessage {
+            session: vec![laptop_session],
+            message: "to alice".to_owned(),
+            ..tcp::TextMessage::default()
+        },
+    )
+    .await;
+    assert_eq!(next_text(&mut laptop).await.message, "to alice");
+    let on_phone = next_text(&mut phone).await;
+    assert_eq!(on_phone.message, "to alice");
+    assert_eq!(on_phone.actor, Some(bob_session));
+
+    // Alice answers from the laptop; Bob has it, and so does her phone.
+    laptop
+        .send(
+            11,
+            &tcp::TextMessage {
+                session: vec![bob_session],
+                message: "from alice".to_owned(),
+                ..tcp::TextMessage::default()
+            },
+        )
+        .await;
+    assert_eq!(next_text(&mut bob).await.message, "from alice");
+    let copy = next_text(&mut phone).await;
+    assert_eq!(copy.message, "from alice");
+    assert_eq!(copy.actor, Some(laptop_session));
+    assert_eq!(
+        copy.session,
+        vec![bob_session],
+        "the copy still says who it was to, which is how the phone files it"
+    );
+
+    deployment.stop().await;
+}

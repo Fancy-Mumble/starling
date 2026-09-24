@@ -694,8 +694,14 @@ struct Relay {
     /// Deliver to this one session instead of the channel, when the body names
     /// its recipient.
     unicast: Option<u32>,
-    /// A recipient named by certificate, to be resolved against the roster when
-    /// `unicast` carries no usable session.
+    /// A recipient named by certificate, resolved against the roster to every
+    /// session holding it.
+    ///
+    /// Every one, and alongside `unicast` rather than only in its absence: a
+    /// linked device carries its owner's certificate and identity seed, so a
+    /// key sealed to that identity opens on all of their devices, and one that
+    /// reached only the session the sender happened to name left the owner's
+    /// other devices unable to read the channel.
     recipient_cert: Option<Vec<u8>>,
     /// Whether the sender is one of the people this body is news to.
     ///
@@ -759,8 +765,7 @@ impl Relay {
                 // recipient's `UserState` knows the hash it sealed to and not
                 // the number to send it to.
                 unicast: Some(deliver.recipient),
-                recipient_cert: (deliver.recipient == 0)
-                    .then(|| deliver.recipient_cert.clone())
+                recipient_cert: Some(deliver.recipient_cert.clone())
                     .filter(|cert| !cert.is_empty()),
                 claims: None,
                 echoes: false,
@@ -1183,22 +1188,28 @@ impl PchatService {
 
         // Resolved here rather than at classification, because it needs the
         // roster and classification is a pure read of the body.
-        let recipient = match (relay.unicast, relay.recipient_cert.as_deref()) {
-            (Some(0) | None, Some(cert)) => self.roster.session_with_cert(cert),
-            (session, _) => session,
-        };
+        let mut recipients = relay
+            .recipient_cert
+            .as_deref()
+            .map(|cert| self.roster.sessions_with_cert(cert))
+            .unwrap_or_default();
+        if let Some(session) = relay.unicast.filter(|&session| session != 0)
+            && !recipients.contains(&session)
+        {
+            recipients.push(session);
+        }
 
-        match (relay.unicast, recipient) {
+        match (relay.unicast, recipients.is_empty()) {
             // Addressed to somebody, and we know where they are.
-            (Some(_), Some(session)) => vec![to_sessions(
-                vec![session],
+            (Some(_), false) => vec![to_sessions(
+                recipients,
                 ServiceKind::Pchat.outer_type(),
                 inbound.payload.clone(),
             )],
             // Addressed to somebody who is not here. Dropped rather than
             // broadcast: this arm carries a key sealed to one identity, and
             // "recipient unknown" must never degrade into "everyone gets it".
-            (Some(_), None) => {
+            (Some(_), true) => {
                 tracing::debug!(
                     channel = relay.channel,
                     "a sealed delivery names a recipient this server cannot place"

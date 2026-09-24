@@ -815,6 +815,12 @@ impl TextService {
     /// The union of the sessions it names outright, the members of every
     /// channel it names, and the members of every channel under a `tree_id`,
     /// minus the sender, who already has it.
+    ///
+    /// A session named outright stands for the person behind it: every other
+    /// session of the same account is added too, so a direct message reaches
+    /// its recipient on whichever of their devices they are looking at. And a
+    /// direct message is copied to the *sender's* other sessions, which is how
+    /// a conversation started on a laptop is on the phone as well.
     async fn recipients_of(
         &self,
         inbound: &Inbound,
@@ -827,9 +833,22 @@ impl TextService {
             }
         };
 
-        // A direct message names its recipients, so they need no lookup.
+        // A direct message names its recipients, so they need no lookup
+        // beyond the rest of each recipient's devices.
         for session in message.session.iter().copied() {
             add(session);
+            if let Some(account) = self.roster.account_of(session) {
+                for device in self.roster.sessions_of_account(account) {
+                    add(device);
+                }
+            }
+        }
+        if !message.session.is_empty()
+            && let Some(account) = self.roster.account_of(inbound.session)
+        {
+            for device in self.roster.sessions_of_account(account) {
+                add(device);
+            }
         }
         for channel in message.channel_id.iter().copied() {
             for session in self.roster.in_channel(channel, inbound.session) {
