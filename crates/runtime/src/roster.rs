@@ -283,6 +283,53 @@ impl Roster {
             .map(|(session, _)| *session)
     }
 
+    /// Every session holding `cert`, in session order.
+    ///
+    /// Plural because one person can be connected from several devices at
+    /// once, and a device linked to an account carries that account's
+    /// certificate. Something sealed to a certificate - a pchat key, above
+    /// all - is sealed to the *person*, and reaching only whichever of their
+    /// sessions a scan happened upon first leaves the others unable to read
+    /// their own channel.
+    ///
+    /// An empty `cert` matches nothing, for the reason
+    /// [`Self::session_with_cert`] gives.
+    #[must_use]
+    pub fn sessions_with_cert(&self, cert: &[u8]) -> Vec<u32> {
+        if cert.is_empty() {
+            return Vec::new();
+        }
+        let Ok(held) = self.certs.lock() else {
+            return Vec::new();
+        };
+        let mut sessions: Vec<u32> = held
+            .iter()
+            .filter(|(_, other)| other.as_slice() == cert)
+            .map(|(session, _)| *session)
+            .collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    /// Every session signed in to `account`, in session order.
+    ///
+    /// Several when the owner is on more than one device. A guest has no
+    /// account and is never in the answer, so account 0, the SuperUser, is
+    /// only ever the SuperUser.
+    #[must_use]
+    pub fn sessions_of_account(&self, account: u64) -> Vec<u32> {
+        let Ok(held) = self.accounts.lock() else {
+            return Vec::new();
+        };
+        let mut sessions: Vec<u32> = held
+            .iter()
+            .filter(|(_, other)| **other == Some(account))
+            .map(|(session, _)| *session)
+            .collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
     /// The display name `session` is using, if it is known.
     #[must_use]
     pub fn name_of(&self, session: u32) -> Option<String> {
@@ -597,6 +644,37 @@ mod tests {
         ]));
 
         assert_eq!(roster.connected_accounts(), vec![42]);
+    }
+
+    #[test]
+    fn one_person_on_two_devices_is_reached_on_both() {
+        // A linked device carries the account's certificate, so one account and
+        // one certificate can each stand for several sessions at once. Anything
+        // addressed to the person has to be able to find all of them.
+        let device = |session: u32, account: Option<u64>, cert: &[u8]| Session {
+            session,
+            channel: 4,
+            account: account.unwrap_or_default(),
+            registered: account.is_some(),
+            cert_hash: cert.to_vec(),
+            ..Session::default()
+        };
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![
+            device(7, Some(42), b"alice"),
+            device(3, Some(42), b"alice"),
+            device(5, Some(43), b"bob"),
+            // A guest: no account, and not the SuperUser's account 0 either.
+            device(9, None, b""),
+        ]));
+
+        assert_eq!(roster.sessions_of_account(42), vec![3, 7]);
+        assert_eq!(roster.sessions_with_cert(b"alice"), vec![3, 7]);
+        assert_eq!(roster.sessions_of_account(0), Vec::<u32>::new());
+        assert!(
+            roster.sessions_with_cert(b"").is_empty(),
+            "no certificate is not a certificate everybody shares"
+        );
     }
 
     #[test]
