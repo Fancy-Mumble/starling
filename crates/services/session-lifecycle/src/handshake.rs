@@ -814,7 +814,10 @@ impl Handshake {
                 password: request.password.clone().unwrap_or_default(),
                 cert_hash: pending.cert_hash.clone(),
                 strong_cert: pending.strong_cert,
-                totp: String::new(),
+                // The fork's field 1000. Left empty, an account with a second
+                // factor answered `TotpRequired` to every login, the code the
+                // client had just typed included, and so could not be used.
+                totp: request.totp_code.clone().unwrap_or_default(),
             })
             .await;
 

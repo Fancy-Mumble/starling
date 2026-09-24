@@ -1609,6 +1609,26 @@ pub const PCHAT_OUTER_TYPE: u16 = starling_proto_fancy::types::ServiceKind::Pcha
 /// `Version`. A client gates real features on that number, so "did it arrive"
 /// is the whole question this helper exists to answer.
 pub async fn handshake_epoch1(client: &mut Client, username: &str) -> (u32, Option<u64>) {
+    handshake_epoch1_as(
+        client,
+        tcp::Authenticate {
+            username: Some(username.to_owned()),
+            opus: Some(true),
+            ..tcp::Authenticate::default()
+        },
+    )
+    .await
+}
+
+/// The epoch-1 handshake, with the `Authenticate` spelled out.
+///
+/// For a test that talks to a Fancy service *as a registered account*: the
+/// self-service surface acts on the account behind the session, so a guest
+/// named like the account would be answered with "not signed in".
+pub async fn handshake_epoch1_as(
+    client: &mut Client,
+    authenticate: tcp::Authenticate,
+) -> (u32, Option<u64>) {
     let (greeting_type, greeting_payload) = client.recv().await;
     assert_eq!(greeting_type, 0, "the server speaks Version first");
     let greeting =
@@ -1628,16 +1648,7 @@ pub async fn handshake_epoch1(client: &mut Client, username: &str) -> (u32, Opti
             },
         )
         .await;
-    client
-        .send(
-            2,
-            &tcp::Authenticate {
-                username: Some(username.to_owned()),
-                opus: Some(true),
-                ..tcp::Authenticate::default()
-            },
-        )
-        .await;
+    client.send(2, &authenticate).await;
 
     let (before_sync, sync_payload) = client.recv_until(5).await;
     // The ordering that matters for this frame specifically: a client reads its

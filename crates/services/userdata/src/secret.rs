@@ -441,12 +441,38 @@ pub fn base32(bytes: &[u8]) -> String {
     out
 }
 
+/// The bytes an unpadded RFC 4648 base32 string encodes, or `None` for a
+/// symbol outside the alphabet.
+///
+/// The inverse of [`base32`], for whoever holds the secret the way an
+/// authenticator app does: the enrolment ack hands it out in this form, so a
+/// test that has to type a code has to be able to read it back.
+#[must_use]
+pub fn from_base32(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+    let mut buffer: u16 = 0;
+    let mut bits = 0_u8;
+    for symbol in text.bytes() {
+        let value = ALPHABET.iter().position(|&known| known == symbol)?;
+        buffer = (buffer << 5) | value as u16;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// The code `secret` shows at `counter`.
 ///
-/// `pub(crate)` for the enrolment tests, which have to be able to *produce*
-/// a code and not only check one. Nothing on a wire calls it: the server
-/// never generates a code, it only ever verifies the one a client sends.
-pub(crate) fn totp(secret: &[u8], counter: u64) -> u32 {
+/// Public for the tests, the enrolment ones here and the end-to-end login
+/// that has to type a code, which have to be able to *produce* one and not
+/// only check it. Nothing on a wire calls it: the server never generates a
+/// code, it only ever verifies the one a client sends.
+#[must_use]
+pub fn totp(secret: &[u8], counter: u64) -> u32 {
     let Ok(mut mac) = <Hmac<Sha1> as KeyInit>::new_from_slice(secret) else {
         return u32::MAX;
     };
@@ -473,6 +499,18 @@ fn fill_random(buffer: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base32_reads_back_what_it_wrote_at_every_length() {
+        // Every remainder mod 5, because each leaves a different number of
+        // bits in the last symbol and that is where a decoder goes wrong.
+        let bytes: Vec<u8> = (0_u8..=20).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+        for len in 0..=bytes.len() {
+            let original = &bytes[..len];
+            assert_eq!(from_base32(&base32(original)).as_deref(), Some(original));
+        }
+        assert_eq!(from_base32("not base32!"), None);
+    }
 
     #[test]
     fn a_password_verifies_against_its_own_secret_and_nothing_else() {
