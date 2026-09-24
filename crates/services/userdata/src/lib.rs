@@ -14,6 +14,7 @@
 pub mod ids;
 
 pub mod accounts;
+pub mod devices;
 mod directory;
 pub mod records;
 pub mod secret;
@@ -204,8 +205,8 @@ impl UserData for UserdataRpc {
         let offered = req.password.clone();
 
         let service = Arc::clone(&self.0);
-        let result =
-            tokio::task::spawn_blocking(move || service.accounts.authenticate(scope, &req))
+        let (result, device) =
+            tokio::task::spawn_blocking(move || service.accounts.authenticate_device(scope, &req))
                 .await
                 .map_err(|error| {
                     // The pool panicked or was shut down. Refusing is the only safe
@@ -213,6 +214,16 @@ impl UserData for UserdataRpc {
                     tracing::error!(%error, "the password check could not be run");
                     Status::internal("the account service could not decide this login")
                 })?;
+
+        // Stored before the answer goes back, so the device is in the owner's
+        // list by the time their session exists to ask for it. The login is
+        // already decided; this write only records it.
+        if let (Some(device), Some(account)) = (device, result.account.as_ref()) {
+            self.0
+                .accounts
+                .admit_device(scope, account.id, device)
+                .await;
+        }
 
         // A password imported from murmur retires itself here. The login has
         // already been decided, so this changes no outcome; what it changes is

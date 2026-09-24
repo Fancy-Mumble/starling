@@ -32,6 +32,9 @@ pub struct Identity {
     pub comment_hash: Vec<u8>,
     /// The account's stored avatar, as a content hash. Empty for a guest.
     pub texture_hash: Vec<u8>,
+    /// The device the login was admitted as, as `userdata` checked it. Empty
+    /// when it named none, and for every guest.
+    pub device_id: String,
 }
 
 /// Everything known about a connection that has not finished the handshake.
@@ -201,6 +204,11 @@ pub struct PendingConnection {
     pub connected_at_ms: u64,
     /// When it was last heard from, for the timeout sweep.
     pub last_seen_ms: u64,
+    /// Which of the account's devices this is, empty if it named none.
+    ///
+    /// What lets one account be online from two devices: a second session of
+    /// the same account from a *different* device is not a ghost of the first.
+    pub device_id: String,
 }
 
 /// What a client last told the server about its own side of the link.
@@ -451,6 +459,7 @@ impl Connections {
         pending.name = identity.name.clone();
         pending.comment_hash = identity.comment_hash.clone();
         pending.texture_hash = identity.texture_hash.clone();
+        pending.device_id = identity.device_id.clone();
         Some(session)
     }
 
@@ -473,12 +482,22 @@ impl Connections {
     /// Only authenticated connections are considered. One still mid-handshake
     /// has no name to collide with, and treating it as one would let a peer
     /// that connects and says nothing block a name indefinitely.
+    ///
+    /// # One account, several devices
+    ///
+    /// The one departure from murmur: a session of the **same account** from a
+    /// **different device** is not a collision. It is the owner on their phone
+    /// as well as their laptop, and evicting either as a ghost of the other is
+    /// the bug that made using both impossible. The same device, or two
+    /// sessions that both named none, still collide, which is what keeps a
+    /// reconnect replacing its own ghost.
     #[must_use]
     pub fn duplicate_of(
         &self,
         conn: u64,
         account: Option<u64>,
         name: &str,
+        device: &str,
     ) -> Option<PendingConnection> {
         let inner = self.inner.lock().ok()?;
         inner
@@ -491,6 +510,7 @@ impl Connections {
                     // administrator must not be excluded by holding account 0.
                     && ((account.is_some() && other.account == account)
                         || other.name.eq_ignore_ascii_case(name))
+                    && !(account.is_some() && other.account == account && other.device_id != device)
             })
             .cloned()
     }
@@ -1061,7 +1081,7 @@ mod tests {
 
         connections.opened(&opened(2), "gw");
         let found = connections
-            .duplicate_of(2, None, "alice")
+            .duplicate_of(2, None, "alice", "")
             .expect("the same name in another case is the same name");
         assert_eq!(found.conn, 1);
     }
@@ -1073,7 +1093,7 @@ mod tests {
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
         let _ = connections.allocate(1, &guest("alice"));
-        assert!(connections.duplicate_of(1, None, "alice").is_none());
+        assert!(connections.duplicate_of(1, None, "alice", "").is_none());
     }
 
     #[test]
@@ -1086,7 +1106,7 @@ mod tests {
         let _ = connections.allocate(1, &guest("alice"));
 
         connections.opened(&opened(2), "gw");
-        assert!(connections.duplicate_of(2, None, "bob").is_none());
+        assert!(connections.duplicate_of(2, None, "bob", "").is_none());
     }
 
     #[test]
@@ -1106,9 +1126,71 @@ mod tests {
 
         connections.opened(&opened(2), "gw");
         let found = connections
-            .duplicate_of(2, Some(7), "someone-else")
+            .duplicate_of(2, Some(7), "someone-else", "")
             .expect("the same account is the same user");
         assert_eq!(found.conn, 1);
+    }
+
+    #[test]
+    fn the_same_account_from_another_device_is_not_a_ghost() {
+        // The owner on a second device. Evicting either session as a ghost of
+        // the other is what made one account unusable from two places at once.
+        let connections = Connections::new(8);
+        let signed_in = |device: &str| Identity {
+            account: Some(7),
+            name: "alice".to_owned(),
+            device_id: device.to_owned(),
+            ..Identity::default()
+        };
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(1, &signed_in("laptop"));
+
+        connections.opened(&opened(2), "gw");
+        assert!(
+            connections
+                .duplicate_of(2, Some(7), "alice", "phone")
+                .is_none(),
+            "another device of the same account is not a collision"
+        );
+        // The same device again is a reconnect, and replaces its ghost.
+        assert_eq!(
+            connections
+                .duplicate_of(2, Some(7), "alice", "laptop")
+                .map(|ghost| ghost.conn),
+            Some(1)
+        );
+        // Neither naming a device is the murmur rule, unchanged.
+        let _ = connections.allocate(2, &signed_in(""));
+        connections.opened(&opened(3), "gw");
+        assert_eq!(
+            connections
+                .duplicate_of(3, Some(7), "alice", "")
+                .map(|ghost| ghost.conn),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_device_does_not_let_a_stranger_share_a_name() {
+        // The carve-out is for one account; a guest wearing a registered
+        // name that is online collides whatever device it names.
+        let connections = Connections::new(8);
+        connections.opened(&opened(1), "gw");
+        let _ = connections.allocate(
+            1,
+            &Identity {
+                account: Some(7),
+                name: "alice".to_owned(),
+                device_id: "laptop".to_owned(),
+                ..Identity::default()
+            },
+        );
+        connections.opened(&opened(2), "gw");
+        assert!(
+            connections
+                .duplicate_of(2, None, "Alice", "phone")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1118,7 +1200,7 @@ mod tests {
         // hold a name indefinitely.
         let connections = Connections::new(8);
         connections.opened(&opened(1), "gw");
-        assert!(connections.duplicate_of(2, None, "alice").is_none());
+        assert!(connections.duplicate_of(2, None, "alice", "").is_none());
     }
 
     #[test]

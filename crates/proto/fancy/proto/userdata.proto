@@ -32,6 +32,11 @@ message AuthRequest {
   bytes cert_hash = 4;
   bool strong_cert = 5;
   string totp = 6;
+  // The install this login comes from, from `Authenticate`'s fork fields.
+  // Empty for a client that sends none, which every stock one is.
+  string device_id = 7;
+  string device_secret = 8;
+  string device_name = 9;
 }
 
 message AuthResult {
@@ -46,12 +51,19 @@ message AuthResult {
     TOTP_INVALID = 5;
     CERT_REQUIRED = 6;
     INVALID_NAME = 7;
+    // The device was signed out of this account, its secret does not match,
+    // or the account admits only devices it knows and this is not one.
+    DEVICE_NOT_TRUSTED = 8;
   }
   Outcome outcome = 1;
   Account account = 2;
   // Present when the name was accepted unregistered: a guest keeps its name
   // but gets no account id.
   bool guest = 3;
+  // The device the login was admitted as, empty when it named none or was a
+  // guest. Checked, unlike the id in the request: this is the one a session
+  // may be recorded under.
+  string device_id = 4;
 }
 
 message Account {

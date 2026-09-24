@@ -25,7 +25,8 @@ use starling_harness::{
 };
 use starling_proto::proto::tcp;
 use starling_proto_fancy::fancy::domain::{
-    AccountAck, AccountAction, UserdataEnvelope, account_action, userdata_envelope,
+    AccountAck, AccountAction, AccountQuery, AccountState, UserdataEnvelope, account_action,
+    userdata_envelope,
 };
 use tokio::time::timeout;
 
@@ -197,3 +198,176 @@ async fn an_account_with_a_second_factor_can_still_log_in_with_its_code() {
 
     deployment.stop().await;
 }
+
+/// `Authenticate` for `name` from the install called `device`.
+fn from_device(name: &str, password: &str, device: &str) -> tcp::Authenticate {
+    tcp::Authenticate {
+        device_id: Some(device.to_owned()),
+        device_secret: Some(format!("{device}-secret-0123456789abcdef0123456789")),
+        device_name: Some(device.to_owned()),
+        ..credentials(name, password)
+    }
+}
+
+/// What the server holds about the caller's own account, asked for now.
+async fn account_state(client: &mut Client) -> AccountState {
+    send_userdata(
+        client,
+        userdata_envelope::Body::AccountQuery(AccountQuery {}),
+    )
+    .await;
+    loop {
+        if let userdata_envelope::Body::Account(state) = next_userdata(client).await {
+            return state;
+        }
+    }
+}
+
+/// The account's devices as `(id, online)`, in id order.
+fn listed(state: &AccountState) -> Vec<(String, bool)> {
+    let mut devices: Vec<(String, bool)> = state
+        .devices
+        .iter()
+        .map(|device| (device.id.clone(), device.online))
+        .collect();
+    devices.sort();
+    devices
+}
+
+/// How long a session is watched for an eviction that must not come.
+const NO_EVICTION: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[tokio::test]
+async fn one_account_is_online_from_two_devices_at_once() {
+    // The reason devices exist. A second login of one account used to be read
+    // as the first one reconnecting, so the laptop was evicted as a ghost the
+    // moment the phone connected, and the phone the moment the laptop
+    // reconnected, and so on for as long as both were on.
+    let data_dir = TempDir::new("two-devices");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    assert_ne!(laptop_session, phone_session);
+
+    assert!(
+        laptop
+            .next_removal_of(laptop_session, NO_EVICTION)
+            .await
+            .is_none(),
+        "the laptop was evicted as a ghost of the phone"
+    );
+
+    // Both are the owner's, both are online, and each knows which it is.
+    let seen_from_laptop = account_state(&mut laptop).await;
+    assert_eq!(seen_from_laptop.this_device, "laptop");
+    assert_eq!(
+        listed(&seen_from_laptop),
+        vec![("laptop".to_owned(), true), ("phone".to_owned(), true)]
+    );
+
+    // The same device coming back is still a reconnect, and still replaces its
+    // own ghost: that rule is untouched, it just no longer fires across
+    // devices.
+    let mut laptop_again = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut laptop_again, from_device("alice", "pw", "laptop")).await;
+    let removal = laptop
+        .next_removal_of(laptop_session, FRAME_TIMEOUT)
+        .await
+        .expect("the laptop's ghost is told it was replaced");
+    assert!(
+        removal
+            .reason
+            .unwrap_or_default()
+            .contains("another device"),
+        "a ghost is told why"
+    );
+    assert_eq!(account_state(&mut phone).await.this_device, "phone");
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn a_device_signed_out_from_another_is_disconnected_and_kept_out() {
+    let data_dir = TempDir::new("sign-out-device");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+
+    // Taking something away needs the password, like every other change that
+    // could lock the owner out.
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::RemoveDevice as i32,
+            current_password: "not it".to_owned(),
+            device_id: "phone".to_owned(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    assert!(!next_ack(&mut laptop).await.ok);
+
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::RemoveDevice as i32,
+            current_password: "pw".to_owned(),
+            device_id: "phone".to_owned(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    let ack = next_ack(&mut laptop).await;
+    assert!(ack.ok, "sign-out refused: {}", ack.detail);
+
+    // The phone is told why and then goes, rather than seeing its link drop
+    // and dialling straight back in.
+    let removal = phone
+        .next_removal_of(phone_session, FRAME_TIMEOUT)
+        .await
+        .expect("the signed-out device is told why");
+    assert_eq!(
+        removal.reason.as_deref(),
+        Some(starling_userdata::selfservice::SIGNED_OUT_REASON)
+    );
+    assert!(phone.closed_by_server(FRAME_TIMEOUT).await);
+
+    // It still has the password, and it is still refused: by id.
+    let mut back = Client::connect(deployment.port).await;
+    let reject = refused(&mut back, from_device("alice", "pw", "phone")).await;
+    assert_eq!(
+        reject.r#type,
+        Some(tcp::reject::RejectType::DeviceNotTrusted as i32)
+    );
+
+    let state = account_state(&mut laptop).await;
+    assert_eq!(listed(&state), vec![("laptop".to_owned(), true)]);
+    assert!(state.devices_locked);
+
+    // A device cannot sign itself out; that is what disconnecting is.
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::RemoveDevice as i32,
+            current_password: "pw".to_owned(),
+            device_id: "laptop".to_owned(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    assert!(!next_ack(&mut laptop).await.ok);
+
+    deployment.stop().await;
+}
+

@@ -384,20 +384,23 @@ impl UserdataService {
         // nothing else will correct it: the account row changed, and a client
         // builds its user list from `UserState`. murmur broadcasts one for
         // exactly this reason (`Messages.cpp:3231`).
-        let Some(session) = self.session_of(inbound.scope, id).await else {
-            return Actions::new();
-        };
-        let announce = tcp::UserState {
-            session: Some(session),
-            actor: Some(inbound.session),
-            name: Some(renamed.name),
-            ..tcp::UserState::default()
-        };
-        vec![to_sessions(
-            Vec::new(),
-            USER_STATE,
-            announce.encode_to_vec(),
-        )]
+        //
+        // One per session: an owner online from two devices is two entries in
+        // every tree, and correcting only the first leaves the second wearing
+        // the old name.
+        self.sessions_of(inbound.scope, id)
+            .await
+            .into_iter()
+            .map(|session| {
+                let announce = tcp::UserState {
+                    session: Some(session),
+                    actor: Some(inbound.session),
+                    name: Some(renamed.name.clone()),
+                    ..tcp::UserState::default()
+                };
+                to_sessions(Vec::new(), USER_STATE, announce.encode_to_vec())
+            })
+            .collect()
     }
 
     /// Unregister an account: an entry the dialog sent back with no name.
@@ -431,12 +434,17 @@ impl UserdataService {
         );
     }
 
-    /// The live session holding `account`, if its owner is connected.
-    async fn session_of(&self, scope: u32, account: u64) -> Option<u32> {
-        self.sessions(scope).await.into_iter().find_map(|session| {
-            (identity::account(session.registered, session.account) == Some(account))
-                .then_some(session.session)
-        })
+    /// Every live session of `account`: none while its owner is away, several
+    /// while they are on more than one device.
+    async fn sessions_of(&self, scope: u32, account: u64) -> Vec<u32> {
+        self.sessions(scope)
+            .await
+            .into_iter()
+            .filter(|session| {
+                identity::account(session.registered, session.account) == Some(account)
+            })
+            .map(|session| session.session)
+            .collect()
     }
 }
 

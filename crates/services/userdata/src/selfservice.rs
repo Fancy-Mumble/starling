@@ -36,8 +36,8 @@ use std::collections::HashMap;
 
 use prost::Message as _;
 use starling_proto_fancy::fancy::domain::{
-    AccountAck, AccountAction, AccountState, Record, RecordGet, RecordKeys, RecordList, RecordPut,
-    Settings, SettingsUpdate, UserdataEnvelope, account_action, userdata_envelope,
+    AccountAck, AccountAction, AccountState, Device, Record, RecordGet, RecordKeys, RecordList,
+    RecordPut, Settings, SettingsUpdate, UserdataEnvelope, account_action, userdata_envelope,
 };
 use starling_proto_fancy::fancy::wire::{Refusal, refusal};
 use starling_proto_fancy::userdata::{Account, UpdateRequest};
@@ -53,6 +53,9 @@ use crate::{UserdataService, actor_of, outer_type};
 /// a secret handed out and abandoned is not sitting in memory at closing time.
 const ENROLMENT_MS: u64 = 10 * 60 * 1000;
 
+/// Upstream `UserRemove`, which is how a session is told why it is ending.
+const USER_REMOVE: u16 = 8;
+
 /// A TOTP secret that has been handed out and not yet confirmed.
 #[derive(Debug, Clone)]
 pub struct Enrolment {
@@ -67,9 +70,26 @@ pub type Enrolments = HashMap<(u32, u64), Enrolment>;
 ///
 /// `UNSPECIFIED` is not in the list and never can be: it is refused before the
 /// question of proof arises.
+///
+/// Naming a device and registering one to be linked are the two exceptions,
+/// and they are safe ones: neither can take anything away from the owner. A
+/// hijacked session that registers a device gains a row that admits nobody
+/// who does not also hold the account's certificate. Signing a device *out*
+/// does take something away, and needs the password like everything else.
 const fn needs_password(kind: account_action::Kind) -> bool {
-    !matches!(kind, account_action::Kind::Unspecified)
+    !matches!(
+        kind,
+        account_action::Kind::Unspecified
+            | account_action::Kind::RenameDevice
+            | account_action::Kind::AddDevice
+    )
 }
+
+/// What a signed-out device's session is told as it is disconnected.
+///
+/// Named so a client can tell it from a kick: this is the owner's own doing,
+/// and reconnecting on its own would only be refused.
+pub const SIGNED_OUT_REASON: &str = "this device was signed out of the account";
 
 /// The prefix in an account's settings map that belongs to the server.
 ///
@@ -256,7 +276,93 @@ impl UserdataService {
             account_action::Kind::EnableTotp => self.enable_totp(inbound, account, &action).await,
             account_action::Kind::DisableTotp => self.disable_totp(inbound, account, &action).await,
             account_action::Kind::Unregister => self.unregister_self(inbound, account).await,
+            account_action::Kind::RenameDevice => {
+                match self
+                    .accounts
+                    .rename_device(inbound.scope, account, &action.device_id, &action.value)
+                    .await
+                {
+                    Ok(()) => ok(action.kind),
+                    Err(why) => refuse(action.kind, &why),
+                }
+            }
+            account_action::Kind::AddDevice => {
+                match self
+                    .accounts
+                    .add_device(
+                        inbound.scope,
+                        account,
+                        &action.device_id,
+                        &action.device_secret,
+                        &action.value,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.record_change(inbound, account, "device added");
+                        ok(action.kind)
+                    }
+                    Err(why) => refuse(action.kind, &why),
+                }
+            }
+            account_action::Kind::RemoveDevice => {
+                self.sign_out_device(inbound, account, &action).await
+            }
         }
+    }
+
+    /// Sign one of this account's devices out, and end its sessions.
+    ///
+    /// Not the connection's own device. A device that signs itself out would be
+    /// disconnected mid-answer and refused on its next login, which is a lot of
+    /// ways to say "log out" and none of them the one the user meant.
+    async fn sign_out_device(
+        &self,
+        inbound: &Inbound,
+        account: u64,
+        action: &AccountAction,
+    ) -> AccountAck {
+        let own = self
+            .view_of(inbound.scope, inbound.session)
+            .await
+            .map(|session| session.device_id)
+            .unwrap_or_default();
+        if !own.is_empty() && own == action.device_id {
+            return refuse(action.kind, "this is the device you are signed in from");
+        }
+        if let Err(why) = self
+            .accounts
+            .sign_out_device(inbound.scope, account, &action.device_id)
+            .await
+        {
+            return refuse(action.kind, &why);
+        }
+        self.record_change(inbound, account, "device signed out");
+
+        // Its sessions go now, not at their next login. Each is told why first,
+        // on its own connection, the way a ghost is: a socket that only closes
+        // looks like a dropped link, and a client that reconnects on its own
+        // would be refused over and over with nothing on screen to say why.
+        for session in self.sessions(inbound.scope).await {
+            let owned =
+                starling_proto_fancy::identity::account(session.registered, session.account)
+                    == Some(account);
+            if !owned || session.device_id != action.device_id {
+                continue;
+            }
+            let removal = starling_proto::proto::tcp::UserRemove {
+                session: session.session,
+                reason: Some(SIGNED_OUT_REASON.to_owned()),
+                ..starling_proto::proto::tcp::UserRemove::default()
+            };
+            self.fanout
+                .push(to_conn(session.conn, USER_REMOVE, removal.encode_to_vec()));
+            self.fanout.push(starling_runtime::plane::disconnect(
+                session.conn,
+                SIGNED_OUT_REASON,
+            ));
+        }
+        ok(action.kind)
     }
 
     /// Whether the action carries this account's current password.
@@ -565,6 +671,34 @@ impl UserdataService {
             // Registered a moment ago and gone now: an UNREGISTER that worked.
             return AccountState::default();
         };
+        let sessions = self.sessions(inbound.scope).await;
+        let this_device = sessions
+            .iter()
+            .find(|session| session.session == inbound.session)
+            .map(|session| session.device_id.clone())
+            .unwrap_or_default();
+        // Online is "a session of this account from this device is connected",
+        // read from the view rather than remembered, so it cannot outlive the
+        // connection it describes.
+        let online = |id: &str| {
+            sessions.iter().any(|session| {
+                starling_proto_fancy::identity::account(session.registered, session.account)
+                    == Some(account)
+                    && session.device_id == id
+            })
+        };
+        let devices = self
+            .accounts
+            .devices(inbound.scope, account)
+            .into_iter()
+            .map(|device| Device {
+                online: online(&device.id),
+                id: device.id,
+                name: device.name,
+                added_at_ms: device.added_at_ms,
+                last_seen_ms: device.last_seen_ms,
+            })
+            .collect();
         AccountState {
             registered: true,
             id: stored.id,
@@ -574,6 +708,9 @@ impl UserdataService {
             totp_enabled: self.accounts.totp_enabled(inbound.scope, account),
             cert_matches_session: self.cert_matches(inbound, account).await,
             cert_hash: stored.cert_hash,
+            devices,
+            devices_locked: self.accounts.devices_locked(inbound.scope, account),
+            this_device,
         }
     }
 
@@ -1016,6 +1153,7 @@ mod tests {
             current_password: password.to_owned(),
             value: String::new(),
             totp: String::new(),
+            ..AccountAction::default()
         }
     }
 

@@ -333,6 +333,12 @@ Information opened nothing and self-mute never took effect, with no error
 anywhere. It is the only emitter of `SessionUp` and `SessionDown`, and the only
 service that acts on `Opened`. Serves `SessionControl` for the admin plane.
 
+A second login of one account evicts the first as a ghost, as murmur does,
+**unless the two name different devices**: a Fancy client sends a per-install
+device id in `Authenticate` (fork fields 1001-1003), and one account may then
+be online from a laptop and a phone at once. The same device reconnecting still
+replaces its ghost.
+
 ### `session-view` — the composed live view
 
 Covered in §2.2. Owns nothing, writes nothing, has no client-facing type. Its
@@ -368,6 +374,13 @@ content-addressed with a refcount, so identical avatars are stored once and
 `RequestBlob` is a primary-key lookup. **The SuperUser is account 0**, so a guest
 is `None` and never `0` — read the other way, the administrator renders as a
 guest. An account with no password is not claimable by name alone.
+
+It also keeps the **devices** each account is used from (`devices.rs`). A new
+device is trusted on first use until its owner signs one out; from then on a
+login proved by the certificate alone must come from a device the account
+knows, and a password registers a new one. A signed-out device is refused by id
+and its sessions are ended. A known device stands in for the second factor, so
+only a new one is asked for a TOTP code.
 
 ### `server-config` — the settings an operator changes while it runs
 

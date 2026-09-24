@@ -99,6 +99,15 @@ message Session {
   // volume without changing which channels it listens to, and a parallel array
   // that fell out of step would silence the wrong room.
   map<uint32, float> listening_volume = 25;
+  // Which of the account's devices this session is, empty for a client that
+  // announced none and for every guest.
+  //
+  // One account may be online from several devices at once, so this is what
+  // tells two of them apart: a reconnect replaces the session from the same
+  // device and leaves the others alone, and the owner's device list shows
+  // which of them are connected. An opaque install id, not a secret - the
+  // secret that proves it stays in `userdata`.
+  string device_id = 26;
 }
 
 message Sessions {

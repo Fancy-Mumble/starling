@@ -224,6 +224,9 @@ fn session_record(pending: &PendingConnection) -> Session {
         fancy_version: pending.fancy_version,
         address: pending.address.clone(),
         cert_hash: pending.cert_hash.clone(),
+        // Which of the account's devices, so the owner's device list can say
+        // which are connected. Not a secret: the secret stayed in `userdata`.
+        device_id: pending.device_id.clone(),
         // An assurance rather than an identifier, and the `strong` ACL group.
         strong_cert: pending.strong_cert,
         // The access tokens, which `permissions` can reach in no other way, it
@@ -370,7 +373,7 @@ impl Handshake {
         // murmur never lets two live sessions share a name: refuse this one,
         // or kick the older one as a ghost (`Messages.cpp:418`). Doing neither
         // puts three of the same user in the tree.
-        let ghost = connections.duplicate_of(inbound.conn, account, name);
+        let ghost = connections.duplicate_of(inbound.conn, account, name, &identity.device_id);
         let older_session_may_stay = ghost
             .as_ref()
             .is_some_and(|ghost| !may_replace(&pending, ghost, account));
@@ -868,6 +871,11 @@ impl Handshake {
                 // factor answered `TotpRequired` to every login, the code the
                 // client had just typed included, and so could not be used.
                 totp: request.totp_code.clone().unwrap_or_default(),
+                // Checked by userdata, which answers with the id it admitted;
+                // the one in the request is only a claim until then.
+                device_id: request.device_id.clone().unwrap_or_default(),
+                device_secret: request.device_secret.clone().unwrap_or_default(),
+                device_name: request.device_name.clone().unwrap_or_default(),
             })
             .await;
 
@@ -921,11 +929,18 @@ impl Handshake {
                 _ => (Vec::new(), Vec::new()),
             };
 
+            // A guest has no account for a device to belong to.
+            let device_id = if account.is_some() {
+                result.device_id
+            } else {
+                String::new()
+            };
             return Ok(Identity {
                 account,
                 name,
                 comment_hash,
                 texture_hash,
+                device_id,
             });
         }
         let (kind, reason) = refusal_for(outcome);
@@ -2010,6 +2025,13 @@ fn refusal_for(outcome: auth_result::Outcome) -> (tcp::reject::RejectType, &'sta
             "this account requires a one-time code",
         ),
         Outcome::TotpInvalid => (RejectType::TotpInvalid, "that one-time code is wrong"),
+        // Its own type rather than a wrong password: the client's answer is to
+        // tell its user this device was signed out, not to ask for a password
+        // it may never have had.
+        Outcome::DeviceNotTrusted => (
+            RejectType::DeviceNotTrusted,
+            "this device is not signed in to that account",
+        ),
         // `Ok` cannot reach here (the caller returns before asking) and an
         // unknown account is the catch-all the enum's default already is.
         Outcome::UnknownAccount | Outcome::Ok => {

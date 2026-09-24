@@ -17,6 +17,7 @@ use starling_runtime::names::{NameRule, is_user_name};
 use starling_runtime::settings::{Settings, USER_NAME_PATTERN};
 use starling_runtime::storage::{Migration, Store, StoreError};
 
+use crate::devices::{self, Device, Verdict};
 use crate::records::MAX_KEY_LEN;
 use crate::secret::{Secret, verify_totp};
 
@@ -51,27 +52,41 @@ fn generated_password() -> String {
 }
 
 /// The schema.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
-    "0001_account",
-    &[
-        "CREATE TABLE IF NOT EXISTS account (\
+const SCHEMA: &[Migration<'static>] = &[
+    Migration::new(
+        "0001_account",
+        &[
+            "CREATE TABLE IF NOT EXISTS account (\
              server_id BIGINT NOT NULL, id BIGINT NOT NULL, \
              name VARCHAR(190) NOT NULL, email VARCHAR(190) NOT NULL, \
              cert_hash BLOB NULL, password BLOB NULL, totp_secret BLOB NULL, \
              texture_hash BLOB NULL, comment_hash BLOB NULL, \
              created_at_ms BIGINT NOT NULL, last_active_ms BIGINT NOT NULL, \
              PRIMARY KEY (server_id, id))",
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_account_name ON account(server_id, name)",
-        "CREATE INDEX IF NOT EXISTS ix_account_cert ON account(server_id, cert_hash)",
-        "CREATE TABLE IF NOT EXISTS blob (\
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_account_name ON account(server_id, name)",
+            "CREATE INDEX IF NOT EXISTS ix_account_cert ON account(server_id, cert_hash)",
+            "CREATE TABLE IF NOT EXISTS blob (\
              hash BLOB NOT NULL PRIMARY KEY, bytes BLOB NOT NULL, \
              size BIGINT NOT NULL, refs BIGINT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS account_setting (\
+            "CREATE TABLE IF NOT EXISTS account_setting (\
              server_id BIGINT NOT NULL, account_id BIGINT NOT NULL, \
              k VARCHAR(190) NOT NULL, v TEXT NOT NULL, \
              PRIMARY KEY (server_id, account_id, k))",
-    ],
-)];
+        ],
+    ),
+    // The devices each account is used from, see `devices`. A table of its own
+    // rather than columns on `account`: there are several per account, and a
+    // signed-out one stays as a row.
+    Migration::new(
+        "0002_account_device",
+        &["CREATE TABLE IF NOT EXISTS account_device (\
+             server_id BIGINT NOT NULL, account_id BIGINT NOT NULL, \
+             device_id VARCHAR(64) NOT NULL, secret_hash BLOB NOT NULL, \
+             name VARCHAR(190) NOT NULL, added_at_ms BIGINT NOT NULL, \
+             last_seen_ms BIGINT NOT NULL, signed_out BIGINT NOT NULL, \
+             PRIMARY KEY (server_id, account_id, device_id))"],
+    ),
+];
 
 /// One account as a migration hands it over.
 ///
@@ -134,6 +149,8 @@ struct Record {
     account: Account,
     password: Option<Secret>,
     totp: Option<Vec<u8>>,
+    /// Every device this account is used from, signed-out ones included.
+    devices: Vec<Device>,
 }
 
 /// What the peer has already proved by the time the password is considered.
@@ -187,6 +204,7 @@ impl Accounts {
             return;
         };
         let mut settings = self.load_settings().await;
+        let mut devices = self.load_devices().await;
         let (Ok(mut cache), Ok(mut next)) = (self.cache.lock(), self.next_id.lock()) else {
             return;
         };
@@ -221,6 +239,7 @@ impl Accounts {
                     .try_get::<Option<Vec<u8>>, _>("totp_secret")
                     .ok()
                     .flatten(),
+                devices: devices.remove(&(scope, id)).unwrap_or_default(),
             };
             *next = (*next).max(id + 1);
             let _ = cache.insert((scope, id), record);
@@ -252,6 +271,41 @@ impl Accounts {
         settings
     }
 
+    /// Every stored device, grouped by the account it belongs to.
+    async fn load_devices(&self) -> HashMap<(u32, u64), Vec<Device>> {
+        use sqlx::Row as _;
+        let mut devices: HashMap<(u32, u64), Vec<Device>> = HashMap::new();
+        let rows = match sqlx::query(
+            "SELECT server_id, account_id, device_id, secret_hash, name, added_at_ms, \
+                    last_seen_ms, signed_out FROM account_device",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "could not load account devices");
+                return devices;
+            }
+        };
+        for row in rows {
+            let scope = row.try_get::<i64, _>("server_id").unwrap_or(1) as u32;
+            let account = row.try_get::<i64, _>("account_id").unwrap_or_default() as u64;
+            let Ok(id) = row.try_get::<String, _>("device_id") else {
+                continue;
+            };
+            devices.entry((scope, account)).or_default().push(Device {
+                id,
+                name: row.try_get("name").unwrap_or_default(),
+                secret_hash: row.try_get("secret_hash").unwrap_or_default(),
+                added_at_ms: row.try_get::<i64, _>("added_at_ms").unwrap_or_default() as u64,
+                last_seen_ms: row.try_get::<i64, _>("last_seen_ms").unwrap_or_default() as u64,
+                signed_out: row.try_get::<i64, _>("signed_out").unwrap_or_default() != 0,
+            });
+        }
+        devices
+    }
+
     /// Read the operator's name rule from `server-config` from now on.
     ///
     /// Not a constructor argument: `Accounts::open` has four callers and only
@@ -277,11 +331,29 @@ impl Accounts {
     /// The name-taken case is murmur's impersonation guard: a registered name
     /// belongs to the certificate that registered it, so a stranger presenting
     /// it is refused rather than let in as a guest with that name.
+    ///
+    /// The device half is decided too, and anything it would register is
+    /// dropped: [`Self::authenticate_device`] is for the caller that keeps it.
     pub fn authenticate(&self, scope: u32, request: &AuthRequest) -> AuthResult {
+        self.authenticate_device(scope, request).0
+    }
+
+    /// [`Self::authenticate`], and the device the login was admitted as.
+    ///
+    /// The device comes back rather than being stored here because this is a
+    /// synchronous, pure check (see [`Self::warm`]) and storing it is a write:
+    /// the caller hands it to [`Self::admit_device`] once it is off the
+    /// blocking pool. `None` when the login named no device, and always `None`
+    /// for a refusal or a guest.
+    pub fn authenticate_device(
+        &self,
+        scope: u32,
+        request: &AuthRequest,
+    ) -> (AuthResult, Option<Device>) {
         use auth_result::Outcome;
 
         if request.name.trim().is_empty() {
-            return outcome(Outcome::InvalidName, None);
+            return (outcome(Outcome::InvalidName, None), None);
         }
         // The operator's name rule, and the SuperUser is exempt from it for the
         // same reason `cert_required` exempts them (`handshake.rs`): a pattern
@@ -289,7 +361,7 @@ impl Accounts {
         // account that could change the pattern back, and the way in is then to
         // edit the database by hand.
         if request.name != identity::SUPERUSER_NAME && !self.name_allowed(scope, &request.name) {
-            return outcome(Outcome::InvalidName, None);
+            return (outcome(Outcome::InvalidName, None), None);
         }
         let by_cert = if request.cert_hash.is_empty() {
             None
@@ -349,7 +421,7 @@ impl Accounts {
                         // impersonation guard: without it, a registered name
                         // reached by certificate alone could be worn by anyone
                         // who typed it.
-                        outcome(Outcome::NameTaken, None)
+                        (outcome(Outcome::NameTaken, None), None)
                     } else {
                         // Only a name was offered, so only the password can
                         // prove it belongs to this peer. An account with no
@@ -367,20 +439,29 @@ impl Accounts {
                 // with them, so it is allowed, and it is the only way for
                 // somebody to connect under a second, unregistered name from a
                 // machine they have already registered from.
-                None => AuthResult {
-                    outcome: Outcome::Ok as i32,
-                    account: None,
-                    guest: true,
-                },
+                None => (
+                    AuthResult {
+                        outcome: Outcome::Ok as i32,
+                        account: None,
+                        guest: true,
+                        device_id: String::new(),
+                    },
+                    None,
+                ),
             },
         }
     }
 
-    fn finish(&self, record: Record, request: &AuthRequest, proof: Proof) -> AuthResult {
+    fn finish(
+        &self,
+        record: Record,
+        request: &AuthRequest,
+        proof: Proof,
+    ) -> (AuthResult, Option<Device>) {
         use auth_result::Outcome;
         match (&record.password, proof) {
             (Some(secret), _) if !secret.verify(&request.password) => {
-                return outcome(Outcome::WrongPassword, None);
+                return (outcome(Outcome::WrongPassword, None), None);
             }
             // A registered account with no stored password, claimed by name
             // alone. There is nothing here to check, so accepting would hand
@@ -398,19 +479,245 @@ impl Accounts {
                     account = record.account.id,
                     "refusing a registered account that has no password to check"
                 );
-                return outcome(Outcome::WrongPassword, None);
+                return (outcome(Outcome::WrongPassword, None), None);
             }
             _ => {}
         }
-        if let Some(totp) = &record.totp {
+        // The device is judged after the first factor and before the second.
+        // `password.is_some()` is the proof it is given: a wrong password was
+        // refused above, so an account with one was proved by it.
+        let admitted = match devices::judge(
+            &record.devices,
+            devices::presented(request),
+            record.password.is_some(),
+            now_ms(),
+        ) {
+            Verdict::Refuse => {
+                tracing::info!(
+                    account = record.account.id,
+                    device = %request.device_id,
+                    "refusing a login from a device this account does not trust"
+                );
+                return (outcome(Outcome::DeviceNotTrusted, None), None);
+            }
+            Verdict::None => None,
+            Verdict::Admit(device) => Some(device),
+        };
+
+        // A device the account already knows, proving the secret it registered
+        // with, *is* a second factor: something the owner has, held on the
+        // thing they log in from. Asking it for a code as well asked for one on
+        // every reconnect - a dropped Wi-Fi, a laptop waking up - where there
+        // is nobody at the keyboard to type one, and a client that cannot
+        // reconnect by itself is one people turn the second factor off for.
+        //
+        // A new device, or a login that names none, still needs the code, and
+        // it is checked before the device is registered: a login that fails it
+        // leaves no row behind. The price is the usual one of "remember this
+        // device": whoever holds the device holds that factor, which is what
+        // signing it out is for.
+        let recognised = admitted
+            .as_ref()
+            .is_some_and(|device| record.devices.iter().any(|known| known.id == device.id));
+        if let Some(totp) = &record.totp
+            && !recognised
+        {
             if request.totp.is_empty() {
-                return outcome(Outcome::TotpRequired, None);
+                return (outcome(Outcome::TotpRequired, None), None);
             }
             if !verify_totp(totp, &request.totp, now_ms() / 1000) {
-                return outcome(Outcome::TotpInvalid, None);
+                return (outcome(Outcome::TotpInvalid, None), None);
             }
         }
-        outcome(Outcome::Ok, Some(record.account))
+
+        let mut result = outcome(Outcome::Ok, Some(record.account));
+        if let Some(device) = &admitted {
+            result.device_id.clone_from(&device.id);
+        }
+        (result, admitted)
+    }
+
+    /// Store the device a login was admitted as: a new one registered, a known
+    /// one's `last_seen_ms` moved on.
+    ///
+    /// Called with what [`Self::authenticate_device`] returned, after the login
+    /// was decided, and deciding nothing itself: if this write is lost the
+    /// device is still admitted, and is registered again next time.
+    pub async fn admit_device(&self, scope: u32, account: u64, device: Device) {
+        self.put_device(scope, account, device).await;
+    }
+
+    /// The devices of one account that are not signed out, most recently seen
+    /// first.
+    #[must_use]
+    pub fn devices(&self, scope: u32, account: u64) -> Vec<Device> {
+        let mut listed: Vec<Device> = self
+            .record(scope, account)
+            .map(|record| record.devices)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|device| !device.signed_out)
+            .collect();
+        listed.sort_by(|a, b| {
+            b.last_seen_ms
+                .cmp(&a.last_seen_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        listed
+    }
+
+    /// Whether the account admits only the devices it knows, see `devices`.
+    #[must_use]
+    pub fn devices_locked(&self, scope: u32, account: u64) -> bool {
+        self.record(scope, account)
+            .is_some_and(|record| devices::locked(&record.devices))
+    }
+
+    /// Register a device before it first logs in.
+    ///
+    /// # Errors
+    ///
+    /// A message when the id or secret has the wrong shape, when the id is
+    /// already one of this account's devices, signed out or not, or when there
+    /// is no such account. An existing id is refused rather than overwritten:
+    /// replacing its secret would sign that device out without saying so.
+    pub async fn add_device(
+        &self,
+        scope: u32,
+        account: u64,
+        id: &str,
+        secret: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        if !devices::valid(id, secret) {
+            return Err("that is not a device id and secret this server accepts".to_owned());
+        }
+        let Some(record) = self.record(scope, account) else {
+            return Err("no such account".to_owned());
+        };
+        if record.devices.iter().any(|device| device.id == id) {
+            return Err("this account already has a device with that id".to_owned());
+        }
+        let now = now_ms();
+        self.put_device(
+            scope,
+            account,
+            Device {
+                id: id.to_owned(),
+                name: devices::clean_name(name),
+                secret_hash: devices::hash(secret),
+                added_at_ms: now,
+                // Never seen: it has not logged in yet, and its entry in the
+                // owner's list says so until it does.
+                last_seen_ms: 0,
+                signed_out: false,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Give one of the account's devices a new name.
+    ///
+    /// # Errors
+    ///
+    /// A message when the account has no such device, or it is signed out.
+    pub async fn rename_device(
+        &self,
+        scope: u32,
+        account: u64,
+        id: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let Some(mut device) = self.live_device(scope, account, id) else {
+            return Err("this account has no such device".to_owned());
+        };
+        device.name = devices::clean_name(name);
+        self.put_device(scope, account, device).await;
+        Ok(())
+    }
+
+    /// Sign one of the account's devices out.
+    ///
+    /// Leaves a tombstone, which is what refuses the device by id from now on
+    /// and what locks the account (see `devices`). Ending the device's live
+    /// sessions is the caller's half; this only decides the next login.
+    ///
+    /// # Errors
+    ///
+    /// A message when the account has no such device, or it is already signed
+    /// out.
+    pub async fn sign_out_device(&self, scope: u32, account: u64, id: &str) -> Result<(), String> {
+        let Some(mut device) = self.live_device(scope, account, id) else {
+            return Err("this account has no such device".to_owned());
+        };
+        device.signed_out = true;
+        self.put_device(scope, account, device).await;
+        Ok(())
+    }
+
+    /// One device of one account that is not signed out.
+    fn live_device(&self, scope: u32, account: u64, id: &str) -> Option<Device> {
+        self.record(scope, account)?
+            .devices
+            .into_iter()
+            .find(|device| device.id == id && !device.signed_out)
+    }
+
+    /// One account's cached record.
+    fn record(&self, scope: u32, account: u64) -> Option<Record> {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&(scope, account)).cloned())
+    }
+
+    /// Put one device into an account's set, applying the ceilings, and write
+    /// both the device and whatever the ceilings pushed out.
+    async fn put_device(&self, scope: u32, account: u64, device: Device) {
+        let dropped = {
+            let Ok(mut cache) = self.cache.lock() else {
+                return;
+            };
+            let Some(record) = cache.get_mut(&(scope, account)) else {
+                return;
+            };
+            let (kept, dropped) = devices::upsert(&record.devices, device.clone());
+            record.devices = kept;
+            dropped
+        };
+        let written = sqlx::query(
+            "INSERT INTO account_device (server_id, account_id, device_id, secret_hash, name, \
+                 added_at_ms, last_seen_ms, signed_out) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (server_id, account_id, device_id) DO UPDATE SET \
+                 secret_hash = excluded.secret_hash, name = excluded.name, \
+                 last_seen_ms = excluded.last_seen_ms, signed_out = excluded.signed_out",
+        )
+        .bind(i64::from(scope))
+        .bind(account as i64)
+        .bind(&device.id)
+        .bind(device.secret_hash.as_slice())
+        .bind(&device.name)
+        .bind(device.added_at_ms as i64)
+        .bind(device.last_seen_ms as i64)
+        .bind(i64::from(device.signed_out))
+        .execute(self.store.pool())
+        .await;
+        if let Err(error) = written {
+            tracing::error!(%error, account, "could not persist a device");
+        }
+        for id in dropped {
+            let _ = sqlx::query(
+                "DELETE FROM account_device \
+                 WHERE server_id = ? AND account_id = ? AND device_id = ?",
+            )
+            .bind(i64::from(scope))
+            .bind(account as i64)
+            .bind(&id)
+            .execute(self.store.pool())
+            .await
+            .inspect_err(|error| tracing::error!(%error, "could not forget a device"));
+        }
     }
 
     /// One account by id.
@@ -553,6 +860,7 @@ impl Accounts {
             account: account.clone(),
             password: secret,
             totp: None,
+            devices: Vec::new(),
         };
         self.write(scope, &record).await;
         if let Ok(mut cache) = self.cache.lock() {
@@ -660,6 +968,7 @@ impl Accounts {
             },
             password: None,
             totp: None,
+            devices: Vec::new(),
         });
         // Deliberately leaves `cert_hash` empty. A certificate on this account
         // would authenticate it *without* the password, and the administrator
@@ -992,6 +1301,7 @@ impl Accounts {
                 },
                 password: account.password.clone(),
                 totp: account.totp_secret.clone(),
+                devices: Vec::new(),
             };
             self.write(scope, &record).await;
             if let Ok(mut cache) = self.cache.lock() {
@@ -1064,6 +1374,7 @@ impl Accounts {
         for statement in [
             "DELETE FROM account WHERE server_id = ? AND id = ?",
             "DELETE FROM account_setting WHERE server_id = ? AND account_id = ?",
+            "DELETE FROM account_device WHERE server_id = ? AND account_id = ?",
         ] {
             let _ = sqlx::query(statement)
                 .bind(i64::from(scope))
@@ -1298,6 +1609,7 @@ fn outcome(outcome: auth_result::Outcome, account: Option<Account>) -> AuthResul
         outcome: outcome as i32,
         account,
         guest: false,
+        device_id: String::new(),
     }
 }
 
@@ -1444,6 +1756,7 @@ mod tests {
             cert_hash: Vec::new(),
             strong_cert: false,
             totp: String::new(),
+            ..AuthRequest::default()
         }
     }
 
@@ -1608,6 +1921,7 @@ mod tests {
             },
             password: Some(Secret::new("lower-secret")),
             totp: None,
+            devices: Vec::new(),
         };
         if let Ok(mut cache) = accounts.cache.lock() {
             let _ = cache.insert((1, lower.account.id), lower.clone());
@@ -2481,5 +2795,290 @@ mod tests {
             .await
             .expect("registered");
         assert!(fresh.id > 400, "id {} collides with an import", fresh.id);
+    }
+
+    /// A login from the install called `device`, with a secret of its own.
+    fn from_device(name: &str, password: &str, cert: &[u8], device: &str) -> AuthRequest {
+        AuthRequest {
+            device_id: device.to_owned(),
+            device_secret: format!("{device}-secret-0123456789abcdef0123456789"),
+            device_name: device.to_owned(),
+            ..auth_with_cert(name, password, cert)
+        }
+    }
+
+    /// Log in from `device` and store what the login admitted, as the RPC does.
+    async fn log_in(accounts: &Accounts, request: &AuthRequest) -> i32 {
+        let (result, admitted) = accounts.authenticate_device(1, request);
+        if let (Some(device), Some(account)) = (admitted, result.account.as_ref()) {
+            accounts.admit_device(1, account.id, device).await;
+        }
+        result.outcome
+    }
+
+    fn code_now(secret: &[u8]) -> String {
+        format!("{:06}", crate::secret::totp(secret, now_ms() / 1000 / 30))
+    }
+
+    const OK: i32 = auth_result::Outcome::Ok as i32;
+    const UNTRUSTED: i32 = auth_result::Outcome::DeviceNotTrusted as i32;
+
+    #[tokio::test]
+    async fn a_certificate_account_trusts_new_devices_until_one_is_signed_out() {
+        // Certificate only, no password: the account a Mumble client makes by
+        // registering itself. Every copy of the certificate is the owner until
+        // the owner says otherwise, and after that a certificate alone is only
+        // good for the devices still on the list.
+        let accounts = accounts().await;
+        let cert = vec![0xab; 20];
+        let owner = accounts
+            .register(
+                1,
+                Account {
+                    name: "erin".to_owned(),
+                    cert_hash: cert.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("register");
+
+        for device in ["laptop", "phone"] {
+            assert_eq!(
+                log_in(&accounts, &from_device("erin", "", &cert, device)).await,
+                OK
+            );
+        }
+        assert_eq!(accounts.devices(1, owner.id).len(), 2);
+        assert!(!accounts.devices_locked(1, owner.id));
+
+        accounts
+            .sign_out_device(1, owner.id, "phone")
+            .await
+            .expect("signed out");
+        assert!(accounts.devices_locked(1, owner.id));
+        assert_eq!(accounts.devices(1, owner.id).len(), 1);
+
+        let refused = [
+            (
+                "the signed-out device",
+                from_device("erin", "", &cert, "phone"),
+            ),
+            ("a new device", from_device("erin", "", &cert, "tablet")),
+            (
+                "a stock client naming none",
+                auth_with_cert("erin", "", &cert),
+            ),
+        ];
+        for (who, request) in &refused {
+            assert_eq!(log_in(&accounts, request).await, UNTRUSTED, "{who}");
+        }
+        assert_eq!(
+            log_in(&accounts, &from_device("erin", "", &cert, "laptop")).await,
+            OK,
+            "the device still on the list is unaffected"
+        );
+
+        // And all of it is in the table, not only the cache.
+        let reopened = Accounts::open(accounts.store.clone())
+            .await
+            .expect("schema");
+        assert_eq!(
+            reopened
+                .authenticate(1, &from_device("erin", "", &cert, "phone"))
+                .outcome,
+            UNTRUSTED
+        );
+        assert_eq!(
+            reopened
+                .authenticate(1, &from_device("erin", "", &cert, "laptop"))
+                .outcome,
+            OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_factor_is_asked_of_a_new_device_and_not_of_a_known_one() {
+        let accounts = accounts().await;
+        let owner = accounts
+            .register(
+                1,
+                Account {
+                    name: "finn".to_owned(),
+                    ..Account::default()
+                },
+                "hunter2",
+            )
+            .await
+            .expect("register");
+        let secret = crate::secret::new_totp_secret();
+        accounts
+            .set_totp(1, owner.id, Some(secret.clone()))
+            .await
+            .expect("second factor on");
+
+        // A new device is asked for the code, and a login that stops there
+        // registers nothing.
+        let (asked, admitted) =
+            accounts.authenticate_device(1, &from_device("finn", "hunter2", &[], "laptop"));
+        assert_eq!(asked.outcome, auth_result::Outcome::TotpRequired as i32);
+        assert!(admitted.is_none());
+        assert!(accounts.devices(1, owner.id).is_empty());
+
+        let with_code = AuthRequest {
+            totp: code_now(&secret),
+            ..from_device("finn", "hunter2", &[], "laptop")
+        };
+        assert_eq!(log_in(&accounts, &with_code).await, OK);
+
+        // The same device again, reconnecting with nobody there to type: in.
+        assert_eq!(
+            log_in(&accounts, &from_device("finn", "hunter2", &[], "laptop")).await,
+            OK
+        );
+        // Still only with the password, which the device does not replace.
+        assert_eq!(
+            log_in(&accounts, &from_device("finn", "wrong", &[], "laptop")).await,
+            auth_result::Outcome::WrongPassword as i32
+        );
+        // A client naming no device, and one borrowing the laptop's id without
+        // its secret, get no such pass.
+        assert_eq!(
+            log_in(&accounts, &auth("finn", "hunter2")).await,
+            auth_result::Outcome::TotpRequired as i32
+        );
+        let borrowed = AuthRequest {
+            device_secret: "f".repeat(40),
+            ..from_device("finn", "hunter2", &[], "laptop")
+        };
+        assert_eq!(log_in(&accounts, &borrowed).await, UNTRUSTED);
+    }
+
+    #[tokio::test]
+    async fn a_password_lets_a_new_device_in_after_the_lock_but_not_a_signed_out_one() {
+        // The password is the second secret a signed-out device does not have,
+        // so it is what registers a new device on a locked account. It is not
+        // a way back for the device that was signed out.
+        let accounts = accounts().await;
+        let owner = accounts
+            .register(
+                1,
+                Account {
+                    name: "gale".to_owned(),
+                    ..Account::default()
+                },
+                "hunter2",
+            )
+            .await
+            .expect("register");
+        assert_eq!(
+            log_in(&accounts, &from_device("gale", "hunter2", &[], "laptop")).await,
+            OK
+        );
+        assert_eq!(
+            log_in(&accounts, &from_device("gale", "hunter2", &[], "phone")).await,
+            OK
+        );
+        accounts
+            .sign_out_device(1, owner.id, "phone")
+            .await
+            .expect("signed out");
+
+        assert_eq!(
+            log_in(&accounts, &from_device("gale", "hunter2", &[], "tablet")).await,
+            OK
+        );
+        assert_eq!(
+            log_in(&accounts, &from_device("gale", "hunter2", &[], "phone")).await,
+            UNTRUSTED
+        );
+        assert_eq!(
+            log_in(&accounts, &auth("gale", "hunter2")).await,
+            OK,
+            "a stock client with the password is not locked out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_registered_ahead_is_admitted_and_an_id_cannot_be_taken_twice() {
+        // How linking gets a new device onto a locked account: the device
+        // already signed in registers it before it first connects.
+        let accounts = accounts().await;
+        let cert = vec![0xcd; 20];
+        let owner = accounts
+            .register(
+                1,
+                Account {
+                    name: "hana".to_owned(),
+                    cert_hash: cert.clone(),
+                    ..Account::default()
+                },
+                "",
+            )
+            .await
+            .expect("register");
+        assert_eq!(
+            log_in(&accounts, &from_device("hana", "", &cert, "laptop")).await,
+            OK
+        );
+        accounts
+            .sign_out_device(1, owner.id, "laptop")
+            .await
+            .expect("signed out");
+
+        let linking = from_device("hana", "", &cert, "phone");
+        accounts
+            .add_device(
+                1,
+                owner.id,
+                &linking.device_id,
+                &linking.device_secret,
+                "Phone",
+            )
+            .await
+            .expect("registered ahead");
+        assert_eq!(log_in(&accounts, &linking).await, OK);
+        assert!(
+            accounts
+                .add_device(1, owner.id, "laptop", &linking.device_secret, "Again")
+                .await
+                .is_err(),
+            "a signed-out id is not handed out again"
+        );
+        assert!(
+            accounts
+                .add_device(1, owner.id, "phone", &linking.device_secret, "Again")
+                .await
+                .is_err(),
+            "nor is a live one overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_takes_its_devices_with_it() {
+        // Ids are handed out again after a restart; a device left behind would
+        // log in to the next holder of the id.
+        let accounts = accounts().await;
+        let owner = accounts
+            .register(
+                1,
+                Account {
+                    name: "ivo".to_owned(),
+                    ..Account::default()
+                },
+                "hunter2",
+            )
+            .await
+            .expect("register");
+        assert_eq!(
+            log_in(&accounts, &from_device("ivo", "hunter2", &[], "laptop")).await,
+            OK
+        );
+        accounts.delete(1, owner.id).await;
+        let reopened = Accounts::open(accounts.store.clone())
+            .await
+            .expect("schema");
+        assert!(reopened.devices(1, owner.id).is_empty());
     }
 }
