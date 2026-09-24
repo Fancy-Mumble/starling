@@ -565,3 +565,64 @@ async fn a_linked_device_logs_in_once_on_its_code_and_then_like_the_account() {
 
     deployment.stop().await;
 }
+
+/// Store a record from `client` and wait for the server's answer to it.
+async fn put_record(client: &mut Client, key: &str, value: &[u8]) {
+    send_userdata(
+        client,
+        userdata_envelope::Body::RecordPut(starling_proto_fancy::fancy::domain::RecordPut {
+            request_id: format!("put-{key}"),
+            key: key.to_owned(),
+            value: value.to_vec(),
+            remove: false,
+        }),
+    )
+    .await;
+    let answer = next_record(client).await;
+    assert_eq!(
+        answer.request_id,
+        format!("put-{key}"),
+        "the writer gets its own answer"
+    );
+}
+
+#[tokio::test]
+async fn a_record_written_on_one_device_is_pushed_to_the_others() {
+    // What was read on the phone, a setting changed on the laptop: kept as a
+    // record, and pushed to the account's other sessions as it changes, so
+    // neither has to poll. Nobody else's sessions hear of it.
+    let data_dir = TempDir::new("record-push");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+    let _ = register_with_password(&deployment, "bob", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut bob, credentials("bob", "pw")).await;
+
+    put_record(&mut laptop, "read/ch/4", b"1700000000000").await;
+
+    let pushed = next_record(&mut phone).await;
+    assert_eq!(
+        pushed.request_id, "",
+        "unasked, so the phone can tell it from an answer"
+    );
+    assert_eq!(pushed.key, "read/ch/4");
+    assert_eq!(pushed.value, b"1700000000000");
+    assert!(pushed.found);
+
+    // Another account is not told, and the writer is not told twice.
+    for (who, client) in [("bob", &mut bob), ("the laptop", &mut laptop)] {
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), next_record(client)).await;
+        assert!(
+            heard.is_err(),
+            "{who} was sent a record it should not have been"
+        );
+    }
+
+    deployment.stop().await;
+}

@@ -793,14 +793,13 @@ impl UserdataService {
     ) -> starling_proto_fancy::control::ServerAction {
         if put.remove {
             self.records.remove(inbound.scope, account, &put.key).await;
-            return self.record_reply(
-                inbound,
-                Record {
-                    request_id: put.request_id,
-                    key: put.key,
-                    ..Record::default()
-                },
-            );
+            let removed = Record {
+                request_id: put.request_id,
+                key: put.key,
+                ..Record::default()
+            };
+            self.tell_other_devices(inbound, account, &removed).await;
+            return self.record_reply(inbound, removed);
         }
 
         let size = put.value.len();
@@ -809,19 +808,47 @@ impl UserdataService {
             .put(inbound.scope, account, &put.key, &put.value)
             .await
         {
-            Ok(updated_at_ms) => self.record_reply(
-                inbound,
-                Record {
+            Ok(updated_at_ms) => {
+                let stored = Record {
                     request_id: put.request_id,
                     key: put.key,
                     value: put.value,
                     found: true,
                     updated_at_ms,
                     refused: None,
-                },
-            ),
+                };
+                self.tell_other_devices(inbound, account, &stored).await;
+                self.record_reply(inbound, stored)
+            }
             Err(denied) => {
                 self.record_refused(inbound, &put.request_id, &put.key, denial(denied, size))
+            }
+        }
+    }
+
+    /// Send a record that just changed to the account's *other* sessions.
+    ///
+    /// What makes a record something a person's devices share rather than
+    /// something each of them has to go and ask about: what was read on the
+    /// phone, the settings changed on the laptop. Pushed with an empty
+    /// `request_id`, which is how a client tells a change it did not ask for
+    /// from the answer to a request it made. The session that wrote it has
+    /// its answer already and is not sent a second copy.
+    async fn tell_other_devices(&self, inbound: &Inbound, account: u64, record: &Record) {
+        let change = UserdataEnvelope {
+            body: Some(userdata_envelope::Body::Record(Record {
+                request_id: String::new(),
+                ..record.clone()
+            })),
+        }
+        .encode_to_vec();
+        for session in self.sessions(inbound.scope).await {
+            let owned =
+                starling_proto_fancy::identity::account(session.registered, session.account)
+                    == Some(account);
+            if owned && session.session != inbound.session {
+                self.fanout
+                    .push(to_conn(session.conn, outer_type(), change.clone()));
             }
         }
     }
