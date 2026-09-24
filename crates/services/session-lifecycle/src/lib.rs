@@ -18,6 +18,7 @@ pub mod ids;
 pub mod session;
 
 pub mod handshake;
+pub mod invite;
 pub mod state;
 
 pub use handshake::Handshake;

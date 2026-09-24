@@ -50,6 +50,7 @@ use starling_runtime::plane::{
 };
 use starling_runtime::serve::ServiceContext;
 
+use crate::invite;
 use crate::state::{Connections, Identity, PendingConnection};
 
 /// The Mumble version Starling announces.
@@ -341,7 +342,10 @@ impl Handshake {
         // and this is the only message that carries them.
         //
         // Not logged, and not counted. The value *is* the password.
-        let _ = connections.set_tokens(inbound.conn, request.tokens.clone());
+        //
+        // An invite code rides in the same list and is taken out here: `admit`
+        // redeems it, and it is never a channel password.
+        let _ = connections.set_tokens(inbound.conn, invite::split_tokens(&request.tokens).0);
         tracing::debug!(
             conn = inbound.conn,
             %name,
@@ -351,11 +355,11 @@ impl Handshake {
         );
 
         let config = self.config(inbound.scope).await;
-        let identity = match self
+        let (identity, invited_to) = match self
             .admit(inbound, &name, &request, &config, &pending)
             .await
         {
-            Ok(identity) => identity,
+            Ok(admitted) => admitted,
             Err(refusal) => return refusal,
         };
         // Borrowed, not re-bound: `identity` owns the name from here on, and
@@ -410,7 +414,10 @@ impl Handshake {
         // with a `default_channel` would quietly seat everybody in the root.
         self.announce_up(connections, inbound.conn).await;
 
-        let Some(channel) = self.landing(inbound.scope, session, account, &config).await else {
+        let Some(channel) = self
+            .landing(inbound.scope, session, account, &config, invited_to)
+            .await
+        else {
             // The root refused them, which it does only when it is full: there
             // is nowhere left to put this user, and admitting them to nowhere
             // would put a session in the tree that is in no channel. murmur
@@ -474,6 +481,13 @@ impl Handshake {
     /// either refuses outright or hands the next one an identity - and because
     /// none of them may touch the session, which does not exist until all
     /// three have passed.
+    ///
+    /// An invite is redeemed first, because a live one is what may let the
+    /// login past the password (`invite_skips_password`). It is redeemed even
+    /// when the password is right or there is none: it still decides where
+    /// they land, which is the second half of the link's promise. A use is
+    /// spent before the later gates run, so a login refused for a wrong
+    /// account password has spent one - once, since a use is a person.
     async fn admit(
         &self,
         inbound: &Inbound,
@@ -481,16 +495,49 @@ impl Handshake {
         request: &tcp::Authenticate,
         config: &Snapshot,
         pending: &PendingConnection,
-    ) -> Result<Identity, Actions> {
+    ) -> Result<(Identity, Option<u32>), Actions> {
+        let invited = match invite::split_tokens(&request.tokens).1 {
+            Some(code) if invite::enabled(config) => {
+                invite::redeem(
+                    &self.resolver,
+                    inbound.scope,
+                    &code,
+                    &pending.cert_hash,
+                    name,
+                )
+                .await
+            }
+            Some(_) => invite::Outcome::Refused,
+            None => invite::Outcome::None,
+        };
+        let invited_to = match invited {
+            invite::Outcome::Admitted { channel } => Some(channel),
+            invite::Outcome::None | invite::Outcome::Refused => None,
+        };
+        let skips_password = invited_to.is_some() && config.invite_skips_password;
         if !config.password.is_empty()
+            && !skips_password
             && request.password.as_deref().unwrap_or_default() != config.password
         {
+            // A refused invite gets the same answer as no invite: a stock client
+            // then asks for the password, which is still a way in, and the
+            // reply says nothing about whether the code was ever real.
             return Err(self.refuse(
                 inbound.conn,
                 name,
                 tcp::reject::RejectType::WrongServerPw,
                 "wrong server password",
             ));
+        }
+        if skips_password && !config.password.is_empty() {
+            self.ctx.logger.log(
+                LogEvent::info(
+                    Category::Session,
+                    "admitted past the server password by an invite",
+                )
+                .with("conn", inbound.conn)
+                .with("name", name.to_owned()),
+            );
         }
 
         let identity = self.identify(inbound.scope, name, request, pending).await?;
@@ -500,7 +547,7 @@ impl Handshake {
         {
             return Err(refusal);
         }
-        Ok(identity)
+        Ok((identity, invited_to))
     }
 
     /// Decode the message, and find the connection it arrived on.
@@ -548,7 +595,10 @@ impl Handshake {
         inbound: &Inbound,
         request: &tcp::Authenticate,
     ) -> Actions {
-        if !connections.set_tokens(inbound.conn, request.tokens.clone()) {
+        // An invite is a way in, and this session is already in: dropped, so
+        // it never lands on the session record as a channel password.
+        let (tokens, _) = invite::split_tokens(&request.tokens);
+        if !connections.set_tokens(inbound.conn, tokens) {
             // Unchanged, which is the common case, since a stock client sends
             // its token list on every reconnect whether or not it has any.
             return Actions::new();
@@ -1413,8 +1463,16 @@ impl Handshake {
         session: u32,
         account: Option<u64>,
         config: &Snapshot,
+        invited_to: Option<u32>,
     ) -> Option<u32> {
         let mut tried = Vec::new();
+        // An invite into a channel comes first: following the link is the most
+        // recent thing this person said about where they want to be. It is
+        // still only a candidate, and the Enter check below applies to it like
+        // any other - an invite never opens a door the ACL keeps shut.
+        if let Some(channel) = invited_to.filter(|&channel| channel != ROOT_CHANNEL) {
+            tried.push(channel);
+        }
         if config.remember_channel
             && let Some(account) = account
             && let Some(remembered) = self
