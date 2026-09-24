@@ -50,6 +50,7 @@ members = [
     # whole renderer to run it in.
     "crates/services/render",
     "crates/services/gifs",
+    "crates/services/invites",
     "crates/services/context-actions",
 
     # Outward-facing: what this server tells the world about itself.
@@ -120,6 +121,7 @@ starling-health = { path = "crates/services/health" }
 starling-link-preview = { path = "crates/services/link-preview" }
 starling-render = { path = "crates/services/render" }
 starling-gifs = { path = "crates/services/gifs" }
+starling-invites = { path = "crates/services/invites" }
 starling-context-actions = { path = "crates/services/context-actions" }
 starling-directory = { path = "crates/services/directory" }
 starling-operator-api = { path = "crates/operator-api" }

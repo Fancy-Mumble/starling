@@ -36,7 +36,7 @@ means logins are refused rather than served on a guess.
 
 | Service | Tier | Wire types | gRPC surface | Store | Calls |
 |---|---|---|---|---|---|
-| `session-lifecycle` | essential | 0, 2, 3, 4, 5, 9, 15, 21, 22, **1000** | `SessionControl` | — | userdata · voice · metadata · permissions · server-config · session-view |
+| `session-lifecycle` | essential | 0, 2, 3, 4, 5, 9, 15, 21, 22, **1000** | `SessionControl` | — | userdata · voice · metadata · permissions · server-config · session-view · invites |
 | `session-view` | essential | *none* | `SessionView` | — | userdata · permissions |
 | `permissions` | essential | 12, 13, 20, **1001** | `Permissions` | yes, optional | metadata · session-view |
 | `metadata` | essential | 6, 7, **1002** | `Metadata` | yes | permissions · session-view |
@@ -56,6 +56,7 @@ means logins are refused rather than served on a guess.
 | `link-preview` | optional | **1016** | *client plane only* | — | — |
 | `context-actions` | optional | 16, 17, **1017** | `ContextActions` | — | — |
 | `gifs` | optional | **1018** | *client plane only* | — | — |
+| `invites` | optional | **1019** | `Invites` | yes | permissions · server-config · audit |
 | `health` | optional | *none* | `HealthOverview` | — | every service, by poll |
 | `directory` | optional | *none* | *none at all* | — | metadata · server-config · session-view |
 
@@ -697,6 +698,55 @@ webview's own origin, and without the header gets an opaque failure where the
 picture or the `403` should be. `*` narrows nothing worth narrowing: the bytes
 are public GIFs and the grant travels in the URL, not in a credential. A plain
 `GET` needs no preflight, so there is no `OPTIONS` route.
+
+### `invites` — one-click links into the server
+
+A private server used to mean sending three things to anybody you wanted on
+it: an address, a port and the password. The password is the problem: it can
+never be taken back from one person without changing it for everybody. An
+invite is a code that stands in for all three. It expires, it counts, it is
+revoked on its own, and the client turns it into
+`fancy://invite/<code>?server=host:port&name=...`, a link that is the whole
+join flow.
+
+**The code travels as an access token**, `invite:<code>`, on the invitee's
+`Authenticate`. Not a new field: a stock Mumble client can redeem one by
+pasting it into its own access-token box, and no upstream message grew.
+`session-lifecycle` takes it **out** of the token list before storing that
+list, so an invite is never a channel password and never sits on a
+`session-view` record, and calls `Redeem` before checking the server password.
+A live invite lets the login past the password when `invite_skips_password`
+is on, and puts its channel at the front of the landing cascade either way.
+The Enter check still applies there: an invite never opens a room the ACL
+keeps shut, and a creator may only point one at a room they can enter.
+
+**A use is a person, not a login.** `invite_use` remembers who redeemed each
+code: the certificate hash, or the name for somebody without one. Somebody
+reconnecting with the same link is recognised and does not spend a second
+use, and an invite that has admitted as many people as it may still re-admits
+every one of them. The last use is spent by a conditional `UPDATE`, so two
+strangers racing for it cannot both get it.
+
+**A refused invite gets the same answer as no invite**, `WrongServerPW`: a
+stock client then asks for the password, which is still a way in, and a login
+cannot be used to learn which codes exist. The reason is logged instead.
+
+Who may mint one is the operator's decision, made in the `Invites` group of the
+settings form (`server-config`): `invites` is `off`, `admins` (Write on the
+root, the default), `registered` or `everyone`. `invite_max_hours` (a week by
+default) and `invite_max_uses` are ceilings that a request is clamped to rather
+than refused against. `invite_address` is the `host:port` a link should name
+when the address members dial is not the public one. `off` also stops every
+invite already handed out from admitting anybody. The invites are kept, so
+turning the setting back on revives the ones that have not expired.
+Administrators list and revoke everybody's invites; anybody else lists and
+revokes their own, and holds at most `invites_per_creator` live ones (a
+service option, 25). Minting and revoking go to the audit log as
+`audit.invite`, with the first four letters of the code and never all of it.
+
+Expired invites are swept hourly. Operators manage invites without a client
+through `GET`/`POST /v1/invites` and `DELETE /v1/invites/{code}`
+(`OPERATOR-API.md`).
 
 ## 6.4 Internal — nothing on the wire reaches these
 

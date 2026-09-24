@@ -66,6 +66,8 @@ pub mod category {
     pub const CONFIG: &str = "audit.config";
     /// A user's avatar or comment changed, or a moderator reset it.
     pub const PROFILE: &str = "audit.profile";
+    /// An invite link was made or revoked.
+    pub const INVITE: &str = "audit.invite";
 
     /// Every category, for the client's filter list.
     ///
@@ -82,6 +84,7 @@ pub mod category {
         ACL,
         CONFIG,
         PROFILE,
+        INVITE,
     ];
 }
 

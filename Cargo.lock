@@ -3676,6 +3676,7 @@ dependencies = [
  "starling-gifs",
  "starling-harness",
  "starling-health",
+ "starling-invites",
  "starling-link-preview",
  "starling-metadata",
  "starling-migrate",
@@ -3893,6 +3894,20 @@ name = "starling-imaging"
 version = "0.2.19"
 dependencies = [
  "image",
+ "tracing",
+]
+
+[[package]]
+name = "starling-invites"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "rand 0.10.2",
+ "sqlx",
+ "starling-proto-fancy",
+ "starling-runtime",
+ "tokio",
+ "tonic",
  "tracing",
 ]
 

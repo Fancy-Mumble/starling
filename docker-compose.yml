@@ -266,6 +266,13 @@ services:
     <<: *starling
     command: ["gifs", "--config", "/etc/starling/starling.toml"]
 
+  # Invite links. Who may mint one, and on what terms, is the `invites*` rows
+  # of the settings form; this container only holds the codes and answers the
+  # handshake's "does this one let them in?".
+  invites:
+    <<: *starling
+    command: ["invites", "--config", "/etc/starling/starling.toml"]
+
   context-actions:
     <<: *starling
     command: ["context-actions", "--config", "/etc/starling/starling.toml"]
@@ -423,6 +430,7 @@ services:
       # until something asks it for a page.
       STARLING_SERVICES_RENDER_ENDPOINT: inproc:render
       STARLING_SERVICES_GIFS_ENDPOINT: inproc:gifs
+      STARLING_SERVICES_INVITES_ENDPOINT: inproc:invites
       STARLING_SERVICES_CONTEXT_ACTIONS_ENDPOINT: inproc:context-actions
       STARLING_SERVICES_HEALTH_ENDPOINT: inproc:health
       STARLING_SERVICES_GATEWAY_ENDPOINT: inproc:gateway

@@ -127,6 +127,9 @@ endpoint = "http://render:50051"
 [services.gifs]
 endpoint = "http://gifs:50051"
 
+[services.invites]
+endpoint = "http://invites:50051"
+
 [services.context-actions]
 endpoint = "http://context-actions:50051"
 

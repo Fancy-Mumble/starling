@@ -41,6 +41,7 @@ pub fn spawn(
         "link-preview" => spawn::<starling_link_preview::LinkPreviewService>(ctx),
         "render" => spawn::<starling_render::RenderService>(ctx),
         "gifs" => spawn::<starling_gifs::GifsService>(ctx),
+        "invites" => spawn::<starling_invites::InvitesService>(ctx),
         "context-actions" => spawn::<starling_context_actions::ContextActionsService>(ctx),
         "directory" => spawn::<starling_directory::DirectoryService>(ctx),
         "operator-api" => spawn::<starling_operator_api::OperatorApi>(ctx),
@@ -79,6 +80,7 @@ pub fn names() -> &'static [&'static str] {
         // preview ladder.
         "render",
         "gifs",
+        "invites",
         "context-actions",
         // No wire type and no gRPC surface: nothing calls it, it calls out.
         "directory",

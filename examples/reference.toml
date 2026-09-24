@@ -150,6 +150,21 @@ registry_hostname = ""
 # ISO country code, shown beside the listing.
 registry_location = ""
 
+# Invite links (the `invites` service). Who may create one: "off", "admins"
+# (Write on the root channel), "registered" or "everyone". "off" also stops
+# every invite already handed out from admitting anybody.
+invites = "admins"
+# The longest an invite may live, in hours. 0 lets one live until revoked.
+invite_max_hours = 168
+# The most people one invite may admit. 0 is no ceiling.
+invite_max_uses = 0
+# Whether a live invite admits past `password`. Off, an invite only picks the
+# channel its holder lands in.
+invite_skips_password = true
+# host or host:port invite links name. Empty uses the address the inviting
+# client dialled, which is wrong only behind NAT or a proxy.
+invite_address = ""
+
 
 # ---------------------------------------------------------------------------
 # [gateway] -- the front door every client connects to
@@ -607,6 +622,12 @@ max_upload = "512MiB"
 # gif_proxy_send_ttl_ms = "315360000000"
 # gif_media_cache_bytes = "67108864"
 # gif_media_max_bytes = "8388608"
+#
+# [services.invites.options]
+# How many live invites one person may hold at once. Administrators are
+# exempt. A guard against a script minting codes in a loop; who may mint at
+# all is the `invites` setting above, not this.
+# invites_per_creator = "25"
 #
 # [services.screenshare.options]
 # The UDP port the SFU binds for media; 0 lets the OS pick.

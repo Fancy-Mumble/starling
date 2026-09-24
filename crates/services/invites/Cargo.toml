@@ -1,0 +1,27 @@
+[package]
+name = "starling-invites"
+description = "one-click invite links: minted by clients, redeemed by the handshake"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# No `starling-proto`: invites never touch an upstream message. The code rides
+# in `Authenticate.tokens`, which the handshake reads and hands over as text.
+starling-proto-fancy.workspace = true
+starling-runtime.workspace = true
+sqlx.workspace = true
+
+prost.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
