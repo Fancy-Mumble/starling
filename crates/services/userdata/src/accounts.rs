@@ -341,7 +341,7 @@ impl Accounts {
     /// [`Self::authenticate`], and the device the login was admitted as.
     ///
     /// The device comes back rather than being stored here because this is a
-    /// synchronous, pure check (see [`Self::warm`]) and storing it is a write:
+    /// synchronous, pure check (see `warm`) and storing it is a write:
     /// the caller hands it to [`Self::admit_device`] once it is off the
     /// blocking pool. `None` when the login named no device, and always `None`
     /// for a refusal or a guest.
