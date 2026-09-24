@@ -616,8 +616,7 @@ async fn a_record_written_on_one_device_is_pushed_to_the_others() {
 
     // Another account is not told, and the writer is not told twice.
     for (who, client) in [("bob", &mut bob), ("the laptop", &mut laptop)] {
-        let heard =
-            tokio::time::timeout(std::time::Duration::from_secs(1), next_record(client)).await;
+        let heard = timeout(std::time::Duration::from_secs(1), next_record(client)).await;
         assert!(
             heard.is_err(),
             "{who} was sent a record it should not have been"
