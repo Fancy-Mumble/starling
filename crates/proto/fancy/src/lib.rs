@@ -87,6 +87,11 @@ generated!(
     "starling.render.v1"
 );
 generated!(
+    /// Invites: redeemed by the handshake, managed by operator-api.
+    invites,
+    "starling.invites.v1"
+);
+generated!(
     /// The channel tree and membership.
     metadata,
     "starling.metadata.v1"
@@ -188,6 +193,11 @@ pub mod fancy {
         /// Outer type 1018.
         media,
         "starling.fancy.media.v1"
+    );
+    generated!(
+        /// Outer type 1019.
+        invites,
+        "starling.fancy.invites.v1"
     );
 }
 

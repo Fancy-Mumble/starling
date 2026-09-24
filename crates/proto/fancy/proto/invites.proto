@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+// Invites, for the services that are not a client: the handshake redeems one,
+// and operator-api manages them without a session. The client-facing half is
+// `fancy/invites.proto` (outer type 1019).
+package starling.invites.v1;
+
+import "common.proto";
+
+service Invites {
+  // Whether `code` admits this login, counting it as a use when it is the
+  // first time this person presents it. Called by the handshake before the
+  // server password is checked, because answering yes is what lets it skip.
+  rpc Redeem(RedeemRequest) returns (RedeemReply);
+
+  // Every live invite on the server, newest first.
+  rpc List(ListRequest) returns (ListReply);
+  // Mint one as the operator.
+  rpc Create(CreateRequest) returns (Record);
+  // Revoke one. Revoking an invite that does not exist is not an error.
+  rpc Revoke(RevokeRequest) returns (RevokeReply);
+}
+
+message RedeemRequest {
+  starling.common.v1.Scope scope = 1;
+  string code = 2;
+  // SHA-1 of the peer's certificate, empty when it presented none. What makes
+  // "the same person again" recognisable, so a reconnect is not a second use.
+  bytes cert_hash = 3;
+  // The name they are logging in with. Only used to tell apart two people who
+  // presented no certificate.
+  string name = 4;
+}
+
+message RedeemReply {
+  // Whether the invite is live and has room for this person.
+  bool admitted = 1;
+  // Where it should land them. Zero: nowhere in particular.
+  uint32 channel = 2;
+  // Why not, for the log. Never shown verbatim to the person refused.
+  string reason = 3;
+}
+
+// One invite, as the mesh stores and reports it.
+message Record {
+  string code = 1;
+  uint32 channel = 2;
+  uint64 created_ms = 3;
+  // Zero: never.
+  uint64 expires_ms = 4;
+  // Zero: unlimited.
+  uint32 max_uses = 5;
+  uint32 uses = 6;
+  string creator = 7;
+  // The creator's account, when they had one. Absent for a guest and for the
+  // operator.
+  optional uint64 creator_account = 8;
+}
+
+message ListRequest {
+  starling.common.v1.Scope scope = 1;
+}
+
+message ListReply {
+  repeated Record invites = 1;
+}
+
+message CreateRequest {
+  starling.common.v1.Scope scope = 1;
+  uint32 channel = 2;
+  // Zero: the server's ceiling, or forever when it has none.
+  uint64 max_age_s = 3;
+  // Zero: the server's ceiling, or unlimited when it has none.
+  uint32 max_uses = 4;
+  // What the invite list should call its creator.
+  string creator = 5;
+}
+
+message RevokeRequest {
+  starling.common.v1.Scope scope = 1;
+  string code = 2;
+}
+
+message RevokeReply {
+  // Whether there was a live invite to revoke.
+  bool found = 1;
+}

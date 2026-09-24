@@ -102,6 +102,8 @@ pub enum ServiceKind {
     ContextActions,
     /// 1018, animated-media search against a provider the operator keys.
     Gifs,
+    /// 1019, one-click links into the server.
+    Invites,
 }
 
 impl ServiceKind {
@@ -132,6 +134,7 @@ impl ServiceKind {
             Self::LinkPreview => 16,
             Self::ContextActions => 17,
             Self::Gifs => 18,
+            Self::Invites => 19,
         }
     }
 
@@ -158,6 +161,7 @@ impl ServiceKind {
             Self::LinkPreview => "link-preview",
             Self::ContextActions => "context-actions",
             Self::Gifs => "gifs",
+            Self::Invites => "invites",
         }
     }
 
@@ -184,6 +188,7 @@ impl ServiceKind {
             Self::LinkPreview,
             Self::ContextActions,
             Self::Gifs,
+            Self::Invites,
         ]
     }
 

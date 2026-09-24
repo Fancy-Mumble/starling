@@ -243,6 +243,8 @@ the payload's first field, so tooling recovers the name with one nested read.
 | 1015 | social |
 | 1016 | link-preview |
 | 1017 | context-actions |
+| 1018 | gifs |
+| 1019 | invites: one-click links, minted, listed and revoked (redeemed in `Authenticate.tokens`) |
 
 New service: take the next number, add a TOML block, ship. No gateway release.
 
