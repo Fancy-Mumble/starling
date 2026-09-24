@@ -107,6 +107,16 @@ pub struct ServerSettings {
     pub channel_name_regex: Option<String>,
     /// What a user name may look like. Empty means no restriction.
     pub user_name_regex: Option<String>,
+    /// Who may mint invite links: "off", "admins", "registered" or "everyone".
+    pub invites: Option<String>,
+    /// The longest an invite may live, in hours. Zero lets one live forever.
+    pub invite_max_hours: Option<u32>,
+    /// The most people one invite may admit. Zero is no ceiling.
+    pub invite_max_uses: Option<u32>,
+    /// Whether a live invite admits past the server password.
+    pub invite_skips_password: Option<bool>,
+    /// `host` or `host:port` an invite link should name.
+    pub invite_address: Option<String>,
 }
 
 impl ServerSettings {
@@ -172,6 +182,11 @@ impl ServerSettings {
             remember_channel_duration,
             channel_name_regex,
             user_name_regex,
+            invites,
+            invite_max_hours,
+            invite_max_uses,
+            invite_skips_password,
+            invite_address,
         );
         named
     }
@@ -266,6 +281,11 @@ mod tests {
             remember_channel_duration: Some(1),
             channel_name_regex: Some(String::new()),
             user_name_regex: Some(String::new()),
+            invites: Some(String::new()),
+            invite_max_hours: Some(1),
+            invite_max_uses: Some(1),
+            invite_skips_password: Some(true),
+            invite_address: Some(String::new()),
         };
         let mut snapshot = defaults(1);
         let named = all.overlay(&mut snapshot);

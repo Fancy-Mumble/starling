@@ -11,7 +11,19 @@
 use starling_proto_fancy::fancy::domain::{Setting, setting::Kind};
 use starling_proto_fancy::serverconfig::Snapshot;
 
+use starling_runtime::settings::INVITES_CHOICES;
 pub use starling_runtime::settings::defaults;
+
+/// The values a `Kind::Choice` row offers, empty for every other kind.
+///
+/// Beside the table rather than a column of it, so a choice can be added
+/// without every other row having to say it has none.
+fn choices(key: &str) -> &'static [&'static str] {
+    match key {
+        "invites" => INVITES_CHOICES,
+        _ => &[],
+    }
+}
 
 /// Copy only `fields` from `values` into `current`.
 ///
@@ -68,6 +80,11 @@ pub fn apply_fields(current: &mut Snapshot, values: &Snapshot, fields: &[String]
                 current.channel_name_regex = values.channel_name_regex.clone();
             }
             "user_name_regex" => current.user_name_regex = values.user_name_regex.clone(),
+            "invites" => current.invites = values.invites.clone(),
+            "invite_max_hours" => current.invite_max_hours = values.invite_max_hours,
+            "invite_max_uses" => current.invite_max_uses = values.invite_max_uses,
+            "invite_skips_password" => current.invite_skips_password = values.invite_skips_password,
+            "invite_address" => current.invite_address = values.invite_address.clone(),
             other => {
                 // Unknown keys land in `extra` rather than being dropped: a
                 // service that adds an operator-facing knob should not need a
@@ -107,7 +124,10 @@ pub fn redact(snapshot: &Snapshot) -> Vec<Setting> {
             } else {
                 (row.read)(snapshot)
             },
-            options: Vec::new(),
+            options: choices(row.key)
+                .iter()
+                .map(|&option| option.to_owned())
+                .collect(),
             secret: row.secret,
             help: row.help.to_owned(),
         })
@@ -552,6 +572,66 @@ const SCHEMA: &[Row] = &[
             true
         },
     },
+    Row {
+        key: "invites",
+        kind: Kind::Choice,
+        group: "Invites",
+        label: "Who may create invite links",
+        help: "off, admins (whoever may edit these settings), registered users, or everyone. Off also stops every invite already handed out.",
+        secret: false,
+        read: |s| s.invites.clone(),
+        write: |s, v| {
+            let v = v.trim();
+            if !INVITES_CHOICES.contains(&v) {
+                return false;
+            }
+            v.clone_into(&mut s.invites);
+            true
+        },
+    },
+    Row {
+        key: "invite_max_hours",
+        kind: Kind::Int,
+        group: "Invites",
+        label: "Longest lifetime (hours)",
+        help: "No invite outlives this. Zero lets an invite live until it is revoked.",
+        secret: false,
+        read: |s| s.invite_max_hours.to_string(),
+        write: |s, v| set_u32(&mut s.invite_max_hours, v),
+    },
+    Row {
+        key: "invite_max_uses",
+        kind: Kind::Int,
+        group: "Invites",
+        label: "Most uses per invite",
+        help: "How many different people one invite may admit. Zero is no ceiling.",
+        secret: false,
+        read: |s| s.invite_max_uses.to_string(),
+        write: |s, v| set_u32(&mut s.invite_max_uses, v),
+    },
+    Row {
+        key: "invite_skips_password",
+        kind: Kind::Bool,
+        group: "Invites",
+        label: "Invites skip the server password",
+        help: "Whether somebody holding a live invite gets in without the server password. Off, an invite only picks the channel they land in.",
+        secret: false,
+        read: |s| s.invite_skips_password.to_string(),
+        write: |s, v| set_bool(&mut s.invite_skips_password, v),
+    },
+    Row {
+        key: "invite_address",
+        kind: Kind::String,
+        group: "Invites",
+        label: "Address in invite links",
+        help: "host or host:port that invite links point at. Empty uses the address the inviting user connected to.",
+        secret: false,
+        read: |s| s.invite_address.clone(),
+        write: |s, v| {
+            v.trim().clone_into(&mut s.invite_address);
+            true
+        },
+    },
 ];
 
 #[cfg(test)]
@@ -667,6 +747,8 @@ mod tests {
             let sample = match setting.kind() {
                 Kind::Int => "7",
                 Kind::Bool => "true",
+                // A choice takes only what it offers, so offer it one of those.
+                Kind::Choice => setting.options.last().map_or("x", String::as_str),
                 _ => "x",
             };
             assert_eq!(
@@ -775,5 +857,32 @@ mod tests {
         assert_eq!(snapshot.max_bandwidth, 72_000);
         assert_eq!(snapshot.text_message_length, 5_000);
         assert_eq!(snapshot.log_days, 31);
+    }
+
+    #[test]
+    fn who_may_invite_is_offered_as_a_choice_and_nothing_else_is_accepted() {
+        // A client draws a dropdown from `options`; a free-text box here would
+        // let an admin type "admin" and switch invites off without noticing,
+        // because every value the invites service does not know reads as off.
+        let settings = redact(&defaults(1));
+        let invites = settings
+            .iter()
+            .find(|s| s.key == "invites")
+            .expect("a row for invites");
+        assert_eq!(invites.kind, Kind::Choice as i32);
+        assert_eq!(invites.options, INVITES_CHOICES);
+        assert_eq!(invites.value, "admins");
+
+        let mut current = defaults(1);
+        let typo = std::collections::HashMap::from([("invites".to_owned(), "admin".to_owned())]);
+        assert!(apply_wire(&mut current, &typo).is_empty());
+        assert_eq!(
+            current.invites, "admins",
+            "an unknown value changes nothing"
+        );
+
+        let open = std::collections::HashMap::from([("invites".to_owned(), "everyone".to_owned())]);
+        assert_eq!(apply_wire(&mut current, &open), vec!["invites".to_owned()]);
+        assert_eq!(current.invites, "everyone");
     }
 }

@@ -220,6 +220,25 @@ message Snapshot {
   // How long that memory lasts, in seconds since they disconnected. Zero, the
   // default, is forever.
   uint32 remember_channel_duration = 39;
+  // Invite links (the `invites` service, outer type 1019). Numbered from 50 so
+  // the settings above can keep growing in order.
+  //
+  // Who may mint one: "off", "admins" (Write on the root, the same people who
+  // edit these settings), "registered" or "everyone". "off" also stops every
+  // invite already handed out from admitting anybody; they are kept, so
+  // turning invites back on revives the ones that have not expired.
+  string invites = 50;
+  // The longest an invite may live, in hours. Zero lets one live forever.
+  uint32 invite_max_hours = 51;
+  // The most people one invite may admit. Zero is no ceiling.
+  uint32 invite_max_uses = 52;
+  // Whether a live invite admits past the server password. The reason invites
+  // exist on a private server, so **on**; off makes an invite a "go to this
+  // channel" link for people who already know the password.
+  bool invite_skips_password = 53;
+  // `host` or `host:port` a link should name. Empty uses whatever address the
+  // inviting client dialled, which is wrong only behind NAT or a proxy.
+  string invite_address = 54;
   // Settings a later service adds, so an operator-facing knob does not need a
   // proto release to exist.
   map<string, string> extra = 40;

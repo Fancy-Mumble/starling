@@ -96,6 +96,25 @@ channel_count_limit = 1000
 # registry_hostname = "frogpond.example"           # how the list should reach you
 # registry_location = "DE"                         # ISO country code
 
+# Invite links --------------------------------------------------------------
+#
+# One-click links into this server (`fancy://invite/...`), which also get
+# past the password while they are live. All of this can also be changed from
+# the client's server settings, under "Invites".
+
+# Who may create invites: "off", "admins" (whoever may edit these settings),
+# "registered" or "everyone". "off" also stops existing invites working.
+invites = "admins"
+# Longest an invite may live, in hours (0: until revoked), and the most people
+# one may admit (0: no ceiling).
+invite_max_hours = 168
+invite_max_uses = 0
+# Whether a live invite admits without the server password.
+invite_skips_password = true
+# host or host:port for the links, when the address members connect to is not
+# the public one (NAT, a proxy). Empty uses whatever the inviter dialled.
+# invite_address = "chat.example.org:64738"
+
 
 # -- Files ------------------------------------------------------------------
 #

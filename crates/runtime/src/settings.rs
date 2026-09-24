@@ -117,6 +117,16 @@ pub fn defaults(instance: u32) -> Snapshot {
         // Forever. murmur's zero, and the reading that makes the setting above
         // mean what it says.
         remember_channel_duration: 0,
+        // On, for the people who can already change the password: an
+        // administrator handing out a link is doing nothing they could not do
+        // by handing out the password, except that a link can be taken back.
+        // A week, because an invite nobody remembers making is a way in nobody
+        // is watching.
+        invites: INVITES_ADMINS.to_owned(),
+        invite_max_hours: 168,
+        invite_max_uses: 0,
+        invite_skips_password: true,
+        invite_address: String::new(),
         // murmur's own patterns, from `Meta.cpp:110`. The leading ` -=` is a
         // **range**, space through `=`, not three literal characters: that is
         // what upstream compiles, so it is what a server migrating from it gets.
@@ -140,6 +150,22 @@ pub fn defaults(instance: u32) -> Snapshot {
 /// lagged re-reads [`Settings::get`] and is exactly as current as one that did
 /// not.
 const CHANGE_BACKLOG: usize = 16;
+
+/// `invites = "off"`: nobody mints an invite, and none admits anybody.
+pub const INVITES_OFF: &str = "off";
+/// `invites = "admins"`: whoever holds Write on the root channel.
+pub const INVITES_ADMINS: &str = "admins";
+/// `invites = "registered"`: any session with an account.
+pub const INVITES_REGISTERED: &str = "registered";
+/// `invites = "everyone"`: any session at all, guests included.
+pub const INVITES_EVERYONE: &str = "everyone";
+/// Every value `invites` may take, in the order a form offers them.
+pub const INVITES_CHOICES: &[&str] = &[
+    INVITES_OFF,
+    INVITES_ADMINS,
+    INVITES_REGISTERED,
+    INVITES_EVERYONE,
+];
 
 /// murmur's default channel-name pattern (`vendor/server/src/murmur/Meta.cpp:111`).
 pub const CHANNEL_NAME_PATTERN: &str = r"[ -=\w\#\[\]\{\}\(\)\@\|]+";
@@ -433,6 +459,16 @@ pub fn from_json(values: &serde_json::Value) -> (Snapshot, Vec<String>) {
             "remember_channel" => write_flag(&mut snapshot.remember_channel),
             "channel_name_regex" => write_text(&mut snapshot.channel_name_regex),
             "user_name_regex" => write_text(&mut snapshot.user_name_regex),
+            "invites" => {
+                // Refused rather than stored: an unknown value would read as
+                // "off" to the invites service, silently.
+                text.is_some_and(|value| INVITES_CHOICES.contains(&value))
+                    && write_text(&mut snapshot.invites)
+            }
+            "invite_max_hours" => count(&mut snapshot.invite_max_hours),
+            "invite_max_uses" => count(&mut snapshot.invite_max_uses),
+            "invite_skips_password" => write_flag(&mut snapshot.invite_skips_password),
+            "invite_address" => write_text(&mut snapshot.invite_address),
             "registry_name" => write_text(&mut snapshot.registry_name),
             "registry_password" => write_text(&mut snapshot.registry_password),
             "registry_url" => write_text(&mut snapshot.registry_url),
@@ -496,6 +532,11 @@ pub fn to_json(snapshot: &Snapshot) -> serde_json::Value {
         "registry_url": snapshot.registry_url,
         "registry_hostname": snapshot.registry_hostname,
         "registry_location": snapshot.registry_location,
+        "invites": snapshot.invites,
+        "invite_max_hours": snapshot.invite_max_hours,
+        "invite_max_uses": snapshot.invite_max_uses,
+        "invite_skips_password": snapshot.invite_skips_password,
+        "invite_address": snapshot.invite_address,
         "extra": snapshot.extra,
     })
 }
