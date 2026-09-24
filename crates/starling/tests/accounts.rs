@@ -442,3 +442,126 @@ async fn a_direct_message_reaches_every_device_on_both_ends() {
 
     deployment.stop().await;
 }
+
+/// The next record answer, skipping everything else on the envelope.
+async fn next_record(client: &mut Client) -> starling_proto_fancy::fancy::domain::Record {
+    loop {
+        if let userdata_envelope::Body::Record(record) = next_userdata(client).await {
+            return record;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_linked_device_logs_in_once_on_its_code_and_then_like_the_account() {
+    // Linking: the laptop registers the phone ahead and leaves it a sealed
+    // parcel in the account's records. The phone has no certificate and no
+    // password yet, so its first login rests on the code alone - and only its
+    // first: after that it is a device of a password account like any other.
+    let data_dir = TempDir::new("link-device");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let phone_creds = from_device("alice", "", "phone");
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::AddDevice as i32,
+            value: "New device".to_owned(),
+            device_id: "phone".to_owned(),
+            device_secret: phone_creds.device_secret.clone().unwrap_or_default(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    let ack = next_ack(&mut laptop).await;
+    assert!(ack.ok, "registering ahead refused: {}", ack.detail);
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::RecordPut(starling_proto_fancy::fancy::domain::RecordPut {
+            request_id: "1".to_owned(),
+            key: "link/phone".to_owned(),
+            value: b"sealed".to_vec(),
+            remove: false,
+        }),
+    )
+    .await;
+    assert!(next_record(&mut laptop).await.found);
+
+    // The phone: no password, no certificate, only what the code gave it.
+    let mut phone = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(
+        &mut phone,
+        tcp::Authenticate {
+            password: None,
+            ..phone_creds.clone()
+        },
+    )
+    .await;
+    send_userdata(
+        &mut phone,
+        userdata_envelope::Body::RecordGet(starling_proto_fancy::fancy::domain::RecordGet {
+            request_id: "2".to_owned(),
+            key: "link/phone".to_owned(),
+        }),
+    )
+    .await;
+    assert_eq!(next_record(&mut phone).await.value, b"sealed");
+    let state = account_state(&mut phone).await;
+    assert_eq!(state.this_device, "phone");
+    assert!(
+        state
+            .devices
+            .iter()
+            .any(|device| device.id == "phone" && device.name == "phone"),
+        "the phone names itself on its first login"
+    );
+
+    // Once only. From now on the phone logs in the way the account does.
+    let mut again = Client::connect(deployment.port).await;
+    let reject = refused(
+        &mut again,
+        tcp::Authenticate {
+            password: None,
+            ..phone_creds
+        },
+    )
+    .await;
+    assert_eq!(
+        reject.r#type,
+        Some(tcp::reject::RejectType::WrongUserPw as i32)
+    );
+
+    // A link nobody completed is withdrawn without the password, and does not
+    // lock the account the way signing a device out does.
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::AddDevice as i32,
+            value: "New device".to_owned(),
+            device_id: "tablet".to_owned(),
+            device_secret: "tablet-secret-0123456789abcdef0123456789".to_owned(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    assert!(next_ack(&mut laptop).await.ok);
+    send_userdata(
+        &mut laptop,
+        userdata_envelope::Body::Action(AccountAction {
+            kind: account_action::Kind::RemoveDevice as i32,
+            device_id: "tablet".to_owned(),
+            ..AccountAction::default()
+        }),
+    )
+    .await;
+    let withdrawn = next_ack(&mut laptop).await;
+    assert!(withdrawn.ok, "withdrawing refused: {}", withdrawn.detail);
+    let state = account_state(&mut laptop).await;
+    assert!(!state.devices_locked);
+    assert!(state.devices.iter().all(|device| device.id != "tablet"));
+
+    deployment.stop().await;
+}

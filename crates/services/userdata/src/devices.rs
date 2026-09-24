@@ -30,6 +30,21 @@
 //! A signed-out device is refused by id whatever it proves, so it cannot come
 //! straight back by presenting the id it was refused under.
 //!
+//! # Linking a device
+//!
+//! A device already signed in can register another before it first connects
+//! (`ADD_DEVICE`), which is how linking works: the new device gets its id and
+//! secret from a code shown on the old one. For its **first** login, and only
+//! within [`LINK_WINDOW_MS`] of being registered, that device needs nothing
+//! else - no certificate and no password - because it has none yet: fetching
+//! them from its owner is what the first login is for. After that it is an
+//! ordinary device and logs in the way the account does.
+//!
+//! The code is therefore as good as the account for ten minutes, the same
+//! bargain every "scan this to log in" makes. It is shown only to its owner,
+//! used once, and withdrawn by removing the device, which for one that never
+//! signed in forgets it rather than signing it out.
+//!
 //! # What this does not do
 //!
 //! A signed-out device still holds the certificate it was given, and a
@@ -68,6 +83,12 @@ const MAX_SECRET_LEN: usize = 256;
 
 /// The longest name kept. A longer one is cut, not refused: it is a label.
 pub const MAX_NAME_LEN: usize = 64;
+
+/// How long a device registered ahead may take to make its first login.
+///
+/// Long enough to find the other device and type a code on it, short enough
+/// that a code photographed off a screen is worthless by the evening.
+pub const LINK_WINDOW_MS: u64 = 10 * 60 * 1000;
 
 /// One device of one account, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +183,43 @@ pub fn clean_name(name: &str) -> String {
 #[must_use]
 pub fn locked(devices: &[Device]) -> bool {
     devices.iter().any(|device| device.signed_out)
+}
+
+/// Whether `device` was registered ahead and has not logged in yet.
+#[must_use]
+pub const fn pending(device: &Device) -> bool {
+    device.last_seen_ms == 0 && !device.signed_out
+}
+
+/// The device a login is completing a link as, if it is one.
+///
+/// A device registered ahead, never logged in, still inside the window, and
+/// proving its secret. The login may then in with no other proof - see the
+/// module documentation for why - and the device takes the name the new
+/// install gives itself, which says more than the placeholder its owner's
+/// other device registered it under.
+#[must_use]
+pub fn completing_link(
+    devices: &[Device],
+    presented: Option<Presented<'_>>,
+    now_ms: u64,
+) -> Option<Device> {
+    let presented = presented?;
+    let device = devices.iter().find(|device| device.id == presented.id)?;
+    let fresh = now_ms.saturating_sub(device.added_at_ms) <= LINK_WINDOW_MS;
+    if !pending(device) || !fresh || !device.proves(presented.secret) {
+        return None;
+    }
+    let name = clean_name(presented.name);
+    Some(Device {
+        name: if name.is_empty() {
+            device.name.clone()
+        } else {
+            name
+        },
+        last_seen_ms: now_ms.max(1),
+        ..device.clone()
+    })
 }
 
 /// What a successful login does about its device.
@@ -369,6 +427,37 @@ mod tests {
         assert!(presented(&request("has space", SECRET)).is_none());
         assert!(presented(&request(&"x".repeat(MAX_ID_LEN + 1), SECRET)).is_none());
         assert!(presented(&request("laptop", "short")).is_none());
+    }
+
+    #[test]
+    fn a_link_is_completed_once_and_only_inside_its_window() {
+        let ahead = Device {
+            last_seen_ms: 0,
+            added_at_ms: 1_000,
+            ..device("laptop", false)
+        };
+        let linked = completing_link(std::slice::from_ref(&ahead), Some(laptop()), 2_000)
+            .expect("a fresh link completes");
+        assert_eq!(linked.name, "Laptop", "the new install names itself");
+        assert_eq!(linked.last_seen_ms, 2_000);
+
+        // Once it has logged in it is an ordinary device again.
+        assert!(completing_link(&[linked], Some(laptop()), 3_000).is_none());
+        // Too late.
+        assert!(
+            completing_link(
+                std::slice::from_ref(&ahead),
+                Some(laptop()),
+                1_000 + LINK_WINDOW_MS + 1
+            )
+            .is_none()
+        );
+        // The wrong secret.
+        let guessed = Presented {
+            secret: "ffffffffffffffffffffffffffffffff",
+            ..laptop()
+        };
+        assert!(completing_link(std::slice::from_ref(&ahead), Some(guessed), 2_000).is_none());
     }
 
     #[test]

@@ -253,7 +253,17 @@ impl UserdataService {
             return refuse(action.kind, "no action was named");
         }
 
-        if needs_password(kind) && !self.proves_password(inbound.scope, account, &action).await {
+        // Withdrawing a link nobody completed takes nothing away - the device
+        // never signed in - and is what closing the link dialog does, so it is
+        // not made to wait on a password the way signing a device out is.
+        let withdrawing_link = matches!(kind, account_action::Kind::RemoveDevice)
+            && self
+                .accounts
+                .device_is_pending(inbound.scope, account, &action.device_id);
+        if needs_password(kind)
+            && !withdrawing_link
+            && !self.proves_password(inbound.scope, account, &action).await
+        {
             self.logger.log(
                 starling_runtime::log::LogEvent::notice(
                     starling_runtime::log::Category::Security,

@@ -381,6 +381,9 @@ login proved by the certificate alone must come from a device the account
 knows, and a password registers a new one. A signed-out device is refused by id
 and its sessions are ended. A known device stands in for the second factor, so
 only a new one is asked for a TOTP code.
+A device already signed in can register another ahead (`ADD_DEVICE`); that
+device's first login, within ten minutes, needs no certificate or password,
+which is how a code shown on one device links another.
 
 ### `server-config` — the settings an operator changes while it runs
 

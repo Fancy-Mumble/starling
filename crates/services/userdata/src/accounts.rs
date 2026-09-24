@@ -397,6 +397,30 @@ impl Accounts {
             // the impersonation guard below still applies, so a peer cannot use
             // one account's certificate to take another's name.
             _ => match by_name {
+                // A device completing a link: registered ahead by one of the
+                // account's own sessions, logging in for the first time with
+                // the id and secret its owner's code gave it. It has no
+                // certificate or password yet - fetching them is what this
+                // login is for - so those are not asked. See `devices`.
+                //
+                // Never the SuperUser, whose login is always the password.
+                Some(record)
+                    if record.account.id != identity::SUPERUSER
+                        && let Some(device) = devices::completing_link(
+                            &record.devices,
+                            devices::presented(request),
+                            now_ms(),
+                        ) =>
+                {
+                    tracing::info!(
+                        account = record.account.id,
+                        device = %device.id,
+                        "a linked device logged in for the first time"
+                    );
+                    let mut result = outcome(Outcome::Ok, Some(record.account));
+                    result.device_id.clone_from(&device.id);
+                    (result, Some(device))
+                }
                 Some(record) => {
                     // A stored password is a credential in its own right, so it
                     // decides this login whatever certificate the peer holds.
@@ -651,9 +675,42 @@ impl Accounts {
         let Some(mut device) = self.live_device(scope, account, id) else {
             return Err("this account has no such device".to_owned());
         };
+        // A device registered ahead that never signed in is a link nobody
+        // completed. Forgotten rather than signed out: there is nothing to
+        // refuse by id, and a tombstone would lock the account over a code
+        // its owner simply closed.
+        if devices::pending(&device) {
+            self.forget_device(scope, account, id).await;
+            return Ok(());
+        }
         device.signed_out = true;
         self.put_device(scope, account, device).await;
         Ok(())
+    }
+
+    /// Whether `id` is one of the account's devices that has never signed in.
+    #[must_use]
+    pub fn device_is_pending(&self, scope: u32, account: u64, id: &str) -> bool {
+        self.live_device(scope, account, id)
+            .is_some_and(|device| devices::pending(&device))
+    }
+
+    /// Remove one device outright, leaving no tombstone.
+    async fn forget_device(&self, scope: u32, account: u64, id: &str) {
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(record) = cache.get_mut(&(scope, account))
+        {
+            record.devices.retain(|device| device.id != id);
+        }
+        let _ = sqlx::query(
+            "DELETE FROM account_device WHERE server_id = ? AND account_id = ? AND device_id = ?",
+        )
+        .bind(i64::from(scope))
+        .bind(account as i64)
+        .bind(id)
+        .execute(self.store.pool())
+        .await
+        .inspect_err(|error| tracing::error!(%error, "could not forget a device"));
     }
 
     /// One device of one account that is not signed out.
