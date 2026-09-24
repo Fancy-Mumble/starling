@@ -19,6 +19,7 @@ mod namespace;
 pub mod sign;
 mod thumb;
 mod tickets;
+mod voice;
 
 pub use sign::{Signature, sign, verify};
 
@@ -52,6 +53,7 @@ use starling_runtime::plane::{
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::settings::Settings;
 use starling_runtime::storage::{Migration, Store};
 use tonic::{Request, Response, Status};
 use zeroize::Zeroizing;
@@ -349,6 +351,8 @@ pub struct FilesService {
     delete_on_download: AtomicBool,
     /// Whether a session's uploads go when the session does.
     delete_on_disconnect: AtomicBool,
+    /// The operator's live settings, for the voice-message limits.
+    settings: Settings,
 }
 
 impl FilesService {
@@ -410,7 +414,11 @@ impl FilesService {
             tracing::info!(public_url = %public_url, "signed URLs now point here");
         }
         self.ttl_ms.store(ttl_ms, Ordering::Relaxed);
-        self.max_upload.store(max_upload, Ordering::Relaxed);
+        if self.max_upload.swap(max_upload, Ordering::Relaxed) != max_upload {
+            // A voice clip's byte ceiling is the lower of this and its own, so
+            // a recorder on screen has just been told the wrong number.
+            self.broadcast_voice_support(1);
+        }
         if let Some(retain) = seconds(service, "retain_seconds") {
             self.retain_ms.store(retain, Ordering::Relaxed);
         }
@@ -718,6 +726,9 @@ impl ClientService for FilesService {
             Some(files_envelope::Body::EmoteQuery(query)) => {
                 self.emote_listing(inbound.scope, &query.request_id).await
             }
+            Some(files_envelope::Body::VoiceQuery(query)) => {
+                self.voice_support(inbound.scope, &query.request_id)
+            }
             _ => return Actions::new(),
         };
         vec![to_conn(inbound.conn, outer, reply.encode_to_vec())]
@@ -731,7 +742,16 @@ impl FilesService {
     /// second to make the share reachable by link. They are separate because
     /// they are separate decisions - a server can want its members exchanging
     /// files without any of them able to publish one to the open internet.
+    ///
+    /// A voice clip is the exception, and is admitted by its own settings and
+    /// bit instead of these two; see `voice`.
     async fn answer_upload(&self, inbound: &Inbound, upload: UploadRequest) -> FilesEnvelope {
+        if let Some(clip) = upload.voice.as_ref() {
+            if let Some(refusal) = self.voice_clip_refusal(inbound, &upload, clip).await {
+                return refusal;
+            }
+            return self.grant_upload(inbound, &upload).await;
+        }
         let visibility = Visibility::try_from(upload.visibility).unwrap_or(Visibility::Session);
         let needed = if visibility == Visibility::Session {
             Perm::SHARE_FILES
@@ -754,6 +774,12 @@ impl FilesService {
                 },
             );
         }
+        self.grant_upload(inbound, &upload).await
+    }
+
+    /// The checks every admitted upload meets, whatever admitted it, then
+    /// the grant.
+    async fn grant_upload(&self, inbound: &Inbound, upload: &UploadRequest) -> FilesEnvelope {
         if upload.size > self.max_upload() {
             return refused(
                 &upload.request_id,
@@ -773,7 +799,7 @@ impl FilesService {
                 "this server has no room for more files",
             );
         }
-        match self.prepare_upload(&upload, inbound.session) {
+        match self.prepare_upload(upload, inbound.session) {
             Ok(envelope) => envelope,
             Err(detail) => refused(&upload.request_id, refusal::Kind::Invalid, &detail),
         }
@@ -1370,6 +1396,7 @@ impl Serve for FilesService {
         let names = names::Names::open(store.clone()).await?;
         let service = ctx.service();
         let (public_url, ttl_ms, max_upload) = Self::settings(&service);
+        let settings = Settings::new(ctx.resolver.clone());
         Ok(Arc::new(Self {
             store,
             secret: sign::secret(&ctx.config.runtime.data_dir)?,
@@ -1405,6 +1432,7 @@ impl Serve for FilesService {
                     .and_then(|value| value.parse::<u64>().ok())
                     .map_or(DEFAULT_RETAIN_MS, |seconds| seconds.saturating_mul(1_000)),
             ),
+            settings,
         }))
     }
 
@@ -1422,6 +1450,10 @@ impl Serve for FilesService {
         // the roster warms is caught by one or the other.
         let sweep = tokio::spawn(Arc::clone(&self).sweep_once_warm(ctx.shutdown.clone()));
         let listener = self.spawn_data_plane(&ctx).await;
+        // Subscribed before the watchers start, so the first snapshot, which
+        // is a change from the defaults, is pushed rather than missed.
+        let voice = tokio::spawn(Arc::clone(&self).follow_voice_settings(self.settings.changes()));
+        let watchers = self.settings.watch(&ctx.instances());
 
         let mut configs = ctx.live.subscribe();
         loop {
@@ -1442,6 +1474,10 @@ impl Serve for FilesService {
         collector.abort();
         departures.abort();
         sweep.abort();
+        voice.abort();
+        for watcher in watchers {
+            watcher.abort();
+        }
         if let Some(listener) = listener {
             listener.abort();
         }
@@ -2500,6 +2536,32 @@ mod tests {
 
     /// A service over an existing database, as a restarted process finds it.
     async fn service_on(store: Store, held: Perm) -> Arc<FilesService> {
+        service_on_with(store, held, starling_runtime::settings::defaults(1)).await
+    }
+
+    /// A service whose sessions hold `held`, under the operator's `settings`.
+    pub(crate) async fn service_with_settings(
+        held: Perm,
+        settings: starling_proto_fancy::serverconfig::Snapshot,
+    ) -> Arc<FilesService> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let store = Store::open(
+            &format!("sqlite:file:files-voice-test-{id}?mode=memory&cache=shared"),
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        service_on_with(store, held, settings).await
+    }
+
+    async fn service_on_with(
+        store: Store,
+        held: Perm,
+        settings: starling_proto_fancy::serverconfig::Snapshot,
+    ) -> Arc<FilesService> {
+        let resolver = gate_granting(held).await;
         store.migrate(SCHEMA).await.expect("schema");
         let names = names::Names::open(store.clone())
             .await
@@ -2518,12 +2580,13 @@ mod tests {
             tickets: tickets::Tickets::default(),
             attempts: attempts::Attempts::default(),
             roster: Arc::new(Roster::new()),
-            permit: Permit::new(gate_granting(held).await),
+            permit: Permit::new(resolver.clone()),
             retain_ms: AtomicU64::new(0),
             max_ttl_ms: AtomicU64::new(0),
             max_total_storage: AtomicU64::new(0),
             delete_on_download: AtomicBool::new(false),
             delete_on_disconnect: AtomicBool::new(false),
+            settings: Settings::fixed(resolver, settings),
         })
     }
 
@@ -3648,7 +3711,7 @@ mod tests {
     }
 
     /// Ask for an upload the way a client does, and read back what it is told.
-    async fn ask(service: &Arc<FilesService>, upload: UploadRequest) -> FilesEnvelope {
+    pub(crate) async fn ask(service: &Arc<FilesService>, upload: UploadRequest) -> FilesEnvelope {
         ask_as(service, 7, upload).await
     }
 
