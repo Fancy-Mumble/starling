@@ -134,6 +134,13 @@ pub fn defaults(instance: u32) -> Snapshot {
     }
 }
 
+/// Change notices a slow subscriber may fall behind by before it misses some.
+///
+/// Small, because a subscriber only ever wants the latest state: one that
+/// lagged re-reads [`Settings::get`] and is exactly as current as one that did
+/// not.
+const CHANGE_BACKLOG: usize = 16;
+
 /// murmur's default channel-name pattern (`vendor/server/src/murmur/Meta.cpp:111`).
 pub const CHANNEL_NAME_PATTERN: &str = r"[ -=\w\#\[\]\{\}\(\)\@\|]+";
 
@@ -154,17 +161,33 @@ pub struct Settings {
     /// full while every other service in the deployment did not, which reads
     /// like a bug in the obfuscation rather than a missing call.
     logger: Option<crate::log::Logger>,
+    /// The scope of every snapshot that differed from the one it replaced.
+    changed: tokio::sync::broadcast::Sender<u32>,
 }
 
 impl Settings {
     /// A view that reads through `resolver`.
     #[must_use]
     pub fn new(resolver: Resolver) -> Self {
+        let (changed, _) = tokio::sync::broadcast::channel(CHANGE_BACKLOG);
         Self {
             resolver,
             cache: Arc::new(RwLock::new(HashMap::new())),
             logger: None,
+            changed,
         }
+    }
+
+    /// The scopes whose settings change from here on.
+    ///
+    /// For a service that has to *tell* clients about a setting rather than
+    /// just enforce it: enforcement reads [`Self::get`] each time and needs no
+    /// signal, but a limit a client draws in its interface is stale until it
+    /// is pushed. The first snapshot a scope receives counts as a change,
+    /// because until then every reader was looking at [`defaults`].
+    #[must_use]
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<u32> {
+        self.changed.subscribe()
     }
 
     /// The same view, keeping `logger` in step with `obfuscate_ips`.
@@ -299,8 +322,25 @@ impl Settings {
         {
             logger.set_obfuscate_addresses(snapshot.obfuscate_ips);
         }
-        if let Ok(mut cache) = self.cache.write() {
-            let _ = cache.insert(snapshot.instance, snapshot);
+        let scope = snapshot.instance;
+        let differs = self.cache.write().is_ok_and(|mut cache| {
+            // The version moves on every write, including one that changed
+            // nothing an operator can see, so compare with it taken out.
+            let differs = cache.get(&scope).is_none_or(|held| {
+                Snapshot {
+                    version: 0,
+                    ..held.clone()
+                } != Snapshot {
+                    version: 0,
+                    ..snapshot.clone()
+                }
+            });
+            let _ = cache.insert(scope, snapshot);
+            differs
+        });
+        if differs {
+            // Nobody listening is the ordinary case, not an error.
+            let _ = self.changed.send(scope);
         }
     }
 }
@@ -480,6 +520,34 @@ mod tests {
     fn settings() -> Settings {
         let config = Config::with_defaults(Path::new("/run/starling"));
         Settings::new(Resolver::new(Arc::new(config), Broker::new()))
+    }
+
+    #[test]
+    fn a_changed_setting_is_announced_and_a_repeated_one_is_not() {
+        // The version moves on every write, so a re-sent snapshot that changed
+        // nothing an operator can see must not wake every subscriber.
+        let settings = settings();
+        let mut changes = settings.changes();
+
+        settings.store(defaults(1));
+        assert_eq!(
+            changes.try_recv().ok(),
+            Some(1),
+            "the first one is a change"
+        );
+
+        settings.store(Snapshot {
+            version: 7,
+            ..defaults(1)
+        });
+        assert!(changes.try_recv().is_err(), "only the version moved");
+
+        settings.store(Snapshot {
+            version: 8,
+            voice_message_max_seconds: 30,
+            ..defaults(1)
+        });
+        assert_eq!(changes.try_recv().ok(), Some(1));
     }
 
     #[test]
