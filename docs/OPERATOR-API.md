@@ -411,7 +411,8 @@ Settable: `welcome_text`, `password`, `max_users`, `max_bandwidth`,
 `allow_recording`, `broadcast_listener_volume_adjustments`, `cert_required`,
 `obfuscate_ips`, `allow_ping`, `channel_name_regex`, `user_name_regex`,
 `registry_name`, `registry_password`, `registry_url`, `registry_hostname`,
-`registry_location`.
+`registry_location`, `invites`, `invite_max_hours`, `invite_max_uses`,
+`invite_skips_password`, `invite_address`.
 
 The mapping lives in `starling_runtime::settings` beside the defaults and the
 field-wise merge, so a setting added there is settable here without a second
@@ -434,6 +435,35 @@ Three asymmetries to know:
 Changes are live. A setting an operator changes here outranks the file, and
 `server-config` publishes it to every subscriber rather than waiting for a
 restart.
+
+### Invites
+
+| Route | Scope | Answer |
+|---|---|---|
+| `GET /v1/invites` | `server-config:read` | every invite that has not expired, newest first |
+| `POST /v1/invites` | `server-config:write` | `201` and the invite |
+| `DELETE /v1/invites/{code}` | `server-config:write` | `204`, or `404` for no such invite |
+
+`POST` takes `{"channel", "max_age_s", "max_uses", "creator"}`, and every field
+may be left out: no channel, the longest lifetime and the most uses the
+`invite_max_hours` and `invite_max_uses` settings allow, and `"operator"` as
+the creator. Longer or larger than those ceilings is clamped, as it is for a
+client. An operator who needs a permanent invite sets `invite_max_hours` to 0
+first, which the audit log records. With `invites` set to `off` it answers `409`:
+an invite that could never admit anybody is a link that fails silently in
+somebody else's hands.
+
+```json
+{"code":"k3m9x2p7qr4t","channel":12,"created_ms":1750000000000,
+ "expires_ms":1750604800000,"max_uses":0,"uses":3,"creator":"alice",
+ "creator_account":7}
+```
+
+`expires_ms` and `max_uses` are 0 for "never" and "unlimited". `uses` counts
+people, not logins. The link a client builds from a code is
+`fancy://invite/<code>?server=<host:port>&name=<server name>`; a stock client
+redeems a code by adding `invite:<code>` to its access tokens. Revoking an
+invite leaves everybody it already admitted connected, and admits nobody after.
 
 ### Health
 

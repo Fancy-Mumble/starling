@@ -75,6 +75,10 @@ pub fn router(api: Arc<OperatorApi>) -> Router {
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/livery", get(get_livery).post(set_livery))
         .route("/v1/greeting", get(get_greeting).post(set_greeting))
+        // Invite links. Who may mint them from a client, and on what terms, is
+        // `/v1/config` (`invites*`); these manage the codes themselves.
+        .route("/v1/invites", get(list_invites).post(create_invite))
+        .route("/v1/invites/{code}", delete(revoke_invite))
         .route(
             "/v1/livery/banner",
             get(get_banner).put(set_banner).delete(clear_banner),
@@ -960,6 +964,132 @@ async fn remove_ban(
         // A ban that is not there is the state the caller asked for, but saying
         // so is what tells an operator their id was wrong.
         return Err(refuse(StatusCode::NOT_FOUND, &result.refused));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One invite, as the operator API reports it.
+fn invite_json(invite: &starling_proto_fancy::invites::Record) -> serde_json::Value {
+    serde_json::json!({
+        "code": invite.code,
+        "channel": invite.channel,
+        "created_ms": invite.created_ms,
+        "expires_ms": invite.expires_ms,
+        "max_uses": invite.max_uses,
+        "uses": invite.uses,
+        "creator": invite.creator,
+        "creator_account": invite.creator_account,
+    })
+}
+
+/// Every invite that has not expired, newest first.
+async fn list_invites(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::invites::ListRequest as InviteListRequest;
+    use starling_proto_fancy::invites::invites_client::InvitesClient;
+
+    let _ = admit(&api, &headers, "server-config:read", "GET /v1/invites").await?;
+    let channel = dial(&api, "invites")?;
+    let invites = InvitesClient::new(channel)
+        .list(InviteListRequest { scope: scope() })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner()
+        .invites;
+    Ok(Json(serde_json::Value::Array(
+        invites.iter().map(invite_json).collect(),
+    )))
+}
+
+/// What `POST /v1/invites` takes. Every field may be left out.
+#[derive(Debug, Default, Deserialize)]
+struct NewInvite {
+    /// Where the invitee lands; zero or absent for nowhere in particular.
+    #[serde(default)]
+    channel: u32,
+    /// Seconds it lives; zero or absent for the longest `invite_max_hours`
+    /// allows.
+    #[serde(default)]
+    max_age_s: u64,
+    /// How many people it admits; zero or absent for the most
+    /// `invite_max_uses` allows.
+    #[serde(default)]
+    max_uses: u32,
+    /// What the invite list calls its creator. "operator" when absent.
+    #[serde(default)]
+    creator: String,
+}
+
+/// Mint an invite as the operator.
+///
+/// The terms are clamped to the server's ceilings exactly as a client's are:
+/// an operator who wants a longer-lived invite raises `invite_max_hours`,
+/// which says so in the audit log, rather than stepping around it here.
+async fn create_invite(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Json(body): Json<NewInvite>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::invites::CreateRequest as InviteCreateRequest;
+    use starling_proto_fancy::invites::invites_client::InvitesClient;
+
+    let _ = admit(&api, &headers, "server-config:write", "POST /v1/invites").await?;
+    let channel = dial(&api, "invites")?;
+    let invite = InvitesClient::new(channel)
+        .create(InviteCreateRequest {
+            scope: scope(),
+            channel: body.channel,
+            max_age_s: body.max_age_s,
+            max_uses: body.max_uses,
+            creator: body.creator,
+        })
+        .await
+        .map_err(|status| {
+            let code = if status.code() == tonic::Code::FailedPrecondition {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            refuse(code, status.message())
+        })?
+        .into_inner();
+    Ok((StatusCode::CREATED, Json(invite_json(&invite))))
+}
+
+/// Revoke an invite. Everybody it already admitted stays connected; nobody is
+/// admitted by it again.
+async fn revoke_invite(
+    State(api): State<Arc<OperatorApi>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    use starling_proto_fancy::invites::RevokeRequest as InviteRevokeRequest;
+    use starling_proto_fancy::invites::invites_client::InvitesClient;
+
+    // The code is not written into the audit record in full: the record is
+    // read by more people than the invite was meant for.
+    let shown = code.get(..4).unwrap_or(&code);
+    let _ = admit(
+        &api,
+        &headers,
+        "server-config:write",
+        &format!("DELETE /v1/invites/{shown}…"),
+    )
+    .await?;
+    let channel = dial(&api, "invites")?;
+    let found = InvitesClient::new(channel)
+        .revoke(InviteRevokeRequest {
+            scope: scope(),
+            code,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner()
+        .found;
+    if !found {
+        return Err(refuse(StatusCode::NOT_FOUND, "no such invite"));
     }
     Ok(StatusCode::NO_CONTENT)
 }

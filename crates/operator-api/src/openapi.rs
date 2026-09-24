@@ -154,6 +154,24 @@ const OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "server-config:write",
     ),
     (
+        "/v1/invites",
+        "get",
+        "List every invite link that has not expired, newest first",
+        "server-config:read",
+    ),
+    (
+        "/v1/invites",
+        "post",
+        "Mint an invite link; channel, max_age_s, max_uses and creator are optional",
+        "server-config:write",
+    ),
+    (
+        "/v1/invites/{code}",
+        "delete",
+        "Revoke an invite link; 404 when there is no such invite",
+        "server-config:write",
+    ),
+    (
         "/v1/livery",
         "get",
         "Read the server's livery: banner, mark, motto, tags and palette",
