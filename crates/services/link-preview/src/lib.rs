@@ -343,7 +343,7 @@ pub async fn of_page(fetcher: &Fetcher, request_id: String, page: Page, rendered
     // its tags would not. `YouTube` serves a `<title>` of "- YouTube" and no
     // picture to a crawler and a full answer here, and an art host describes
     // the sharing card it drew in its tags and the work itself here.
-    if let Some(embed) = oembed::ask(fetcher, &page.url, &card.oembed).await {
+    if let Some(embed) = oembed::ask(fetcher, &page.url, &endpoint_for(&card, &page.url)).await {
         adopt(&mut card, embed);
     }
     // The rendered body is evidence in its own right - a `<video>` is a video
@@ -435,6 +435,21 @@ pub async fn of_card(
             .map(|mark| mark.mime.to_owned())
             .unwrap_or_default(),
         ..with_picture(picture.as_ref())
+    }
+}
+
+/// The oEmbed endpoint to ask about a page that was read, or `""`.
+///
+/// The one the page advertises where it advertises one. Where it does not, a
+/// known provider's published endpoint: `YouTube` serves a server it takes for
+/// a bot a head with "- `YouTube`" for a title, no picture and no oEmbed link,
+/// and that page is a *successful* fetch, so the climb's own oEmbed rung -
+/// which answers only when no page could be had - never gets to it.
+fn endpoint_for(card: &parse::Card, page_url: &str) -> String {
+    if card.oembed.is_empty() {
+        oembed::known_endpoint(page_url).unwrap_or_default()
+    } else {
+        card.oembed.clone()
     }
 }
 
@@ -793,6 +808,24 @@ mod tests {
         // The port and any credentials belong to the connection, not to the
         // label a reader is shown.
         assert_eq!(host_of("http://user:pw@example.org:8080/a"), "example.org");
+    }
+
+    #[test]
+    fn a_stub_page_from_a_known_provider_is_asked_at_its_published_endpoint() {
+        // The bot wall: a fetch that succeeded, and a head with nothing in it.
+        let stub = parse::card("<head><title>- YouTube</title></head>");
+        let asked = endpoint_for(&stub, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert!(asked.starts_with("https://www.youtube.com/oembed?format=json&url="));
+        // A page that advertises its own endpoint is asked there instead.
+        let advertised = parse::card(
+            r#"<head><link rel="alternate" type="application/json+oembed" href="/o?u=x"></head>"#,
+        );
+        assert_eq!(
+            endpoint_for(&advertised, "https://www.youtube.com/watch?v=x"),
+            "/o?u=x"
+        );
+        // And a stranger's page that advertises none is not asked anywhere.
+        assert_eq!(endpoint_for(&stub, "https://example.org/watch"), "");
     }
 
     /// A service whose ladder reaches nothing, so `frame` cannot fetch.

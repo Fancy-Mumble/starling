@@ -97,9 +97,9 @@ const KNOWN: &[(&str, &str)] = &[
 
 /// The endpoint to ask about `url`, if this is a provider with a known one.
 ///
-/// Used only when the page itself could not be read; a page that was fetched
-/// advertises its own endpoint and that one is preferred, because it is the
-/// site's current answer rather than this table's.
+/// Used when the page could not be read, or was read and advertised no
+/// endpoint; a page that advertises one is asked there instead, because that
+/// is the site's current answer rather than this table's.
 #[must_use]
 pub fn known_endpoint(url: &str) -> Option<String> {
     let host = host_of(url)?.to_ascii_lowercase();
