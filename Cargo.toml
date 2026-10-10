@@ -294,13 +294,13 @@ syn = { version = "3", features = ["full", "extra-traits"] }
 goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
 # The WASM plugin backend, behind `starling-plugin-host/wasm-plugins` and off by
 # default. Pinned to an LTS line for its backported sandbox-escape fixes.
-wasmtime = { version = "47", default-features = false, features = [
+wasmtime = { version = "48", default-features = false, features = [
     "runtime",
     "component-model",
     "cranelift",
     "std",
 ] }
-wasmtime-wasi = "47"
+wasmtime-wasi = "48"
 # The guest side of the same contract, for plugin authors. Its major must track
 # `wasmtime` above, or guest and host disagree about the component encoding.
 wit-bindgen = "0.60"
