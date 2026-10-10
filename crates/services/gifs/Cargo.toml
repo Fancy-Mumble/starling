@@ -1,7 +1,7 @@
 [package]
 name = "starling-gifs"
 description = "GIF search against a provider the operator keys, rate-limited and cached"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
