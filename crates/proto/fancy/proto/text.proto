@@ -38,6 +38,10 @@ message StoredMessage {
   string sender_name = 4;
   string body = 5;
   uint64 sent_at_ms = 6;
+  // The author rewrote it after it was sent. The row holds the latest body,
+  // because an edit replaces its original in the archive rather than standing
+  // beside it as a second message.
+  bool edited = 7;
 }
 
 message HistoryPage {

@@ -51,6 +51,7 @@ use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 pub mod filter;
+pub mod owners;
 pub mod scheduled;
 
 /// Upstream `TextMessage`.
@@ -103,17 +104,40 @@ const EVENT_BACKLOG: usize = 1024;
 /// The primary key is `(server_id, channel_id, id)`, so the table is physically
 /// ordered tenant → channel → time and both query shapes, newest page and
 /// scroll-back, are one range scan.
-const SCHEMA: &[Migration<'static>] = &[Migration::new(
-    "0001_text_message",
-    &[
-        "CREATE TABLE IF NOT EXISTS text_message (\
-             server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, id BLOB NOT NULL, \
-             sender_account BIGINT NOT NULL, sender_name VARCHAR(190) NOT NULL, \
-             body TEXT NOT NULL, sent_at_ms BIGINT NOT NULL, \
-             PRIMARY KEY (server_id, channel_id, id))",
-        "CREATE INDEX IF NOT EXISTS ix_text_sent ON text_message(server_id, sent_at_ms)",
-    ],
-)];
+const SCHEMA: &[Migration<'static>] = &[
+    Migration::new(
+        "0001_text_message",
+        &[
+            "CREATE TABLE IF NOT EXISTS text_message (\
+                 server_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, id BLOB NOT NULL, \
+                 sender_account BIGINT NOT NULL, sender_name VARCHAR(190) NOT NULL, \
+                 body TEXT NOT NULL, sent_at_ms BIGINT NOT NULL, \
+                 PRIMARY KEY (server_id, channel_id, id))",
+            "CREATE INDEX IF NOT EXISTS ix_text_sent ON text_message(server_id, sent_at_ms)",
+        ],
+    ),
+    // An edit names the message it replaces by the id its *sender* minted, and
+    // this table only knew its own uuid7. So an edit could not find its
+    // original, was archived as a message of its own, and history replayed
+    // both: the words the author retracted and, below them, the correction,
+    // reading as two messages.
+    //
+    // `client_id` is that sender's id, `sender_cert` is who may rewrite the row
+    // (the certificate, because it is the identity that outlives the session
+    // that sent it), and `edited_at_ms` is what history reports as "edited".
+    // All nullable: rows from before this have none of them, and stay
+    // unattributed rather than guessed at.
+    Migration::new(
+        "0002_text_message_edits",
+        &[
+            "ALTER TABLE text_message ADD COLUMN client_id TEXT NULL",
+            "ALTER TABLE text_message ADD COLUMN sender_cert BLOB NULL",
+            "ALTER TABLE text_message ADD COLUMN edited_at_ms BIGINT NULL",
+            "CREATE INDEX IF NOT EXISTS ix_text_client_id \
+             ON text_message(server_id, client_id)",
+        ],
+    ),
+];
 
 /// The service.
 #[derive(Debug)]
@@ -164,16 +188,45 @@ pub struct TextService {
     /// behind whatever the timer was already sleeping on, which is up to a
     /// day.
     schedules: tokio::sync::Notify,
+    /// Who wrote each recent message, so an edit can be checked against its
+    /// author before it reaches anyone.
+    ///
+    /// In memory as well as in the archive because a persistent channel's
+    /// plaintext copies are never archived here, and those are exactly the
+    /// messages a Fancy client edits most.
+    owners: owners::Owners,
+}
+
+/// Who sent an archived message, and under which id.
+///
+/// Empty for a message the server posted itself, which nobody may edit.
+#[derive(Debug, Default)]
+struct Authorship<'a> {
+    /// The id the sender minted, which is what an edit names.
+    client_id: &'a str,
+    /// The sender's certificate hash, or empty for none.
+    cert: &'a [u8],
 }
 
 impl TextService {
     /// Store one message and return the id it was given.
     async fn record(&self, scope: u32, message: &StoredMessage) -> Uuid7 {
+        self.record_by(scope, message, &Authorship::default()).await
+    }
+
+    /// Store one message with the identity a later edit is matched against.
+    async fn record_by(
+        &self,
+        scope: u32,
+        message: &StoredMessage,
+        author: &Authorship<'_>,
+    ) -> Uuid7 {
         let id = Uuid7::now();
         let result = sqlx::query(
             "INSERT INTO text_message \
-                 (server_id, channel_id, id, sender_account, sender_name, body, sent_at_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (server_id, channel_id, id, sender_account, sender_name, body, sent_at_ms, \
+                  client_id, sender_cert) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(i64::from(scope))
         .bind(i64::from(message.channel))
@@ -182,6 +235,8 @@ impl TextService {
         .bind(&message.sender_name)
         .bind(&message.body)
         .bind(message.sent_at_ms as i64)
+        .bind((!author.client_id.is_empty()).then_some(author.client_id))
+        .bind((!author.cert.is_empty()).then_some(author.cert))
         .execute(self.store.pool())
         .await;
         if let Err(error) = result {
@@ -190,6 +245,103 @@ impl TextService {
             tracing::error!(%error, "could not store a chat message");
         }
         id
+    }
+
+    /// Rewrite the archived message `client_id` in place with an edit's body.
+    ///
+    /// In place rather than as a row of its own, so history replays the
+    /// message once, where it was said, reading as edited. Returns whether a
+    /// row was rewritten; an original this table never held (one sent before
+    /// it kept client ids, or into a persistent channel) leaves nothing to
+    /// rewrite, and the edit is then not archived at all rather than filed as
+    /// a second message.
+    ///
+    /// Only a row carrying `cert` is touched. The caller has already checked
+    /// the author, but the row is the last word on who wrote it, and an edit
+    /// must never land on somebody else's message because that check was
+    /// answered from memory.
+    async fn revise(
+        &self,
+        scope: u32,
+        channel: u32,
+        client_id: &str,
+        cert: &[u8],
+        body: &str,
+    ) -> bool {
+        if client_id.is_empty() || cert.is_empty() {
+            return false;
+        }
+        let result = sqlx::query(
+            "UPDATE text_message SET body = ?, edited_at_ms = ? \
+             WHERE server_id = ? AND channel_id = ? AND client_id = ? AND sender_cert = ?",
+        )
+        .bind(body)
+        .bind(now_ms() as i64)
+        .bind(i64::from(scope))
+        .bind(i64::from(channel))
+        .bind(client_id)
+        .bind(cert)
+        .execute(self.store.pool())
+        .await;
+        match result {
+            Ok(done) => done.rows_affected() > 0,
+            Err(error) => {
+                tracing::error!(%error, "could not archive a chat message edit");
+                false
+            }
+        }
+    }
+
+    /// Who wrote message `client_id`, from memory or failing that from the
+    /// archive.
+    ///
+    /// The archive is what survives a restart and the eviction of the
+    /// in-memory window. It knows the certificate only, never the session, so
+    /// an archived row without one names an author nobody matches.
+    async fn author_of(&self, scope: u32, client_id: &str) -> Option<owners::Author> {
+        use sqlx::Row as _;
+        if let Some(author) = self.owners.author_of(scope, client_id) {
+            return Some(author);
+        }
+        let row = sqlx::query(
+            "SELECT sender_cert FROM text_message WHERE server_id = ? AND client_id = ?",
+        )
+        .bind(i64::from(scope))
+        .bind(client_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .ok()??;
+        Some(owners::Author {
+            cert: row
+                .try_get::<Option<Vec<u8>>, _>("sender_cert")
+                .ok()
+                .flatten()
+                .filter(|cert| !cert.is_empty()),
+            session: None,
+        })
+    }
+
+    /// Why `author` may not make the edit `message` carries, or `None` when it
+    /// may, or when it is not an edit at all.
+    ///
+    /// The fork's rule (`Messages.cpp`, "Edit validation"): an edit naming an
+    /// id this server does not know is refused as well as one naming somebody
+    /// else's, because "cannot tell who wrote it" must not mean "anyone may
+    /// rewrite it".
+    async fn edit_refusal(
+        &self,
+        scope: u32,
+        author: &owners::Author,
+        message: &starling_proto::proto::tcp::TextMessage,
+    ) -> Option<&'static str> {
+        let target = message.edit_id.as_deref().filter(|id| !id.is_empty())?;
+        match self.author_of(scope, target).await {
+            None => Some("that message is not known to the server and cannot be edited"),
+            Some(original) if !author.is(&original) => {
+                Some("only the author of a message may edit it")
+            }
+            Some(_) => None,
+        }
     }
 
     /// A page, in the direction the caller asked for, optionally from a cursor.
@@ -210,19 +362,23 @@ impl TextService {
         let limit = starling_proto_fancy::page::page_size(limit, 50, 200);
         let sql = match (direction, cursor.is_empty()) {
             (Direction::Backward, true) => {
-                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                "SELECT id, sender_account, sender_name, body, sent_at_ms, edited_at_ms \
+                 FROM text_message \
                  WHERE server_id = ? AND channel_id = ? ORDER BY id DESC LIMIT ?"
             }
             (Direction::Backward, false) => {
-                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                "SELECT id, sender_account, sender_name, body, sent_at_ms, edited_at_ms \
+                 FROM text_message \
                  WHERE server_id = ? AND channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
             }
             (Direction::Forward, true) => {
-                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                "SELECT id, sender_account, sender_name, body, sent_at_ms, edited_at_ms \
+                 FROM text_message \
                  WHERE server_id = ? AND channel_id = ? ORDER BY id ASC LIMIT ?"
             }
             (Direction::Forward, false) => {
-                "SELECT id, sender_account, sender_name, body, sent_at_ms FROM text_message \
+                "SELECT id, sender_account, sender_name, body, sent_at_ms, edited_at_ms \
+                 FROM text_message \
                  WHERE server_id = ? AND channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?"
             }
         };
@@ -249,6 +405,11 @@ impl TextService {
                 sender_name: row.try_get("sender_name").unwrap_or_default(),
                 body: row.try_get("body").unwrap_or_default(),
                 sent_at_ms: row.try_get::<i64, _>("sent_at_ms").unwrap_or_default() as u64,
+                edited: row
+                    .try_get::<Option<i64>, _>("edited_at_ms")
+                    .ok()
+                    .flatten()
+                    .is_some(),
             })
             .collect();
         HistoryPage { messages, more }
@@ -517,6 +678,7 @@ impl Text for TextRpc {
                     sender_name: String::new(),
                     body: req.body.clone(),
                     sent_at_ms: now_ms(),
+                    edited: false,
                 };
                 let _ = self.0.record(scope, &stored).await;
             }
@@ -589,6 +751,129 @@ impl TextService {
         }
     }
 
+    /// The two refusals that need no permission round trip and come after the
+    /// markup filter: a body left empty by it, and an edit of a message that
+    /// is not the sender's. `Ok` carries the sender's identity, which is what
+    /// the message's own id is then recorded against.
+    async fn admit(
+        &self,
+        inbound: &Inbound,
+        message: &starling_proto::proto::tcp::TextMessage,
+    ) -> Result<owners::Author, Actions> {
+        let first_channel = message.channel_id.first().copied().unwrap_or_default();
+        // A body that was only markup is now empty, and an empty message is
+        // not delivered: murmur does not broadcast a blank line to a channel
+        // either. But murmur returned in silence, and so did this, which left
+        // the sender's own copy reading "sent" for a message nobody received.
+        // Said out loud, so the client can show that it was not.
+        if message.message.is_empty() {
+            self.logger.log(
+                LogEvent::notice(Category::Message, "text message refused")
+                    .with("session", inbound.session)
+                    .with("reason", "nothing left once html was stripped"),
+            );
+            return Err(vec![refused(
+                inbound,
+                starling_proto::proto::tcp::permission_denied::DenyType::Text,
+                first_channel,
+                "that message has nothing left to send once its formatting is removed",
+            )]);
+        }
+
+        // Before the permission round trip, like the length check: who wrote a
+        // message is known here, and an edit of somebody else's is refused
+        // whatever the editor may otherwise do in the channel.
+        let author = owners::Author::new(inbound.session, self.roster.cert_of(inbound.session));
+        if let Some(reason) = self.edit_refusal(inbound.scope, &author, message).await {
+            self.logger.log(
+                LogEvent::notice(Category::Message, "text message edit refused")
+                    .with("session", inbound.session)
+                    .with("reason", reason),
+            );
+            return Err(vec![refused(
+                inbound,
+                starling_proto::proto::tcp::permission_denied::DenyType::Text,
+                first_channel,
+                reason,
+            )]);
+        }
+        Ok(author)
+    }
+
+    /// Record who sent `message`, and archive it: as a row of its own, or for
+    /// an edit by rewriting the row it names. Returns what was archived, which
+    /// carries an empty id when nothing was written.
+    async fn archive(
+        &self,
+        inbound: &Inbound,
+        message: &starling_proto::proto::tcp::TextMessage,
+        author: &owners::Author,
+        edit_of: Option<&str>,
+    ) -> StoredMessage {
+        // The id this message is known by, for whoever edits it later. Claimed
+        // only when nobody else already holds it: a client that reused
+        // somebody else's id would otherwise be recorded as its author, and
+        // could then edit their message by "editing its own".
+        let client_id = match message.message_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => match self.author_of(inbound.scope, id).await {
+                Some(holder) if !author.is(&holder) => "",
+                Some(_) => id,
+                None => {
+                    self.owners.record(inbound.scope, id, author.clone());
+                    id
+                }
+            },
+            None => "",
+        };
+        let cert = author.cert.clone().unwrap_or_default();
+
+        let mut stored = StoredMessage {
+            id: Vec::new(),
+            channel: message.channel_id.first().copied().unwrap_or_default(),
+            sender_account: 0,
+            sender_name: String::new(),
+            body: message.message.clone(),
+            sent_at_ms: now_ms(),
+            edited: false,
+        };
+        // A channel that runs persistent chat keeps its history in `pchat`.
+        // What arrives here for such a channel is the legacy copy a Fancy
+        // client sends beside the sealed message, so that peers too old to
+        // decrypt still see something. Archiving it wrote the conversation to
+        // disk twice, the second time in clear text -- and with dual path
+        // enabled that copy is the real body, not the `[Encrypted message]`
+        // placeholder. Delivered, never stored: the relay is what the legacy
+        // copy is for.
+        if self.modes.is_persistent(stored.channel) {
+            tracing::debug!(
+                channel = stored.channel,
+                "not archiving the legacy copy of a persistent channel's message"
+            );
+        } else if let Some(original) = edit_of {
+            // An edit rewrites the row it names instead of adding one, so
+            // history replays the message once, with its latest words.
+            if !self
+                .revise(inbound.scope, stored.channel, original, &cert, &stored.body)
+                .await
+            {
+                tracing::debug!(
+                    channel = stored.channel,
+                    "an edit of a message this archive does not hold was not archived"
+                );
+            }
+        } else {
+            let authorship = Authorship {
+                client_id,
+                cert: &cert,
+            };
+            stored.id = self
+                .record_by(inbound.scope, &stored, &authorship)
+                .await
+                .to_vec();
+        }
+        stored
+    }
+
     async fn on_text_message(&self, inbound: &Inbound) -> Actions {
         let Ok(mut message) =
             starling_proto::proto::tcp::TextMessage::decode(inbound.payload.as_slice())
@@ -607,12 +892,11 @@ impl TextService {
         if let Err(denial) = self.bound_body(inbound, &mut message) {
             return denial;
         }
-        // A body that was only markup is now empty, and an empty message is
-        // not delivered, murmur returns here too rather than broadcasting a
-        // blank line to a channel.
-        if message.message.is_empty() {
-            return Actions::new();
-        }
+        let author = match self.admit(inbound, &message).await {
+            Ok(author) => author,
+            Err(denial) => return denial,
+        };
+        let edit_of = message.edit_id.clone().filter(|id| !id.is_empty());
 
         // Checked before the message is stored or delivered, and against every
         // channel it is addressed to: a message naming five channels the sender
@@ -655,56 +939,46 @@ impl TextService {
                 .with("length", message.message.len()),
         );
 
-        let mut stored = StoredMessage {
-            id: Vec::new(),
-            channel: message.channel_id.first().copied().unwrap_or_default(),
-            sender_account: 0,
-            sender_name: String::new(),
-            body: message.message.clone(),
-            sent_at_ms: now_ms(),
-        };
-        // A channel that runs persistent chat keeps its history in `pchat`.
-        // What arrives here for such a channel is the legacy copy a Fancy
-        // client sends beside the sealed message, so that peers too old to
-        // decrypt still see something. Archiving it wrote the conversation to
-        // disk twice, the second time in clear text -- and with dual path
-        // enabled that copy is the real body, not the `[Encrypted message]`
-        // placeholder. Delivered, never stored: the relay is what the legacy
-        // copy is for.
-        if self.modes.is_persistent(stored.channel) {
-            tracing::debug!(
-                channel = stored.channel,
-                "not archiving the legacy copy of a persistent channel's message"
-            );
-        } else {
-            stored.id = self.record(inbound.scope, &stored).await.to_vec();
-        }
+        let stored = self
+            .archive(inbound, &message, &author, edit_of.as_deref())
+            .await;
 
         // Published after the message is stored and before it is returned for
         // delivery. A watcher is an observer, so this is never allowed to
         // decide whether the message goes out, `send` failing means only that
         // nobody is watching.
-        let _ = self.events.send(MessageEvent {
-            sender_session: inbound.session,
-            sender_account: stored.sender_account,
-            sender_name: stored.sender_name.clone(),
-            // `on_text_message` does not resolve the sender's account, so this
-            // says what is actually known rather than implying account 0 is
-            // the SuperUser.
-            sender_registered: false,
-            channels: message.channel_id.clone(),
-            sessions: message.session.clone(),
-            tree: message.tree_id.clone(),
-            body: stored.body.clone(),
-            sent_at_ms: stored.sent_at_ms,
-            from_client: true,
-        });
+        //
+        // Not for an edit: `MessageEvent` has no way to say "this replaces
+        // that", so a watcher would read the correction as a second message
+        // and, a bot, answer it twice.
+        let is_edit = edit_of.is_some();
+        if !is_edit {
+            let _ = self.events.send(MessageEvent {
+                sender_session: inbound.session,
+                sender_account: stored.sender_account,
+                sender_name: stored.sender_name.clone(),
+                // `on_text_message` does not resolve the sender's account, so this
+                // says what is actually known rather than implying account 0 is
+                // the SuperUser.
+                sender_registered: false,
+                channels: message.channel_id.clone(),
+                sessions: message.session.clone(),
+                tree: message.tree_id.clone(),
+                body: stored.body.clone(),
+                sent_at_ms: stored.sent_at_ms,
+                from_client: true,
+            });
+        }
 
         let recipients = self.recipients_of(inbound, &message).await;
 
         // Before the empty-recipients return below, because a message into a
-        // channel nobody is sitting in is exactly the one push exists for.
-        self.notify_absent(inbound, &message).await;
+        // channel nobody is sitting in is exactly the one push exists for. An
+        // edit is not news, and a phone buzzing for every typo fixed is the
+        // wrong side of what push is for.
+        if !is_edit {
+            self.notify_absent(inbound, &message).await;
+        }
 
         let echo = echo_of(message, inbound.session, stored.sent_at_ms);
 
@@ -1033,7 +1307,7 @@ impl TextService {
                     sender_name: message.sender_name,
                     body: message.body,
                     sent_at_ms: message.sent_at_ms,
-                    edited: false,
+                    edited: message.edited,
                 },
             )
             .collect();
@@ -1370,6 +1644,7 @@ impl TextService {
                 sender_name: row.creator_name.clone(),
                 body: row.body.clone(),
                 sent_at_ms: sent_at,
+                edited: false,
             };
             let _ = self.record(scope, &stored).await;
         }
@@ -1490,6 +1765,7 @@ impl Serve for TextService {
             modes: Arc::new(ChannelModes::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
+            owners: owners::Owners::default(),
             live_push: ctx
                 .config
                 .services
@@ -1580,6 +1856,7 @@ mod tests {
             modes: Arc::new(ChannelModes::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             schedules: tokio::sync::Notify::new(),
+            owners: owners::Owners::default(),
             // On, so the path a message takes in production is the path these
             // tests take; `push` is unreachable here, which is the case the
             // budget and the empty answer exist for.
@@ -1595,6 +1872,7 @@ mod tests {
             sender_name: "someone".to_owned(),
             body: body.to_owned(),
             sent_at_ms: now_ms(),
+            edited: false,
         }
     }
 
@@ -1915,6 +2193,194 @@ mod tests {
             deny_type(&service.on_text_message(&frame("far too long")).await),
             Some(DenyType::TextTooLong as i32)
         );
+    }
+
+    // -- Edits ---------------------------------------------------------------
+
+    /// An edit frame from session 7: `id` is the edit's own id, `of` the
+    /// message it rewrites.
+    fn edit_frame(id: &str, of: &str, body: &str) -> Inbound {
+        use prost::Message as _;
+        Inbound {
+            conn: 1,
+            session: 7,
+            scope: 1,
+            type_id: TEXT_MESSAGE,
+            gateway: String::new(),
+            payload: starling_proto::proto::tcp::TextMessage {
+                channel_id: vec![4],
+                message: body.to_owned(),
+                message_id: Some(id.to_owned()),
+                edit_id: Some(of.to_owned()),
+                ..starling_proto::proto::tcp::TextMessage::default()
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    /// The reason a `PermissionDenied` action carries.
+    fn deny_reason(actions: &Actions) -> String {
+        use prost::Message as _;
+        use starling_proto_fancy::control::server_action::Action;
+        let Some(Action::Send(send)) = actions.first().and_then(|action| action.action.as_ref())
+        else {
+            return String::new();
+        };
+        starling_proto::proto::tcp::PermissionDenied::decode(send.payload.as_slice())
+            .ok()
+            .and_then(|denied| denied.reason)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_somebody_elses_message_is_refused() {
+        // The finding: nothing read `edit_id`, so any member could name
+        // anybody's message and every Fancy client rewrote it in place.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service().await;
+        warm_with_certs(&service);
+        service
+            .owners
+            .record(1, "m-1", owners::Author::new(8, Some(BOB.to_vec())));
+
+        let refusal = service
+            .on_text_message(&edit_frame("e-1", "m-1", "words bob never said"))
+            .await;
+        assert_eq!(deny_type(&refusal), Some(DenyType::Text as i32));
+        assert!(
+            deny_reason(&refusal).contains("author"),
+            "the refusal says why: {}",
+            deny_reason(&refusal)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_naming_an_unknown_message_is_refused() {
+        // The fork's rule: an author that cannot be established is not
+        // "anybody may".
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service().await;
+        warm_with_certs(&service);
+        let refusal = service
+            .on_text_message(&edit_frame("e-1", "nothing-like-it", "x"))
+            .await;
+        assert_eq!(deny_type(&refusal), Some(DenyType::Text as i32));
+    }
+
+    #[tokio::test]
+    async fn an_author_may_edit_after_reconnecting_on_a_new_session() {
+        // By certificate, not session: alice sent it as session 3, and is
+        // session 7 now. Getting as far as the permission check, which these
+        // tests always deny, is the proof the ownership check let it through.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service().await;
+        warm_with_certs(&service);
+        service
+            .owners
+            .record(1, "m-1", owners::Author::new(3, Some(ALICE.to_vec())));
+        let actions = service
+            .on_text_message(&edit_frame("e-1", "m-1", "fixed"))
+            .await;
+        assert_eq!(deny_type(&actions), Some(DenyType::Permission as i32));
+    }
+
+    #[tokio::test]
+    async fn the_archive_remembers_the_author_after_memory_forgets() {
+        // A restart empties the in-memory window; the archived row still says
+        // who wrote it.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service().await;
+        warm_with_certs(&service);
+        let _ = service
+            .record_by(
+                1,
+                &message(4, "bob's"),
+                &Authorship {
+                    client_id: "m-bob",
+                    cert: BOB,
+                },
+            )
+            .await;
+        let _ = service
+            .record_by(
+                1,
+                &message(4, "alice's"),
+                &Authorship {
+                    client_id: "m-alice",
+                    cert: ALICE,
+                },
+            )
+            .await;
+
+        let theirs = service
+            .on_text_message(&edit_frame("e-1", "m-bob", "x"))
+            .await;
+        assert_eq!(deny_type(&theirs), Some(DenyType::Text as i32));
+        let mine = service
+            .on_text_message(&edit_frame("e-2", "m-alice", "x"))
+            .await;
+        assert_eq!(deny_type(&mine), Some(DenyType::Permission as i32));
+    }
+
+    #[tokio::test]
+    async fn an_edit_replaces_its_original_in_history() {
+        // An edit used to be archived as a message of its own, and history
+        // replayed both the retracted words and the correction.
+        let service = service().await;
+        let _ = service
+            .record_by(
+                1,
+                &message(5, "teh original"),
+                &Authorship {
+                    client_id: "m-1",
+                    cert: ALICE,
+                },
+            )
+            .await;
+        let _ = service.record(1, &message(5, "somebody else")).await;
+
+        assert!(
+            !service.revise(1, 5, "m-1", BOB, "hijacked").await,
+            "a row is only rewritten under its own author's certificate"
+        );
+        assert!(service.revise(1, 5, "m-1", ALICE, "the original").await);
+
+        let page = service.history(1, 5, 50, &[], Direction::Backward).await;
+        let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, vec!["somebody else", "the original"]);
+        assert!(page.messages[1].edited, "history says it was edited");
+        assert!(!page.messages[0].edited);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_strips_to_nothing_is_refused_out_loud() {
+        // It used to be dropped in silence, and the sender's copy read "sent"
+        // for a message nobody received.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service_with(starling_proto_fancy::serverconfig::Snapshot {
+            allow_html: false,
+            ..starling_runtime::settings::defaults(1)
+        })
+        .await;
+        let refusal = service.on_text_message(&frame("<b></b>")).await;
+        assert_eq!(deny_type(&refusal), Some(DenyType::Text as i32));
+        assert!(!deny_reason(&refusal).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_marker_only_body_is_not_refused_with_html_off() {
+        // A voice note with HTML off reaches the permission check rather than
+        // being stripped to nothing.
+        use starling_proto::proto::tcp::permission_denied::DenyType;
+        let service = service_with(starling_proto_fancy::serverconfig::Snapshot {
+            allow_html: false,
+            ..starling_runtime::settings::defaults(1)
+        })
+        .await;
+        let actions = service
+            .on_text_message(&frame("<!-- FANCY_VOICE:{\"id\":\"v\"} -->"))
+            .await;
+        assert_eq!(deny_type(&actions), Some(DenyType::Permission as i32));
     }
 
     // -- Scheduled messages -------------------------------------------------

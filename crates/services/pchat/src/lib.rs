@@ -436,6 +436,117 @@ impl PchatService {
         }
     }
 
+    /// The archived row an edit replaces, or `None` for a message that is not
+    /// an edit the archive can honour.
+    ///
+    /// `supersedes` makes every Fancy client rewrite the message it names in
+    /// place, so it is only honoured, and only relayed, when it names a row
+    /// the *same certificate* wrote. Anything else is cleared, and the message
+    /// travels and is stored as an ordinary one: a member who puts somebody
+    /// else's id there gets a message of their own, never a rewrite of theirs.
+    /// The same goes for an id naming no row, since nobody can be shown to be
+    /// its author.
+    ///
+    /// A `signal_v1` edit is left alone. That mode keeps no archive, so there
+    /// is no row to check against, and its recipients check the sender's
+    /// certificate against the original they hold, which is the only copy.
+    async fn edit_target(&self, scope: u32, message: &mut Message) -> Option<NamedRow> {
+        if message.supersedes.is_empty() || !archivable(message.protocol) {
+            return None;
+        }
+        let named = self
+            .named_rows(
+                scope,
+                message.channel,
+                std::slice::from_ref(&message.supersedes),
+            )
+            .await
+            .ok()
+            .and_then(|mut rows| rows.pop().flatten());
+        match named {
+            Some(row)
+                if !message.sender_cert.is_empty()
+                    && row.sender_cert.as_deref() == Some(message.sender_cert.as_slice()) =>
+            {
+                Some(row)
+            }
+            _ => {
+                tracing::debug!(
+                    channel = message.channel,
+                    "an edit naming a message its sender did not write is relayed as a new one"
+                );
+                message.supersedes.clear();
+                None
+            }
+        }
+    }
+
+    /// Replace the archived row `original` with the edit `message`.
+    ///
+    /// In place, under the row's own uuid7, so the message keeps its position
+    /// in history and a page carries it once, with its latest words. It used
+    /// to be a row of its own, and a reader paging back saw both versions.
+    ///
+    /// Everything that seals the ciphertext moves with it: the sender sealed
+    /// the edit under `AAD = channel ‖ its own id ‖ its own clock`, so the row
+    /// takes the edit's id and time, and keeps the original's id in
+    /// `client_supersedes`, which is how a reader files it under the message
+    /// it replaced and how a later edit or delete naming that id still finds
+    /// the row.
+    async fn revise_message(&self, scope: u32, original: &NamedRow, message: &Message) -> Kept {
+        let Some(id) = Uuid7::from_slice(&original.id) else {
+            return Kept::Failed;
+        };
+        let Some(stored) = self.seal_for_storage(scope, &id, message) else {
+            tracing::error!(
+                channel = message.channel,
+                "could not seal a server-managed edit; not storing it"
+            );
+            return Kept::Failed;
+        };
+        let result = sqlx::query(
+            "UPDATE pchat_message SET sent_at_ms = ?, sender = ?, epoch = ?, ciphertext = ?, \
+                 supersedes = ?, epoch_fingerprint = ?, chain_index = ?, protocol = ?, \
+                 client_id = ?, client_supersedes = ?, at_rest_key_id = ? \
+             WHERE server_id = ? AND channel_id = ? AND id = ?",
+        )
+        .bind(if message.sent_at_ms == 0 {
+            now_ms() as i64
+        } else {
+            message.sent_at_ms as i64
+        })
+        .bind(i64::from(message.sender))
+        .bind(i64::from(message.epoch))
+        .bind(stored.bytes.as_slice())
+        .bind(Uuid7::parse(&message.supersedes).map(Uuid7::to_vec))
+        .bind((!message.epoch_fingerprint.is_empty()).then(|| message.epoch_fingerprint.clone()))
+        .bind(i64::from(message.chain_index))
+        .bind(i64::from(message.protocol))
+        .bind((!message.message_id.is_empty()).then(|| message.message_id.clone()))
+        .bind(message.supersedes.clone())
+        .bind(stored.key_id.map(i64::from))
+        .bind(i64::from(scope))
+        .bind(i64::from(message.channel))
+        .bind(original.id.as_slice())
+        .execute(self.store.pool())
+        .await;
+        match result {
+            Ok(_) => Kept::New(id),
+            // The edit's own id already names another row: a retry of an edit
+            // whose first attempt landed as a message of its own.
+            Err(error) => match self
+                .stored_id(scope, message.channel, &message.message_id)
+                .await
+            {
+                Some(existing) => Kept::Duplicate(existing),
+                None => {
+                    tracing::error!(%error, "could not store a persistent-chat edit");
+                    Kept::Failed
+                }
+            },
+        }
+    }
+
     /// The row this channel already holds under a sender's own id, if any.
     ///
     /// Strictly what is on the table: unlike [`Self::cursor_of`] this does not
@@ -981,9 +1092,14 @@ impl PchatService {
 
         message.sender = inbound.session;
         message.sender_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
+        let original = self.edit_target(inbound.scope, &mut message).await;
         // Relayed either way; this decides whether a row outlives the relay.
         let archived = if archivable(message.protocol) {
-            match self.store_message(inbound.scope, &message).await {
+            let kept = match &original {
+                Some(row) => self.revise_message(inbound.scope, row, &message).await,
+                None => self.store_message(inbound.scope, &message).await,
+            };
+            match kept {
                 Kept::New(id) => Some((id, ack::Status::Stored)),
                 Kept::Duplicate(id) => Some((id, ack::Status::Duplicate)),
                 Kept::Failed => {
@@ -1304,6 +1420,11 @@ impl PchatService {
     ///
     /// Resolved as [`Self::cursor_of`] does: the sender's id first, then this
     /// server's uuid7, the only identity of a row written before `client_id`.
+    /// Between the two, the id an edit replaced: an edited row carries the
+    /// edit's id, and every client still files the message under the original
+    /// one, so that is the id a delete or a further edit names. The oldest
+    /// such row wins, which is the original itself, rather than an edit row an
+    /// older archive filed beside it.
     async fn named_rows(
         &self,
         scope: u32,
@@ -1326,6 +1447,18 @@ impl PchatService {
             .bind(wire_id.as_str())
             .fetch_optional(self.store.pool())
             .await?;
+            if found.is_none() {
+                found = sqlx::query(
+                    "SELECT id, sender_cert FROM pchat_message \
+                     WHERE server_id = ? AND channel_id = ? AND client_supersedes = ? \
+                     ORDER BY id ASC LIMIT 1",
+                )
+                .bind(i64::from(scope))
+                .bind(i64::from(channel))
+                .bind(wire_id.as_str())
+                .fetch_optional(self.store.pool())
+                .await?;
+            }
             if found.is_none()
                 && let Some(legacy) = Uuid7::parse(wire_id)
             {
@@ -2810,6 +2943,106 @@ mod tests {
     }
 
     const MINE: &str = "8f14e45f-ea8f-4f2b-b1a4-2f0e1d3c4b5a";
+
+    /// The id an edit of [`MINE`] is sent under.
+    const EDIT: &str = "1c9d2b3a-7e6f-4a5b-9c8d-0e1f2a3b4c5d";
+
+    /// An edit of `of` from session 7, under its own id [`EDIT`].
+    fn edit_of(of: &str, words: &[u8]) -> Inbound {
+        frame(pchat_envelope::Body::Message(Message {
+            message_id: EDIT.to_owned(),
+            supersedes: of.to_owned(),
+            sent_at_ms: 2_000,
+            ..message(4, words)
+        }))
+    }
+
+    /// The message the channel was sent, from among `actions`.
+    fn relayed_message(actions: &[ServerAction]) -> Message {
+        actions
+            .iter()
+            .filter(|action| addressed(action).0.contains(&8))
+            .find_map(|action| {
+                match PchatEnvelope::decode(sent_payload(action).as_slice())
+                    .ok()?
+                    .body?
+                {
+                    pchat_envelope::Body::Message(message) => Some(message),
+                    _ => None,
+                }
+            })
+            .expect("the channel is sent the message")
+    }
+
+    #[tokio::test]
+    async fn an_edit_replaces_its_original_in_the_archive() {
+        // It used to be filed as a row of its own, so a reader paging back saw
+        // the retracted words and the correction as two messages.
+        let service = service_holding(Perm::TEXT_MESSAGE).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+
+        let actions = service.frame(edit_of(MINE, b"what I meant")).await;
+
+        assert_eq!(relayed_message(&actions).supersedes, MINE);
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages.len(), 1, "one message, not two");
+        let row = &page.messages[0];
+        assert_eq!(row.ciphertext, b"what I meant");
+        assert_eq!(row.message_id, EDIT, "under the id it was sealed with");
+        assert_eq!(row.supersedes, MINE, "and naming the message it replaced");
+        assert_eq!(row.sent_at_ms, 2_000);
+    }
+
+    #[tokio::test]
+    async fn a_second_edit_and_a_delete_still_find_the_edited_row() {
+        // Clients keep filing the message under its original id, so that is
+        // the id everything after the first edit names.
+        let service = service_holding(Perm::TEXT_MESSAGE | Perm::ENTER).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+        let _ = service.frame(edit_of(MINE, b"first fix")).await;
+
+        let second = frame(pchat_envelope::Body::Message(Message {
+            message_id: "22222222-0000-4000-8000-000000000000".to_owned(),
+            supersedes: MINE.to_owned(),
+            ..message(4, b"second fix")
+        }));
+        let _ = service.frame(second).await;
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].ciphertext, b"second fix");
+
+        let _ = service.frame(delete_of(&[MINE])).await;
+        assert_eq!(service.count(1, 4).await, 0, "the delete found it");
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_somebody_elses_message_is_neither_honoured_nor_relayed() {
+        // The forged edit: session 7 names a message another certificate wrote.
+        // It must not rewrite the row, and the channel must not be told it is
+        // a replacement, or every Fancy client would rewrite it locally.
+        let service = service_holding(Perm::TEXT_MESSAGE).await;
+        let _ = written_by(&service, MINE, b"somebody-elses-cert").await;
+
+        let actions = service.frame(edit_of(MINE, b"forged")).await;
+
+        assert!(relayed_message(&actions).supersedes.is_empty());
+        let page = service.fetch(1, &fetch(4, 10)).await;
+        assert_eq!(page.messages.len(), 2, "kept as a message of its own");
+        assert!(page.messages.iter().all(|m| m.supersedes.is_empty()));
+        assert!(
+            page.messages
+                .iter()
+                .any(|m| m.message_id == MINE && m.ciphertext == b"x"),
+            "the original is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_naming_no_stored_message_is_not_relayed_as_one() {
+        let service = service_holding(Perm::TEXT_MESSAGE).await;
+        let actions = service.frame(edit_of(MINE, b"orphan")).await;
+        assert!(relayed_message(&actions).supersedes.is_empty());
+    }
 
     #[tokio::test]
     async fn an_author_deletes_its_own_message_and_hears_it_back() {
