@@ -18,6 +18,20 @@
 //! `text_message_length` be exhausted by tags the recipient never sees, which
 //! is how a 5000-character limit ends up refusing a two-line message pasted
 //! with formatting.
+//!
+//! # Why Fancy markers survive the strip
+//!
+//! A Fancy client says what a message *is* in HTML comments: `<!-- FANCY_FILE:
+//! ... -->` for an attachment, others for a voice note, a reply, a watch
+//! invitation. Stripped with the rest of the markup, a voice note or a picture
+//! sent without a caption became an empty body and vanished, and one with a
+//! caption reached other Fancy clients as the caption alone. They are not
+//! formatting, a stock client draws a comment as nothing, so they are kept.
+//!
+//! The one fenced region, `<!-- FANCY_LEGACY -->...<!-- /FANCY_LEGACY -->`, is
+//! the part written *for* stock clients, and its contents are stripped like any
+//! other text: with HTML off, that audience gets the words of the fallback
+//! ("(edited)" before an edit, a file's name) and none of its markup.
 
 use starling_runtime::over_limit;
 
@@ -40,8 +54,10 @@ pub enum Verdict {
 #[must_use]
 pub fn check(text: &str, allow_html: bool, text_limit: u32, image_limit: u32) -> Verdict {
     if !allow_html {
-        let stripped = strip_html(text);
-        if over_limit(stripped.chars().count(), text_limit) {
+        let (stripped, visible) = strip_keeping_markers(text);
+        // The markers are not words anybody reads, so they do not spend the
+        // limit; a file marker alone is a few hundred characters of JSON.
+        if over_limit(visible, text_limit) {
             return Verdict::TooLong;
         }
         return if stripped == text {
@@ -113,6 +129,90 @@ pub fn strip_html(html: &str) -> String {
     // a message is a truncated tag, and printing it would put a `<` back into
     // text that is supposed to have none.
     escape(&simplify(&out))
+}
+
+/// Stands in for a kept marker while the rest of the body is stripped.
+///
+/// Private-use characters, which no renderer draws and the stripper treats as
+/// ordinary text, so whitespace around a marker is collapsed exactly as it
+/// would be around a word and the marker itself is never touched.
+const SLOT_OPEN: char = '\u{E000}';
+/// Closes the index a [`SLOT_OPEN`] opened.
+const SLOT_CLOSE: char = '\u{E001}';
+
+/// Opens an HTML comment.
+const COMMENT_OPEN: &str = "<!--";
+/// Closes one.
+const COMMENT_CLOSE: &str = "-->";
+
+/// The inside of the Fancy marker comment `after_open` continues, and what
+/// follows it, if what follows a `<!--` is one.
+///
+/// `<!-- FANCY_... -->` or `<!-- /FANCY_... -->`, ending at the first `-->`.
+/// One carrying a `<` or `>` inside is not a marker this keeps: the guarantee
+/// of the strip is that nothing in its output can be markup again, and a
+/// comment is only inert while nothing in it can close it early or open a tag.
+fn fancy_marker(after_open: &str) -> Option<(&str, &str)> {
+    let (inside, after) = after_open.split_once(COMMENT_CLOSE)?;
+    let content = inside.trim();
+    let name = content.strip_prefix('/').unwrap_or(content);
+    (name.starts_with("FANCY_") && !content.contains(['<', '>'])).then_some((inside, after))
+}
+
+/// [`strip_html`], keeping every Fancy marker comment where it stood.
+///
+/// Returns the stripped body and how many characters of it are visible text,
+/// which is what the length limit is measured against.
+#[must_use]
+pub fn strip_keeping_markers(html: &str) -> (String, usize) {
+    // A body that already holds the stand-in characters could name a marker
+    // slot of its own choosing, so they go first. Nothing legitimate is lost:
+    // they are private-use code points no client draws.
+    let clean: String = html
+        .chars()
+        .filter(|c| *c != SLOT_OPEN && *c != SLOT_CLOSE)
+        .collect();
+    if !clean.contains(COMMENT_OPEN) {
+        let stripped = strip_html(&clean);
+        let visible = stripped.chars().count();
+        return (stripped, visible);
+    }
+
+    let mut markers: Vec<String> = Vec::new();
+    let mut masked = String::with_capacity(clean.len());
+    let mut rest = clean.as_str();
+    while let Some((before, after_open)) = rest.split_once(COMMENT_OPEN) {
+        masked.push_str(before);
+        if let Some((inside, after)) = fancy_marker(after_open) {
+            masked.push(SLOT_OPEN);
+            masked.push_str(&markers.len().to_string());
+            masked.push(SLOT_CLOSE);
+            markers.push(format!("{COMMENT_OPEN}{inside}{COMMENT_CLOSE}"));
+            rest = after;
+        } else {
+            // Not ours: left for the stripper, which drops it as a tag.
+            masked.push_str(COMMENT_OPEN);
+            rest = after_open;
+        }
+    }
+    masked.push_str(rest);
+
+    let stripped = strip_html(&masked);
+    let mut out = String::with_capacity(stripped.len());
+    let mut visible = 0_usize;
+    let mut chars = stripped.chars();
+    while let Some(character) = chars.next() {
+        if character != SLOT_OPEN {
+            out.push(character);
+            visible += 1;
+            continue;
+        }
+        let index: String = chars.by_ref().take_while(|c| *c != SLOT_CLOSE).collect();
+        if let Some(marker) = index.parse::<usize>().ok().and_then(|i| markers.get(i)) {
+            out.push_str(marker);
+        }
+    }
+    (out, visible)
 }
 
 /// Whether a tag ends a line, as murmur's filter has it: `br` and `p`.
@@ -257,6 +357,69 @@ mod tests {
     #[test]
     fn an_unterminated_tag_is_dropped_rather_than_printed() {
         assert_eq!(strip_html("hello <b"), "hello");
+    }
+
+    #[test]
+    fn a_marker_only_body_survives_html_off() {
+        // A voice note or a captionless picture is nothing but its marker.
+        // Stripped, it was an empty body, and the server dropped it.
+        let voice = "<!-- FANCY_VOICE:{\"id\":\"abc\"} -->";
+        assert_eq!(check(voice, false, 0, 0), Verdict::Deliver);
+    }
+
+    #[test]
+    fn a_caption_keeps_its_marker_and_loses_its_markup() {
+        let body = "<b>look</b> <!-- FANCY_FILE:{\"id\":\"f1\"} -->";
+        assert_eq!(
+            check(body, false, 0, 0),
+            Verdict::Rewritten("look <!-- FANCY_FILE:{\"id\":\"f1\"} -->".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_legacy_fence_is_kept_and_its_contents_are_stripped() {
+        // The fallback is written for stock clients; with HTML off they get its
+        // words, and the fence still tells a Fancy client to cut them out.
+        let body = "<!-- FANCY_LEGACY --><i>(edited)</i> <!-- /FANCY_LEGACY -->fixed";
+        assert_eq!(
+            check(body, false, 0, 0),
+            Verdict::Rewritten(
+                "<!-- FANCY_LEGACY -->(edited) <!-- /FANCY_LEGACY -->fixed".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn an_ordinary_comment_is_still_stripped() {
+        assert_eq!(
+            check("hi <!-- not ours -->", false, 0, 0),
+            Verdict::Rewritten("hi".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_marker_that_could_close_early_is_not_kept() {
+        // The output of the strip must never be markup again; a "marker" that
+        // carries a tag is treated as the markup it is.
+        let (out, _) = strip_keeping_markers("<!-- FANCY_X <script> -->hi");
+        assert!(!out.contains("<script"), "kept markup in: {out}");
+        assert!(
+            !out.contains("FANCY_X <"),
+            "kept a hostile marker in: {out}"
+        );
+    }
+
+    #[test]
+    fn a_body_cannot_forge_a_marker_slot() {
+        let forged = format!("{SLOT_OPEN}0{SLOT_CLOSE}<!-- FANCY_A -->");
+        let (out, _) = strip_keeping_markers(&forged);
+        assert_eq!(out, "0<!-- FANCY_A -->");
+    }
+
+    #[test]
+    fn markers_do_not_spend_the_length_limit() {
+        let body = format!("hi<!-- FANCY_FILE:{} -->", "x".repeat(500));
+        assert!(matches!(check(&body, false, 10, 0), Verdict::Deliver));
     }
 
     #[test]
