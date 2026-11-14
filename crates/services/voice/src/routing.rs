@@ -130,6 +130,10 @@ pub struct RoutingSnapshot {
     parent_of: HashMap<ChannelId, ChannelId>,
     /// Every session's registered whisper and shout targets.
     targets: TargetRegistry,
+    /// The id other users know a session by, for a user on several devices.
+    ///
+    /// Sparse: a session absent from here is shown as itself.
+    presented: HashMap<SessionId, SessionId>,
 }
 
 impl RoutingSnapshot {
@@ -164,6 +168,32 @@ impl RoutingSnapshot {
     pub fn with_listener_gain(mut self, session: SessionId, channel: ChannelId, gain: f32) -> Self {
         let _ = self.listener_gain.insert((session, channel), gain);
         self
+    }
+
+    /// Record that `session` is a device of the user shown as `shown`.
+    #[must_use]
+    pub fn with_presented(mut self, session: SessionId, shown: SessionId) -> Self {
+        if session != shown {
+            let _ = self.presented.insert(session, shown);
+        }
+        self
+    }
+
+    /// The id everyone but `session`'s own user hears it as.
+    #[must_use]
+    pub fn presented_as(&self, session: SessionId) -> SessionId {
+        self.presented.get(&session).copied().unwrap_or(session)
+    }
+
+    /// Every connected device of the user shown as `shown`.
+    ///
+    /// A whisper names a user the way the whisperer sees them, so it has to
+    /// reach whichever of that user's devices is listening.
+    fn devices_of(&self, shown: SessionId) -> impl Iterator<Item = SessionId> + '_ {
+        self.channel_of
+            .keys()
+            .copied()
+            .filter(move |session| self.presented_as(*session) == shown)
     }
 
     /// Mark a session as unable to receive.
@@ -277,7 +307,7 @@ impl RoutingSnapshot {
                 let Some(channel) = self.channel_of(speaker) else {
                     return Vec::new();
                 };
-                let mut audience = Audience::new(speaker, &self.deaf);
+                let mut audience = self.audience(speaker);
                 self.gather_channel(&mut audience, channel, context::NORMAL);
                 audience.finish()
             }
@@ -305,12 +335,13 @@ impl RoutingSnapshot {
             return Vec::new();
         };
 
-        let mut audience = Audience::new(speaker, &self.deaf);
+        let mut audience = self.audience(speaker);
         for named in target.users() {
             // A target outlives the sessions it names, so whispering at somebody
-            // who has since disconnected is routine rather than exceptional.
-            if self.channel_of(*named).is_some() {
-                audience.add(*named, context::WHISPER, None);
+            // who has since disconnected is routine rather than exceptional:
+            // such a name has no devices and reaches nobody.
+            for device in self.devices_of(*named) {
+                audience.add(device, context::WHISPER, None);
             }
         }
         for shout in target.channels() {
@@ -369,6 +400,17 @@ impl RoutingSnapshot {
         false
     }
 
+    /// An empty audience for `speaker`'s frame.
+    fn audience(&self, speaker: SessionId) -> Audience<'_> {
+        Audience {
+            speaker: self.presented_as(speaker),
+            presented: &self.presented,
+            deaf: &self.deaf,
+            order: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
     /// Members of a channel plus anyone listening to it.
     ///
     /// `standing` is the context for people actually in the channel, normal
@@ -394,24 +436,18 @@ impl RoutingSnapshot {
 /// echo.
 struct Audience<'a> {
     /// Excluded from their own fan-out, normal speech echoed back would double
-    /// every speaker's own audio.
+    /// every speaker's own audio. The user, not the device: the owner's phone
+    /// in the same room as their laptop would otherwise feed back.
     speaker: SessionId,
+    /// How [`Self::speaker`] is matched against a device.
+    presented: &'a HashMap<SessionId, SessionId>,
     /// Excluded because they receive nothing at all.
     deaf: &'a HashSet<SessionId>,
     order: Vec<Reception>,
     index: HashMap<SessionId, usize>,
 }
 
-impl<'a> Audience<'a> {
-    fn new(speaker: SessionId, deaf: &'a HashSet<SessionId>) -> Self {
-        Self {
-            speaker,
-            deaf,
-            order: Vec::new(),
-            index: HashMap::new(),
-        }
-    }
-
+impl Audience<'_> {
     /// Record one way of reaching `session`, folding it with any other.
     ///
     /// Both folds are murmur's (`AudioReceiverBuffer.cpp:87-90`) and neither is
@@ -425,7 +461,8 @@ impl<'a> Audience<'a> {
     ///   channel is unity, so a listener who turned that channel down to 0.2 and
     ///   then walked into it hears it at 1.0.
     fn add(&mut self, session: SessionId, context: u8, gain: Option<f32>) {
-        if session == self.speaker || self.deaf.contains(&session) {
+        let user = self.presented.get(&session).copied().unwrap_or(session);
+        if user == self.speaker || self.deaf.contains(&session) {
             return;
         }
         match self.index.get(&session).copied() {
@@ -903,5 +940,58 @@ mod tests {
     fn speaking_alone_is_an_empty_list_not_an_error() {
         let snapshot = RoutingSnapshot::new().with_member(ALICE, LOBBY);
         assert!(snapshot.recipients(ALICE, Target::Normal).is_empty());
+    }
+
+    /// Alice's phone, a second device of the user everyone knows as Alice.
+    const ALICE_PHONE: SessionId = SessionId(9);
+
+    fn alice_on_two_devices() -> RoutingSnapshot {
+        lobby_with_three()
+            .with_member(ALICE_PHONE, LOBBY)
+            .with_presented(ALICE_PHONE, ALICE)
+    }
+
+    #[test]
+    fn a_users_own_devices_never_hear_each_other() {
+        // The laptop and the phone in one room would otherwise feed back.
+        let snapshot = alice_on_two_devices();
+        assert!(
+            !snapshot
+                .recipients(ALICE, Target::Normal)
+                .contains(&ALICE_PHONE)
+        );
+        let mut heard = snapshot.recipients(ALICE_PHONE, Target::Normal);
+        heard.sort_by_key(|s| s.0);
+        assert_eq!(heard, vec![BOB, CAROL]);
+    }
+
+    #[test]
+    fn a_second_device_speaks_as_the_user_everyone_knows() {
+        assert_eq!(alice_on_two_devices().presented_as(ALICE_PHONE), ALICE);
+        assert_eq!(alice_on_two_devices().presented_as(BOB), BOB);
+    }
+
+    #[test]
+    fn a_whisper_to_a_user_reaches_every_device_of_it() {
+        let snapshot =
+            alice_on_two_devices().with_target(BOB, 2, VoiceTarget::new().whispering_to(ALICE));
+        let mut heard = snapshot.recipients(BOB, Target::Whisper(2));
+        heard.sort_by_key(|s| s.0);
+        assert_eq!(heard, vec![ALICE, ALICE_PHONE]);
+    }
+
+    #[test]
+    fn a_whisper_still_reaches_a_user_whose_first_device_left() {
+        // The id Bob whispers to stays the one he sees, after the device that
+        // first held it is gone.
+        let snapshot = RoutingSnapshot::new()
+            .with_member(BOB, LOBBY)
+            .with_member(ALICE_PHONE, LOBBY)
+            .with_presented(ALICE_PHONE, ALICE)
+            .with_target(BOB, 2, VoiceTarget::new().whispering_to(ALICE));
+        assert_eq!(
+            snapshot.recipients(BOB, Target::Whisper(2)),
+            vec![ALICE_PHONE]
+        );
     }
 }

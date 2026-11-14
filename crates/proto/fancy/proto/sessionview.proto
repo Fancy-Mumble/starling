@@ -108,6 +108,14 @@ message Session {
   // which of them are connected. An opaque install id, not a secret - the
   // secret that proves it stays in `userdata`.
   string device_id = 26;
+  // The session id everyone else knows this session by.
+  //
+  // An account online from several devices is shown to other users as one
+  // user, so every device of it presents as one id: the first device's, held
+  // until the last device leaves (`docs/SERVICES.md`, "One user, several
+  // devices"). Equal to `session` for every other session. 0 from a writer that
+  // predates the field, read as `session`.
+  uint32 presented_as = 27;
 }
 
 message Sessions {

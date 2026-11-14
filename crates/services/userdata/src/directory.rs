@@ -24,7 +24,8 @@ use starling_proto_fancy::userdata::Account;
 use starling_runtime::log::timestamp::rfc3339;
 use starling_runtime::log::{Category, LogEvent};
 use starling_runtime::permit::permission_denied;
-use starling_runtime::plane::{Actions, Inbound, to_conn, to_sessions};
+use starling_runtime::plane::{Actions, Inbound, to_conn, to_views};
+use starling_runtime::roster::Roster;
 use starling_runtime::trail::{self, Record};
 
 use crate::{ROOT_CHANNEL, USER_LIST, UserdataService, actor_of};
@@ -385,22 +386,27 @@ impl UserdataService {
         // builds its user list from `UserState`. murmur broadcasts one for
         // exactly this reason (`Messages.cpp:3231`).
         //
-        // One per session: an owner online from two devices is two entries in
-        // every tree, and correcting only the first leaves the second wearing
-        // the old name.
-        self.sessions_of(inbound.scope, id)
-            .await
-            .into_iter()
-            .map(|session| {
-                let announce = tcp::UserState {
-                    session: Some(session),
-                    actor: Some(inbound.session),
-                    name: Some(renamed.name.clone()),
-                    ..tcp::UserState::default()
-                };
-                to_sessions(Vec::new(), USER_STATE, announce.encode_to_vec())
-            })
-            .collect()
+        // An owner online from two devices is one user to everyone else and
+        // one entry on each device, so each recipient is told under the id its
+        // own tree has.
+        let sessions = self.sessions(inbound.scope).await;
+        let Some(owner) = sessions
+            .iter()
+            .find(|session| identity::account(session.registered, session.account) == Some(id))
+            .map(|session| session.session)
+        else {
+            return Actions::new();
+        };
+        let everyone = Roster::of(sessions);
+        to_views(everyone.sessions(), USER_STATE, |viewer| {
+            tcp::UserState {
+                session: Some(everyone.seen_by(viewer, owner)),
+                actor: Some(everyone.seen_by(viewer, inbound.session)),
+                name: Some(renamed.name.clone()),
+                ..tcp::UserState::default()
+            }
+            .encode_to_vec()
+        })
     }
 
     /// Unregister an account: an entry the dialog sent back with no name.
@@ -432,19 +438,6 @@ impl UserdataService {
                 .target_account(id)
                 .detail(name),
         );
-    }
-
-    /// Every live session of `account`: none while its owner is away, several
-    /// while they are on more than one device.
-    async fn sessions_of(&self, scope: u32, account: u64) -> Vec<u32> {
-        self.sessions(scope)
-            .await
-            .into_iter()
-            .filter(|session| {
-                identity::account(session.registered, session.account) == Some(account)
-            })
-            .map(|session| session.session)
-            .collect()
     }
 }
 

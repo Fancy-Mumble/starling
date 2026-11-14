@@ -46,10 +46,12 @@ use starling_runtime::greeting::{self, Greetings};
 use starling_runtime::greeting_binary;
 use starling_runtime::log::{Category, LogEvent};
 use starling_runtime::plane::{
-    Actions, Fanout, Inbound, broadcast_except, disconnect, to_conn, to_sessions,
+    Actions, Fanout, Inbound, broadcast_except, broadcast_excluding, disconnect, to_conn,
+    to_sessions,
 };
 use starling_runtime::serve::ServiceContext;
 
+use crate::announce;
 use crate::invite;
 use crate::state::{Connections, Identity, PendingConnection};
 
@@ -227,6 +229,9 @@ fn session_record(pending: &PendingConnection) -> Session {
         // Which of the account's devices, so the owner's device list can say
         // which are connected. Not a secret: the secret stayed in `userdata`.
         device_id: pending.device_id.clone(),
+        // One user on several devices is one id to everyone else, and every
+        // service that names a sender to others reads it from here.
+        presented_as: pending.presented_as,
         // An assurance rather than an identifier, and the `strong` ACL group.
         strong_cert: pending.strong_cert,
         // The access tokens, which `permissions` can reach in no other way, it
@@ -370,21 +375,10 @@ impl Handshake {
         let account = identity.account;
         let name = identity.name.as_str();
 
-        // murmur never lets two live sessions share a name: refuse this one,
-        // or kick the older one as a ghost (`Messages.cpp:418`). Doing neither
-        // puts three of the same user in the tree.
-        let ghost = connections.duplicate_of(inbound.conn, account, name, &identity.device_id);
-        let older_session_may_stay = ghost
-            .as_ref()
-            .is_some_and(|ghost| !may_replace(&pending, ghost, account));
-        if older_session_may_stay {
-            return self.refuse(
-                inbound.conn,
-                name,
-                tcp::reject::RejectType::UsernameInUse,
-                "that name is already in use",
-            );
-        }
+        let ghost = match self.ghost_of(connections, inbound, &pending, &identity) {
+            Ok(ghost) => ghost,
+            Err(refusal) => return refusal,
+        };
 
         let Some(session) = connections.allocate(inbound.conn, &identity) else {
             return self.refuse(
@@ -418,7 +412,14 @@ impl Handshake {
         self.announce_up(connections, inbound.conn).await;
 
         let Some(channel) = self
-            .landing(inbound.scope, session, account, &config, invited_to)
+            .land(
+                connections,
+                inbound.scope,
+                session,
+                account,
+                &config,
+                invited_to,
+            )
             .await
         else {
             // The root refused them, which it does only when it is full: there
@@ -623,6 +624,35 @@ impl Handshake {
         self.push_permissions(&pending, channel).await
     }
 
+    /// The older session this login replaces, or the refusal if it may not.
+    ///
+    /// murmur never lets two live sessions share a name: refuse this one, or
+    /// kick the older one as a ghost (`Messages.cpp:418`). Doing neither puts
+    /// three of the same user in the tree.
+    fn ghost_of(
+        &self,
+        connections: &Connections,
+        inbound: &Inbound,
+        pending: &PendingConnection,
+        identity: &Identity,
+    ) -> Result<Option<PendingConnection>, Actions> {
+        let account = identity.account;
+        let ghost =
+            connections.duplicate_of(inbound.conn, account, &identity.name, &identity.device_id);
+        if ghost
+            .as_ref()
+            .is_some_and(|ghost| !may_replace(pending, ghost, account))
+        {
+            return Err(self.refuse(
+                inbound.conn,
+                &identity.name,
+                tcp::reject::RejectType::UsernameInUse,
+                "that name is already in use",
+            ));
+        }
+        Ok(ghost)
+    }
+
     /// Disconnect the older session a reconnecting user left behind.
     ///
     /// Through the fan-out, because the ghost may be held by another gateway
@@ -700,8 +730,19 @@ impl Handshake {
                 .await,
         );
         actions.extend(
-            self.user_states(inbound, session, identity, pending, config, channel)
-                .await,
+            // The live record, not `pending`: that copy predates the session
+            // and so does not know which user it joined.
+            self.user_states(
+                inbound,
+                session,
+                identity,
+                &connections
+                    .by_session(session)
+                    .unwrap_or_else(|| pending.clone()),
+                config,
+                channel,
+            )
+            .await,
         );
         actions.push(to_conn(
             inbound.conn,
@@ -799,6 +840,14 @@ impl Handshake {
             texture_hash: blob_hash(&identity.texture_hash),
             ..tcp::UserState::default()
         };
+        let me = connections.by_session(session);
+        let shown = me.as_ref().map_or(session, |me| me.presented_as);
+        if connections.devices_of(shown).len() > 1 {
+            // Another device of a user everyone already sees: nobody arrived,
+            // though the user may now read as unmuted.
+            actions.extend(announce::merged_flags(connections, shown));
+            return actions;
+        }
         actions.push(broadcast_except(session, 9, joined.encode_to_vec()));
         actions
     }
@@ -930,10 +979,13 @@ impl Handshake {
             };
 
             // A guest has no account for a device to belong to.
-            let device_id = if account.is_some() {
-                result.device_id
+            let (device_id, device_name) = if account.is_some() {
+                (
+                    result.device_id,
+                    request.device_name.clone().unwrap_or_default(),
+                )
             } else {
-                String::new()
+                (String::new(), String::new())
             };
             return Ok(Identity {
                 account,
@@ -941,6 +993,7 @@ impl Handshake {
                 comment_hash,
                 texture_hash,
                 device_id,
+                device_name,
             });
         }
         let (kind, reason) = refusal_for(outcome);
@@ -1191,16 +1244,25 @@ impl Handshake {
             return actions;
         };
 
-        for other in sessions.into_inner().sessions {
-            if other.session == session {
+        let mine = if pending.presented_as == 0 {
+            session
+        } else {
+            pending.presented_as
+        };
+        for (shown, devices) in users(sessions.into_inner().sessions) {
+            if shown == mine {
+                // The arriving client's own other devices: it never sees them.
                 continue;
             }
+            let Some(other) = devices.first().cloned() else {
+                continue;
+            };
             let state = tcp::UserState {
-                session: Some(other.session),
+                session: Some(shown),
                 name: Some(other.name),
                 channel_id: Some(other.channel),
-                self_mute: Some(other.self_mute),
-                self_deaf: Some(other.self_deaf),
+                self_mute: Some(devices.iter().all(|device| device.self_mute)),
+                self_deaf: Some(devices.iter().all(|device| device.self_deaf)),
                 // Through `identity`, not `other.account` directly: the pair is
                 // meaningless without the flag, and account 0 is the SuperUser
                 // rather than "nobody".
@@ -1287,12 +1349,18 @@ impl Handshake {
         // adjustments before the second send (`Messages.cpp:851`).
         let mut actions = Actions::new();
         if !restored.added.is_empty() {
+            let shown = connections.shown_of(session);
             let public = tcp::UserState {
-                session: Some(session),
+                session: Some(shown),
                 listening_channel_add: restored.added.clone(),
                 ..tcp::UserState::default()
             };
-            actions.push(broadcast_except(session, 9, public.encode_to_vec()));
+            let devices = connections
+                .devices_of(shown)
+                .iter()
+                .map(|device| device.session)
+                .collect();
+            actions.push(broadcast_excluding(devices, 9, public.encode_to_vec()));
         }
         let mine = tcp::UserState {
             session: Some(session),
@@ -1472,6 +1540,37 @@ impl Handshake {
     /// A full **root** is where the cascade runs out, and upstream rejects the
     /// login as `ServerFull` rather than admitting somebody to nowhere. Same
     /// here: `None` means there is no channel to put this user in.
+    /// Where a new session goes: where its user already is, when this is
+    /// another device of a user online, and otherwise [`Self::landing`].
+    ///
+    /// Everyone else sees the user as one row, and one row is in one channel.
+    async fn land(
+        &self,
+        connections: &Connections,
+        scope: u32,
+        session: u32,
+        account: Option<u64>,
+        config: &Snapshot,
+        invited_to: Option<u32>,
+    ) -> Option<u32> {
+        let joining = connections
+            .named(connections.shown_of(session))
+            .into_iter()
+            .find(|device| device.session != session)
+            .map(|device| device.channel);
+        match joining {
+            Some(channel) => self
+                .enter(scope, session, channel, account, true)
+                .await
+                .filter(|result| result.applied)
+                .map(|_| channel),
+            None => {
+                self.landing(scope, session, account, config, invited_to)
+                    .await
+            }
+        }
+    }
+
     async fn landing(
         &self,
         scope: u32,
@@ -2266,6 +2365,23 @@ fn sfu_available(config: &starling_runtime::Config) -> bool {
         .services
         .get("screenshare")
         .is_some_and(|service| service.enabled && service.media_ip().is_some())
+}
+
+/// The view's sessions grouped into users, by the id each is shown as, the
+/// device that holds that id (or else the oldest) first.
+fn users(sessions: Vec<Session>) -> std::collections::BTreeMap<u32, Vec<Session>> {
+    let mut users: std::collections::BTreeMap<u32, Vec<Session>> =
+        std::collections::BTreeMap::new();
+    for session in sessions {
+        users
+            .entry(starling_runtime::roster::presented_as(&session))
+            .or_default()
+            .push(session);
+    }
+    for (shown, devices) in &mut users {
+        devices.sort_by_key(|device| (device.session != *shown, device.session));
+    }
+    users
 }
 
 #[cfg(test)]

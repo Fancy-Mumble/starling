@@ -51,7 +51,7 @@ use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions, to_views,
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -639,12 +639,7 @@ impl PluginsService {
         // Deduplicated, because a receiver named twice would be sent the
         // message twice, and order is preserved so a plugin that cares about
         // it sees what the sender wrote.
-        let mut receivers: Vec<u32> = Vec::with_capacity(message.receiver_sessions.len());
-        for session in &message.receiver_sessions {
-            if !receivers.contains(session) {
-                receivers.push(*session);
-            }
-        }
+        let receivers = self.devices_named(&message.receiver_sessions);
         if receivers.is_empty() {
             // Named nobody. Where this used to be the end of the road it is now
             // only the end of the *relay*: a client addressing a server-side
@@ -659,9 +654,26 @@ impl PluginsService {
             return Actions::new();
         }
 
-        message.sender_session = Some(inbound.session);
         message.receiver_sessions.clear();
-        vec![to_sessions(receivers, PLUGIN_DATA, message.encode_to_vec())]
+        to_views(receivers, PLUGIN_DATA, |viewer| {
+            let mut named = message.clone();
+            named.sender_session = Some(self.roster.seen_by(viewer, inbound.session));
+            named.encode_to_vec()
+        })
+    }
+
+    /// Every device of every user `named`, each once and in the order named.
+    ///
+    /// A client names a user by the id it was shown, which stands for all of
+    /// their devices and may belong to one that has since left.
+    fn devices_named(&self, named: &[u32]) -> Vec<u32> {
+        let mut devices: Vec<u32> = Vec::with_capacity(named.len());
+        for session in named.iter().flat_map(|user| self.roster.devices_of(*user)) {
+            if !devices.contains(&session) {
+                devices.push(session);
+            }
+        }
+        devices
     }
 
     /// Hand an addressed plugin message to the plugin that owns the name, or
@@ -701,7 +713,7 @@ impl PluginsService {
             return Actions::new();
         }
 
-        let recipients = opaque.recipients.clone();
+        let recipients = self.devices_named(&opaque.recipients);
         if recipients.is_empty() {
             tracing::debug!(
                 plugin = %opaque.plugin,
@@ -709,20 +721,18 @@ impl PluginsService {
             );
             return Actions::new();
         }
-        let relay = PluginsEnvelope {
-            body: Some(plugins_envelope::Body::Opaque(
-                starling_proto_fancy::fancy::feature::Opaque {
-                    sender: inbound.session,
-                    recipients: Vec::new(),
-                    ..opaque
-                },
-            )),
-        };
-        vec![to_sessions(
-            recipients,
-            ServiceKind::Plugins.outer_type(),
-            relay.encode_to_vec(),
-        )]
+        to_views(recipients, ServiceKind::Plugins.outer_type(), |viewer| {
+            PluginsEnvelope {
+                body: Some(plugins_envelope::Body::Opaque(
+                    starling_proto_fancy::fancy::feature::Opaque {
+                        sender: self.roster.seen_by(viewer, inbound.session),
+                        recipients: Vec::new(),
+                        ..opaque.clone()
+                    },
+                )),
+            }
+            .encode_to_vec()
+        })
     }
 }
 
@@ -1117,5 +1127,106 @@ mod tests {
             .into_inner();
         assert!(!result.applied);
         assert!(result.refused.contains("not found"), "{}", result.refused);
+    }
+
+    /// Seat `session` as a device of the user shown as `shown`.
+    fn seat(service: &PluginsService, session: u32, shown: u32) {
+        service
+            .roster
+            .upsert(&starling_proto_fancy::sessionview::Session {
+                session,
+                conn: u64::from(session) * 10,
+                presented_as: shown,
+                ..Default::default()
+            });
+    }
+
+    /// Each session `actions` sends to, with the payload it was sent.
+    fn delivered(actions: &Actions) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for action in actions {
+            let Some(starling_proto_fancy::control::server_action::Action::Send(send)) =
+                &action.action
+            else {
+                panic!("expected a Send");
+            };
+            out.extend(
+                send.sessions
+                    .iter()
+                    .map(|session| (*session, send.payload.clone())),
+            );
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_plugin_message_to_a_user_reaches_every_device_they_are_on() {
+        // The sender names 7, the id it was shown; the user is on 7 and 9.
+        let service = service().await;
+        seat(&service, 2, 2);
+        seat(&service, 7, 7);
+        seat(&service, 9, 7);
+        let envelope = PluginsEnvelope {
+            body: Some(plugins_envelope::Body::Opaque(
+                starling_proto_fancy::fancy::feature::Opaque {
+                    plugin: "nobody-loads-this".to_owned(),
+                    payload: b"x".to_vec(),
+                    recipients: vec![7],
+                    sender: 0,
+                    payload_type: "typing".to_owned(),
+                },
+            )),
+        };
+        let actions = service
+            .frame(Inbound {
+                conn: 20,
+                session: 2,
+                type_id: ServiceKind::Plugins.outer_type(),
+                payload: envelope.encode_to_vec(),
+                gateway: "gw".to_owned(),
+                scope: 1,
+            })
+            .await;
+
+        let reached: Vec<u32> = delivered(&actions)
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect();
+        assert_eq!(reached, vec![7, 9]);
+    }
+
+    #[tokio::test]
+    #[expect(deprecated, reason = "the legacy envelope shipped clients still send")]
+    async fn plugin_data_from_a_second_device_names_the_user_others_know() {
+        // 4 is a second device of the user others know as 3.
+        let service = service().await;
+        seat(&service, 3, 3);
+        seat(&service, 4, 3);
+        seat(&service, 8, 8);
+        let message = starling_proto::proto::tcp::PluginDataTransmission {
+            sender_session: None,
+            receiver_sessions: vec![8],
+            data: Some(b"x".to_vec()),
+            data_id: Some("probe".to_owned()),
+        };
+        let actions = service
+            .frame(Inbound {
+                conn: 40,
+                session: 4,
+                type_id: PLUGIN_DATA,
+                payload: message.encode_to_vec(),
+                gateway: "gw".to_owned(),
+                scope: 1,
+            })
+            .await;
+
+        let sent = delivered(&actions);
+        assert_eq!(sent.len(), 1);
+        let relayed =
+            starling_proto::proto::tcp::PluginDataTransmission::decode(sent[0].1.as_slice())
+                .expect("a plugin data message");
+        assert_eq!(sent[0].0, 8);
+        assert_eq!(relayed.sender_session, Some(3), "never the device, 4");
     }
 }

@@ -29,8 +29,9 @@ use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger, describe_actor};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, disconnect, to_conn, to_views,
 };
+use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
 use starling_runtime::trail::{self, Record, Trail};
@@ -320,9 +321,11 @@ impl Moderation for ModerationRpc {
         );
 
         if req.session != 0 {
-            self.0
-                .fanout
-                .push(disconnect(u64::from(req.session), "banned"));
+            // By connection: a session id is not one, and passing it as one
+            // closed whichever connection happened to hold that number.
+            for device in self.0.devices(scope, req.session).await.1 {
+                self.0.fanout.push(disconnect(device.conn, "banned"));
+            }
         }
         Ok(Response::new(BanResult {
             applied: true,
@@ -382,9 +385,10 @@ impl Moderation for ModerationRpc {
         );
         // A kick is a disconnect and nothing else: the client reconnects, and
         // that is the difference between a kick and a ban.
-        self.0
-            .fanout
-            .push(disconnect(u64::from(req.session), &req.reason));
+        let scope = req.scope.map_or(1, |s| s.instance);
+        for device in self.0.devices(scope, req.session).await.1 {
+            self.0.fanout.push(disconnect(device.conn, &req.reason));
+        }
         Ok(Response::new(BanResult {
             applied: true,
             refused: String::new(),
@@ -423,7 +427,8 @@ impl ModerationService {
         };
         let banning = request.ban.unwrap_or(false);
 
-        let Some(target) = self.session(inbound.scope, request.session).await else {
+        let (everyone, devices) = self.devices(inbound.scope, request.session).await;
+        let Some(target) = devices.first().cloned() else {
             tracing::debug!(session = request.session, "kick for an unknown session");
             return Actions::new();
         };
@@ -448,8 +453,12 @@ impl ModerationService {
 
         let reason = request.reason.clone().unwrap_or_default();
         if banning {
-            self.record_ban(inbound.scope, &target, &request, &reason)
-                .await;
+            // Every device: each has its own address, and a ban that caught
+            // only the laptop would let the same person stay on the phone.
+            for device in &devices {
+                self.record_ban(inbound.scope, device, &request, &reason)
+                    .await;
+            }
         }
 
         self.logger.log(
@@ -484,20 +493,27 @@ impl ModerationService {
 
         // Everyone is told, with the actor filled in as murmur does
         // (`Messages.cpp:1602`), a client renders "X was kicked by Y" from it.
-        let announce = starling_proto::proto::tcp::UserRemove {
-            session: request.session,
-            actor: Some(inbound.session),
-            reason: Some(reason.clone()),
-            ban: Some(banning),
-            ..starling_proto::proto::tcp::UserRemove::default()
-        };
-        vec![
-            to_sessions(Vec::new(), USER_REMOVE, announce.encode_to_vec()),
-            // And the connection actually goes. Announcing a removal without
-            // closing the socket leaves the user connected and talking while
-            // every other client has stopped rendering them.
-            disconnect(target.conn, if banning { "banned" } else { "kicked" }),
-        ]
+        // Each named the way the recipient's own tree names them.
+        let shown = everyone.presented_as(target.session);
+        let mut actions = to_views(everyone.sessions(), USER_REMOVE, |viewer| {
+            starling_proto::proto::tcp::UserRemove {
+                session: everyone.seen_by(viewer, shown),
+                actor: Some(everyone.seen_by(viewer, inbound.session)),
+                reason: Some(reason.clone()),
+                ban: Some(banning),
+                ..starling_proto::proto::tcp::UserRemove::default()
+            }
+            .encode_to_vec()
+        });
+        // And the connections actually go. Announcing a removal without
+        // closing the socket leaves the user connected and talking while
+        // every other client has stopped rendering them.
+        actions.extend(
+            devices
+                .iter()
+                .map(|device| disconnect(device.conn, if banning { "banned" } else { "kicked" })),
+        );
+        actions
     }
 
     /// Whether the actor may kick, or ban, at the root.
@@ -522,20 +538,36 @@ impl ModerationService {
     }
 
     /// Who a session id refers to, from `session-view`.
-    async fn session(&self, scope: u32, session: u32) -> Option<Session> {
-        use starling_proto_fancy::sessionview::GetRequest;
+    /// Everyone connected, and the devices a peer means by naming `named`.
+    ///
+    /// A user on several devices is one id to everyone else, and that id can
+    /// outlive the device it was first handed to, so it is resolved against
+    /// the whole list rather than looked up as one session. Empty devices for
+    /// a session nobody holds or an unreachable view.
+    async fn devices(&self, scope: u32, named: u32) -> (Roster, Vec<Session>) {
+        use starling_proto_fancy::sessionview::SubscribeRequest;
         use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 
-        let transport = self.resolver.channel("session-view").ok()?;
-        let found = SessionViewClient::new(transport)
-            .get(GetRequest {
+        let Ok(transport) = self.resolver.channel("session-view") else {
+            return (Roster::new(), Vec::new());
+        };
+        let Ok(listed) = SessionViewClient::new(transport)
+            .list(SubscribeRequest {
                 scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
-                session,
+                subscriber: "moderation".to_owned(),
             })
             .await
-            .ok()?
-            .into_inner();
-        (found.session != 0).then_some(found)
+        else {
+            return (Roster::new(), Vec::new());
+        };
+        let sessions = listed.into_inner().sessions;
+        let everyone = Roster::of(sessions.clone());
+        let ids = everyone.devices_of(named);
+        let devices = sessions
+            .into_iter()
+            .filter(|session| ids.contains(&session.session))
+            .collect();
+        (everyone, devices)
     }
 
     /// Write the ban a kick left behind.

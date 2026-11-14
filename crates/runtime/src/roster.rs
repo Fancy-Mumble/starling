@@ -98,6 +98,13 @@ pub struct Roster {
     /// `session-view` has carried this all along (`Session.conn`); it was
     /// simply never folded in.
     conns: Mutex<HashMap<u32, u64>>,
+    /// Session id to the id everyone else knows it by.
+    ///
+    /// The same as the session for everyone but an account online from
+    /// several devices, which other users see as one user under one id
+    /// (`docs/SERVICES.md`, "One user, several devices"). That id can outlive
+    /// the device it was first handed to, so it is not always a key here.
+    presented: Mutex<HashMap<u32, u32>>,
     warm: AtomicBool,
 }
 
@@ -106,6 +113,15 @@ impl Roster {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A roster of exactly `sessions`, for a caller that listed them once
+    /// rather than following the view.
+    #[must_use]
+    pub fn of(sessions: Vec<Session>) -> Self {
+        let roster = Self::new();
+        roster.replace(sessions);
+        roster
     }
 
     /// Fold one `session-view` event in.
@@ -178,6 +194,12 @@ impl Roster {
                 .map(|session| (session.session, session.conn))
                 .collect();
         }
+        if let Ok(mut held) = self.presented.lock() {
+            *held = sessions
+                .iter()
+                .map(|session| (session.session, presented_as(session)))
+                .collect();
+        }
         if let Ok(mut held) = self.channels.lock() {
             *held = sessions
                 .into_iter()
@@ -207,6 +229,9 @@ impl Roster {
         if let Ok(mut held) = self.conns.lock() {
             let _ = held.insert(session.session, session.conn);
         }
+        if let Ok(mut held) = self.presented.lock() {
+            let _ = held.insert(session.session, presented_as(session));
+        }
     }
 
     /// Forget one session.
@@ -229,6 +254,70 @@ impl Roster {
         if let Ok(mut held) = self.conns.lock() {
             let _ = held.remove(&session);
         }
+        if let Ok(mut held) = self.presented.lock() {
+            let _ = held.remove(&session);
+        }
+    }
+
+    /// The id everyone but the session's own account knows it by.
+    ///
+    /// `session` itself for an unknown session, so a cold roster attributes
+    /// as it did before devices were merged rather than to nobody.
+    #[must_use]
+    pub fn presented_as(&self, session: u32) -> u32 {
+        self.presented
+            .lock()
+            .ok()
+            .and_then(|held| held.get(&session).copied())
+            .unwrap_or(session)
+    }
+
+    /// Every live session behind the id other users know, in session order.
+    ///
+    /// What a peer naming a user means: one user may be several devices, and
+    /// the id it names may belong to a device that has since left while the
+    /// others stay. An id nothing presents as is answered as itself, which is
+    /// what a cold roster or a single-device user needs.
+    #[must_use]
+    pub fn devices_of(&self, presented: u32) -> Vec<u32> {
+        let Ok(held) = self.presented.lock() else {
+            return vec![presented];
+        };
+        let mut sessions: Vec<u32> = held
+            .iter()
+            .filter(|(_, face)| **face == presented)
+            .map(|(session, _)| *session)
+            .collect();
+        if sessions.is_empty() {
+            return vec![presented];
+        }
+        sessions.sort_unstable();
+        sessions
+    }
+
+    /// How `session` is named in a message delivered to `viewer`.
+    ///
+    /// A user's own devices never see each other, so one of them is named as
+    /// the viewer itself; anyone else is named by the id that user is shown
+    /// as, which is also what an id that only names a user (its first device
+    /// gone) resolves to.
+    #[must_use]
+    pub fn seen_by(&self, viewer: u32, session: u32) -> u32 {
+        let shown = self.presented_as(session);
+        if shown == self.presented_as(viewer) {
+            viewer
+        } else {
+            shown
+        }
+    }
+
+    /// Whether `a` and `b` are devices of the same user.
+    ///
+    /// Such a pair is never shown to each other: each device sees only itself,
+    /// so the owner's own tree does not list them twice.
+    #[must_use]
+    pub fn same_user(&self, a: u32, b: u32) -> bool {
+        self.presented_as(a) == self.presented_as(b)
     }
 
     /// The connection carrying `session`, or `None` for an unknown session or a
@@ -532,6 +621,17 @@ impl Roster {
     }
 }
 
+/// The id `session` presents as, reading the 0 an older writer leaves as the
+/// session itself.
+#[must_use]
+pub fn presented_as(session: &Session) -> u32 {
+    if session.presented_as == 0 {
+        session.session
+    } else {
+        session.presented_as
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +858,53 @@ mod tests {
         assert!(roster.in_channel(4, 0).is_empty());
         assert_eq!(roster.in_channel(9, 0), vec![1]);
         assert_eq!(roster.channel_of(1), Some(9));
+    }
+
+    fn device(session: u32, presented_as: u32) -> Session {
+        Session {
+            session,
+            presented_as,
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn a_second_device_is_known_to_others_by_the_first_ones_id() {
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![device(1, 1), device(2, 1), device(3, 3)]));
+
+        assert_eq!(roster.presented_as(2), 1);
+        assert_eq!(roster.devices_of(1), vec![1, 2]);
+        assert!(roster.same_user(1, 2));
+        assert!(!roster.same_user(2, 3));
+    }
+
+    #[test]
+    fn the_shown_id_still_reaches_the_devices_after_its_first_one_left() {
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![device(1, 1), device(2, 1)]));
+        let _ = roster.apply(ViewEvent {
+            event: Some(view_event::Event::Gone(Gone {
+                session: 1,
+                ..Gone::default()
+            })),
+        });
+
+        assert_eq!(roster.devices_of(1), vec![2]);
+        assert_eq!(roster.presented_as(2), 1);
+    }
+
+    #[test]
+    fn a_writer_that_predates_merging_presents_every_session_as_itself() {
+        let roster = Roster::new();
+        let _ = roster.apply(snapshot(vec![session(4, 1)]));
+
+        assert_eq!(roster.presented_as(4), 4);
+        assert_eq!(roster.devices_of(4), vec![4]);
+        assert_eq!(
+            roster.devices_of(9),
+            vec![9],
+            "unknown is answered as itself"
+        );
     }
 }

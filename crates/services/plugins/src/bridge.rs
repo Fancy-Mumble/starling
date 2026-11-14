@@ -181,6 +181,29 @@ impl StarlingBridge {
         }
         actions
     }
+
+    /// The live sessions a plugin's `targets` stand for.
+    ///
+    /// A plugin is handed device sessions, so a live one is meant exactly and
+    /// widening it to the user's other devices would hand them a reply to
+    /// something they never sent. One that has gone may still be the id its
+    /// user is shown by, and then it means the devices that remain.
+    fn resolved(&self, targets: &[u32]) -> Vec<u32> {
+        let mut sessions: Vec<u32> = Vec::with_capacity(targets.len());
+        for target in targets {
+            let devices = if self.roster.conn_of(*target).is_some() {
+                vec![*target]
+            } else {
+                self.roster.devices_of(*target)
+            };
+            for device in devices {
+                if !sessions.contains(&device) {
+                    sessions.push(device);
+                }
+            }
+        }
+        sessions
+    }
 }
 
 impl HostBridge for StarlingBridge {
@@ -261,7 +284,8 @@ impl HostBridge for StarlingBridge {
             data: Some(data.to_vec()),
             data_id: Some(data_id.to_owned()),
         };
-        for action in self.addressed(vec![target_session], PLUGIN_DATA, message.encode_to_vec()) {
+        let targets = self.resolved(&[target_session]);
+        for action in self.addressed(targets, PLUGIN_DATA, message.encode_to_vec()) {
             self.fanout.push(action);
         }
         Ok(())
@@ -280,7 +304,7 @@ impl HostBridge for StarlingBridge {
                 None => return Ok(()),
             }
         } else {
-            message.target_sessions.to_vec()
+            self.resolved(message.target_sessions)
         };
         if recipients.is_empty() {
             return Ok(());
@@ -794,5 +818,42 @@ mod tests {
         // An unbounded scan here would delete every setting in the namespace.
         assert_eq!(prefix_end(b""), None);
         assert_eq!(prefix_end(&[0xFF, 0xFF]), None);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_target_that_is_live_is_meant_exactly_and_a_gone_one_means_its_user() {
+        // 7 and 9 are one user, shown as 7. A plugin replying to device 7 must
+        // not reach 9; once 7 has gone, the id 7 means the user, now on 9.
+        let store = starling_runtime::storage::Store::open(
+            "sqlite:file:bridge-targets-test?mode=memory&cache=shared",
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        let device = |session: u32| starling_proto_fancy::sessionview::Session {
+            session,
+            conn: u64::from(session) * 10,
+            presented_as: 7,
+            ..Default::default()
+        };
+        let roster = Arc::new(Roster::of(vec![device(7), device(9)]));
+        let bridge = StarlingBridge::new(
+            tokio::runtime::Handle::current(),
+            Resolver::new(
+                Arc::new(starling_runtime::config::Config::with_defaults(
+                    std::path::Path::new("/run/starling"),
+                )),
+                starling_runtime::inproc::Broker::new(),
+            ),
+            Arc::clone(&roster),
+            Fanout::default(),
+            store.kv(),
+            1,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(bridge.resolved(&[7]), vec![7]);
+        roster.remove(7);
+        assert_eq!(bridge.resolved(&[7]), vec![9]);
     }
 }

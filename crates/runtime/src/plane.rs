@@ -107,9 +107,44 @@ pub fn to_conns(conns: Vec<u64>, type_id: u16, payload: Vec<u8>) -> ServerAction
     }
 }
 
+/// Send each recipient the payload `view` builds for it, one `Send` per
+/// distinct payload.
+///
+/// For a message that names users: one user on several devices is named
+/// differently to its own devices than to everyone else, so the same message
+/// has a few shapes. Almost every recipient shares one, which is the one `Send`
+/// they cost.
+pub fn to_views(
+    recipients: Vec<u32>,
+    type_id: u16,
+    view: impl Fn(u32) -> Vec<u8>,
+) -> Vec<ServerAction> {
+    let mut shapes: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
+    for recipient in recipients {
+        let payload = view(recipient);
+        match shapes.iter_mut().find(|(shape, _)| *shape == payload) {
+            Some((_, sessions)) => sessions.push(recipient),
+            None => shapes.push((payload, vec![recipient])),
+        }
+    }
+    shapes
+        .into_iter()
+        .map(|(payload, sessions)| to_sessions(sessions, type_id, payload))
+        .collect()
+}
+
 /// Build a `Send` action for everyone except the speaker.
 #[must_use]
 pub fn broadcast_except(except: u32, type_id: u16, payload: Vec<u8>) -> ServerAction {
+    broadcast_excluding(vec![except], type_id, payload)
+}
+
+/// Build a `Send` action for everyone except `except`.
+///
+/// Plural for a user on several devices: none of them is shown the user as
+/// somebody else.
+#[must_use]
+pub fn broadcast_excluding(except: Vec<u32>, type_id: u16, payload: Vec<u8>) -> ServerAction {
     ServerAction {
         action: Some(server_action::Action::Send(
             starling_proto_fancy::control::Send {
@@ -118,7 +153,7 @@ pub fn broadcast_except(except: u32, type_id: u16, payload: Vec<u8>) -> ServerAc
                 r#type: u32::from(type_id),
                 payload,
                 audio: false,
-                except: vec![except],
+                except,
             },
         )),
     }

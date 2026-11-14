@@ -48,7 +48,10 @@ use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::names::{NameRule, is_channel_name};
 use starling_runtime::permit::{Permit, permission_denied, refused};
-use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_sessions};
+use starling_runtime::plane::{
+    Actions, ClientService, Fanout, Inbound, Plane, broadcast_excluding, to_sessions,
+};
+use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::settings::Settings;
 use starling_runtime::storage::{Migration, Store};
@@ -153,6 +156,12 @@ pub struct MetadataService {
     /// Needed because announcing a *hidden* channel is addressed rather than
     /// broadcast: the recipient list has to be built before it can be filtered.
     resolver: Resolver,
+    /// Who is connected, and which devices are one user.
+    ///
+    /// Read only to name a moved user the way each client knows it. Not a
+    /// readiness gate: a cold roster names every session as itself, which is
+    /// what this did before users had several devices.
+    roster: Arc<Roster>,
     /// The operator-facing record of channel edits.
     ///
     /// Separate from `logger`: that is the server's own diagnostic log, this is
@@ -207,19 +216,48 @@ const fn refusal_limit(refusal: ListenRefusal) -> listen_refusal::Limit {
 /// (`Server.cpp:2202`), rather than one message listing everybody: the field is
 /// `listening_channel_remove` on a *user*, so there is nowhere in the message
 /// to put a second one.
-fn unlisten_broadcast(unlistened: &[Unlistened]) -> Actions {
+fn unlisten_broadcast(roster: &Roster, unlistened: &[Unlistened]) -> Actions {
     unlistened
         .iter()
-        .map(|entry| {
-            let payload = starling_proto::proto::tcp::UserState {
-                session: Some(entry.session),
-                listening_channel_remove: entry.channels.clone(),
-                ..starling_proto::proto::tcp::UserState::default()
-            }
-            .encode_to_vec();
-            to_sessions(Vec::new(), USER_STATE, payload)
+        .flat_map(|entry| {
+            to_everyone(
+                roster,
+                entry.session,
+                &starling_proto::proto::tcp::UserState {
+                    listening_channel_remove: entry.channels.clone(),
+                    ..starling_proto::proto::tcp::UserState::default()
+                },
+            )
         })
         .collect()
+}
+
+/// `state` about `session`, to everyone.
+///
+/// A device of a user on several is told about itself under its own id, and
+/// everyone else about the user under the one id they know it by; the user's
+/// other devices never see it. Anyone else is one broadcast, as before.
+fn to_everyone(
+    roster: &Roster,
+    session: u32,
+    state: &starling_proto::proto::tcp::UserState,
+) -> Actions {
+    let shown = roster.presented_as(session);
+    let devices = roster.devices_of(shown);
+    let about = |id: u32| {
+        starling_proto::proto::tcp::UserState {
+            session: Some(id),
+            ..state.clone()
+        }
+        .encode_to_vec()
+    };
+    if devices == [session] {
+        return vec![to_sessions(Vec::new(), USER_STATE, about(session))];
+    }
+    vec![
+        to_sessions(vec![session], USER_STATE, about(session)),
+        broadcast_excluding(devices, USER_STATE, about(shown)),
+    ]
 }
 
 /// Tell every client where a removed channel's occupants went.
@@ -229,17 +267,18 @@ fn unlisten_broadcast(unlistened: &[Unlistened]) -> Actions {
 /// gone while it still believes it is inside would be rendering itself in a
 /// room the server has forgotten, and there is no way to leave a channel that
 /// does not exist. Telling it where it now is first leaves no such window.
-fn move_broadcast(moved: &[Relocated]) -> Actions {
+fn move_broadcast(roster: &Roster, moved: &[Relocated]) -> Actions {
     moved
         .iter()
-        .map(|entry| {
-            let payload = starling_proto::proto::tcp::UserState {
-                session: Some(entry.session),
-                channel_id: Some(entry.to),
-                ..starling_proto::proto::tcp::UserState::default()
-            }
-            .encode_to_vec();
-            to_sessions(Vec::new(), USER_STATE, payload)
+        .flat_map(|entry| {
+            to_everyone(
+                roster,
+                entry.session,
+                &starling_proto::proto::tcp::UserState {
+                    channel_id: Some(entry.to),
+                    ..starling_proto::proto::tcp::UserState::default()
+                },
+            )
         })
         .collect()
 }
@@ -487,10 +526,10 @@ impl Metadata for MetadataRpc {
             // the point: a client has to be told where it now is before it is
             // told the room is gone, and a `listening_channel_remove` naming a
             // channel it has already deleted is one it cannot match.
-            for action in move_broadcast(&removal.moved) {
+            for action in move_broadcast(&self.0.roster, &removal.moved) {
                 self.0.fanout.push(action);
             }
-            for action in unlisten_broadcast(&removal.unlistened) {
+            for action in unlisten_broadcast(&self.0.roster, &removal.unlistened) {
                 self.0.fanout.push(action);
             }
             let payload = starling_proto::proto::tcp::ChannelRemove {
@@ -1410,10 +1449,13 @@ impl MetadataService {
             TreeLimits::UNLIMITED,
         );
         if !stopped.removed.is_empty() {
-            for action in unlisten_broadcast(&[Unlistened {
-                session: session.session,
-                channels: stopped.removed,
-            }]) {
+            for action in unlisten_broadcast(
+                &self.roster,
+                &[Unlistened {
+                    session: session.session,
+                    channels: stopped.removed,
+                }],
+            ) {
                 self.fanout.push(action);
             }
         }
@@ -2008,8 +2050,8 @@ impl MetadataService {
         // must learn where it now is before its channel stops existing, and it
         // has to be able to match `listening_channel_remove` to a channel it
         // still has.
-        let mut actions = move_broadcast(&removal.moved);
-        actions.extend(unlisten_broadcast(&removal.unlistened));
+        let mut actions = move_broadcast(&self.roster, &removal.moved);
+        actions.extend(unlisten_broadcast(&self.roster, &removal.unlistened));
         actions.push(to_sessions(
             recipients,
             CHANNEL_REMOVE,
@@ -2057,6 +2099,7 @@ impl Serve for MetadataService {
             store,
             journal,
             channel_names: NameRule::new(),
+            roster: Arc::new(Roster::new()),
         }))
     }
 
@@ -2076,6 +2119,8 @@ impl Serve for MetadataService {
         // every channel a client creates, and a gRPC round trip on that path
         // would put `server-config` in the way of the channel tree.
         let watchers = self.settings.watch(&scopes);
+        // Ungated, see the field: the gate it opens is never declared closed.
+        let roster = Arc::clone(&self.roster).follow(ctx.clone(), Self::NAME, "metadata roster");
         let sweeper = tokio::spawn({
             let service = Arc::clone(&self);
             let scopes = scopes.clone();
@@ -2093,6 +2138,7 @@ impl Serve for MetadataService {
         });
         ctx.shutdown.wait().await;
         sweeper.abort();
+        roster.abort();
         for watcher in watchers {
             watcher.abort();
         }
@@ -2181,6 +2227,7 @@ mod tests {
             store: Some(store),
             journal: None,
             channel_names: NameRule::new(),
+            roster: Arc::new(Roster::new()),
         }
     }
 

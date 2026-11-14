@@ -427,12 +427,14 @@ impl UserdataService {
             return Actions::new();
         };
 
-        let sessions = self.sessions(inbound.scope).await;
+        // Through any device of the user: the id a client asks about may be one
+        // shown for a user whose first device has since left.
+        let everyone = starling_runtime::roster::Roster::of(self.sessions(inbound.scope).await);
         let account_of = |session: u32| {
-            sessions
-                .iter()
-                .find(|other| other.session == session)
-                .and_then(|other| identity::account(other.registered, other.account))
+            everyone
+                .devices_of(session)
+                .into_iter()
+                .find_map(|device| everyone.account_of(device))
         };
 
         // Half the budget, not all of it: this reply shares the lane with

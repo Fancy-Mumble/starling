@@ -41,7 +41,7 @@ use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::log::{Category, LogEvent, Logger, describe_actor};
 use starling_runtime::permit::{Permit, permission_denied, refused};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions, to_views,
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -991,7 +991,20 @@ impl TextService {
             }
             return Actions::new();
         }
-        vec![to_sessions(recipients, TEXT_MESSAGE, echo.encode_to_vec())]
+        // Each recipient sees the sender, and anyone the message names, the
+        // way its own tree shows them.
+        to_views(recipients, TEXT_MESSAGE, |viewer| {
+            starling_proto::proto::tcp::TextMessage {
+                actor: echo.actor.map(|actor| self.roster.seen_by(viewer, actor)),
+                session: echo
+                    .session
+                    .iter()
+                    .map(|named| self.roster.seen_by(viewer, *named))
+                    .collect(),
+                ..echo.clone()
+            }
+            .encode_to_vec()
+        })
     }
 
     /// Tell `push` about a message, for the people who are not here to read it.
@@ -1109,12 +1122,16 @@ impl TextService {
 
         // A direct message names its recipients, so they need no lookup
         // beyond the rest of each recipient's devices.
-        for session in message.session.iter().copied() {
-            add(session);
-            if let Some(account) = self.roster.account_of(session) {
-                for device in self.roster.sessions_of_account(account) {
-                    add(device);
-                }
+        for named in message.session.iter().copied() {
+            // The id the sender sees may be a user on several devices, or one
+            // whose first device has left: every device behind it.
+            let siblings = self
+                .roster
+                .account_of(named)
+                .map(|account| self.roster.sessions_of_account(account))
+                .unwrap_or_default();
+            for session in self.roster.devices_of(named).into_iter().chain(siblings) {
+                add(session);
             }
         }
         if !message.session.is_empty()

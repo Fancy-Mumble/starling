@@ -30,7 +30,7 @@ use starling_runtime::data_key::{DataKey, KeyId};
 use starling_runtime::ids::{Uuid7, now_ms};
 use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions, to_views,
 };
 use starling_runtime::ratelimit::Throttled;
 use starling_runtime::roster::Roster;
@@ -974,6 +974,20 @@ impl PchatService {
         echoes: bool,
         payload: Vec<u8>,
     ) -> Actions {
+        let members = self.members(inbound, channel, echoes);
+        if members.is_empty() {
+            return Actions::new();
+        }
+        vec![to_sessions(
+            members,
+            ServiceKind::Pchat.outer_type(),
+            payload,
+        )]
+    }
+
+    /// Who a relay to `channel` reaches: everyone there but the sender, and
+    /// the sender too when the body `echoes`.
+    fn members(&self, inbound: &Inbound, channel: u32, echoes: bool) -> Vec<u32> {
         let mut members = self.roster.in_channel(channel, inbound.session);
         if members.is_empty() && !self.roster.is_warm() {
             tracing::warn!(
@@ -983,19 +997,27 @@ impl PchatService {
             // An echo cannot rescue this. Membership is unknown, so telling the
             // sender its pin took would be the one client on the server that
             // believes it.
-            return Actions::new();
+            return Vec::new();
         }
         if echoes {
             members.push(inbound.session);
         }
-        if members.is_empty() {
-            return Actions::new();
-        }
-        vec![to_sessions(
-            members,
-            ServiceKind::Pchat.outer_type(),
-            payload,
-        )]
+        members
+    }
+
+    /// `message` relayed to its channel, its sender named as each member
+    /// knows them: a user on several devices is one id to everyone else, and
+    /// their own device to themselves.
+    fn message_to_channel(&self, inbound: &Inbound, message: &Message) -> Actions {
+        let members = self.members(inbound, message.channel, false);
+        to_views(members, ServiceKind::Pchat.outer_type(), |viewer| {
+            let mut named = message.clone();
+            named.sender = self.roster.seen_by(viewer, message.sender);
+            PchatEnvelope {
+                body: Some(pchat_envelope::Body::Message(named)),
+            }
+            .encode_to_vec()
+        })
     }
 
     /// One acknowledgement, addressed at the connection that asked.
@@ -1162,14 +1184,11 @@ impl PchatService {
             _ => "",
         };
         let acknowledgement = self.ack(inbound, &message.message_id, status, detail);
-        let relay = PchatEnvelope {
-            body: Some(pchat_envelope::Body::Message(message)),
-        };
 
         let mut actions = vec![acknowledgement];
         // No echo: a sender learns its own message landed from the `ack`
         // above, which says more than a copy of what it just sent.
-        actions.extend(self.to_channel(inbound, channel, false, relay.encode_to_vec()));
+        actions.extend(self.message_to_channel(inbound, &message));
         actions
     }
 
@@ -1243,7 +1262,12 @@ impl PchatService {
             return vec![permission_denied(inbound, Perm::ENTER, request.channel)];
         }
 
-        let page = self.fetch(inbound.scope, &request).await;
+        let mut page = self.fetch(inbound.scope, &request).await;
+        // Named as a live message would be. A stored id whose device has gone
+        // is answered as itself, which is all an archive id ever promised.
+        for message in &mut page.messages {
+            message.sender = self.roster.seen_by(inbound.session, message.sender);
+        }
         let reply = PchatEnvelope {
             body: Some(pchat_envelope::Body::FetchResponse(page)),
         };
@@ -1309,10 +1333,14 @@ impl PchatService {
             .as_deref()
             .map(|cert| self.roster.sessions_with_cert(cert))
             .unwrap_or_default();
-        if let Some(session) = relay.unicast.filter(|&session| session != 0)
-            && !recipients.contains(&session)
-        {
-            recipients.push(session);
+        // A named session may be a user on several devices, or a device that
+        // has left while the user is still shown under its id.
+        if let Some(named) = relay.unicast.filter(|&session| session != 0) {
+            for session in self.roster.devices_of(named) {
+                if !recipients.contains(&session) {
+                    recipients.push(session);
+                }
+            }
         }
 
         match (relay.unicast, recipients.is_empty()) {
@@ -3312,5 +3340,82 @@ mod tests {
             ),
             _ => (Vec::new(), false),
         }
+    }
+
+    /// Seat `session` in channel 4 as a device of the user shown as `shown`.
+    fn seat_device(service: &PchatService, session: u32, shown: u32, cert: &[u8]) {
+        service
+            .roster
+            .upsert(&starling_proto_fancy::sessionview::Session {
+                session,
+                channel: 4,
+                cert_hash: cert.to_vec(),
+                presented_as: shown,
+                ..starling_proto_fancy::sessionview::Session::default()
+            });
+    }
+
+    /// Each session `actions` sends a pchat envelope to, with that envelope.
+    fn delivered(actions: &[ServerAction]) -> Vec<(u32, pchat_envelope::Body)> {
+        let mut out = Vec::new();
+        for action in actions {
+            let (sessions, _) = addressed(action);
+            let body = PchatEnvelope::decode(sent_payload(action).as_slice())
+                .ok()
+                .and_then(|envelope| envelope.body);
+            if let Some(body) = body {
+                out.extend(sessions.into_iter().map(|session| (session, body.clone())));
+            }
+        }
+        out.sort_unstable_by_key(|(session, _)| *session);
+        out
+    }
+
+    #[tokio::test]
+    async fn a_message_from_a_second_device_names_the_user_others_know() {
+        // 7 (the sender) is a second device of the user others know as 3.
+        let service = service_holding(Perm::ENTER | Perm::TEXT_MESSAGE).await;
+        seat_device(&service, 3, 3, SPEAKER_CERT);
+        seat_device(&service, 7, 3, SPEAKER_CERT);
+
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Message(message(4, b"x"))))
+            .await;
+
+        let senders: Vec<(u32, u32)> = delivered(&actions)
+            .into_iter()
+            .filter_map(|(session, body)| match body {
+                pchat_envelope::Body::Message(message) => Some((session, message.sender)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            senders,
+            vec![(3, 3), (8, 3)],
+            "a stranger sees the user, the sibling device sees itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_for_a_user_whose_named_device_left_reaches_their_other_devices() {
+        // The sender sealed to 3, which has gone; the user is on 11 and 12.
+        let service = service_holding(Perm::ENTER).await;
+        seat_device(&service, 11, 3, b"");
+        seat_device(&service, 12, 3, b"");
+        let inbound = frame(pchat_envelope::Body::KeyDeliver(KeyDeliver {
+            channel: 4,
+            epoch: 1,
+            recipient: 3,
+            sealed_key: vec![9],
+            ..KeyDeliver::default()
+        }));
+
+        let actions = service.frame(inbound).await;
+
+        let recipients: Vec<u32> = delivered(&actions)
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect();
+        assert_eq!(recipients, vec![11, 12]);
     }
 }

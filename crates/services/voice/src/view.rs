@@ -80,11 +80,17 @@ impl SessionCache {
     /// speaker's. Off the packet path entirely, this runs once per
     /// `VoiceTarget`, not once per frame.
     #[must_use]
+    ///
+    /// `session` may be the id a user on several devices is shown as, which
+    /// outlives the device it was first handed to; any device of that user
+    /// answers for it, since they share one channel.
     pub fn channel_of(&self, session: u32) -> Option<u32> {
-        self.sessions
-            .lock()
-            .ok()?
-            .get(&session)
+        let held = self.sessions.lock().ok()?;
+        held.get(&session)
+            .or_else(|| {
+                held.values()
+                    .find(|device| starling_runtime::roster::presented_as(device) == session)
+            })
             .map(|session| session.channel)
     }
 
@@ -125,6 +131,10 @@ pub fn compose<'a>(sessions: impl Iterator<Item = &'a Session>) -> RoutingSnapsh
     for session in sessions {
         let id = SessionId(session.session);
         snapshot = snapshot.with_member(id, ChannelId(session.channel));
+        snapshot = snapshot.with_presented(
+            id,
+            SessionId(starling_runtime::roster::presented_as(session)),
+        );
 
         // Listening to a channel without being in it, and the gain the user set
         // on each. The volume map is read separately from the channel list

@@ -400,7 +400,8 @@ async fn a_direct_message_reaches_every_device_on_both_ends() {
     let (laptop_session, _) =
         handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
     let mut phone = Client::connect(deployment.port).await;
-    let _ = handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
     let mut bob = Client::connect(deployment.port).await;
     let bob_session = starling_harness::handshake(&mut bob, "bob").await;
 
@@ -433,7 +434,11 @@ async fn a_direct_message_reaches_every_device_on_both_ends() {
     assert_eq!(next_text(&mut bob).await.message, "from alice");
     let copy = next_text(&mut phone).await;
     assert_eq!(copy.message, "from alice");
-    assert_eq!(copy.actor, Some(laptop_session));
+    assert_eq!(
+        copy.actor,
+        Some(phone_session),
+        "the phone never sees the laptop: what Alice said reads as its own"
+    );
     assert_eq!(
         copy.session,
         vec![bob_session],
@@ -622,6 +627,326 @@ async fn a_record_written_on_one_device_is_pushed_to_the_others() {
             "{who} was sent a record it should not have been"
         );
     }
+
+    deployment.stop().await;
+}
+
+/// Log in as `authenticate` and keep the user list the server sends before
+/// `ServerSync`, which the harness's own handshakes read past.
+async fn user_list(
+    client: &mut Client,
+    authenticate: tcp::Authenticate,
+) -> (u32, Vec<tcp::UserState>) {
+    let (greeting, _) = client.recv().await;
+    assert_eq!(greeting, 0, "the server speaks Version first");
+    client
+        .send(
+            0,
+            &tcp::Version {
+                version_v2: Some(MUMBLE_VERSION_V2),
+                ..tcp::Version::default()
+            },
+        )
+        .await;
+    client.send(2, &authenticate).await;
+    let mut users = Vec::new();
+    loop {
+        let (type_id, payload) = client.recv().await;
+        match type_id {
+            9 => users.push(tcp::UserState::decode(payload.as_slice()).expect("a UserState")),
+            5 => {
+                let sync = tcp::ServerSync::decode(payload.as_slice()).expect("a ServerSync");
+                return (sync.session.expect("a session id"), users);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `client` is told anything about `session` within `within`.
+///
+/// For an id that must stay hidden: a `UserState` or `UserRemove` naming it
+/// would put a user in the tree that nobody else can see.
+async fn hears_of(client: &mut Client, session: u32, within: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some((type_id, payload)) = client.next_frame(remaining).await else {
+            return false;
+        };
+        let named = match type_id {
+            9 => tcp::UserState::decode(payload.as_slice())
+                .ok()
+                .and_then(|state| state.session),
+            8 => tcp::UserRemove::decode(payload.as_slice())
+                .ok()
+                .map(|removal| removal.session),
+            _ => None,
+        };
+        if named == Some(session) {
+            return true;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_user_on_two_devices_is_one_user_to_everyone_else() {
+    // The bug: Alice on her laptop and her phone was two "Alice" rows in
+    // every other client's tree.
+    let data_dir = TempDir::new("one-user");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = starling_harness::handshake(&mut bob, "bob").await;
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+
+    assert!(
+        !hears_of(&mut bob, phone_session, NO_EVICTION).await,
+        "a client already connected was shown the second device"
+    );
+
+    let mut carol = Client::connect(deployment.port).await;
+    let (_, listed) = user_list(&mut carol, credentials("carol", "")).await;
+    let alices: Vec<u32> = listed
+        .iter()
+        .filter(|state| state.name.as_deref() == Some("alice"))
+        .filter_map(|state| state.session)
+        .collect();
+    assert_eq!(
+        alices,
+        vec![laptop_session],
+        "one Alice, under the first id"
+    );
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn a_users_own_devices_do_not_see_each_other() {
+    let data_dir = TempDir::new("own-devices");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, listed) = user_list(&mut phone, from_device("alice", "pw", "phone")).await;
+
+    let named: Vec<u32> = listed.iter().filter_map(|state| state.session).collect();
+    assert_eq!(named, vec![phone_session], "the phone sees only itself");
+    assert!(
+        !hears_of(&mut laptop, phone_session, NO_EVICTION).await,
+        "the laptop was shown its own phone"
+    );
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn the_first_device_leaving_keeps_the_user_online_under_the_same_id() {
+    let data_dir = TempDir::new("first-leaves");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = starling_harness::handshake(&mut bob, "bob").await;
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+
+    laptop.close().await;
+    assert!(
+        bob.next_removal_of(laptop_session, NO_EVICTION)
+            .await
+            .is_none(),
+        "Alice is still here on her phone"
+    );
+
+    phone.close().await;
+    assert!(
+        bob.next_removal_of(laptop_session, FRAME_TIMEOUT)
+            .await
+            .is_some(),
+        "the last device leaving is Alice leaving, under the id Bob knows"
+    );
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn a_message_from_a_second_device_is_from_the_user_everyone_knows() {
+    let data_dir = TempDir::new("second-device-text");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let _ = handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = starling_harness::handshake(&mut bob, "bob").await;
+
+    phone
+        .send(
+            11,
+            &tcp::TextMessage {
+                channel_id: vec![0],
+                message: "hi from the phone".to_owned(),
+                ..tcp::TextMessage::default()
+            },
+        )
+        .await;
+    assert_eq!(next_text(&mut bob).await.actor, Some(laptop_session));
+    assert_eq!(
+        next_text(&mut laptop).await.actor,
+        Some(laptop_session),
+        "the laptop reads its own user's message as its own"
+    );
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn moving_one_device_moves_the_whole_user() {
+    let data_dir = TempDir::new("move-devices");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+    let lounge = deployment.create_channel("Lounge").await;
+
+    let mut bob = Client::connect(deployment.port).await;
+    let _ = starling_harness::handshake(&mut bob, "bob").await;
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+
+    let _ = phone
+        .enter(phone_session, lounge, "the phone walks into the lounge")
+        .await
+        .expect("anyone may enter");
+    // Bob sees Alice, under the id he knows, walk in.
+    reaches(&mut bob, laptop_session, lounge).await;
+    // And the laptop is told it came along.
+    reaches(&mut laptop, laptop_session, lounge).await;
+
+    deployment.stop().await;
+}
+
+/// Wait until `client` is told `session` is in `channel`.
+///
+/// Past the join announcement, which names a channel too.
+async fn reaches(client: &mut Client, session: u32, channel: u32) {
+    timeout(FRAME_TIMEOUT, async {
+        while client.next_move_of(session).await.channel_id != Some(channel) {}
+    })
+    .await
+    .expect("the move was announced");
+}
+
+/// The `UserStats` answer about `session`, asked for now.
+async fn stats_of(client: &mut Client, session: u32) -> tcp::UserStats {
+    client
+        .send(
+            22,
+            &tcp::UserStats {
+                session: Some(session),
+                ..tcp::UserStats::default()
+            },
+        )
+        .await;
+    timeout(FRAME_TIMEOUT, async {
+        loop {
+            let (type_id, payload) = client.recv().await;
+            if type_id == 22 {
+                return tcp::UserStats::decode(payload.as_slice()).expect("a UserStats");
+            }
+        }
+    })
+    .await
+    .expect("UserStats was answered")
+}
+
+#[tokio::test]
+async fn an_administrator_sees_every_device_of_a_user_and_nobody_else_does() {
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::{AclEntry, AclSet};
+
+    let data_dir = TempDir::new("device-stats");
+    let deployment = Deployment::start(data_dir.path()).await;
+    let _ = register_with_password(&deployment, "alice", "pw").await;
+
+    let mut laptop = Client::connect(deployment.port).await;
+    let (laptop_session, _) =
+        handshake_epoch1_as(&mut laptop, from_device("alice", "pw", "laptop")).await;
+    let mut phone = Client::connect(deployment.port).await;
+    let (phone_session, _) =
+        handshake_epoch1_as(&mut phone, from_device("alice", "pw", "phone")).await;
+    let mut bob = Client::connect(deployment.port).await;
+    let bob_session = starling_harness::handshake(&mut bob, "bob").await;
+
+    let ordinary = stats_of(&mut bob, laptop_session).await;
+    assert_eq!(ordinary.session, Some(laptop_session));
+    assert!(
+        ordinary.devices.is_empty(),
+        "only an administrator is shown the devices"
+    );
+
+    // murmur's administrator: Ban on the root channel.
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![AclEntry {
+                apply_here: true,
+                apply_subs: true,
+                group: Some("all".to_owned()),
+                grant: Perm::BAN.bits(),
+                ..AclEntry::default()
+            }],
+            groups: Vec::new(),
+        })
+        .await;
+    deployment
+        .wait_until_permitted(bob_session, 0, Perm::BAN.bits())
+        .await;
+
+    let admin = stats_of(&mut bob, laptop_session).await;
+    let mut devices: Vec<(u32, String)> = admin
+        .devices
+        .iter()
+        .map(|device| {
+            (
+                device.session.unwrap_or_default(),
+                device.device_name.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    devices.sort();
+    assert_eq!(
+        devices,
+        vec![
+            (laptop_session, "laptop".to_owned()),
+            (phone_session, "phone".to_owned())
+        ]
+    );
+    assert!(
+        admin
+            .devices
+            .iter()
+            .all(|device| device.onlinesecs.is_some()),
+        "each device carries its own statistics"
+    );
 
     deployment.stop().await;
 }

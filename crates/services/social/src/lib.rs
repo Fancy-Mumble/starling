@@ -61,9 +61,7 @@ use starling_proto_fancy::fancy::social::{
 use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::permit::Permit;
-use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
-};
+use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_views};
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_runtime::storage::{Migration, Store};
@@ -384,16 +382,64 @@ impl SocialService {
     /// Empty means "nobody is there", never "everybody": a `Send` naming no
     /// sessions is delivered to the whole server, which is the leak this
     /// service used to have.
-    fn relay(sessions: Vec<u32>, body: social_envelope::Body) -> Actions {
+    ///
+    /// Each recipient gets the body with every session in it named as that
+    /// recipient knows it: a user on several devices is one id to everyone
+    /// else, and only their own device to themselves.
+    fn relay(&self, sessions: Vec<u32>, body: &social_envelope::Body) -> Actions {
         if sessions.is_empty() {
             return Actions::new();
         }
-        let envelope = SocialEnvelope { body: Some(body) };
-        vec![to_sessions(
-            sessions,
-            ServiceKind::Social.outer_type(),
-            envelope.encode_to_vec(),
-        )]
+        to_views(sessions, ServiceKind::Social.outer_type(), |viewer| {
+            SocialEnvelope {
+                body: Some(self.named_for(viewer, body)),
+            }
+            .encode_to_vec()
+        })
+    }
+
+    /// `body` with every session it names rewritten for `viewer`.
+    fn named_for(&self, viewer: u32, body: &social_envelope::Body) -> social_envelope::Body {
+        use social_envelope::Body;
+        let seen = |session: u32| self.roster.seen_by(viewer, session);
+        let mut body = body.clone();
+        match &mut body {
+            Body::Reaction(reaction) => reaction.actor = seen(reaction.actor),
+            Body::Typing(typing) => typing.actor = seen(typing.actor),
+            Body::Receipt(receipt) => receipt.actor = seen(receipt.actor),
+            Body::Poll(poll) => poll.creator = seen(poll.creator),
+            Body::Vote(vote) => vote.voter = seen(vote.voter),
+            Body::Stroke(stroke) => stroke.actor = seen(stroke.actor),
+            Body::Clear(clear) => clear.actor = seen(clear.actor),
+            Body::WatchState(state) => {
+                state.host = seen(state.host);
+                // Two devices of one viewer are one viewer to everybody else.
+                let mut viewers: Vec<u32> = Vec::with_capacity(state.viewers.len());
+                for named in state.viewers.iter().map(|viewer| seen(*viewer)) {
+                    if !viewers.contains(&named) {
+                        viewers.push(named);
+                    }
+                }
+                state.viewers = viewers;
+            }
+            Body::PollState(_) | Body::Watch(_) => {}
+        }
+        body
+    }
+
+    /// The device of the user `named` that should host a watch session.
+    ///
+    /// A peer names a user by the id it knows, which may be a device that has
+    /// left; a device already watching is the one with a connection to end
+    /// the session on, so it is preferred.
+    fn host_device(&self, named: u32, watching: &HashMap<u32, u64>) -> u32 {
+        let devices = self.roster.devices_of(named);
+        devices
+            .iter()
+            .copied()
+            .find(|device| watching.contains_key(device))
+            .or_else(|| devices.first().copied())
+            .unwrap_or(named)
     }
 
     /// Record a poll, or refuse it.
@@ -680,7 +726,7 @@ impl SocialService {
             return Actions::new();
         };
         let sessions = self.channel_including(channel);
-        Self::relay(sessions, social_envelope::Body::Poll(stamped))
+        self.relay(sessions, &social_envelope::Body::Poll(stamped))
     }
 
     /// Count a vote and relay it, or tell the voter why it was not counted.
@@ -692,7 +738,7 @@ impl SocialService {
         {
             Ballot::Counted(stamped) => {
                 let sessions = self.channel_including(stamped.channel);
-                Self::relay(sessions, social_envelope::Body::Vote(stamped))
+                self.relay(sessions, &social_envelope::Body::Vote(stamped))
             }
             Ballot::Unknown => {
                 tracing::info!(
@@ -853,7 +899,7 @@ impl SocialService {
                 if state.host != actor {
                     return None;
                 }
-                state.host = sync.new_host;
+                state.host = self.host_device(sync.new_host, &record.viewer_conns);
                 // The new host's connection, if they were watching as a viewer.
                 // Unknown otherwise, and a host whose connection is unknown is
                 // one whose disconnect cannot end the session, so the entry
@@ -861,7 +907,7 @@ impl SocialService {
                 // sweep below treats as already gone.
                 record.host_conn = record
                     .viewer_conns
-                    .get(&sync.new_host)
+                    .get(&state.host)
                     .copied()
                     .unwrap_or(u64::MAX);
             }
@@ -920,10 +966,7 @@ impl ClientService for SocialService {
         let mut actions = Actions::new();
         for (channel, state) in self.forget_conn(conn) {
             let sessions = self.channel_including(channel);
-            actions.extend(Self::relay(
-                sessions,
-                social_envelope::Body::WatchState(state),
-            ));
+            actions.extend(self.relay(sessions, &social_envelope::Body::WatchState(state)));
         }
         actions
     }
@@ -959,14 +1002,14 @@ impl ClientService for SocialService {
                 // keys on: a session id is recycled, a certificate is the
                 // person. Empty for a peer that presented none.
                 reaction.actor_cert = self.roster.cert_of(inbound.session).unwrap_or_default();
-                Self::relay(sessions, social_envelope::Body::Reaction(reaction))
+                self.relay(sessions, &social_envelope::Body::Reaction(reaction))
             }
             // Everyone but the sender, who knows they are typing. murmur is
             // explicit about the exclusion (`Messages.cpp:4098`).
             Some(social_envelope::Body::Typing(mut typing)) => {
                 let sessions = self.channel_excluding(typing.channel, inbound.session);
                 typing.actor = inbound.session;
-                Self::relay(sessions, social_envelope::Body::Typing(typing))
+                self.relay(sessions, &social_envelope::Body::Typing(typing))
             }
             Some(social_envelope::Body::Receipt(mut receipt)) => {
                 let sessions = self.channel_including(receipt.channel);
@@ -989,7 +1032,7 @@ impl ClientService for SocialService {
                     readers = sessions.len(),
                     "relayed a read watermark"
                 );
-                Self::relay(sessions, social_envelope::Body::Receipt(receipt))
+                self.relay(sessions, &social_envelope::Body::Receipt(receipt))
             }
             Some(social_envelope::Body::Poll(poll)) => self.on_poll(&inbound, poll).await,
             Some(social_envelope::Body::Vote(vote)) => self.on_vote(&inbound, &vote).await,
@@ -998,19 +1041,19 @@ impl ClientService for SocialService {
                     return Actions::new();
                 };
                 let sessions = self.channel_including(state.channel);
-                Self::relay(sessions, social_envelope::Body::WatchState(state))
+                self.relay(sessions, &social_envelope::Body::WatchState(state))
             }
             Some(social_envelope::Body::Stroke(mut stroke)) => {
                 let sessions = self.channel_excluding(stroke.channel, inbound.session);
                 stroke.actor = inbound.session;
                 // Bounded before it is relayed. Flat x,y pairs, hence twice.
                 stroke.points.truncate(MAX_STROKE_POINTS * 2);
-                Self::relay(sessions, social_envelope::Body::Stroke(stroke))
+                self.relay(sessions, &social_envelope::Body::Stroke(stroke))
             }
             Some(social_envelope::Body::Clear(mut clear)) => {
                 let sessions = self.channel_excluding(clear.channel, inbound.session);
                 clear.actor = inbound.session;
-                Self::relay(sessions, social_envelope::Body::Clear(clear))
+                self.relay(sessions, &social_envelope::Body::Clear(clear))
             }
             // Server-to-client bodies, and an envelope with nothing in it.
             // Answering would mean echoing a client's own claim about state
@@ -1678,5 +1721,88 @@ mod tests {
         assert_eq!(poll_expiry(&poll, 0), 2 * POLL_RETENTION_MS);
         let open = Poll::default();
         assert_eq!(poll_expiry(&open, 5), 5 + POLL_RETENTION_MS);
+    }
+
+    /// Add `device` to the roster as a further device of the user shown as
+    /// `shown`, in [`CHANNEL`].
+    fn second_device(service: &SocialService, device: u32, shown: u32) {
+        service.roster.upsert(&Session {
+            session: device,
+            channel: CHANNEL,
+            presented_as: shown,
+            ..Session::default()
+        });
+    }
+
+    /// Every recipient of `actions` and the envelope it was sent.
+    fn per_recipient(actions: &Actions) -> HashMap<u32, SocialEnvelope> {
+        let mut seen = HashMap::new();
+        for action in actions {
+            let Some(server_action::Action::Send(send)) = &action.action else {
+                panic!("expected a Send");
+            };
+            let envelope = SocialEnvelope::decode(send.payload.as_slice()).expect("an envelope");
+            for session in &send.sessions {
+                let _ = seen.insert(*session, envelope.clone());
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_receipt_from_a_second_device_names_the_user_others_know() {
+        // 9 is a second device of the user everyone else knows as 7.
+        let service = service(&[7, 8]).await;
+        second_device(&service, 9, 7);
+        let envelope = SocialEnvelope {
+            body: Some(social_envelope::Body::Receipt(ReadReceipt {
+                channel: CHANNEL,
+                message_id: "m-1".to_owned(),
+                ..ReadReceipt::default()
+            })),
+        };
+        let relayed = per_recipient(&service.frame(frame(9, &envelope)).await);
+
+        let actor = |session: u32| match &relayed[&session].body {
+            Some(social_envelope::Body::Receipt(receipt)) => receipt.actor,
+            _ => panic!("expected a receipt"),
+        };
+        assert_eq!(actor(8), 7, "a stranger sees the id the user is shown as");
+        assert_eq!(actor(7), 7, "a sibling device sees itself, never 9");
+        assert_eq!(actor(9), 9, "the sender sees itself");
+    }
+
+    #[tokio::test]
+    async fn a_watch_handed_to_a_user_goes_to_the_device_that_is_watching() {
+        // 7 has left; the user is still shown as 7, now on device 9 alone.
+        let service = service(&[8]).await;
+        second_device(&service, 9, 7);
+        let start = WatchSync {
+            session_id: "w1".to_owned(),
+            channel: CHANNEL,
+            kind: watch_sync::Kind::Start as i32,
+            ..WatchSync::default()
+        };
+        let _ = service.watch(&start, 8, 100).expect("host starts");
+        let join = WatchSync {
+            kind: watch_sync::Kind::Join as i32,
+            ..start.clone()
+        };
+        let _ = service.watch(&join, 9, 109).expect("device 9 joins");
+        let transfer = WatchSync {
+            kind: watch_sync::Kind::TransferHost as i32,
+            new_host: 7,
+            ..start
+        };
+        let state = service.watch(&transfer, 8, 100).expect("transferred");
+        assert_eq!(state.host, 9, "the device watching is the one that hosts");
+
+        let relayed =
+            per_recipient(&service.relay(vec![8, 9], &social_envelope::Body::WatchState(state)));
+        let Some(social_envelope::Body::WatchState(seen)) = &relayed[&8].body else {
+            panic!("expected a watch state");
+        };
+        assert_eq!(seen.host, 7, "others know the host by the id shown");
+        assert_eq!(seen.viewers, vec![7]);
     }
 }

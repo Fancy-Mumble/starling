@@ -14,11 +14,13 @@
 //! [`handshake`]. Getting it wrong produces a client that connects in
 //! development and hangs in the wild (`docs/PORTING-PLAN.md` R4).
 
+pub mod announce;
 pub mod ids;
 pub mod session;
 
 pub mod handshake;
 pub mod invite;
+pub mod presence;
 pub mod state;
 
 pub use handshake::Handshake;
@@ -63,53 +65,6 @@ const CODEC_VERSION: u16 = 21;
 
 /// Upstream `PermissionDenied`.
 const PERMISSION_DENIED: u16 = 12;
-
-/// Announce a `UserState` change that happened in `channel`.
-///
-/// murmur broadcasts to everybody, which is why its control fan-out grows with
-/// the square of the population (`PROTOCOL-REDESIGN.md` §5, S1). Subscribers
-/// get a `SyncDelta` only if they are looking at `channel`, and one looking
-/// elsewhere gets nothing; that omission is the saving. Encoded once for both
-/// (§4, Z3). `subject` is who the change is *about*, never who caused it.
-fn announce_user_state(connections: &Connections, subject: u32, state: &tcp::UserState) -> Actions {
-    let payload = state.encode_to_vec();
-    let channel = connections
-        .by_session(subject)
-        .map_or(0, |pending| pending.channel);
-    let (flood, subscribed) = connections.audience(channel);
-
-    // The roster is empty or a lock was lost. Falling back to the unaddressed
-    // broadcast is what this did before subscriptions existed, and it is the
-    // safe direction: a state change that reaches nobody leaves a client
-    // rendering a world that has moved on.
-    let nobody_is_reachable = flood.is_empty() && subscribed.is_empty();
-    if nobody_is_reachable {
-        return vec![to_sessions(Vec::new(), USER_STATE, payload)];
-    }
-
-    let mut actions = Actions::new();
-    if !flood.is_empty() {
-        actions.push(to_sessions(flood, USER_STATE, payload.clone()));
-    }
-    if !subscribed.is_empty() {
-        let delta = starling_proto_fancy::fancy::domain::MetadataEnvelope {
-            body: Some(
-                starling_proto_fancy::fancy::domain::metadata_envelope::Body::Delta(
-                    starling_proto_fancy::fancy::domain::SyncDelta {
-                        user_states: vec![payload],
-                        ..Default::default()
-                    },
-                ),
-            ),
-        };
-        actions.push(to_sessions(
-            subscribed,
-            ServiceKind::Metadata.outer_type(),
-            delta.encode_to_vec(),
-        ));
-    }
-    actions
-}
 
 /// The root channel, which is always id 0.
 const ROOT_CHANNEL: u32 = 0;
@@ -234,7 +189,7 @@ impl ClientService for SessionLifecycleService {
             .as_ref()
             .map(|pending| pending.name.clone())
             .unwrap_or_default();
-        let Some(session) = self.connections.close(conn) else {
+        let Some((session, departure)) = self.connections.close(conn) else {
             // No session means the connection never finished the handshake, so
             // nobody ever "left"; the gateway already recorded the disconnect.
             return Actions::new();
@@ -256,21 +211,26 @@ impl ClientService for SessionLifecycleService {
                 .await;
         }
 
+        let unbind = ServerAction {
+            action: Some(server_action::Action::SessionDown(
+                starling_proto_fancy::control::SessionDown { conn, session },
+            )),
+        };
+        if !departure.last {
+            // The user is still here on another device, which is all anyone
+            // else ever saw of them; this device's own peers never saw it.
+            let mut actions = announce::merged_flags(&self.connections, departure.shown);
+            actions.push(unbind);
+            return actions;
+        }
         // Everyone else is told, because a client that never hears a
         // `UserRemove` renders a ghost for the rest of its connection.
         let removal = tcp::UserRemove {
-            session,
+            session: departure.shown,
             reason: Some(reason.to_owned()),
             ..tcp::UserRemove::default()
         };
-        vec![
-            to_sessions(Vec::new(), 8, removal.encode_to_vec()),
-            ServerAction {
-                action: Some(server_action::Action::SessionDown(
-                    starling_proto_fancy::control::SessionDown { conn, session },
-                )),
-            },
-        ]
+        vec![to_sessions(Vec::new(), 8, removal.encode_to_vec()), unbind]
     }
 }
 
@@ -622,7 +582,9 @@ impl SessionLifecycleService {
         // No session named means "tell me about myself", which is how a client
         // asks for its own connection information.
         let wanted = request.session.unwrap_or(inbound.session);
-        let Some(target) = self.connections.by_session(wanted) else {
+        // The id the asker knows may be a user on several devices: the stats are
+        // the first device's, the one holding that id while it is connected.
+        let Some(target) = self.connections.named(wanted).into_iter().next() else {
             // Asking about somebody who has just gone is ordinary, not an
             // error, but it is worth seeing when a window stays empty.
             tracing::debug!(
@@ -647,17 +609,23 @@ impl SessionLifecycleService {
         // them: `voice` should not be asked about sessions the asker may not
         // see into.
         let from_client = if local {
-            let crypt = self.voice_crypt(inbound.scope, wanted).await;
-            tcp::user_stats::Stats {
-                good: Some(crypt.good),
-                late: Some(crypt.late),
-                lost: Some(crypt.lost),
-                resync: Some(crypt.resync),
-            }
+            self.crypt_stats(inbound.scope, target.session).await
         } else {
             tcp::user_stats::Stats::default()
         };
-        let reply = user_stats(&target, from_client, details, local, now_ms());
+        // An administrator looking at a user on several devices is shown each
+        // of them; everyone else sees the one user they know.
+        let devices = self.connections.named(wanted);
+        let breakdown = details && wanted != inbound.session && devices.len() > 1;
+        let reply = tcp::UserStats {
+            session: Some(wanted),
+            devices: if breakdown {
+                self.device_stats(inbound.scope, &devices).await
+            } else {
+                Vec::new()
+            },
+            ..user_stats(&target, from_client, details, local, now_ms())
+        };
         tracing::debug!(
             conn = inbound.conn,
             session = wanted,
@@ -666,6 +634,32 @@ impl SessionLifecycleService {
             "answering UserStats"
         );
         vec![to_conn(inbound.conn, USER_STATS, reply.encode_to_vec())]
+    }
+
+    /// The server's crypt counters for `session`, murmur's `from_client` half.
+    async fn crypt_stats(&self, scope: u32, session: u32) -> tcp::user_stats::Stats {
+        let crypt = self.voice_crypt(scope, session).await;
+        tcp::user_stats::Stats {
+            good: Some(crypt.good),
+            late: Some(crypt.late),
+            lost: Some(crypt.lost),
+            resync: Some(crypt.resync),
+        }
+    }
+
+    /// Everything an administrator is shown about each of a user's devices,
+    /// each under its own session id.
+    async fn device_stats(&self, scope: u32, devices: &[PendingConnection]) -> Vec<tcp::UserStats> {
+        let mut stats = Vec::with_capacity(devices.len());
+        for device in devices {
+            let from_client = self.crypt_stats(scope, device.session).await;
+            stats.push(tcp::UserStats {
+                session: Some(device.session),
+                device_name: (!device.device_name.is_empty()).then(|| device.device_name.clone()),
+                ..user_stats(device, from_client, true, true, now_ms())
+            });
+        }
+        stats
     }
 
     /// Whether the asker is an administrator, by murmur's test for it.
@@ -784,7 +778,8 @@ impl SessionLifecycleService {
     /// refused for a user's own session too unless they hold it.
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
-        let Some(target) = self.connections.by_session(target_session) else {
+        let devices = self.connections.named(target_session);
+        let Some(target) = devices.first().cloned() else {
             tracing::debug!(
                 session = target_session,
                 "speak-state for an unknown session"
@@ -847,28 +842,29 @@ impl SessionLifecycleService {
             )];
         }
 
-        let updated = self.connections.set_speak_state(
-            target.conn,
-            state.mute,
-            state.deaf,
-            state.priority_speaker,
-            // Never from a client: the guard above already refused any message
-            // carrying `suppress`, and passing it through would walk it past
-            // that refusal.
-            None,
-        );
-        let Some(session) = updated else {
+        // Every device of the user: a mute that silenced only the laptop would
+        // leave the phone talking under the same name.
+        for device in &devices {
+            let _ = self.connections.set_speak_state(
+                device.conn,
+                state.mute,
+                state.deaf,
+                state.priority_speaker,
+                // Never from a client: the guard above already refused any
+                // message carrying `suppress`, and passing it through would walk
+                // it past that refusal.
+                None,
+            );
+            self.handshake
+                .announce_changed(&self.connections, device.conn)
+                .await;
+        }
+        let Some(applied) = self.connections.by_session(target.session) else {
             return Actions::new();
         };
-        let Some(applied) = self.connections.by_session(session) else {
-            return Actions::new();
-        };
+        let session = applied.session;
 
         self.record_speak_change(inbound, &target, &applied);
-
-        self.handshake
-            .announce_changed(&self.connections, target.conn)
-            .await;
 
         // Asked for, or changed underneath, never simply "all of them".
         //
@@ -901,7 +897,7 @@ impl SessionLifecycleService {
             ),
             ..tcp::UserState::default()
         };
-        announce_user_state(&self.connections, session, &echo)
+        announce::whole_user(&self.connections, applied.presented_as, &echo)
     }
 
     /// Register a user, or oneself (`UserState.user_id`).
@@ -1036,7 +1032,27 @@ impl SessionLifecycleService {
             user_id: Some(account.id as u32),
             ..tcp::UserState::default()
         };
-        announce_user_state(&self.connections, session, &echo)
+        announce::user_state(&self.connections, session, &echo)
+    }
+
+    /// Bring a user's other devices into `target` after `moved` went there,
+    /// and tell the view about every one of them.
+    ///
+    /// On the first device's permission: they are the same person, already
+    /// let in.
+    async fn follow(&self, scope: u32, devices: &[PendingConnection], moved: u32, target: u32) {
+        for other in devices.iter().filter(|device| device.session != moved) {
+            let _ = self
+                .handshake
+                .enter(scope, other.session, target, other.account, true)
+                .await;
+            self.connections.set_channel(other.conn, target);
+        }
+        for device in devices {
+            self.handshake
+                .announce_changed(&self.connections, device.conn)
+                .await;
+        }
     }
 
     /// Move `moved` into `target`, whether or not that is the caller.
@@ -1053,10 +1069,15 @@ impl SessionLifecycleService {
         target: u32,
         tokens: Vec<String>,
     ) -> Actions {
-        let Some(subject) = self.connections.by_session(moved) else {
+        let Some(subject) = self.connections.named(moved).into_iter().next() else {
             tracing::debug!(session = moved, "move for an unknown session");
             return Actions::new();
         };
+        // A user's devices share one row in everyone else's tree, so they share
+        // one channel: moving any of them moves them all.
+        let devices = self.connections.devices_of(subject.presented_as);
+        let moved = subject.session;
+        let moves_self = subject.presented_as == self.connections.shown_of(inbound.session);
         // Already there. murmur returns early on this rather than re-entering,
         // and re-entering would broadcast a move that did not happen.
         if subject.channel == target {
@@ -1067,7 +1088,7 @@ impl SessionLifecycleService {
         // now (`vendor/server/src/murmur/Messages.cpp:1075`), the power is
         // over the room they are being taken out of, which is why it is checked
         // there and not on the mover.
-        if moved != inbound.session
+        if !moves_self
             && !self
                 .permit
                 .allows(inbound, subject.channel, Perm::MOVE.bits())
@@ -1149,6 +1170,7 @@ impl SessionLifecycleService {
         // tree about where this session is. `set_channel` existed and was never
         // called, which is why every session read as being in the root.
         self.connections.set_channel(subject.conn, target);
+        self.follow(inbound.scope, &devices, moved, target).await;
 
         // Recorded after `metadata` accepted it, so the log carries moves that
         // happened rather than moves that were asked for. `subject` still holds
@@ -1168,14 +1190,6 @@ impl SessionLifecycleService {
                 .detail(format!("{}: {} -> {target}", subject.name, subject.channel)),
         );
 
-        self.handshake
-            .announce_changed(&self.connections, subject.conn)
-            .await;
-
-        // Everyone is told, not just the mover: a client builds its user tree
-        // from these, so a move only one client hears about is a user who
-        // appears in two channels at once.
-        //
         // `actor` is who caused the change, and it is what makes this read as a
         // move the user *made* rather than one done to them: a client with no
         // actor to attribute the change to logs "You were moved to X by the
@@ -1188,11 +1202,7 @@ impl SessionLifecycleService {
             channel_id: Some(target),
             ..tcp::UserState::default()
         };
-        vec![to_sessions(
-            Vec::new(),
-            USER_STATE,
-            announce.encode_to_vec(),
-        )]
+        announce::moved(&self.connections, subject.presented_as, &announce)
     }
 
     /// Self-mute and self-deafen, which are the only `UserState` fields a
@@ -1307,7 +1317,7 @@ impl SessionLifecycleService {
         // A self-mute is the highest-rate presence change there is, a
         // push-to-talk binding emits two per utterance, so it is the one most
         // worth not sending to ten thousand people who are looking elsewhere.
-        announce_user_state(&self.connections, session, &echo)
+        announce::user_state(&self.connections, session, &echo)
     }
 
     /// Start or stop listening to channels, and re-weight the ones already on.
@@ -1538,7 +1548,7 @@ impl SessionLifecycleService {
             texture: cleared_texture.then(Vec::new),
             ..tcp::UserState::default()
         };
-        announce_user_state(&self.connections, target_session, &echo)
+        announce::user_state(&self.connections, target_session, &echo)
     }
 
     /// Clear the stored comment or avatar on a registered account.

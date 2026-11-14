@@ -339,6 +339,27 @@ device id in `Authenticate` (fork fields 1001-1003), and one account may then
 be online from a laptop and a phone at once. The same device reconnecting still
 replaces its ghost.
 
+#### One user, several devices
+
+Those devices are one user to everyone else (`session-lifecycle/src/presence.rs`):
+
+* **One id.** Every device presents as the first device's session id, published
+  as `Session.presented_as`. The id stays reserved in the pool until the last
+  device leaves, so peers never see the user leave and rejoin because the
+  first device dropped. Only the last device leaving sends a `UserRemove`.
+* **Each device sees only itself.** A message reaching a device names the
+  user's other devices as that device itself, and anyone else's devices by
+  their shown id (`Roster::seen_by`, sent with `plane::to_views`). A user's own
+  devices never hear each other's voice.
+* **One channel.** A new device lands where the user is, and moving any device
+  moves them all.
+* **Merged flags.** Peers see the user self-muted or self-deafened only when
+  every device is.
+* **A named user is every device.** Whispers, direct messages, kicks, bans and
+  moves that name the shown id reach every device behind it
+  (`Roster::devices_of`), including after the device that first held the id
+  has left.
+
 ### `session-view` — the composed live view
 
 Covered in §2.2. Owns nothing, writes nothing, has no client-facing type. Its

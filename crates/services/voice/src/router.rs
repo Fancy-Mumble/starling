@@ -773,7 +773,9 @@ impl Router {
         let target = Target::decode(packet.target);
         // Overwriting rather than trusting: the sender field arrived from a peer
         // that could have written anyone's id in it.
-        packet.sender = speaker;
+        // And as the user everyone else knows, not the device: the listener
+        // has never heard of the owner's second one.
+        packet.sender = self.snapshot.presented_as(speaker);
 
         // Each recipient with the context and gain their own copy carries: one
         // frame can arrive as a whisper for one person, a shout for another and

@@ -49,7 +49,7 @@ use starling_runtime::ids::now_ms;
 use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::permit::Permit;
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions, to_views,
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -870,7 +870,11 @@ impl FilesService {
             body: Some(files_envelope::Body::Listing(Listing {
                 channel: request.channel,
                 files: if allowed {
-                    self.listing(request.channel, request.limit).await
+                    self.listing(request.channel, request.limit)
+                        .await
+                        .iter()
+                        .map(|share| self.owned_as_seen_by(inbound.session, share))
+                        .collect()
                 } else {
                     Vec::new()
                 },
@@ -2249,23 +2253,21 @@ impl FilesService {
             },
             &std::cell::OnceCell::new(),
         );
-        let share = FilesEnvelope {
-            body: Some(files_envelope::Body::Share(Share {
-                key: key.to_owned(),
-                thumb_key,
-                channel: pending.channel,
-                owner,
-                uploader_account: pending.uploader.account.unwrap_or_default(),
-                uploader_name: pending.uploader.name.clone().unwrap_or_default(),
-                uploader_cert: pending.uploader.cert.clone().unwrap_or_default(),
-                filename: pending.filename.clone(),
-                size,
-                shared_at_ms: now_ms(),
-                public: pending.public,
-                visibility: pending.visibility() as i32,
-                share_url: self.share_url_if(pending.public, key),
-                expires_at_ms: pending.share_expires_at_ms.unwrap_or_default(),
-            })),
+        let share = Share {
+            key: key.to_owned(),
+            thumb_key,
+            channel: pending.channel,
+            owner,
+            uploader_account: pending.uploader.account.unwrap_or_default(),
+            uploader_name: pending.uploader.name.clone().unwrap_or_default(),
+            uploader_cert: pending.uploader.cert.clone().unwrap_or_default(),
+            filename: pending.filename.clone(),
+            size,
+            shared_at_ms: now_ms(),
+            public: pending.public,
+            visibility: pending.visibility() as i32,
+            share_url: self.share_url_if(pending.public, key),
+            expires_at_ms: pending.share_expires_at_ms.unwrap_or_default(),
         };
         // The uploader included: it learns the final key and size from the same
         // message everyone else does, rather than from a reply only it gets.
@@ -2273,11 +2275,27 @@ impl FilesService {
         if sessions.is_empty() {
             return;
         }
-        self.fanout.push_all(vec![to_sessions(
+        self.fanout.push_all(to_views(
             sessions,
             ServiceKind::Files.outer_type(),
-            share.encode_to_vec(),
-        )]);
+            |viewer| {
+                FilesEnvelope {
+                    body: Some(files_envelope::Body::Share(
+                        self.owned_as_seen_by(viewer, &share),
+                    )),
+                }
+                .encode_to_vec()
+            },
+        ));
+    }
+
+    /// `share` with its owner named as `viewer` knows them: a user on several
+    /// devices is one id to everyone else, and their own device to themselves.
+    fn owned_as_seen_by(&self, viewer: u32, share: &Share) -> Share {
+        Share {
+            owner: self.roster.seen_by(viewer, share.owner),
+            ..share.clone()
+        }
     }
 
     /// The files shared in a channel, newest first.
@@ -4724,5 +4742,51 @@ mod tests {
             .strip_prefix("https://files.example.org/s/")
             .expect("a link on this server");
         assert!(stat_of(&service, key).await.exists);
+    }
+
+    /// The owner each listed file is named by, as `viewer` asks for channel 4.
+    async fn owners_seen_by(service: &FilesService, viewer: u32) -> Vec<u32> {
+        let inbound = Inbound {
+            conn: 1,
+            session: viewer,
+            type_id: ServiceKind::Files.outer_type(),
+            payload: Vec::new(),
+            gateway: String::new(),
+            scope: 1,
+        };
+        let request = starling_proto_fancy::fancy::files::ListRequest {
+            channel: 4,
+            limit: 50,
+            ..Default::default()
+        };
+        match service.answer_list(&inbound, request).await.body {
+            Some(files_envelope::Body::Listing(listing)) => {
+                listing.files.iter().map(|share| share.owner).collect()
+            }
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_shared_from_a_device_that_left_is_owned_by_the_user_others_know() {
+        // Alice shared from 7, which has gone; she is still shown as 7 and is
+        // online on 9. Carol must not be told about 9, a device she never saw.
+        let service = service().await;
+        service.roster.replace(vec![alice(), carol()]);
+        let hers = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
+        assert_eq!(put_through(&service, &hers, b"hi").await, 201);
+
+        let second = starling_proto_fancy::sessionview::Session {
+            presented_as: 7,
+            ..session_of(9, 109, Some(42), "alice", &[0xA1; 20])
+        };
+        service.roster.replace(vec![second, carol()]);
+
+        assert_eq!(owners_seen_by(&service, 5).await, vec![7]);
+        assert_eq!(
+            owners_seen_by(&service, 9).await,
+            vec![9],
+            "her device sees itself"
+        );
     }
 }

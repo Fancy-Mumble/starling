@@ -12,6 +12,7 @@ use starling_proto_fancy::control::Opened;
 use starling_runtime::ids::now_ms;
 
 use crate::ids::SessionId;
+use crate::presence::{Departure, Presences};
 use crate::session::{SessionAllocator, SessionSource as _};
 
 /// Who a peer turned out to be, once `userdata` has answered.
@@ -35,6 +36,9 @@ pub struct Identity {
     /// The device the login was admitted as, as `userdata` checked it. Empty
     /// when it named none, and for every guest.
     pub device_id: String,
+    /// What the owner calls that device, as the client announced it. Shown
+    /// only to administrators, beside the device's statistics.
+    pub device_name: String,
 }
 
 /// Everything known about a connection that has not finished the handshake.
@@ -209,6 +213,11 @@ pub struct PendingConnection {
     /// What lets one account be online from two devices: a second session of
     /// the same account from a *different* device is not a ghost of the first.
     pub device_id: String,
+    /// What the owner calls this device, empty if it named none.
+    pub device_name: String,
+    /// The id other users know this session by: its own, unless another
+    /// device of the same account arrived first ([`crate::presence`]).
+    pub presented_as: u32,
 }
 
 /// What a client last told the server about its own side of the link.
@@ -294,6 +303,9 @@ pub struct ReportedStats {
 pub struct Connections {
     inner: Arc<Mutex<HashMap<u64, PendingConnection>>>,
     sessions: Arc<Mutex<SessionAllocator>>,
+    /// Which devices are one user. Locked only while `sessions` is held, so an
+    /// id is reserved for a user in the same step it is allocated or freed.
+    presences: Arc<Mutex<Presences>>,
     /// Session ids in use, against the pool's own size.
     ///
     /// The one gauge here with a real denominator: `max_users * 2` is what an
@@ -334,6 +346,7 @@ impl Connections {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(SessionAllocator::new(max_users))),
+            presences: Arc::new(Mutex::new(Presences::default())),
             in_use: pressure.gauge("sessions.in_use", u64::from(max_users).saturating_mul(2)),
         }
     }
@@ -450,16 +463,25 @@ impl Connections {
                 return None;
             };
             self.in_use.observe(sessions.in_use() as u64);
-            session.0
+            let shown = self
+                .presences
+                .lock()
+                .ok()?
+                .arrive(identity.account, session.0)
+                .shown;
+            (session.0, shown)
         };
+        let (session, shown) = session;
         let mut inner = self.inner.lock().ok()?;
         let pending = inner.get_mut(&conn)?;
         pending.session = session;
+        pending.presented_as = shown;
         pending.account = identity.account;
         pending.name = identity.name.clone();
         pending.comment_hash = identity.comment_hash.clone();
         pending.texture_hash = identity.texture_hash.clone();
         pending.device_id = identity.device_id.clone();
+        pending.device_name = identity.device_name.clone();
         Some(session)
     }
 
@@ -776,17 +798,98 @@ impl Connections {
         (pending.session != 0).then_some(pending.session)
     }
 
-    /// Forget a connection, returning its session id to the pool.
-    pub fn close(&self, conn: u64) -> Option<u32> {
+    /// Forget a connection, returning to the pool whatever ids nobody shows
+    /// any more.
+    ///
+    /// `None` for a connection that never got a session, so nobody left.
+    pub fn close(&self, conn: u64) -> Option<(u32, Departure)> {
         let pending = self.inner.lock().ok()?.remove(&conn)?;
-        if pending.session != 0 {
-            if let Ok(mut sessions) = self.sessions.lock() {
-                sessions.release(SessionId(pending.session));
-                self.in_use.observe(sessions.in_use() as u64);
-            }
-            return Some(pending.session);
+        if pending.session == 0 {
+            return None;
         }
-        None
+        let mut sessions = self.sessions.lock().ok()?;
+        let departure = self.presences.lock().ok()?.leave(pending.session);
+        for id in &departure.released {
+            sessions.release(SessionId(*id));
+        }
+        self.in_use.observe(sessions.in_use() as u64);
+        Some((pending.session, departure))
+    }
+
+    /// The id other users know `session` by, `session` itself if unknown.
+    #[must_use]
+    pub fn shown_of(&self, session: u32) -> u32 {
+        self.by_session(session)
+            .map_or(session, |pending| pending.presented_as)
+    }
+
+    /// How `session` is named in a message to `viewer`.
+    ///
+    /// A user's own devices never see each other, so one of them is named as
+    /// the viewer itself; anyone else's device is named by the id that user
+    /// is shown as.
+    #[must_use]
+    pub fn seen_by(&self, viewer: u32, session: u32) -> u32 {
+        let shown = self.shown_of(session);
+        if shown == self.shown_of(viewer) {
+            viewer
+        } else {
+            shown
+        }
+    }
+
+    /// Whether the user shown as `shown` reads as self-muted and self-deafened.
+    ///
+    /// Only when every device is: one device still talking means the user can
+    /// still be heard.
+    #[must_use]
+    pub fn merged_self_flags(&self, shown: u32) -> (bool, bool) {
+        let devices = self.devices_of(shown);
+        let all =
+            |flag: fn(&PendingConnection) -> bool| !devices.is_empty() && devices.iter().all(flag);
+        (
+            all(|device| device.self_mute),
+            all(|device| device.self_deaf),
+        )
+    }
+
+    /// The devices a peer means by naming `session`.
+    ///
+    /// Every device of the user when it names the id that user is shown as;
+    /// otherwise the one session, which is what a device naming itself means.
+    /// Empty for a session nobody holds.
+    #[must_use]
+    pub fn named(&self, session: u32) -> Vec<PendingConnection> {
+        let devices = self.devices_of(session);
+        if devices.is_empty() {
+            self.by_session(session).into_iter().collect()
+        } else {
+            devices
+        }
+    }
+
+    /// Every device of this server's connections that presents as `shown`.
+    ///
+    /// The local half of [`starling_runtime::roster::Roster::devices_of`]:
+    /// what a moderator or a move naming a user has to reach.
+    ///
+    /// The device holding `shown` first, then the rest in session order, so
+    /// "the user's device" means the same one on every call.
+    #[must_use]
+    pub fn devices_of(&self, shown: u32) -> Vec<PendingConnection> {
+        let mut devices: Vec<PendingConnection> = self
+            .inner
+            .lock()
+            .map(|inner| {
+                inner
+                    .values()
+                    .filter(|pending| pending.session != 0 && pending.presented_as == shown)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        devices.sort_by_key(|device| (device.session != shown, device.session));
+        devices
     }
 
     /// Every connection that has been given a session id.
@@ -1027,10 +1130,43 @@ mod tests {
         let connections = Connections::new(2);
         connections.opened(&opened(1), "gw");
         let first = connections.allocate(1, &guest("a")).expect("a session id");
-        assert_eq!(connections.close(1), Some(first));
+        assert_eq!(
+            connections.close(1).map(|(session, _)| session),
+            Some(first)
+        );
 
         connections.opened(&opened(2), "gw");
         assert!(connections.allocate(2, &guest("b")).is_some());
+    }
+
+    #[test]
+    fn the_id_a_user_is_shown_by_is_not_reused_while_a_device_still_shows_it() {
+        // A pool of three ids: two held by one account, one by a guest.
+        let connections = Connections::new(2);
+        let alice = Identity {
+            account: Some(7),
+            ..guest("alice")
+        };
+        connections.opened(&opened(1), "gw");
+        let laptop = connections.allocate(1, &alice).expect("a session id");
+        connections.opened(&opened(2), "gw");
+        let phone = connections.allocate(2, &alice).expect("a session id");
+        assert_eq!(connections.get(2).map(|p| p.presented_as), Some(laptop));
+        connections.opened(&opened(9), "gw");
+        assert!(connections.allocate(9, &guest("carol")).is_some());
+
+        let (_, gone) = connections.close(1).expect("the laptop had a session");
+        assert!(!gone.last, "the phone is still the same user");
+        connections.opened(&opened(3), "gw");
+        assert!(
+            connections.allocate(3, &guest("bob")).is_none(),
+            "the laptop's id is still shown for the phone"
+        );
+
+        let (_, gone) = connections.close(2).expect("the phone had a session");
+        assert!(gone.last);
+        assert_eq!(gone.released, vec![phone, laptop]);
+        assert!(connections.allocate(3, &guest("bob")).is_some());
     }
 
     #[test]

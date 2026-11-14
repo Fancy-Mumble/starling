@@ -81,7 +81,7 @@ use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::types::ServiceKind;
 use starling_runtime::permit::Permit;
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions,
+    Actions, ClientService, Fanout, Inbound, Plane, to_conn, to_sessions, to_views,
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -351,7 +351,7 @@ impl ScreenshareService {
                     // routes an answer by whose stream it is for, and one
                     // stamped with anything else is an answer it drops.
                     Dialect::Signal => signal_bytes(
-                        broadcaster_session,
+                        self.roster.seen_by(target_session, broadcaster_session),
                         target_session,
                         SignalType::SdpAnswer,
                         sdp,
@@ -396,16 +396,53 @@ impl ScreenshareService {
     /// The share's channel, never the whole server: a title is content, and
     /// "Quarterly numbers, draft" announced server-wide is that content
     /// leaving the room it belongs to.
-    fn audience(&self, channel: u32, except: u32, payload: Vec<u8>) -> Actions {
+    ///
+    /// Each member gets the payload `view` builds for them, because a session
+    /// in it is named per viewer: a user on several devices is one id to
+    /// everyone else, and only their own device to themselves.
+    fn audience(&self, channel: u32, except: u32, view: impl Fn(u32) -> Vec<u8>) -> Actions {
         let sessions = self.roster.in_channel(channel, except);
         if sessions.is_empty() {
             return Actions::new();
         }
-        vec![to_sessions(
-            sessions,
-            ServiceKind::Screenshare.outer_type(),
-            payload,
-        )]
+        to_views(sessions, ServiceKind::Screenshare.outer_type(), view)
+    }
+
+    /// A signal from `sender` as `viewer` is to read it.
+    fn signal_for(
+        &self,
+        viewer: u32,
+        sender: u32,
+        target: u32,
+        kind: SignalType,
+        payload: &str,
+    ) -> Vec<u8> {
+        let target = if target == 0 {
+            0
+        } else {
+            self.roster.seen_by(viewer, target)
+        };
+        signal_bytes(
+            self.roster.seen_by(viewer, sender),
+            target,
+            kind,
+            payload.to_owned(),
+        )
+    }
+
+    /// The device presenting as the user `named`, if any of theirs is.
+    ///
+    /// A viewer addresses a presenter by the id it knows, which is the user's
+    /// and may belong to a device that has left or is not the one sharing;
+    /// shares are filed by the device, so the device with one is the answer.
+    /// A sibling device names the presenter as itself, which is why `named`
+    /// is widened to its user first.
+    fn presenting_device(&self, named: u32) -> Option<u32> {
+        let user = self.roster.presented_as(named);
+        self.roster
+            .devices_of(user)
+            .into_iter()
+            .find(|device| self.share(&signal_share_id(*device)).is_some())
     }
 
     /// The share `share_id` names, if there is one.
@@ -464,15 +501,18 @@ impl ScreenshareService {
             sfu.create_session(inbound.session);
         }
         let channel = start.channel;
-        let announcement = ScreenshareEnvelope {
-            body: Some(screenshare_envelope::Body::Start(Start {
-                // Stamped, never taken from the message: a presenter field a
-                // client fills is a client announcing somebody else's share.
-                presenter: inbound.session,
-                ..start
-            })),
-        };
-        self.audience(channel, inbound.session, announcement.encode_to_vec())
+        self.audience(channel, inbound.session, |viewer| {
+            ScreenshareEnvelope {
+                body: Some(screenshare_envelope::Body::Start(Start {
+                    // Stamped, never taken from the message: a presenter field
+                    // a client fills is a client announcing somebody else's
+                    // share.
+                    presenter: self.roster.seen_by(viewer, inbound.session),
+                    ..start.clone()
+                })),
+            }
+            .encode_to_vec()
+        })
     }
 
     /// An SDP offer, handed to the SFU.
@@ -572,11 +612,9 @@ impl ScreenshareService {
                     // Relayed rather than dropped, because a viewer that missed
                     // the first one is still showing a dead stream and this is
                     // idempotent for one that did not.
-                    None => self.audience(
-                        channel,
-                        inbound.session,
-                        signal_bytes(inbound.session, 0, SignalType::Stop, String::new()),
-                    ),
+                    None => self.audience(channel, inbound.session, |viewer| {
+                        self.signal_for(viewer, inbound.session, 0, SignalType::Stop, "")
+                    }),
                 }
             }
             SignalType::SdpOffer => self.signal_offer(inbound, signal, channel),
@@ -593,7 +631,11 @@ impl ScreenshareService {
                     // Accepted and dropped: this SFU is ICE-lite. Handed over
                     // rather than discarded here so that the one place that
                     // decides what a candidate is worth stays the SFU's.
-                    let broadcaster = if target == 0 { inbound.session } else { target };
+                    let broadcaster = if target == 0 {
+                        inbound.session
+                    } else {
+                        self.presenting_device(target).unwrap_or(target)
+                    };
                     sfu.add_ice_candidate(broadcaster, inbound.session, signal.payload.clone());
                     return Actions::new();
                 }
@@ -629,19 +671,18 @@ impl ScreenshareService {
             // offer it drops.
             sfu.create_session(inbound.session);
         }
-        self.audience(
-            channel,
-            inbound.session,
-            // The payload is the track metadata every viewer re-parses, so it
-            // is relayed verbatim; a re-announce that lost it downgrades every
-            // viewer's idea of the share to a single screen track.
-            signal_bytes(
+        // The payload is the track metadata every viewer re-parses, so it is
+        // relayed verbatim; a re-announce that lost it downgrades every
+        // viewer's idea of the share to a single screen track.
+        self.audience(channel, inbound.session, |viewer| {
+            self.signal_for(
+                viewer,
                 inbound.session,
                 0,
                 SignalType::Start,
-                signal.payload.clone(),
-            ),
-        )
+                &signal.payload,
+            )
+        })
     }
 
     /// A `WebRtcSignal` SDP offer: the stream coming in, or one going out.
@@ -679,7 +720,10 @@ impl ScreenshareService {
                 sfu.broadcaster_offer(inbound.session, signal.payload.clone());
             }
             SignalOffer::Outbound { broadcaster } => {
-                let Some(share) = self.share(&signal_share_id(broadcaster)) else {
+                let Some(share) = self
+                    .presenting_device(broadcaster)
+                    .and_then(|device| self.share(&signal_share_id(device)))
+                else {
                     tracing::debug!(
                         session = inbound.session,
                         broadcaster,
@@ -699,19 +743,23 @@ impl ScreenshareService {
     /// rather than a degraded one - the clients negotiate a mesh between
     /// themselves and no media touches this process.
     fn relay(&self, inbound: &Inbound, channel: u32, signal: &WebRtcSignal) -> Actions {
-        let payload = signal_bytes(
-            inbound.session,
-            signal.target_session,
-            signal.signal_type(),
-            signal.payload.clone(),
-        );
+        let view = |viewer| {
+            self.signal_for(
+                viewer,
+                inbound.session,
+                signal.target_session,
+                signal.signal_type(),
+                &signal.payload,
+            )
+        };
         if signal.target_session == 0 {
-            return self.audience(channel, inbound.session, payload);
+            return self.audience(channel, inbound.session, view);
         }
         // Directed, and only within the channel: murmur checks
         // `pDst->cChannel == c` before relaying, which is what stops a signal
         // being addressed at a session on the other side of the server.
-        if self.roster.channel_of(signal.target_session) != Some(channel) {
+        let targets = self.directed_at(signal.target_session, channel);
+        if targets.is_empty() {
             tracing::debug!(
                 session = inbound.session,
                 target = signal.target_session,
@@ -719,11 +767,25 @@ impl ScreenshareService {
             );
             return Actions::new();
         }
-        vec![to_sessions(
-            vec![signal.target_session],
-            ServiceKind::Screenshare.outer_type(),
-            payload,
-        )]
+        to_views(targets, ServiceKind::Screenshare.outer_type(), view)
+    }
+
+    /// The devices in `channel` a signal naming the user `named` is for.
+    ///
+    /// The presenting device when the user is presenting, since a signal to a
+    /// presenter is about their broadcast; otherwise every device of theirs in
+    /// the channel, because nothing says which one is negotiating and the
+    /// others drop a signal for a peer connection they do not have.
+    fn directed_at(&self, named: u32, channel: u32) -> Vec<u32> {
+        let in_channel = |device: &u32| self.roster.channel_of(*device) == Some(channel);
+        if let Some(device) = self.presenting_device(named).filter(in_channel) {
+            return vec![device];
+        }
+        self.roster
+            .devices_of(named)
+            .into_iter()
+            .filter(in_channel)
+            .collect()
     }
 
     /// Somebody ending a share.
@@ -780,10 +842,21 @@ impl ScreenshareService {
                 listed
             })
             .unwrap_or_default();
+        // Named as the asker knows them, and once per user: two devices of
+        // one viewer are one viewer to everybody else.
+        let mut sessions: Vec<u32> = Vec::with_capacity(viewers.len());
+        for named in viewers
+            .into_iter()
+            .map(|viewer| self.roster.seen_by(inbound.session, viewer))
+        {
+            if !sessions.contains(&named) {
+                sessions.push(named);
+            }
+        }
         let reply = ScreenshareEnvelope {
             body: Some(screenshare_envelope::Body::Viewers(Viewers {
                 share_id: request.share_id.clone(),
-                sessions: viewers,
+                sessions,
             })),
         };
         vec![to_conn(
@@ -798,8 +871,11 @@ impl ScreenshareService {
     /// The presenter, or the moderator power in that channel. Anyone else
     /// naming the id used to be enough, which made every live share stoppable
     /// by every connected client.
+    ///
+    /// The presenter is the user, not the device: their other devices are
+    /// told the share is their own, so refusing them its stop would be a lie.
     async fn may_stop(&self, inbound: &Inbound, share: &Share) -> bool {
-        inbound.session == share.presenter
+        self.roster.same_user(inbound.session, share.presenter)
             || self.allows(inbound, share.channel, Perm::MUTE_DEAFEN).await
     }
 
@@ -860,34 +936,31 @@ impl ScreenshareService {
             // outbound peer holding sockets for the life of the process.
             sfu.destroy_session(share.presenter);
         }
-        let (stopped, except) = match share.dialect {
-            Dialect::Canon => (
+        match share.dialect {
+            // Nobody is excepted, the presenter included: a presenter whose
+            // share was stopped by a moderator has to be told, and a presenter
+            // who stopped it themselves is not harmed by the confirmation.
+            Dialect::Canon => self.audience(share.channel, 0, |viewer| {
                 ScreenshareEnvelope {
                     body: Some(screenshare_envelope::Body::Stop(Stop {
                         share_id: share_id.to_owned(),
-                        actor,
+                        actor: self.roster.seen_by(viewer, actor),
                     })),
                 }
-                .encode_to_vec(),
-                // Nobody is excepted, the presenter included: a presenter whose
-                // share was stopped by a moderator has to be told, and a
-                // presenter who stopped it themselves is not harmed by the
-                // confirmation.
-                0,
-            ),
-            Dialect::Signal => (
-                // Stamped with the presenter however it ended: viewers tear
-                // down the stream the *sender* was broadcasting, so a STOP
-                // carrying a moderator's session would tear down nothing.
-                signal_bytes(share.presenter, 0, SignalType::Stop, String::new()),
-                // This dialect has no `actor` field, so a client cannot tell
-                // its own STOP from anybody else's and tears its local view
-                // down on either. Excepting whoever ended it keeps that from
-                // happening to them, and is what murmur's relay did anyway.
-                actor,
-            ),
-        };
-        self.audience(share.channel, except, stopped)
+                .encode_to_vec()
+            }),
+            // Stamped with the presenter however it ended: viewers tear down
+            // the stream the *sender* was broadcasting, so a STOP carrying a
+            // moderator's session would tear down nothing.
+            //
+            // This dialect has no `actor` field, so a client cannot tell its
+            // own STOP from anybody else's and tears its local view down on
+            // either. Excepting whoever ended it keeps that from happening to
+            // them, and is what murmur's relay did anyway.
+            Dialect::Signal => self.audience(share.channel, actor, |viewer| {
+                self.signal_for(viewer, share.presenter, 0, SignalType::Stop, "")
+            }),
+        }
     }
 }
 
@@ -1683,5 +1756,85 @@ mod tests {
 
         let _ = service.frame(frame(4, &claimed)).await;
         assert_eq!(service.share("s8").map(|share| share.presenter), Some(4));
+    }
+
+    /// Put `devices` in the roster: each a session, its channel, and the id
+    /// its user is shown as.
+    fn seat_devices(service: &ScreenshareService, devices: &[(u32, u32, u32)]) {
+        service.roster.replace(
+            devices
+                .iter()
+                .map(|(session, channel, shown)| Session {
+                    session: *session,
+                    channel: *channel,
+                    presented_as: *shown,
+                    ..Session::default()
+                })
+                .collect(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_from_a_second_device_names_the_user_others_know() {
+        // 6 is a second device of the user everyone else knows as 4.
+        let service = permissive();
+        seat_devices(&service, &[(1, 3, 1), (4, 3, 4), (6, 3, 4)]);
+
+        let actions = service
+            .frame(frame(6, &signal_of(0, SignalType::Start, "tracks")))
+            .await;
+        let mut told: Vec<u32> = Vec::new();
+        for action in &actions {
+            assert_eq!(carried_signal(action).sender_session, 4);
+            told.extend(addressed(action));
+        }
+        told.sort_unstable();
+        assert_eq!(told, vec![1, 4], "a stranger and the sibling, never 6");
+    }
+
+    #[tokio::test]
+    async fn a_presenters_other_device_may_stop_their_share() {
+        let service = strict();
+        seat_devices(&service, &[(1, 3, 1), (4, 3, 4), (6, 3, 4)]);
+        let permitted = permissive();
+        let _ = permitted.frame(frame(4, &start_of("s6", 3))).await;
+        if let (Ok(mut theirs), Ok(mine)) = (service.shares.lock(), permitted.shares.lock()) {
+            theirs.clone_from(&mine);
+        }
+
+        let actions = service.frame(frame(6, &stop_of("s6"))).await;
+        assert!(service.share("s6").is_none(), "the share is over");
+        let mut actors: Vec<(u32, u32)> = Vec::new();
+        for action in &actions {
+            let Some(screenshare_envelope::Body::Stop(stop)) = carried(action).body else {
+                panic!("expected a stop");
+            };
+            actors.extend(addressed(action).into_iter().map(|told| (told, stop.actor)));
+        }
+        actors.sort_unstable();
+        assert_eq!(
+            actors,
+            vec![(1, 4), (4, 4), (6, 6)],
+            "a stranger is told the user stopped it, each device that it did"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signal_to_a_user_reaches_the_device_that_is_presenting() {
+        // The user is still shown as 4, whose device has left; 6 presents.
+        let service = permissive();
+        seat_devices(&service, &[(1, 3, 1), (6, 3, 4), (7, 3, 4)]);
+        let _ = service
+            .frame(frame(6, &signal_of(0, SignalType::Start, "")))
+            .await;
+
+        let actions = service
+            .frame(frame(1, &signal_of(4, SignalType::SdpOffer, "v=0")))
+            .await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(addressed(&actions[0]), vec![6], "not the idle device 7");
+        let relayed = carried_signal(&actions[0]);
+        assert_eq!(relayed.target_session, 6, "the device reads itself");
+        assert_eq!(relayed.sender_session, 1);
     }
 }
