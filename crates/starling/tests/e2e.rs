@@ -5367,10 +5367,42 @@ async fn a_scheduled_message_can_be_cancelled_and_then_never_arrives() {
 /// The whole path: the user's own `UserState` through `session-lifecycle`, the
 /// trail into `audit`, the copy kept beside the chain and trimmed to
 /// `profile_history`, and an admin reading it back over the client channel.
+/// The profile-change records `client` may read, newest first, asked for now.
+async fn profile_records(client: &mut Client) -> Vec<fancy::feature::AuditRecord> {
+    use starling_proto_fancy::fancy::feature::{AuditEnvelope, Query, audit_envelope};
+    use starling_proto_fancy::types::ServiceKind;
+
+    let outer = ServiceKind::Audit.outer_type();
+    client
+        .send(
+            outer,
+            &AuditEnvelope {
+                body: Some(audit_envelope::Body::Query(Query {
+                    category: "audit.profile".to_owned(),
+                    query_id: "profile".to_owned(),
+                    ..Query::default()
+                })),
+            },
+        )
+        .await;
+    loop {
+        let (type_id, payload) = client.recv().await;
+        if type_id != outer {
+            continue;
+        }
+        if let Some(audit_envelope::Body::Page(page)) = AuditEnvelope::decode(payload.as_slice())
+            .expect("an envelope")
+            .body
+        {
+            return page.records;
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_admin_reads_back_a_comment_the_profile_history_kept() {
     use starling_proto_fancy::fancy::feature::{
-        AuditEnvelope, Query, SnapshotQuery, Verify, audit_envelope,
+        AuditEnvelope, SnapshotQuery, Verify, audit_envelope,
     };
     use starling_proto_fancy::perm::Perm;
     use starling_proto_fancy::permissions::AclSet;
@@ -5402,7 +5434,10 @@ async fn an_admin_reads_back_a_comment_the_profile_history_kept() {
         .wait_until_permitted(session, 0, Perm::WRITE.bits())
         .await;
 
-    for comment in ["first", "second", "third"] {
+    // One at a time, each waited for: the trail is written by a spawned task,
+    // so two changes sent close together can reach `audit` in either order,
+    // and a fixed pause only makes that unlikely, not impossible.
+    for (sent, comment) in ["first", "second", "third"].into_iter().enumerate() {
         alice
             .send(
                 9,
@@ -5412,49 +5447,21 @@ async fn an_admin_reads_back_a_comment_the_profile_history_kept() {
                 },
             )
             .await;
-        // The trail is spawned, so two changes sent back to back may reach
-        // `audit` out of order; spacing them keeps "newest" meaning "last sent".
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
-    let outer = ServiceKind::Audit.outer_type();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let records = loop {
-        alice
-            .send(
-                outer,
-                &AuditEnvelope {
-                    body: Some(audit_envelope::Body::Query(Query {
-                        category: "audit.profile".to_owned(),
-                        query_id: "profile".to_owned(),
-                        ..Query::default()
-                    })),
-                },
-            )
-            .await;
-        let page = loop {
-            let (type_id, payload) = alice.recv().await;
-            if type_id != outer {
-                continue;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let landed = profile_records(&mut alice).await;
+            if landed.len() > sent {
+                break;
             }
-            if let Some(audit_envelope::Body::Page(page)) =
-                AuditEnvelope::decode(payload.as_slice())
-                    .expect("an envelope")
-                    .body
-            {
-                break page;
-            }
-        };
-        if page.records.len() >= 3 {
-            break page.records;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the comment change never reached the audit log: {landed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the comment changes never reached the audit log: {:?}",
-            page.records
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    }
+    let records = profile_records(&mut alice).await;
+    let outer = ServiceKind::Audit.outer_type();
 
     assert_eq!(records.len(), 3, "{records:?}");
     assert!(records.iter().all(|r| r.action == "comment changed"));
