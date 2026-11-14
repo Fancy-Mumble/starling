@@ -38,6 +38,14 @@ ignore = [
     # moves to `compact_str` or `smol_str`, which its own tree is the only thing
     # holding up.
     { id = "RUSTSEC-2026-0215", reason = "smallstr (unmaintained): transitive via yrs, no fixed version exists" },
+
+    # SQLite before 3.54 can return stale page-cache bytes when it opens a
+    # database together with a crafted `-wal` of a different page size. Only a
+    # database a less trusted party could have written is exposed; Starling
+    # opens its own data directory and nothing else. The fix is libsqlite3-sys
+    # 0.39, and sqlx-sqlite 0.9.0, the newest sqlx, caps it below 0.38. Clears
+    # when sqlx releases with the newer bound.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys (bundled SQLite): needs a crafted -wal beside our own database; sqlx 0.9 caps the fixed 0.39" },
 ]
 
 # ---------------------------------------------------------------------------
