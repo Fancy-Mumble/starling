@@ -248,6 +248,10 @@ impl Row {
 }
 
 impl ClientService for InvitesService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         if inbound.type_id != ServiceKind::Invites.outer_type() {
             return Actions::new();
@@ -305,20 +309,30 @@ impl ClientService for InvitesService {
 
 impl InvitesService {
     /// Who `inbound`'s session is.
-    async fn caller(&self, inbound: &Inbound) -> Caller {
+    ///
+    /// Refused for a session the roster does not know (one that has not
+    /// authenticated, or whose arrival has not reached this service yet):
+    /// keyed as a nameless guest, every such caller shared one ledger, so any
+    /// of them could list and revoke what another had minted.
+    async fn caller(&self, inbound: &Inbound) -> Result<Caller, Refusal> {
+        let Some(name) = self.roster.name_of(inbound.session) else {
+            return Err(Refusal(
+                invite_refused::Reason::Permission,
+                "this connection is not known as anybody yet",
+            ));
+        };
         let account = self.roster.account_of(inbound.session);
         let cert = self.roster.cert_of(inbound.session).unwrap_or_default();
-        let name = self.roster.name_of(inbound.session).unwrap_or_default();
         let manages = self
             .permit
             .allows(inbound, ROOT_CHANNEL, Perm::WRITE.bits())
             .await;
-        Caller {
+        Ok(Caller {
             key: identity_key(account, &cert, &name),
             name,
             account,
             manages,
-        }
+        })
     }
 
     /// What this session may do, said up front.
@@ -331,7 +345,12 @@ impl InvitesService {
                 ..InviteSupport::default()
             };
         }
-        let caller = self.caller(inbound).await;
+        let Ok(caller) = self.caller(inbound).await else {
+            return InviteSupport {
+                request_id,
+                ..InviteSupport::default()
+            };
+        };
         InviteSupport {
             request_id,
             available: true,
@@ -354,7 +373,7 @@ impl InvitesService {
                 "invites are switched off on this server",
             ));
         }
-        let caller = self.caller(inbound).await;
+        let caller = self.caller(inbound).await?;
         if !policy.may_create(caller.account, caller.manages) {
             return Err(Refusal(
                 invite_refused::Reason::Permission,
@@ -434,7 +453,7 @@ impl InvitesService {
                 "invites are switched off on this server",
             ));
         }
-        let caller = self.caller(inbound).await;
+        let caller = self.caller(inbound).await?;
         if query.everyone && !caller.manages {
             return Err(Refusal(
                 invite_refused::Reason::Permission,
@@ -450,7 +469,7 @@ impl InvitesService {
 
     /// Revoke one: any for an administrator, only their own for anybody else.
     async fn revoke(&self, inbound: &Inbound, revoke: &InviteRevoke) -> Result<(), Refusal> {
-        let caller = self.caller(inbound).await;
+        let caller = self.caller(inbound).await?;
         let only = (!caller.manages).then_some(caller.key.as_str());
         let found = store::remove(&self.store, inbound.scope, &revoke.code, only)
             .await

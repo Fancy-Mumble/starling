@@ -22,6 +22,7 @@ use starling_proto_fancy::userdata::{
 };
 
 use crate::OperatorApi;
+use crate::art_upload::{Blobs, put_and_name};
 use crate::audit::AuditRecord;
 use crate::auth::Refusal;
 
@@ -855,13 +856,9 @@ impl NewBan {
     /// A ban matching nothing is refused, never stored: it would sit in the
     /// list looking like protection and catch nobody.
     fn resolve(self) -> Result<(starling_proto_fancy::moderation::Ban, u32), String> {
-        let address = match self.address.as_deref().filter(|a| !a.is_empty()) {
-            None => Vec::new(),
-            Some(text) => match text.parse::<std::net::IpAddr>() {
-                Ok(std::net::IpAddr::V4(v4)) => v4.octets().to_vec(),
-                Ok(std::net::IpAddr::V6(v6)) => v6.octets().to_vec(),
-                Err(_) => return Err(format!("{text:?} is not an IP address")),
-            },
+        let (address, prefix_len) = match self.address.as_deref().filter(|a| !a.is_empty()) {
+            None => (Vec::new(), 0),
+            Some(text) => crate::ban_address::stored(text, self.prefix_len)?,
         };
         let cert_hash = if self.cert_hash.is_empty() {
             Vec::new()
@@ -874,9 +871,6 @@ impl NewBan {
                     .to_owned(),
             );
         }
-        let prefix_len = self
-            .prefix_len
-            .unwrap_or_else(|| u32::try_from(address.len() * 8).unwrap_or(0));
         Ok((
             starling_proto_fancy::moderation::Ban {
                 id: 0,
@@ -2202,8 +2196,23 @@ async fn set_acl(
     )
     .await?;
     let channel = dial(&api, "permissions")?;
+    let mut permissions = PermissionsClient::new(channel);
+    // A role's colour, icon and style are not in this body, so a group the
+    // write keeps by name keeps them too; replacing the table blanked them.
+    let styled: std::collections::HashMap<String, _> = permissions
+        .get_acl(starling_proto_fancy::permissions::AclRequest {
+            scope: scope(),
+            channel: id,
+        })
+        .await
+        .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
+        .into_inner()
+        .groups
+        .into_iter()
+        .filter_map(|group| Some((group.name, group.presentation?)))
+        .collect();
 
-    let result = PermissionsClient::new(channel)
+    let result = permissions
         .set_acl(SetAclRequest {
             scope: scope(),
             actor: operator_actor(subject, "permissions:write"),
@@ -2234,6 +2243,7 @@ async fn set_acl(
                     .into_iter()
                     .filter(|g| !g.inherited)
                     .map(|g| Group {
+                        presentation: styled.get(&g.name).cloned(),
                         name: g.name,
                         inherited: false,
                         inherit: g.inherit,
@@ -2639,6 +2649,17 @@ async fn set_livery(
     if fields.is_empty() {
         return Err(refuse(StatusCode::BAD_REQUEST, "no livery field was named"));
     }
+    // A key named by hand would hold no reference to its blob; the upload
+    // routes take one. See `livery::ART_FIELDS`.
+    if let Some(art) = fields
+        .iter()
+        .find(|field| starling_runtime::livery::is_art(field))
+    {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            &format!("{art} is set by uploading an image"),
+        ));
+    }
     write_livery(&api, subject, fields, values).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2699,9 +2720,18 @@ async fn write_art(
     )
     .await?;
 
-    let key = if bytes.is_empty() {
+    let field = vec![which.field().to_owned()];
+    let named = async |key: String| {
+        let mut values = starling_proto_fancy::serverconfig::Livery::default();
+        match which {
+            Art::Banner => values.banner_key = key,
+            Art::Icon => values.icon_key = key,
+        }
+        write_livery(api, subject, field, values).await
+    };
+    if bytes.is_empty() {
         // Empty clears it, as an account texture does.
-        String::new()
+        named(String::new()).await?;
     } else {
         if bytes.len() > which.limit() {
             return Err(refuse(
@@ -2723,7 +2753,21 @@ async fn write_art(
         // `userdata` hashes the content itself, so the key is the content's
         // own digest. That is what carries the image's identity into the
         // livery digest without the bytes ever being hashed twice.
-        let hash = UserDataClient::new(dial(api, "userdata")?)
+        let mut blobs = UserdataBlobs(UserDataClient::new(dial(api, "userdata")?));
+        put_and_name(&mut blobs, bytes, async |hash| named(hex(&hash)).await).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `userdata`'s blob store, as a livery upload uses it.
+struct UserdataBlobs(UserDataClient<tonic::transport::Channel>);
+
+impl Blobs for UserdataBlobs {
+    type Error = (StatusCode, Json<ApiError>);
+
+    async fn put(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        Ok(self
+            .0
             .put_blob(starling_proto_fancy::userdata::Blob {
                 scope: scope(),
                 hash: Vec::new(),
@@ -2732,17 +2776,18 @@ async fn write_art(
             .await
             .map_err(|status| refuse(StatusCode::BAD_GATEWAY, status.message()))?
             .into_inner()
-            .hash;
-        hex(&hash)
-    };
-
-    let mut values = starling_proto_fancy::serverconfig::Livery::default();
-    match which {
-        Art::Banner => values.banner_key = key,
-        Art::Icon => values.icon_key = key,
+            .hash)
     }
-    write_livery(api, subject, vec![which.field().to_owned()], values).await?;
-    Ok(StatusCode::NO_CONTENT)
+
+    async fn release(&mut self, hash: Vec<u8>) {
+        let released = self
+            .0
+            .release_blob(starling_proto_fancy::userdata::BlobRef { hash, size: 0 })
+            .await;
+        if let Err(status) = released {
+            tracing::warn!(%status, "a livery image nothing names stays stored");
+        }
+    }
 }
 
 async fn get_banner(

@@ -17,6 +17,7 @@ pub mod coalesce;
 pub mod evaluate;
 pub mod group;
 pub mod import;
+pub mod presentation;
 
 pub use coalesce::Coalescer;
 pub use evaluate::{Acls, evaluate};
@@ -44,6 +45,7 @@ use starling_runtime::log::{Category, LogEvent, Logger};
 use starling_runtime::permit::permission_denied;
 use starling_runtime::plane::{Actions, ClientService, Fanout, Inbound, Plane, to_conn};
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
+use starling_runtime::settings::Settings;
 use starling_runtime::storage::{Migration, Store};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
@@ -95,6 +97,9 @@ pub struct PermissionsService {
     /// the only way to hand out anything beyond the default set, that is the
     /// whole of a server's configured authority disappearing silently.
     store: Option<Store>,
+    /// The operator's limits, for the one this service applies: the size of a
+    /// role's icon. `None` in tests, which get the defaults.
+    settings: Option<Settings>,
 }
 
 impl PermissionsService {
@@ -777,6 +782,11 @@ impl PermissionsService {
     /// "guest" would mean that taking `session-view` down promotes every caller
     /// to one, with the default set that comes with it.
     async fn resolve(&self, scope: u32, session: u32) -> Option<Subject> {
+        // Session 0 is a connection that has not authenticated: not a guest,
+        // nobody, whatever the view happens to hold.
+        if session == starling_runtime::roster::NOBODY {
+            return None;
+        }
         let resolver = self.resolver.as_ref()?;
         let transport = resolver.channel("session-view").ok()?;
         let resolved = SessionViewClient::new(transport)
@@ -875,7 +885,18 @@ impl PermissionsService {
             return vec![permission_denied(inbound, Perm::WRITE, channel)];
         }
 
-        let set = evaluate::from_wire(acl);
+        let mut set = evaluate::from_wire(acl);
+        let limit = self.settings.as_ref().map_or_else(
+            || starling_runtime::settings::defaults(inbound.scope),
+            |settings| settings.get(inbound.scope),
+        );
+        for role in presentation::drop_oversized_icons(&mut set, limit.image_message_length) {
+            tracing::info!(
+                channel,
+                role,
+                "role icon over image_message_length; not kept"
+            );
+        }
         let (groups, entries) = (set.groups.len(), set.acls.len());
         self.acls.set(inbound.scope, set.clone());
         self.persist(inbound.scope, &set).await;
@@ -1062,6 +1083,7 @@ impl Serve for PermissionsService {
             logger: ctx.logger.clone(),
             resolver: Some(ctx.resolver.clone()),
             store,
+            settings: Some(Settings::new(ctx.resolver.clone())),
         };
         service.warm().await;
         ctx.health.ready("acls loaded");
@@ -1073,7 +1095,11 @@ impl Serve for PermissionsService {
     /// One subscription per server instance: `metadata` shards by it, and a tree
     /// is only meaningful within one.
     async fn run(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
-        let mut followers = Vec::new();
+        let mut followers = self
+            .settings
+            .as_ref()
+            .map(|settings| settings.watch(&ctx.instances()))
+            .unwrap_or_default();
         for scope in ctx.instances() {
             let service = Arc::clone(&self);
             followers.push(tokio::spawn(
@@ -1130,6 +1156,7 @@ mod tests {
             // subject they want directly.
             resolver: None,
             store: None,
+            settings: None,
         })
     }
 
@@ -1166,6 +1193,7 @@ mod tests {
                 logger: Logger::null(),
                 resolver: None,
                 store: Some(store.clone()),
+                settings: None,
             };
             before.acls.set(1, set.clone());
             before.persist(1, &set).await;
@@ -1181,6 +1209,7 @@ mod tests {
             logger: Logger::null(),
             resolver: None,
             store: Some(store),
+            settings: None,
         };
         assert!(
             after.acls.get(1, 7).acls.is_empty(),
@@ -1206,6 +1235,7 @@ mod tests {
             logger: Logger::null(),
             resolver: None,
             store: Some(store.clone()),
+            settings: None,
         }
     }
 

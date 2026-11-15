@@ -25,7 +25,7 @@ pub(super) struct SfuRuntime {
 
 impl SfuRuntime {
     pub(super) fn new(config: SfuConfig) -> Option<Self> {
-        let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.udp_port));
+        let bind_addr = SocketAddr::new(config.bind_ip, config.udp_port);
         let socket = Self::bind_socket(bind_addr)?;
         // A bound socket has an address; asking is still fallible, and a
         // panic on the SFU thread is silent to everyone but the log.
@@ -256,5 +256,25 @@ impl SfuRuntime {
             }
             SfuCommand::Shutdown => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_media_socket_binds_the_configured_address_and_no_other() {
+        // It bound 0.0.0.0 whatever the deployment said, so a server set to
+        // loopback offered its media plane to every network the host is on.
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("an address");
+        let runtime = SfuRuntime::new(SfuConfig {
+            udp_port: 0,
+            public_ip: loopback,
+            bind_ip: loopback,
+        })
+        .expect("binds");
+        let bound = runtime.socket.local_addr().expect("bound");
+        assert_eq!(bound.ip(), loopback);
     }
 }

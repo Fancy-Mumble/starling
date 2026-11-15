@@ -48,6 +48,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
+[features]
+# Test doubles for other crates' tests (`testing`); never for a build that ships.
+testing = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 

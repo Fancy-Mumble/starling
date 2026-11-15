@@ -4,10 +4,14 @@
 //! here and not in `session-view`: that view is of *connected* users, and a ban
 //! is most useful precisely when its subject is not.
 //!
-//! The gateway asks [`Moderation::check_ban`] on accept, before anything is
-//! spent on a peer that is not allowed in.
+//! `session-lifecycle` asks [`Moderation::check_ban`] at `Authenticate`, before
+//! any password is looked at; who a ban covers is `covering`'s.
 
+mod ban_ids;
+mod covering;
 pub mod import;
+mod list_write;
+mod written;
 
 // The async test harness, and nothing else in this crate, needs tokio.
 #[cfg(test)]
@@ -79,6 +83,8 @@ pub struct ModerationService {
     /// months later, so it belongs in the queryable, hash-chained trail and not
     /// only in the server's own log.
     trail: Trail,
+    /// Mints each ban's id, so two in one millisecond are both stored.
+    ids: ban_ids::BanIds,
 }
 
 /// The client on `session`, as an audit actor.
@@ -234,24 +240,22 @@ impl Moderation for ModerationRpc {
     async fn check_ban(&self, request: Request<BanCheck>) -> Result<Response<BanVerdict>, Status> {
         let req = request.into_inner();
         let scope = req.scope.map_or(1, |s| s.instance);
-        let now = now_ms();
-        for ban in self.0.bans(scope).await {
-            let by_address = covers(&ban, &req.address);
-            let by_cert = !ban.cert_hash.is_empty() && ban.cert_hash == req.cert_hash;
-            if by_address || by_cert {
-                return Ok(Response::new(BanVerdict {
-                    banned: true,
-                    reason: ban.reason.clone(),
-                    expires_at_ms: if ban.duration_s == 0 {
-                        0
-                    } else {
-                        ban.start_ms + u64::from(ban.duration_s) * 1000
-                    },
-                }));
-            }
-        }
-        let _ = now;
-        Ok(Response::new(BanVerdict::default()))
+        let person = covering::Person {
+            address: &req.address,
+            cert_hash: &req.cert_hash,
+            name: &req.name,
+        };
+        // Expired bans are already gone from `bans`, so a ban that has run
+        // out lets its subject back in, and the sweep deletes it.
+        let verdict = self
+            .0
+            .bans(scope)
+            .await
+            .iter()
+            .find(|ban| person.is_covered_by(ban))
+            .map(covering::verdict)
+            .unwrap_or_default();
+        Ok(Response::new(verdict))
     }
 
     async fn ban(&self, request: Request<BanRequest>) -> Result<Response<BanResult>, Status> {
@@ -264,7 +268,7 @@ impl Moderation for ModerationRpc {
                 bans: Vec::new(),
             }));
         };
-        ban.id = now_ms();
+        ban.id = self.0.ids.next(now_ms());
         ban.start_ms = now_ms();
         let result = sqlx::query(
             "INSERT INTO ban (server_id, id, address, prefix_len, name, cert_hash, reason, \
@@ -327,6 +331,8 @@ impl Moderation for ModerationRpc {
                 self.0.fanout.push(disconnect(device.conn, "banned"));
             }
         }
+        // And whoever else is here that it covers, by address or certificate.
+        self.0.turn_away(scope, std::slice::from_ref(&ban)).await;
         Ok(Response::new(BanResult {
             applied: true,
             refused: String::new(),
@@ -427,6 +433,21 @@ impl ModerationService {
         };
         let banning = request.ban.unwrap_or(false);
 
+        // The permission first, as murmur checks it (`Messages.cpp:1679`):
+        // whoever may not kick is told that, in the same words, whether the
+        // target exists, is the administrator, or is anybody else. Asked after
+        // the target, the refusal said who the administrator was.
+        if !self.may_remove(inbound, banning).await {
+            tracing::info!(
+                actor = inbound.session,
+                session = request.session,
+                banning,
+                "kick refused"
+            );
+            let missing = if banning { Perm::BAN } else { Perm::KICK };
+            return vec![permission_denied(inbound, missing, ROOT_CHANNEL)];
+        }
+
         let (everyone, devices) = self.devices(inbound.scope, request.session).await;
         let Some(target) = devices.first().cloned() else {
             tracing::debug!(session = request.session, "kick for an unknown session");
@@ -438,17 +459,6 @@ impl ModerationService {
         // owner out of their own server.
         if identity::is_superuser(target.registered, target.account) {
             return vec![deny_superuser(inbound)];
-        }
-
-        if !self.may_remove(inbound, banning).await {
-            tracing::info!(
-                actor = inbound.session,
-                session = request.session,
-                banning,
-                "kick refused"
-            );
-            let missing = if banning { Perm::BAN } else { Perm::KICK };
-            return vec![permission_denied(inbound, missing, ROOT_CHANNEL)];
         }
 
         let reason = request.reason.clone().unwrap_or_default();
@@ -545,22 +555,7 @@ impl ModerationService {
     /// the whole list rather than looked up as one session. Empty devices for
     /// a session nobody holds or an unreachable view.
     async fn devices(&self, scope: u32, named: u32) -> (Roster, Vec<Session>) {
-        use starling_proto_fancy::sessionview::SubscribeRequest;
-        use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
-
-        let Ok(transport) = self.resolver.channel("session-view") else {
-            return (Roster::new(), Vec::new());
-        };
-        let Ok(listed) = SessionViewClient::new(transport)
-            .list(SubscribeRequest {
-                scope: Some(starling_proto_fancy::common::Scope { instance: scope }),
-                subscriber: "moderation".to_owned(),
-            })
-            .await
-        else {
-            return (Roster::new(), Vec::new());
-        };
-        let sessions = listed.into_inner().sessions;
+        let sessions = self.listed(scope).await;
         let everyone = Roster::of(sessions.clone());
         let ids = everyone.devices_of(named);
         let devices = sessions
@@ -603,7 +598,7 @@ impl ModerationService {
             Vec::new()
         };
         let ban = Ban {
-            id: now_ms(),
+            id: self.ids.next(now_ms()),
             address,
             // A single host, not a range: `/128` over the v6-mapped form.
             prefix_len: if by_address { 128 } else { 0 },
@@ -623,20 +618,15 @@ impl ModerationService {
     }
 
     async fn on_ban_list(&self, inbound: &Inbound) -> Actions {
-        let Ok(query) = starling_proto::proto::tcp::BanList::decode(inbound.payload.as_slice())
+        let Ok(list) = starling_proto::proto::tcp::BanList::decode(inbound.payload.as_slice())
         else {
             return Actions::new();
         };
-        if !query.query.unwrap_or(false) {
-            // A write from the client plane is refused: issuing a ban is an
-            // operator action and takes an operator identity.
-            return Actions::new();
-        }
 
-        // Reading the ban list takes `Ban` at the root, as murmur asks. It is a
-        // list of names, addresses and certificate hashes of people who were
-        // thrown off, handing it to any client who asks is a disclosure that
-        // has nothing to do with using the server.
+        // Reading the ban list and writing it both take `Ban` at the root, as
+        // murmur asks (`Messages.cpp:968`). It is a list of names, addresses
+        // and certificate hashes of people who were thrown off, and writing it
+        // is how a ban is added or lifted from a client's ban editor.
         if !self
             .permit
             .allows(inbound, ROOT_CHANNEL, Perm::BAN.bits())
@@ -644,31 +634,21 @@ impl ModerationService {
         {
             return vec![permission_denied(inbound, Perm::BAN, ROOT_CHANNEL)];
         }
+        if !list.query.unwrap_or(false) {
+            return self.on_ban_write(inbound, &list).await;
+        }
 
         let reply = starling_proto::proto::tcp::BanList {
             query: Some(false),
             bans: self
                 .bans(inbound.scope)
                 .await
-                .into_iter()
-                .map(|ban| starling_proto::proto::tcp::ban_list::BanEntry {
-                    address: ban.address,
-                    mask: ban.prefix_len,
-                    name: Some(ban.name),
-                    hash: Some(hex(&ban.cert_hash)),
-                    reason: Some(ban.reason),
-                    start: None,
-                    duration: Some(ban.duration_s),
-                })
+                .iter()
+                .map(written::entry_of)
                 .collect(),
         };
         vec![to_conn(inbound.conn, BAN_LIST, reply.encode_to_vec())]
     }
-}
-
-/// Certificate hashes travel as hex on the wire, as they do in murmur.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl Serve for ModerationService {
@@ -684,6 +664,7 @@ impl Serve for ModerationService {
             permit: Permit::new(ctx.resolver.clone()),
             resolver: ctx.resolver.clone(),
             trail: Trail::new(ctx.resolver.clone()),
+            ids: ban_ids::BanIds::default(),
         }))
     }
 

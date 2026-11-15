@@ -218,7 +218,7 @@ def check_frozen(here: pathlib.Path, update: bool) -> list[str]:
 # is well-formed, it simply arrives at the wrong service, which decodes an
 # envelope it does not recognise and skips it. A feature that silently does
 # nothing, with the numbers looking plausible in both files.
-CLIENT_OUTER = "crates/mumble-protocol/src/canon.rs"
+CLIENT_OUTER = "src/crates/mumble-protocol/src/canon.rs"
 
 
 def check_outer_types(here: pathlib.Path, root: pathlib.Path) -> list[str]:
@@ -273,7 +273,7 @@ def main() -> int:
     copies = [
         here / "crates/proto/classic/proto/Mumble.proto",
         root / "vendor/server/src/Mumble.proto",
-        root / "vendor/client/crates/mumble-protocol/proto/Mumble.proto",
+        root / "vendor/client/src/crates/mumble-protocol/proto/Mumble.proto",
     ]
     for proto in copies:
         if not proto.is_file():

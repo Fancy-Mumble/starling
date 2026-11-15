@@ -342,9 +342,9 @@ A ban matches on any of three things, so all three are optional individually:
 | Field | Notes |
 |---|---|
 | `address` | dotted-quad or IPv6 literal; anything else is `400` |
-| `prefix_len` | how much of `address` to match; defaults to all of it |
+| `prefix_len` | how much of `address` to match, in the address's own bits (`24` for an IPv4 /24); defaults to all of it. Stored over the sixteen-byte form Mumble keeps, so an IPv4 /24 is listed to a client as `120` |
 | `cert_hash` | hex |
-| `name` | matched as stored |
+| `name` | matched ignoring case, and only on a ban that names no `address` and no `cert_hash`: murmur never matches a ban's name at all, and a ban with an address does not ban everybody else called the same |
 | `reason` | free text |
 | `duration_s` | absent or `0` is permanent, as in murmur's `BanTable` |
 | `session` | a connected session to drop as part of the ban |

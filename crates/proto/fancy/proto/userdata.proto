@@ -23,6 +23,9 @@ service UserData {
   // RequestBlob is a primary-key lookup and two identical avatars cost one row.
   rpc GetBlob(BlobRequest) returns (Blob);
   rpc PutBlob(Blob) returns (BlobRef);
+  // Drop the one reference a `PutBlob` took. The last reference deletes the
+  // blob, so every holder that puts has to release what it stops holding.
+  rpc ReleaseBlob(BlobRef) returns (starling.common.v1.Ack);
 }
 
 message AuthRequest {

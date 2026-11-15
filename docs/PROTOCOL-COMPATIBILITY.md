@@ -163,6 +163,10 @@ same number (the audit tab, at 0.4.2) is dark for the same reason.
 `fancy_announcement` in `session-lifecycle/src/handshake.rs` is the whole rule,
 and `FANCY_VERSION` there records which level Starling claims and why.
 
+The gateway reads `fancy_protocol` from the same `Version` as it passes, so
+that a peer asking for the livery before it authenticates can be answered;
+why, and how little that lets through, is `ARCHITECTURE.md` §1.
+
 The client keeps the mirror of this in `mumble-protocol/src/fancy_codec.rs`
 (`FANCY_PROTOCOL_EPOCH`, `speaks_epoch`), and announces its own epoch in the
 `Version` it sends, so the judgement is symmetric.

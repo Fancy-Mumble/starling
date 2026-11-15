@@ -240,10 +240,57 @@ pub trait ClientService: Send + Sync + 'static {
     /// A frame arrived for one of this service's types.
     fn frame(&self, inbound: Inbound) -> impl Future<Output = Actions> + Send;
 
+    /// Whether a frame from a connection that has not authenticated is this
+    /// service's to handle at all.
+    ///
+    /// No, unless the service says otherwise. Such a peer has proved nothing,
+    /// so anything a service does for it is done for somebody anonymous, and
+    /// the gateway's refusal to write service types to it is a second line,
+    /// not the only one. The few that must speak first (the handshake, the
+    /// livery) override this, narrowly. [`dispatch`] asks before [`frame`].
+    ///
+    /// [`frame`]: ClientService::frame
+    fn before_session(&self, _inbound: &Inbound) -> bool {
+        false
+    }
+
+    /// The roster this service judges a sender by, if it keeps one.
+    ///
+    /// [`dispatch`] makes sure it knows the sender before [`frame`] runs: a
+    /// client is told it has joined before every roster has heard of it, and
+    /// a decision about a session the roster does not know yet ("needs a
+    /// certificate", "only the author") is a decision about nobody.
+    ///
+    /// [`frame`]: ClientService::frame
+    fn roster(&self) -> Option<&crate::roster::Roster> {
+        None
+    }
+
     /// A connection went away.
     fn closed(&self, _conn: u64, _reason: &str) -> impl Future<Output = Actions> + Send {
         async { Actions::new() }
     }
+}
+
+/// Hand `inbound` to `service`, unless it arrived before its connection had a
+/// session and the service does not handle such frames.
+///
+/// The one way a frame reaches [`ClientService::frame`], so the rule cannot be
+/// forgotten by a service; tests that mean "as a client would reach it" call
+/// this rather than `frame`.
+pub async fn dispatch<S: ClientService>(service: &S, inbound: Inbound) -> Actions {
+    if inbound.session == 0 && !service.before_session(&inbound) {
+        tracing::debug!(
+            conn = inbound.conn,
+            type_id = inbound.type_id,
+            "a frame from a connection with no session, not handled"
+        );
+        return Actions::new();
+    }
+    if let Some(roster) = service.roster() {
+        roster.catch_up(inbound.scope, inbound.session).await;
+    }
+    service.frame(inbound).await
 }
 
 /// The gRPC adapter: [`ClientService`] in, `ClientPlane` out.
@@ -399,16 +446,18 @@ async fn handle<S: ClientService>(
                 frame.payload.len(),
             );
             tracing::trace!(service = name, conn, session, type_id, len, "frame");
-            let actions = service
-                .frame(Inbound {
+            let actions = dispatch(
+                service.as_ref(),
+                Inbound {
                     conn,
                     session,
                     type_id,
                     payload: frame.payload,
                     gateway: gateway.clone(),
                     scope: *scope,
-                })
-                .await;
+                },
+            )
+            .await;
             trace_actions(name, conn, session, &actions);
             actions
         }
@@ -490,6 +539,50 @@ mod tests {
         };
         assert_eq!(send.conns, vec![4]);
         assert!(send.sessions.is_empty());
+    }
+
+    /// Answers every frame it is handed, and says whether it takes one from a
+    /// connection with no session when told to.
+    struct Echo {
+        before_session: bool,
+    }
+
+    impl ClientService for Echo {
+        async fn frame(&self, inbound: Inbound) -> Actions {
+            vec![to_conn(inbound.conn, inbound.type_id, Vec::new())]
+        }
+
+        fn before_session(&self, _inbound: &Inbound) -> bool {
+            self.before_session
+        }
+    }
+
+    fn inbound(session: u32) -> Inbound {
+        Inbound {
+            conn: 3,
+            session,
+            type_id: 1005,
+            payload: Vec::new(),
+            gateway: "gw".to_owned(),
+            scope: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_from_a_connection_with_no_session_is_not_handled() {
+        let service = Echo {
+            before_session: false,
+        };
+        assert!(dispatch(&service, inbound(0)).await.is_empty());
+        assert_eq!(dispatch(&service, inbound(7)).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_speaks_first_says_so_and_is_handed_the_frame() {
+        let service = Echo {
+            before_session: true,
+        };
+        assert_eq!(dispatch(&service, inbound(0)).await.len(), 1);
     }
 
     #[test]

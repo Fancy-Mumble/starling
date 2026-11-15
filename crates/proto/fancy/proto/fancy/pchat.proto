@@ -262,11 +262,32 @@ message Pin {
   string message_id = 1;
   uint32 channel = 2;
   bool unpin = 3;
+
+  // -- Who and when, written by the server -----------------------------------
+  //
+  // Never read from a client: whatever a client puts here is replaced on
+  // relay, from the connection the pin arrived on and the server's own clock,
+  // so a pin cannot be attributed to somebody else or backdated. Empty from a
+  // server too old to write them.
+
+  // The pinner, named as the reader knows them, while they are connected; 0
+  // once they are not.
+  uint32 pinner = 4;
+  // The pinner's certificate hash, which outlives the connection. Empty for a
+  // pinner who presented none.
+  bytes pinner_cert = 5;
+  // The name the pinner had when they pinned it.
+  string pinner_name = 6;
+  uint64 pinned_at_ms = 7;
 }
 
 message PinList {
   uint32 channel = 1;
+  // Each pinned message by its id alone. Kept for clients that read nothing
+  // else; a reader that knows `pins` reads that instead.
   repeated Message pinned = 2;
+  // Each pin with who made it and when, oldest first.
+  repeated Pin pins = 3;
 }
 
 message Delete {

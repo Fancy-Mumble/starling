@@ -26,8 +26,10 @@
 //! running. `audit.fail_closed = false` trades that refusal for a logged error
 //! and is the operator's decision, not the default.
 
+pub(crate) mod art_upload;
 pub mod audit;
 pub mod auth;
+pub(crate) mod ban_address;
 pub mod events;
 pub mod live;
 pub mod openapi;

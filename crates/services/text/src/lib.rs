@@ -335,12 +335,11 @@ impl TextService {
         message: &starling_proto::proto::tcp::TextMessage,
     ) -> Option<&'static str> {
         let target = message.edit_id.as_deref().filter(|id| !id.is_empty())?;
+        // One answer for "no such message" and "somebody else's": two would
+        // tell anybody which message ids exist.
         match self.author_of(scope, target).await {
-            None => Some("that message is not known to the server and cannot be edited"),
-            Some(original) if !author.is(&original) => {
-                Some("only the author of a message may edit it")
-            }
-            Some(_) => None,
+            Some(original) if author.is(&original) => None,
+            _ => Some("only the author of a message may edit it, and this is none of yours"),
         }
     }
 
@@ -692,6 +691,10 @@ impl Text for TextRpc {
 }
 
 impl ClientService for TextService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         match inbound.type_id {
             TEXT_MESSAGE => self.on_text_message(&inbound).await,
@@ -827,9 +830,26 @@ impl TextService {
         };
         let cert = author.cert.clone().unwrap_or_default();
 
+        // History is kept per channel and served to whoever may enter it, so a
+        // message addressed to no channel has no history to join. Filed under
+        // channel 0, as it was, every direct message became part of the root
+        // channel's history, readable by anybody who may enter the root.
+        let Some(channel) = message.channel_id.first().copied() else {
+            tracing::debug!("a message to people or trees is delivered, not archived");
+            return StoredMessage {
+                id: Vec::new(),
+                channel: 0,
+                sender_account: 0,
+                sender_name: String::new(),
+                body: message.message.clone(),
+                sent_at_ms: now_ms(),
+                edited: false,
+            };
+        };
+
         let mut stored = StoredMessage {
             id: Vec::new(),
-            channel: message.channel_id.first().copied().unwrap_or_default(),
+            channel,
             sender_account: 0,
             sender_name: String::new(),
             body: message.message.clone(),
@@ -904,12 +924,23 @@ impl TextService {
         // whole message rather than delivering it partially, and a partial
         // delivery is the worse answer, the sender is told nothing and some
         // recipients saw it.
+        //
+        // A message to people is checked in the channel each of them stands
+        // in, as murmur checks it (`Messages.cpp`, `msgTextMessage`, the
+        // `msg.session` loop). It was not checked at all, so anybody could
+        // write to anybody, past every ACL that silences a room.
+        let mut checked = Vec::new();
         for channel in message
             .channel_id
             .iter()
             .chain(message.tree_id.iter())
             .copied()
+            .chain(self.channels_of_people(&message.session))
         {
+            if checked.contains(&channel) {
+                continue;
+            }
+            checked.push(channel);
             if !self
                 .permit
                 .allows(inbound, channel, Perm::TEXT_MESSAGE.bits())
@@ -1005,6 +1036,19 @@ impl TextService {
             }
             .encode_to_vec()
         })
+    }
+
+    /// The channels the people a message names are standing in.
+    ///
+    /// Through every device of each, since a named user is all of them
+    /// (`docs/SERVICES.md`, "One user, several devices"); somebody the roster
+    /// does not know is in no channel and is not reached either.
+    fn channels_of_people(&self, people: &[u32]) -> Vec<u32> {
+        people
+            .iter()
+            .flat_map(|named| self.roster.devices_of(*named))
+            .filter_map(|device| self.roster.channel_of(device))
+            .collect()
     }
 
     /// Tell `push` about a message, for the people who are not here to read it.
@@ -1835,6 +1879,24 @@ mod tests {
     async fn service_with(
         config: starling_proto_fancy::serverconfig::Snapshot,
     ) -> Arc<TextService> {
+        // Points at a `permissions` nothing is serving, so every check denies.
+        // These tests exercise storage and history, not delivery; a test that
+        // wanted delivery would have to stand one up, which is the right amount
+        // of friction for skipping an authorisation.
+        let resolver = starling_runtime::channel::Resolver::new(
+            Arc::new(starling_runtime::config::Config::with_defaults(
+                std::path::Path::new("/run/starling"),
+            )),
+            starling_runtime::inproc::Broker::new(),
+        );
+        service_reaching(config, resolver).await
+    }
+
+    /// The same service, reaching whatever `resolver` reaches.
+    async fn service_reaching(
+        config: starling_proto_fancy::serverconfig::Snapshot,
+        resolver: starling_runtime::channel::Resolver,
+    ) -> Arc<TextService> {
         // A name unique per call: `cache=shared` makes same-named in-memory
         // databases visible to every connection that names them, so two tests
         // sharing one name would race on the same `starling_migration` row.
@@ -1852,16 +1914,6 @@ mod tests {
             .migrate(scheduled::SCHEMA)
             .await
             .expect("the scheduled-message schema");
-        // Points at a `permissions` nothing is serving, so every check denies.
-        // These tests exercise storage and history, not delivery; a test that
-        // wanted delivery would have to stand one up, which is the right amount
-        // of friction for skipping an authorisation.
-        let resolver = starling_runtime::channel::Resolver::new(
-            Arc::new(starling_runtime::config::Config::with_defaults(
-                std::path::Path::new("/run/starling"),
-            )),
-            starling_runtime::inproc::Broker::new(),
-        );
         Arc::new(TextService {
             store,
             fanout: Fanout::default(),
@@ -1891,6 +1943,112 @@ mod tests {
             sent_at_ms: now_ms(),
             edited: false,
         }
+    }
+
+    /// A `TextMessage` as session 7 sends it.
+    fn sent(message: &starling_proto::proto::tcp::TextMessage) -> Inbound {
+        Inbound {
+            conn: 70,
+            session: 7,
+            type_id: TEXT_MESSAGE,
+            payload: message.encode_to_vec(),
+            gateway: "gw".to_owned(),
+            scope: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_is_not_kept_as_the_root_channels_history() {
+        // A message with no channel was filed under channel 0, so every direct
+        // message became root history, readable by anybody who may enter it.
+        let service = service().await;
+        let between_us = starling_proto::proto::tcp::TextMessage {
+            session: vec![9],
+            message: "between us".to_owned(),
+            ..Default::default()
+        };
+        let stored = service
+            .archive(
+                &sent(&between_us),
+                &between_us,
+                &owners::Author::new(7, None),
+                None,
+            )
+            .await;
+        assert!(stored.id.is_empty(), "nothing was written");
+        let root = service.history(1, 0, 10, &[], Direction::Backward).await;
+        assert!(root.messages.is_empty(), "{:?}", root.messages);
+
+        let to_the_room = starling_proto::proto::tcp::TextMessage {
+            channel_id: vec![0],
+            message: "hello room".to_owned(),
+            ..Default::default()
+        };
+        let _ = service
+            .archive(
+                &sent(&to_the_room),
+                &to_the_room,
+                &owners::Author::new(7, None),
+                None,
+            )
+            .await;
+        let root = service.history(1, 0, 10, &[], Direction::Backward).await;
+        assert_eq!(root.messages.len(), 1, "a channel's own message still is");
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_needs_text_message_where_its_recipient_stands() {
+        // murmur checks `TextMessage` in each recipient's channel; this checked
+        // nothing for a message to people, so it went through every ACL. The
+        // service under test reaches no `permissions`, so any check denies:
+        // the refusal naming the recipient's channel is the check happening.
+        let service = service().await;
+        service.roster.replace(vec![
+            starling_proto_fancy::sessionview::Session {
+                session: 7,
+                channel: 0,
+                ..Default::default()
+            },
+            // 9 and 10 are one user on two devices, shown as 9, in channel 4.
+            starling_proto_fancy::sessionview::Session {
+                session: 9,
+                channel: 4,
+                ..Default::default()
+            },
+            starling_proto_fancy::sessionview::Session {
+                session: 10,
+                channel: 4,
+                presented_as: 9,
+                ..Default::default()
+            },
+        ]);
+        let to_nine = starling_proto::proto::tcp::TextMessage {
+            session: vec![9],
+            message: "hello".to_owned(),
+            ..Default::default()
+        };
+        let actions = service.frame(sent(&to_nine)).await;
+        let denied = actions
+            .iter()
+            .find_map(|action| match &action.action {
+                Some(starling_proto_fancy::control::server_action::Action::Send(send))
+                    if send.r#type == 12 =>
+                {
+                    starling_proto::proto::tcp::PermissionDenied::decode(send.payload.as_slice())
+                        .ok()
+                }
+                _ => None,
+            })
+            .expect("refused");
+        assert_eq!(denied.channel_id, Some(4));
+        assert!(
+            actions.iter().all(|action| !matches!(
+                &action.action,
+                Some(starling_proto_fancy::control::server_action::Action::Send(send))
+                    if send.r#type == u32::from(TEXT_MESSAGE)
+            )),
+            "and nothing was delivered"
+        );
     }
 
     #[tokio::test]
@@ -2282,6 +2440,16 @@ mod tests {
             .on_text_message(&edit_frame("e-1", "nothing-like-it", "x"))
             .await;
         assert_eq!(deny_type(&refusal), Some(DenyType::Text as i32));
+
+        // And in the same words as an edit of somebody else's message: two
+        // answers told anybody which message ids exist.
+        service
+            .owners
+            .record(1, "m-1", owners::Author::new(8, Some(BOB.to_vec())));
+        let theirs = service
+            .on_text_message(&edit_frame("e-2", "m-1", "x"))
+            .await;
+        assert_eq!(deny_reason(&refusal), deny_reason(&theirs));
     }
 
     #[tokio::test]
@@ -2471,6 +2639,57 @@ mod tests {
             created_at_ms: now_ms(),
             status: ScheduleStatus::SchedulePending as i32,
         }
+    }
+
+    #[tokio::test]
+    async fn a_sender_the_roster_has_not_heard_of_yet_is_asked_about_not_refused() {
+        // The race the e2e suite tripped over under load: a client is told it
+        // has joined before this service's roster has followed the view, and
+        // schedules at once. Decided from the roster alone, the certificate it
+        // holds was "missing". Here the view knows alice and the roster does
+        // not yet, every time.
+        let broker = starling_runtime::inproc::Broker::new();
+        let view = starling_runtime::testing::view::View::serve_on(
+            &broker,
+            vec![starling_proto_fancy::sessionview::Session {
+                session: 7,
+                channel: 4,
+                cert_hash: ALICE.to_vec(),
+                name: "alice".to_owned(),
+                ..Default::default()
+            }],
+        )
+        .expect("a view double");
+        let _granting = starling_runtime::testing::Granting::serve_on(&broker, Perm::all().bits())
+            .expect("a permissions double");
+        let service = service_reaching(
+            starling_runtime::settings::defaults(1),
+            starling_runtime::testing::resolver(broker.clone()),
+        )
+        .await;
+        service
+            .roster
+            .ask_through(starling_runtime::testing::resolver(broker));
+
+        let schedule = || {
+            envelope(text_envelope::Body::Schedule(Scheduled {
+                channels: vec![4],
+                body: "later".to_owned(),
+                deliver_at_ms: now_ms() + 60_000,
+                ..Scheduled::default()
+            }))
+        };
+        let ack = ack_of(&starling_runtime::plane::dispatch(service.as_ref(), schedule()).await);
+        assert_eq!(
+            ack.status,
+            ScheduleStatus::SchedulePending as i32,
+            "refused: {}",
+            ack.reason
+        );
+        assert_eq!(view.asked(), 1, "the view was asked once");
+
+        let _ = starling_runtime::plane::dispatch(service.as_ref(), schedule()).await;
+        assert_eq!(view.asked(), 1, "and not again once the roster knows");
     }
 
     #[tokio::test]

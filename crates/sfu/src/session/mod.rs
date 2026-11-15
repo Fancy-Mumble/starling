@@ -105,6 +105,10 @@ pub struct SfuConfig {
     pub udp_port: u16,
     /// Public IP address for ICE candidates in SDP answers.
     pub public_ip: std::net::IpAddr,
+    /// The local address the media socket binds. Separate from `public_ip`,
+    /// which is what clients are told and may be a NAT's address this host
+    /// does not hold; a server set to loopback stays on loopback.
+    pub bind_ip: std::net::IpAddr,
 }
 
 // ---------------------------------------------------------------------------

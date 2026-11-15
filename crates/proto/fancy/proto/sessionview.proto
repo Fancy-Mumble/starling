@@ -62,16 +62,19 @@ message Session {
   // SuperUser's id. Interpret the pair through
   // `starling_proto_fancy::identity`, never by comparing `account` directly.
   bool registered = 20;
-  // The account's stored comment and avatar, as content hashes.
+  // The session's comment and avatar, as content hashes.
   //
   // Carried on the session because that is what the roster is built from: a
   // client learns of everyone else through `Session`, and a hash that stops
   // here is a profile picture nobody but its owner can see. The bodies stay in
-  // `userdata`'s blob store and are fetched with `RequestBlob`, so a session
-  // costs the same 20 bytes whether the avatar is 1 KiB or 500.
+  // `userdata`'s blob store and are fetched with `RequestBlob`, which serves
+  // the blob these name, so a session costs the same 20 bytes whether the
+  // avatar is 1 KiB or 500.
   //
-  // Empty means the account has none, or that this is a guest, who has no
-  // account to have stored one on.
+  // A registered user starts with what their account stores. A guest has
+  // these too, for what they set while connected, and they are visible to
+  // everyone as long as the guest is, as in murmur; nothing keeps them after.
+  // Empty means the user has set none.
   bytes comment_hash = 21;
   bytes texture_hash = 22;
   // The access tokens this client presented, for `#token` ACL groups.

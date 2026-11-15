@@ -88,6 +88,15 @@ keeps the bytes per user.
 **Greenfield:** a `blob` table keyed by hash, with a refcount. Identical avatars
 are stored once, and `RequestBlob` becomes a primary-key lookup.
 
+Every `PutBlob` is one reference, and whoever stops holding the content
+releases it with `ReleaseBlob`; the last release deletes the row. `userdata`
+releases what an account replaces or loses with the account, and
+`session-lifecycle` releases a guest's content when the guest replaces it, has
+it reset, or leaves, and hands it to the account when the guest registers (as
+murmur's `registerUser` does). Livery art is held by the livery document: the
+upload takes the reference, so only an upload sets an art key, and
+`server-config` releases the key a write replaces or clears.
+
 The hash is **SHA-1**, and that is not a free choice. It is the same key the
 protocol uses, and a Mumble client recomputes it from any body it is handed
 (`UserModel.cpp:1188`) rather than trusting the announced one, then keys its
@@ -264,6 +273,13 @@ pchat_message(
   PRIMARY KEY (server_id, channel_id, id)             -- clustered by tenant→channel→time
 );
 CREATE INDEX ix_pchat_expiry ON pchat_message(server_id, expires_at_ms);
+
+-- A pin is a property of a stored message: one per row, gone with the row.
+pchat_pin(
+  server_id INTEGER, channel_id INTEGER, row_id BLOB,  -- pchat_message.id
+  message_id TEXT, pinner_cert BLOB NULL, pinner_name TEXT, pinned_at_ms INTEGER,
+  PRIMARY KEY (server_id, channel_id, row_id)
+);
 
 -- Plugin storage: namespaced, opaque to the core ---------------------------
 -- Tables named plugin_<id>_*, created and owned by the plugin. The core never

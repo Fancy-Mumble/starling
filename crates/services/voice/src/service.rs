@@ -795,6 +795,11 @@ impl VoiceService {
                 continue;
             }
 
+            // A refused whisper names the speaker's own channel. It named the
+            // target's, which said where somebody is, a hidden room included;
+            // and a target not on the server is refused the same way, or the
+            // difference says who is online.
+            let own = self.view.channel_of(inbound.session).unwrap_or_default();
             for whispered in &entry.session {
                 // The permission is on the channel the *recipient* is in, not
                 // the speaker's: whispering is a right to reach into a room.
@@ -804,6 +809,7 @@ impl VoiceService {
                         target = *whispered,
                         "whisper target is not on this server"
                     );
+                    refused = refused.or(Some(own));
                     continue;
                 };
                 if self.may_whisper_into(inbound, channel).await {
@@ -815,7 +821,7 @@ impl VoiceService {
                         channel,
                         "whisper refused: no Whisper in the target's channel"
                     );
-                    refused = refused.or(Some(channel));
+                    refused = refused.or(Some(own));
                 }
             }
 
@@ -1419,6 +1425,58 @@ mod tests {
                 scope: 1,
             })
             .await
+    }
+
+    /// The channel a `PermissionDenied` in `actions` names.
+    fn denied_channel(actions: &Actions) -> Option<u32> {
+        use starling_proto_fancy::control::server_action::Action;
+        let Some(Action::Send(send)) = actions.first().and_then(|action| action.action.as_ref())
+        else {
+            return None;
+        };
+        tcp::PermissionDenied::decode(send.payload.as_slice())
+            .ok()
+            .and_then(|denied| denied.channel_id)
+    }
+
+    #[tokio::test]
+    async fn a_refused_whisper_names_the_speakers_room_never_the_targets() {
+        // 100 is in the lobby; 200 is in room 9, which may be hidden. The
+        // refusal named 9, which told 100 where 200 was; and a target not on
+        // the server went unanswered, which told 100 who is online.
+        let service = service();
+        let _ = service.mint(&mint_request(1, 100, 0, MUMBLE_1_6));
+        service.apply_view_event(ViewEvent {
+            event: Some(view_event::Event::Snapshot(Sessions {
+                version: 1,
+                sessions: vec![
+                    Session {
+                        session: 100,
+                        channel: 0,
+                        ..Session::default()
+                    },
+                    Session {
+                        session: 200,
+                        channel: 9,
+                        ..Session::default()
+                    },
+                ],
+            })),
+        });
+        let whisper_to = |session: u32| {
+            voice_target(
+                4,
+                tcp::voice_target::Target {
+                    session: vec![session],
+                    ..tcp::voice_target::Target::default()
+                },
+            )
+        };
+
+        let to_someone = register(&service, 100, whisper_to(200)).await;
+        let to_nobody = register(&service, 100, whisper_to(999)).await;
+        assert_eq!(denied_channel(&to_someone), Some(0), "the speaker's own");
+        assert_eq!(to_someone, to_nobody, "and the same whether they exist");
     }
 
     #[tokio::test]

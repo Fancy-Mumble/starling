@@ -341,6 +341,10 @@ impl Handshake {
         }
 
         let name = request.username.clone().unwrap_or_default();
+        // Before anything else is looked at, the password above all.
+        if let Some(refusal) = self.banned(inbound, &pending, &name).await {
+            return refusal;
+        }
         // `Authenticate` is where a client announces Opus
         // (`vendor/server/src/murmur/Messages.cpp:538`), so it is recorded
         // before anything can refuse the login and lose it.
@@ -749,6 +753,30 @@ impl Handshake {
             5,
             server_sync(session, config, &welcome).encode_to_vec(),
         ));
+        // The gateway learns the conn↔session mapping from this and nothing
+        // else, so it is sent once the client's own view is complete, which
+        // `ServerSync` closes, and no later. What follows is for a session:
+        // the greeting offer is a service type, which the gateway withholds
+        // from a connection without one, and a client answers `ServerSync`
+        // at once, with frames that must arrive carrying its session.
+        actions.push(ServerAction {
+            action: Some(server_action::Action::SessionUp(SessionUp {
+                conn: inbound.conn,
+                session,
+                // Flattened, and safe to flatten: the gateway routes and does not
+                // authorize, so it never reads this field. Nothing downstream of
+                // here makes a permission decision from it.
+                account: identity::wire(account).0,
+                name: name.to_owned(),
+                channel,
+                fancy_version: pending.fancy_version,
+                // What the gateway gates delivery on. Sent here rather than
+                // derived there because this is the only place the peer's
+                // `Version` is read, and a gateway guessing the epoch from the
+                // product version is the mistake this field exists to stop.
+                fancy_protocol: pending.fancy_protocol,
+            })),
+        });
         // The greeting's *hash*, not the greeting. A greeting changes when an
         // operator edits it and a peer may join twenty times a day, so the
         // first thing across is what identifies the document - and a client
@@ -794,27 +822,6 @@ impl Handshake {
             pending.fancy_protocol,
             config,
         ));
-
-        // The gateway learns the conn↔session mapping from this and nothing
-        // else, so it is sent after the client's own view is complete.
-        actions.push(ServerAction {
-            action: Some(server_action::Action::SessionUp(SessionUp {
-                conn: inbound.conn,
-                session,
-                // Flattened, and safe to flatten: the gateway routes and does not
-                // authorize, so it never reads this field. Nothing downstream of
-                // here makes a permission decision from it.
-                account: identity::wire(account).0,
-                name: name.to_owned(),
-                channel,
-                fancy_version: pending.fancy_version,
-                // What the gateway gates delivery on. Sent here rather than
-                // derived there because this is the only place the peer's
-                // `Version` is read, and a gateway guessing the epoch from the
-                // product version is the mistake this field exists to stop.
-                fancy_protocol: pending.fancy_protocol,
-            })),
-        });
 
         // The flood is the only way a legacy client learns someone joined
         // (`docs/ARCHITECTURE.md` §6). The new session is excluded because it
@@ -1393,7 +1400,9 @@ impl Handshake {
 
     /// Tell session-view a session has changed.
     pub async fn announce_changed(&self, connections: &Connections, conn: u64) {
-        let Some(pending) = connections.get(conn) else {
+        // A connection with no session is nobody, and a record of it in the
+        // view made it a user to every service, one that never left.
+        let Some(pending) = connections.get(conn).filter(|pending| pending.session != 0) else {
             return;
         };
         self.announce(Announcement {
@@ -2015,6 +2024,25 @@ impl Handshake {
     /// then disconnects (`Messages.cpp:568`). Sending only the first left a
     /// refused connection open and pinging, which the idle sweep never reaps;
     /// emitting the disconnect elsewhere would make the order a race.
+    /// The refusal for this login if a ban covers it: a banned peer learns
+    /// nothing about the account it names. See `crate::ban`.
+    async fn banned(
+        &self,
+        inbound: &Inbound,
+        pending: &PendingConnection,
+        name: &str,
+    ) -> Option<Actions> {
+        let banned = crate::ban::Bans(&self.resolver)
+            .covering(pending, name)
+            .await?;
+        Some(self.refuse(
+            inbound.conn,
+            name,
+            tcp::reject::RejectType::None,
+            &banned.message(),
+        ))
+    }
+
     fn refuse(
         &self,
         conn: u64,

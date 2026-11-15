@@ -62,6 +62,7 @@ use starling_runtime::storage::{Migration, Store};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tonic::{Request, Response, Status};
 
+mod art;
 pub mod import;
 pub mod snapshot;
 pub mod ticket;
@@ -579,6 +580,9 @@ impl ServerConfigRpc for ConfigRpc {
         let Some(values) = req.values else {
             return Ok(Response::new(current));
         };
+        // The caller put the new art; the old is released once this is
+        // written. See `art`.
+        let replaced = livery::replaced_art(&current, &req.fields);
 
         // Refused rather than partially written. Unlike the settings merge, an
         // unknown key here cannot be another service's knob, so the only thing
@@ -594,6 +598,7 @@ impl ServerConfigRpc for ConfigRpc {
         current.instance = scope;
         current.version += 1;
         self.0.publish_livery(current.clone(), req.actor).await;
+        self.0.release_art(&replaced).await;
         Ok(Response::new(self.0.livery(scope).await))
     }
 
@@ -704,6 +709,19 @@ impl ServerConfigRpc for ConfigRpc {
 }
 
 impl ClientService for ServerConfigService {
+    /// The livery and nothing else: presentation a client draws before it has
+    /// joined, and the gateway writes this outer type to a connection with no
+    /// session on that promise (`starling-gateway`, `epoch::BEFORE_SESSION`).
+    fn before_session(&self, inbound: &Inbound) -> bool {
+        inbound.type_id == ServiceKind::ServerConfig.outer_type()
+            && ServerConfigEnvelope::decode(inbound.payload.as_slice()).is_ok_and(|envelope| {
+                matches!(
+                    envelope.body,
+                    Some(server_config_envelope::Body::LiveryQuery(_))
+                )
+            })
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::ServerConfig.outer_type();
         if inbound.type_id != outer {
@@ -873,6 +891,12 @@ impl ServerConfigService {
         let Some(values) = update.values else {
             return Actions::new();
         };
+        // Art is set by uploading it, which this channel cannot carry; a key
+        // named here would hold no reference. See `livery::ART_FIELDS`.
+        if update.fields.iter().any(|field| livery::is_art(field)) {
+            tracing::info!(session = inbound.session, "livery write names art by hand");
+            return Actions::new();
+        }
         let mut current = self.livery(inbound.scope).await;
         let wire = from_doc(&values);
         if let Err(error) = livery::apply_fields(&mut current, &wire, &update.fields) {
@@ -1524,6 +1548,84 @@ mod tests {
             .await;
 
         assert!(actions.is_empty(), "an unauthorised read is not answered");
+    }
+
+    /// `inbound` as it arrives from a connection that has not authenticated.
+    fn before_authentication(inbound: Inbound) -> Inbound {
+        Inbound {
+            session: 0,
+            ..inbound
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_has_not_joined_is_sent_the_livery() {
+        // The connect screen is drawn before the user has decided to join, so
+        // the question arrives on a connection that never authenticates.
+        let service = service();
+        service
+            .publish_livery(
+                Livery {
+                    instance: 1,
+                    tagline: "cozy corner".to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+
+        let doc = livery_reply(
+            &starling_runtime::plane::dispatch(
+                service.as_ref(),
+                before_authentication(livery_query(&[])),
+            )
+            .await,
+        );
+        assert_eq!(doc.tagline, "cozy corner");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_has_not_joined_is_sent_nothing_but_the_livery() {
+        // The gateway writes this service's outer type to a connection with no
+        // session because the livery is all this service says to one. So every
+        // other request goes unanswered there, refusals included: a refusal is
+        // still a frame of this type, and the promise is about the type.
+        let service = service();
+        let requests = [
+            server_config_envelope::Body::Query(
+                starling_proto_fancy::fancy::domain::ConfigQuery {},
+            ),
+            server_config_envelope::Body::Update(
+                starling_proto_fancy::fancy::domain::ConfigUpdate {
+                    values: HashMap::from([("welcome_text".to_owned(), "hi".to_owned())]),
+                },
+            ),
+            server_config_envelope::Body::LiveryUpdate(
+                starling_proto_fancy::fancy::domain::LiveryUpdate {
+                    fields: vec!["tagline".to_owned()],
+                    values: Some(LiveryDoc {
+                        tagline: "not allowed".to_owned(),
+                        ..Default::default()
+                    }),
+                },
+            ),
+            server_config_envelope::Body::TicketRequest(OperatorTicketRequest {
+                scopes: vec!["server-config:read".to_owned()],
+            }),
+        ];
+        for body in requests {
+            let label = format!("{body:?}");
+            let actions = starling_runtime::plane::dispatch(
+                service.as_ref(),
+                before_authentication(frame_from_client(body)),
+            )
+            .await;
+            assert!(
+                actions.is_empty(),
+                "answered before authentication: {label}"
+            );
+        }
+        assert_eq!(service.livery(1).await.tagline, "", "nothing was written");
     }
 
     #[test]

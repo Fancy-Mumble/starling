@@ -172,7 +172,8 @@ u16 type is in the frame header, so a client frame is sliced out of the socket
 buffer once and travels to the owning service as that slice
 (`control.v1.Frame.payload`). Outbound, `Send.payload` is written to N sockets
 from one buffer. The gateway links no service's generated stubs; a new service
-is a TOML route.
+is a TOML route. One exception, the client's wire epoch in `Version`, is
+`ARCHITECTURE.md` §1.
 
 **Z2, opaque at the edge stays opaque to the store.** Anything a service does
 not itself interpret is declared `bytes` and stays the same bytes end-to-end:

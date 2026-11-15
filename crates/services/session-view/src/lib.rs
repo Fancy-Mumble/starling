@@ -191,13 +191,14 @@ impl SessionView for ViewRpc {
         let req = request.into_inner();
         let scope = req.scope.map_or(1, |s| s.instance);
         match req.what {
-            Some(announcement::What::Up(session)) => {
-                self.0.sessions.upsert(scope, session.clone());
-                self.0.publish(ViewEvent {
-                    event: Some(view_event::Event::Upsert(session)),
-                });
+            // Session 0 is a connection that has not authenticated, and a
+            // record of it would make it a user to every subscriber.
+            Some(announcement::What::Up(session) | announcement::What::Changed(session))
+                if session.session == starling_runtime::roster::NOBODY =>
+            {
+                tracing::warn!(conn = session.conn, "refused a record for session 0");
             }
-            Some(announcement::What::Changed(session)) => {
+            Some(announcement::What::Up(session) | announcement::What::Changed(session)) => {
                 self.0.sessions.upsert(scope, session.clone());
                 self.0.publish(ViewEvent {
                     event: Some(view_event::Event::Upsert(session)),
@@ -324,6 +325,34 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_record_for_session_zero_is_refused() {
+        // Session 0 is a connection that has not authenticated. Recorded, it
+        // was a user to every subscriber, and nothing ever took it down.
+        let rpc = ViewRpc(service());
+        for what in [
+            announcement::What::Up(session(0)),
+            announcement::What::Changed(session(0)),
+        ] {
+            let _ = rpc
+                .announce(Request::new(Announcement {
+                    scope: Some(Scope { instance: 1 }),
+                    what: Some(what),
+                }))
+                .await
+                .expect("announce");
+        }
+        let listed = rpc
+            .list(Request::new(SubscribeRequest {
+                scope: Some(Scope { instance: 1 }),
+                subscriber: "test".to_owned(),
+            }))
+            .await
+            .expect("list")
+            .into_inner();
+        assert!(listed.sessions.is_empty(), "{:?}", listed.sessions);
     }
 
     #[tokio::test]

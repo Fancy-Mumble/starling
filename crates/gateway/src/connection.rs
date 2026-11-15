@@ -16,12 +16,17 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use starling_runtime::pressure::Gauge;
 use tokio::sync::{Notify, mpsc};
+
+/// Set beside the epoch once `SessionUp` has stated it.
+const EPOCH_FINAL: u64 = 1 << 32;
+/// The epoch itself.
+const EPOCH_MASK: u64 = 0xFFFF_FFFF;
 
 /// Which queue a frame belongs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +110,11 @@ pub struct ClientHandle {
     /// its decoder can read, and only the second one decides whether a frame
     /// is safe to write. Conflating them is what let a service outer type
     /// reach a peer that treats an unknown id as fatal.
-    fancy_protocol: AtomicU32,
+    ///
+    /// The epoch in the low word, and [`EPOCH_FINAL`] once `SessionUp` has set
+    /// it: one word, so a `Version` read in the same instant cannot overwrite
+    /// what `SessionUp` said.
+    fancy_protocol: AtomicU64,
     /// The resume token, which is what the replay ring is keyed by.
     pub token: String,
     /// Whether this peer's frames carry a sequence number.
@@ -187,9 +196,38 @@ impl ClientHandle {
             .store((version & u64::from(u32::MAX)) as u32, Ordering::Release);
     }
 
-    /// Record the announced wire epoch.
+    /// Record the wire epoch `SessionUp` carries, which no `Version` read
+    /// afterwards may change.
     pub fn set_epoch(&self, epoch: u32) {
-        self.fancy_protocol.store(epoch, Ordering::Release);
+        self.fancy_protocol
+            .store(EPOCH_FINAL | u64::from(epoch), Ordering::Release);
+    }
+
+    /// Record the epoch a `Version` from this peer announces, until it has a
+    /// session.
+    ///
+    /// The last one read wins, as in session-lifecycle's own record, except
+    /// that an undecodable one reads as epoch 0 here where session-lifecycle
+    /// skips it: the side that withholds. Once `SessionUp` has set the epoch
+    /// from that record a `Version` changes nothing here, as it never did,
+    /// and the check and the store are one step, so not even one read in the
+    /// same instant.
+    pub fn heard_version(&self, payload: &[u8]) {
+        let announced = u64::from(crate::epoch::announced(payload));
+        // The loop `fetch_update` would run, written out for the reason
+        // `control_sent` gives.
+        let mut current = self.fancy_protocol.load(Ordering::Acquire);
+        while current & EPOCH_FINAL == 0 {
+            match self.fancy_protocol.compare_exchange_weak(
+                current,
+                announced,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Whether a frame of `type_id` may be written to this peer.
@@ -203,13 +241,17 @@ impl ClientHandle {
     /// audience it never enumerates, and the epoch is a property of each
     /// recipient.
     ///
-    /// Upstream types (0-99) are always allowed: they are frozen, and they are
-    /// the whole conversation with a stock Mumble client.
+    /// Upstream types (0-99) are always allowed. Before the peer has a session,
+    /// a service outer type reaches it only if it is also on the short list of
+    /// what may be said to somebody who has proved nothing. The rule itself is
+    /// in `crate::epoch`.
     #[must_use]
     pub fn accepts(&self, type_id: u16) -> bool {
-        type_id < starling_proto_fancy::types::SERVICE_BASE
-            || self.fancy_protocol.load(Ordering::Acquire)
-                == starling_proto_fancy::types::FANCY_PROTOCOL_EPOCH
+        crate::epoch::may_write(
+            type_id,
+            (self.fancy_protocol.load(Ordering::Acquire) & EPOCH_MASK) as u32,
+            self.session() != 0,
+        )
     }
 
     /// Whether this peer's frames carry a sequence number.
@@ -398,7 +440,7 @@ pub(crate) fn channel(
         conn,
         session: AtomicU32::new(0),
         fancy_version: AtomicU32::new(0),
-        fancy_protocol: AtomicU32::new(0),
+        fancy_protocol: AtomicU64::new(0),
         token,
         control: tx,
         sequenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -880,6 +922,128 @@ mod tests {
             handle.control_sent(taken.len());
         }
         assert_eq!(handle.queued_control_bytes(), 0);
+    }
+
+    /// What the gateway may write to a peer, by when it learned the epoch.
+    mod epoch {
+        use super::*;
+        use prost::Message as _;
+        use starling_proto_fancy::types::{FANCY_PROTOCOL_EPOCH, ServiceKind};
+
+        const LIVERY: u16 = ServiceKind::ServerConfig.outer_type();
+        const TEXT: u16 = ServiceKind::Text.outer_type();
+
+        fn version(fancy_protocol: Option<u32>) -> Vec<u8> {
+            starling_proto::proto::tcp::Version {
+                fancy_protocol,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        }
+
+        fn peer() -> Arc<ClientHandle> {
+            channel(1, "tok".to_owned(), 16, 4).0
+        }
+
+        #[test]
+        fn a_peer_on_our_epoch_without_a_session_accepts_the_livery_and_no_other_service() {
+            let handle = peer();
+            handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+            assert!(handle.accepts(LIVERY));
+            assert!(
+                !handle.accepts(TEXT),
+                "only the livery is said before a session"
+            );
+            assert!(handle.accepts(0), "upstream types are unaffected");
+        }
+
+        #[test]
+        fn a_peer_that_announced_no_epoch_or_an_older_one_accepts_no_service_frame() {
+            for announced in [None, Some(0)] {
+                let handle = peer();
+                handle.heard_version(&version(announced));
+                assert!(!handle.accepts(LIVERY), "{announced:?}");
+                assert!(handle.accepts(0), "{announced:?}");
+            }
+            assert!(
+                !peer().accepts(LIVERY),
+                "nor one that sent no Version at all"
+            );
+        }
+
+        #[test]
+        fn a_malformed_version_is_read_as_epoch_zero() {
+            let handle = peer();
+            handle.heard_version(&[0x38, 0x81]);
+            assert!(!handle.accepts(LIVERY));
+        }
+
+        #[test]
+        fn before_a_session_the_last_version_is_the_one_that_counts() {
+            // As session-lifecycle's own record: each `Version` replaces it.
+            let handle = peer();
+            handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+            handle.heard_version(&version(None));
+            assert!(!handle.accepts(LIVERY), "the second one took it back");
+            handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+            assert!(handle.accepts(LIVERY), "and a third gave it again");
+        }
+
+        #[test]
+        fn after_session_up_a_version_changes_nothing_and_every_service_reaches_the_peer() {
+            // `SessionUp` sets both, from session-lifecycle's record, as before.
+            let handle = peer();
+            handle.set_session(7);
+            handle.set_epoch(FANCY_PROTOCOL_EPOCH);
+            assert!(handle.accepts(TEXT));
+            assert!(handle.accepts(LIVERY));
+
+            handle.heard_version(&version(None));
+            assert!(handle.accepts(TEXT), "a later Version must not move it");
+        }
+
+        #[test]
+        fn once_session_up_has_set_the_epoch_no_version_moves_it_whatever_the_order() {
+            // The race this closes: the session bound, `SessionUp`'s epoch not
+            // yet stored, a `Version` read in between. The epoch is final the
+            // moment it is set, whether or not the session is visible yet.
+            let handle = peer();
+            handle.set_epoch(FANCY_PROTOCOL_EPOCH);
+            handle.heard_version(&version(None));
+            assert!(handle.accepts(LIVERY));
+
+            let handle = peer();
+            handle.set_epoch(0);
+            handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+            assert!(!handle.accepts(LIVERY));
+
+            // And from many threads at once, the final word is still `SessionUp`'s.
+            let handle = peer();
+            let announce = || {
+                for _ in 0..1000 {
+                    handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+                }
+            };
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let _ = scope.spawn(announce);
+                }
+                handle.set_epoch(0);
+            });
+            assert!(!handle.accepts(LIVERY));
+        }
+
+        #[test]
+        fn session_up_on_an_older_epoch_overrides_what_the_version_said() {
+            // The two readings agree in every honest case. Where they do not,
+            // session-lifecycle's is the one in force once a session exists.
+            let handle = peer();
+            handle.heard_version(&version(Some(FANCY_PROTOCOL_EPOCH)));
+            handle.set_session(7);
+            handle.set_epoch(0);
+            assert!(!handle.accepts(LIVERY));
+            assert!(!handle.accepts(TEXT));
+        }
     }
 
     #[test]

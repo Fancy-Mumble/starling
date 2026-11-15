@@ -1,7 +1,7 @@
 //! `pchat`: persistent chat: a relay and a store, never a decryptor.
 //!
 //! The end-to-end crypto lives in the client
-//! (`vendor/client/crates/mumble-protocol/src/persistent/`), so this service
+//! (`vendor/client/src/crates/mumble-protocol/src/persistent/`), so this service
 //! never sees plaintext. What it owns is storage, fan-out, offline queues,
 //! key-holder bookkeeping and rate limiting (`docs/PORTING-PLAN.md`, persistent
 //! chat).
@@ -13,6 +13,8 @@
 
 mod at_rest;
 mod limits;
+mod pin_relay;
+mod pins;
 
 use std::sync::Arc;
 
@@ -184,6 +186,7 @@ const SCHEMA: &[Migration<'static>] = &[
         "0007_pchat_at_rest",
         &["ALTER TABLE pchat_message ADD COLUMN at_rest_key_id INTEGER NULL"],
     ),
+    pins::SCHEMA,
 ];
 
 /// Whether a message of this protocol belongs in the archive at all.
@@ -247,6 +250,8 @@ pub struct PchatService {
     data_key: Option<DataKey>,
     /// Per-connection budgets.
     limits: Limits,
+    /// The pins of channels that keep their messages.
+    pins: pins::Pins,
 }
 
 /// The file the at-rest key lives in, under the server's data directory.
@@ -747,6 +752,7 @@ impl PchatService {
         .bind(now_ms() as i64)
         .execute(self.store.pool())
         .await;
+        self.pins.sweep().await;
     }
 }
 
@@ -919,6 +925,10 @@ impl Relay {
 }
 
 impl ClientService for PchatService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         if inbound.type_id != ServiceKind::Pchat.outer_type() {
             return Actions::new();
@@ -948,6 +958,8 @@ impl ClientService for PchatService {
             // Before the relay: a delete removes rows, and its authorisation
             // depends on who wrote them.
             Some(body @ pchat_envelope::Body::Delete(_)) => self.on_delete(&inbound, &body).await,
+            // Kept as well as told, and stamped with who and when.
+            Some(body @ pchat_envelope::Body::Pin(_)) => self.on_pin(&inbound, &body).await,
             Some(body) => self.on_relay(&inbound, &body).await,
             None => Actions::new(),
         }
@@ -1268,14 +1280,23 @@ impl PchatService {
         for message in &mut page.messages {
             message.sender = self.roster.seen_by(inbound.session, message.sender);
         }
+        let first_page = request
+            .page
+            .as_ref()
+            .is_none_or(|page| page.before_id.is_empty() && page.after_id.is_empty());
         let reply = PchatEnvelope {
             body: Some(pchat_envelope::Body::FetchResponse(page)),
         };
-        vec![to_conn(
+        let mut actions = vec![to_conn(
             inbound.conn,
             ServiceKind::Pchat.outer_type(),
             reply.encode_to_vec(),
-        )]
+        )];
+        // After the page, so the messages the pins sit on are there first.
+        if first_page {
+            actions.extend(self.pin_list(inbound, request.channel).await);
+        }
+        actions
     }
 
     /// Pass a body this service does not read on to whoever it is addressed to.
@@ -1528,14 +1549,18 @@ impl PchatService {
         }
         let mut tx = self.store.pool().begin().await?;
         for row in rows.iter().flatten() {
-            let _ = sqlx::query(
+            // A deleted message takes its pin with it, in the same commit.
+            for table in [
                 "DELETE FROM pchat_message WHERE server_id = ? AND channel_id = ? AND id = ?",
-            )
-            .bind(i64::from(scope))
-            .bind(i64::from(channel))
-            .bind(row.id.as_slice())
-            .execute(&mut *tx)
-            .await?;
+                "DELETE FROM pchat_pin WHERE server_id = ? AND channel_id = ? AND row_id = ?",
+            ] {
+                let _ = sqlx::query(table)
+                    .bind(i64::from(scope))
+                    .bind(i64::from(channel))
+                    .bind(row.id.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await
     }
@@ -1558,6 +1583,7 @@ impl Serve for PchatService {
         store.migrate(SCHEMA).await?;
         ctx.health.gate(VIEW_GATE);
         Ok(Arc::new(Self {
+            pins: pins::Pins::new(store.clone()),
             store,
             fanout: Fanout::default(),
             permit: Permit::new(ctx.resolver.clone()),
@@ -1639,6 +1665,7 @@ mod tests {
             starling_runtime::inproc::Broker::new(),
         );
         Arc::new(PchatService {
+            pins: pins::Pins::new(store.clone()),
             store,
             fanout: Fanout::default(),
             permit: Permit::new(resolver),
@@ -2132,6 +2159,7 @@ mod tests {
             modes: Arc::clone(&service.modes),
             data_key: None,
             limits: Limits::new(),
+            pins: service.pins.clone(),
         }
     }
 
@@ -2697,6 +2725,7 @@ mod tests {
                 message_id: "m".to_owned(),
                 channel: 4,
                 unpin: false,
+                ..Pin::default()
             }),
             pchat_envelope::Body::KeyAnnounce(KeyAnnounce {
                 channel: 4,
@@ -2724,6 +2753,7 @@ mod tests {
                 message_id: "m".to_owned(),
                 channel: 4,
                 unpin: false,
+                ..Pin::default()
             })))
             .await;
 
@@ -2790,6 +2820,7 @@ mod tests {
             message_id: "m".to_owned(),
             channel: 4,
             unpin: false,
+            ..Pin::default()
         }));
 
         let actions = service.to_channel(&inbound, 4, true, inbound.payload.clone());
@@ -3216,6 +3247,7 @@ mod tests {
                     message_id: "m".to_owned(),
                     channel: 4,
                     unpin: false,
+                    ..Pin::default()
                 }),
                 true,
             ),
@@ -3253,6 +3285,7 @@ mod tests {
                     message_id: "m".to_owned(),
                     channel: 4,
                     unpin: false,
+                    ..Pin::default()
                 }),
                 Some((4, Perm::TEXT_MESSAGE)),
             ),
@@ -3417,5 +3450,156 @@ mod tests {
             .map(|(session, _)| session)
             .collect();
         assert_eq!(recipients, vec![11, 12]);
+    }
+
+    /// A service where channel 4 keeps its messages under `mode`, holding
+    /// `held`, with session 7 named "speaker".
+    async fn keeping(mode: u32, held: Perm) -> Arc<PchatService> {
+        use starling_proto_fancy::metadata::{Channel, Tree, TreeEvent, tree_event};
+        let service = service_holding(held).await;
+        let _ = service.modes.apply(TreeEvent {
+            event: Some(tree_event::Event::Snapshot(Tree {
+                channels: vec![Channel {
+                    id: 4,
+                    pchat_protocol: mode,
+                    ..Channel::default()
+                }],
+                ..Tree::default()
+            })),
+        });
+        service
+            .roster
+            .upsert(&starling_proto_fancy::sessionview::Session {
+                session: 7,
+                channel: 4,
+                cert_hash: SPEAKER_CERT.to_vec(),
+                name: "speaker".to_owned(),
+                ..starling_proto_fancy::sessionview::Session::default()
+            });
+        service
+    }
+
+    /// A pin of `id` in channel 4 from session 7, claiming to be somebody
+    /// else at some other time.
+    fn pin_of(id: &str, unpin: bool) -> Inbound {
+        frame(pchat_envelope::Body::Pin(Pin {
+            message_id: id.to_owned(),
+            channel: 4,
+            unpin,
+            pinner: 99,
+            pinner_cert: b"forged".to_vec(),
+            pinner_name: "somebody else".to_owned(),
+            pinned_at_ms: 1,
+        }))
+    }
+
+    /// What a first-page fetch of channel 4 is told is pinned there.
+    async fn listed_pins(service: &PchatService) -> Option<PinList> {
+        let actions = service
+            .frame(frame(pchat_envelope::Body::Fetch(fetch(4, 50))))
+            .await;
+        actions.iter().find_map(|action| {
+            match PchatEnvelope::decode(sent_payload(action).as_slice())
+                .ok()?
+                .body?
+            {
+                pchat_envelope::Body::PinList(list) => Some(list),
+                _ => None,
+            }
+        })
+    }
+
+    const FULL_ARCHIVE: u32 = Protocol::FancyV1FullArchive as u32;
+
+    #[tokio::test]
+    async fn a_pin_is_kept_and_told_to_whoever_fetches_later_with_who_and_when() {
+        let service = keeping(FULL_ARCHIVE, Perm::ENTER | Perm::TEXT_MESSAGE).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+
+        let told = delivered(&service.frame(pin_of(MINE, false)).await);
+        assert_eq!(
+            told.iter().map(|(session, _)| *session).collect::<Vec<_>>(),
+            vec![7, 8],
+            "the channel, the pinner included"
+        );
+        for (_, body) in &told {
+            let pchat_envelope::Body::Pin(pin) = body else {
+                panic!("expected a pin, got {body:?}");
+            };
+            assert_eq!(pin.pinner, 7);
+            assert_eq!(
+                pin.pinner_cert, SPEAKER_CERT,
+                "the connection's, not the claim"
+            );
+            assert_eq!(pin.pinner_name, "speaker");
+            assert!(pin.pinned_at_ms > 1, "the server's clock, not the client's");
+        }
+
+        let list = listed_pins(&service)
+            .await
+            .expect("a list with the history");
+        assert_eq!(list.pins.len(), 1);
+        assert_eq!(list.pins[0].message_id, MINE);
+        assert_eq!(list.pins[0].pinner_cert, SPEAKER_CERT);
+        assert_eq!(list.pins[0].pinner_name, "speaker");
+        assert!(list.pins[0].pinned_at_ms > 1);
+        assert_eq!(
+            list.pinned
+                .iter()
+                .map(|m| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![MINE],
+            "and by id alone, for a client that reads only that"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpin_and_a_delete_each_take_the_pin_away() {
+        let service = keeping(FULL_ARCHIVE, Perm::ENTER | Perm::TEXT_MESSAGE).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+        let _ = service.frame(pin_of(MINE, false)).await;
+        let _ = service.frame(pin_of(MINE, true)).await;
+        assert!(listed_pins(&service).await.expect("a list").pins.is_empty());
+
+        let _ = service.frame(pin_of(MINE, false)).await;
+        assert_eq!(listed_pins(&service).await.expect("a list").pins.len(), 1);
+        let _ = service.frame(delete_of(&[MINE])).await;
+        assert!(
+            listed_pins(&service).await.expect("a list").pins.is_empty(),
+            "a deleted message takes its pin with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_keeps_nothing_keeps_no_pins_and_lists_none() {
+        let service = keeping(0, Perm::ENTER | Perm::TEXT_MESSAGE).await;
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+        let told = delivered(&service.frame(pin_of(MINE, false)).await);
+        assert_eq!(told.len(), 2, "still told to who is there");
+        assert!(listed_pins(&service).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pin_from_a_second_device_names_the_user_others_know() {
+        // 7 (the pinner) is a second device of the user others know as 3.
+        let service = keeping(FULL_ARCHIVE, Perm::ENTER | Perm::TEXT_MESSAGE).await;
+        seat_device(&service, 3, 3, SPEAKER_CERT);
+        seat_device(&service, 7, 3, SPEAKER_CERT);
+        let _ = written_by(&service, MINE, SPEAKER_CERT).await;
+
+        let pinners: Vec<(u32, u32)> = delivered(&service.frame(pin_of(MINE, false)).await)
+            .into_iter()
+            .filter_map(|(session, body)| match body {
+                pchat_envelope::Body::Pin(pin) => Some((session, pin.pinner)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pinners,
+            vec![(3, 3), (7, 7), (8, 3)],
+            "a stranger sees the user, each device sees itself"
+        );
+        let list = listed_pins(&service).await.expect("a list");
+        assert_eq!(list.pins[0].pinner, 7, "the reader, 7, sees its own device");
     }
 }

@@ -32,6 +32,7 @@
 
 pub mod grants;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -43,9 +44,9 @@ use starling_proto_fancy::types::ServiceKind;
 
 use crate::grants::Grants;
 use starling_runtime::ids::now_ms;
-use starling_runtime::permit::Permit;
+use starling_runtime::permit::{Permit, permission_denied};
 use starling_runtime::plane::{
-    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn,
+    Actions, ClientService, Fanout, Inbound, Plane, broadcast_except, to_conn, to_conns,
 };
 use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
@@ -102,7 +103,9 @@ const SCHEMA: &[Migration<'static>] = &[
 #[derive(Debug)]
 pub struct OnboardingService {
     store: Store,
-    config: RwLock<Option<Flow>>,
+    /// Each server instance's flow, once read: one instance's questions are
+    /// not another's.
+    config: RwLock<HashMap<u32, Flow>>,
     roster: Arc<Roster>,
     permit: Permit,
     grants: Grants,
@@ -122,7 +125,7 @@ impl OnboardingService {
 
     /// The configured flow, reading through to the database on first use.
     async fn config(&self, scope: u32) -> Option<Flow> {
-        if let Some(cached) = self.config.read().await.clone() {
+        if let Some(cached) = self.config.read().await.get(&scope).cloned() {
             return Some(cached);
         }
         use sqlx::Row as _;
@@ -133,7 +136,7 @@ impl OnboardingService {
             .ok()??;
         let bytes: Vec<u8> = row.try_get("config").ok()?;
         let config = Flow::decode(bytes.as_slice()).ok()?;
-        *self.config.write().await = Some(config.clone());
+        let _ = self.config.write().await.insert(scope, config.clone());
         Some(config)
     }
 
@@ -159,7 +162,7 @@ impl OnboardingService {
         .execute(self.store.pool())
         .await;
 
-        *self.config.write().await = Some(config.clone());
+        let _ = self.config.write().await.insert(scope, config.clone());
         config
     }
 
@@ -279,6 +282,10 @@ impl OnboardingService {
 }
 
 impl ClientService for OnboardingService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         if inbound.type_id != Self::outer() {
             return Actions::new();
@@ -336,7 +343,9 @@ impl OnboardingService {
                 session = inbound.session,
                 "onboarding config update without root Write; refused"
             );
-            return Actions::new();
+            // Said, not swallowed: the editor's page otherwise shows the
+            // questions as saved. It names only the asker's own permission.
+            return vec![permission_denied(inbound, Perm::WRITE, ROOT_CHANNEL)];
         }
         let Some(config) = flow else {
             return Actions::new();
@@ -390,8 +399,20 @@ impl OnboardingService {
         response.flow_version = self.config(inbound.scope).await.map_or(0, |c| c.version);
         self.record(inbound.scope, account, &response).await;
         let _ = self.apply_grants(inbound.scope, account).await;
-        vec![to_conn(
-            inbound.conn,
+        // To every device of the account, not only the one that answered:
+        // the answers are the account's, and another device holding the old
+        // ones would ask the questions again.
+        let mut conns: Vec<u64> = self
+            .roster
+            .sessions_of_account(account)
+            .into_iter()
+            .filter_map(|session| self.roster.conn_of(session))
+            .collect();
+        if !conns.contains(&inbound.conn) {
+            conns.push(inbound.conn);
+        }
+        vec![to_conns(
+            conns,
             Self::outer(),
             Self::envelope(onboarding_envelope::Body::Response(response)),
         )]
@@ -407,16 +428,19 @@ impl OnboardingService {
         if let Some(account) = self.roster.account_of(inbound.session) {
             let _ = self.apply_grants(inbound.scope, account).await;
         }
+        // The answers go first: a client deciding on the questions whether to
+        // ask them otherwise sees questions with no answers yet, and asks for
+        // the answers a second time.
         let mut actions = Actions::new();
+        if include_answers {
+            actions.extend(self.deliver_answers(inbound).await);
+        }
         if let Some(flow) = self.config(inbound.scope).await {
             actions.push(to_conn(
                 inbound.conn,
                 Self::outer(),
                 Self::envelope(onboarding_envelope::Body::Flow(flow)),
             ));
-        }
-        if include_answers {
-            actions.extend(self.deliver_answers(inbound).await);
         }
         actions
     }
@@ -430,7 +454,7 @@ impl Serve for OnboardingService {
         store.migrate(SCHEMA).await?;
         Ok(Arc::new(Self {
             store,
-            config: RwLock::new(None),
+            config: RwLock::new(HashMap::new()),
             roster: Arc::new(Roster::new()),
             permit: Permit::new(ctx.resolver.clone()),
             grants: Grants::new(ctx.resolver.clone()),
@@ -481,7 +505,7 @@ mod tests {
         );
         Arc::new(OnboardingService {
             store,
-            config: RwLock::new(None),
+            config: RwLock::new(HashMap::new()),
             roster: Arc::new(Roster::new()),
             permit: Permit::new(nowhere.clone()),
             grants: Grants::new(nowhere),
@@ -550,7 +574,7 @@ mod tests {
         assert_eq!(second.version, 2);
 
         // A restart drops the cache but not the stored revision.
-        *service.config.write().await = None;
+        service.config.write().await.clear();
         let third = service.store_config(1, Flow::default(), "7").await;
         assert_eq!(third.version, 3);
     }
@@ -559,6 +583,18 @@ mod tests {
     async fn a_server_with_no_flow_has_nothing_to_serve() {
         let service = service().await;
         assert!(service.config(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_server_instances_questions_are_not_anothers() {
+        // The cache held one flow for the whole process, so the first instance
+        // read answered every instance with its questions.
+        let service = service().await;
+        let _ = service.store_config(1, Flow::default(), "7").await;
+        assert!(service.config(1).await.is_some());
+        assert!(service.config(2).await.is_none());
+        let second = service.store_config(2, Flow::default(), "7").await;
+        assert_eq!(second.version, 1, "its own revisions");
     }
 
     #[tokio::test]
@@ -711,7 +747,7 @@ mod tests {
 
         // Read back through the database, not the cache, or this asserts only
         // that a clone is a clone.
-        *service.config.write().await = None;
+        service.config.write().await.clear();
         let stored = service.config(1).await.expect("the flow is on record");
         let choice = stored
             .steps
@@ -725,5 +761,87 @@ mod tests {
             "a multi-select question that round-trips as single-select silently \
              discards every answer but one"
         );
+    }
+
+    /// Who a `Send` reaches by connection, and the body it carries.
+    fn sent(action: &starling_proto_fancy::control::ServerAction) -> (Vec<u64>, Vec<u8>) {
+        use starling_proto_fancy::control::server_action::Action;
+        match &action.action {
+            Some(Action::Send(send)) => (send.conns.clone(), send.payload.clone()),
+            other => panic!("expected a send, got {other:?}"),
+        }
+    }
+
+    fn inbound(session: u32, conn: u64) -> Inbound {
+        Inbound {
+            conn,
+            session,
+            scope: 1,
+            type_id: OnboardingService::outer(),
+            gateway: String::new(),
+            payload: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_without_root_write_is_refused_out_loud_and_changes_nothing() {
+        // The test resolver reaches no `permissions`, so every check denies.
+        let service = service().await;
+        let actions = service
+            .on_flow_update(&inbound(4, 40), Some(Flow::default()))
+            .await;
+        assert_eq!(actions.len(), 1);
+        let (conns, _) = sent(&actions[0]);
+        assert_eq!(conns, vec![40], "to the editor alone");
+        let Some(starling_proto_fancy::control::server_action::Action::Send(send)) =
+            &actions[0].action
+        else {
+            panic!("expected a send");
+        };
+        assert_eq!(send.r#type, 12, "upstream PermissionDenied");
+        assert!(service.config(1).await.is_none(), "nothing stored");
+    }
+
+    #[tokio::test]
+    async fn an_answer_given_on_one_device_reaches_every_device_of_the_account() {
+        use starling_proto_fancy::sessionview::Session;
+        let service = service().await;
+        for (session, conn) in [(5, 50), (6, 60)] {
+            service.roster.upsert(&Session {
+                session,
+                conn,
+                account: 9,
+                registered: true,
+                presented_as: 5,
+                ..Session::default()
+            });
+        }
+        let actions = service
+            .on_response(&inbound(6, 60), Response::default())
+            .await;
+        let (mut conns, payload) = sent(&actions[0]);
+        conns.sort_unstable();
+        assert_eq!(conns, vec![50, 60]);
+        let Some(onboarding_envelope::Body::Response(echo)) =
+            OnboardingEnvelope::decode(payload.as_slice())
+                .expect("an envelope")
+                .body
+        else {
+            panic!("expected the answers");
+        };
+        assert!(echo.submitted_at_ms > 0, "stamped by the server");
+        assert!(
+            service.answers(1, 9).await.is_some(),
+            "kept for the account"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guests_answers_are_not_kept() {
+        let service = service().await;
+        let actions = service
+            .on_response(&inbound(7, 70), Response::default())
+            .await;
+        assert!(actions.is_empty());
     }
 }

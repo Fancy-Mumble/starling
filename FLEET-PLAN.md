@@ -526,7 +526,7 @@ client windows share one display.
   is a mounted component carrying every *old* testid and none of the *new* ones —
   when source archaeology says "this cannot be missing", check the dist's mtime
   (`ui/dist/index.html`) against the commit before anything else. `npm run build`
-  in `crates/mumble-tauri/ui`, then cargo. (Grepping the exe for a testid proves
+  in `src/ui/tauri/ui`, then cargo. (Grepping the exe for a testid proves
   nothing either way: release builds embed assets brotli-compressed.)
 - **The harness config is a delta; a pre-`check-config` binary is not.** Current
   `starling.ts` writes a partial TOML and relies on `Config::load` overlaying it

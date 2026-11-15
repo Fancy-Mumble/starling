@@ -533,6 +533,10 @@ impl Push for PushRpc {
 }
 
 impl ClientService for PushService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Push.outer_type();
         if inbound.type_id != outer {

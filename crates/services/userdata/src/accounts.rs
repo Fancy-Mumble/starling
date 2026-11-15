@@ -1072,6 +1072,17 @@ impl Accounts {
 
         let values = request.values.unwrap_or_default();
         let settings = request.fields.iter().any(|field| field == "settings");
+        // What the account stops holding: the caller put the new content, and
+        // the reference to the old is released once the change is written.
+        let replaced: Vec<Vec<u8>> = request
+            .fields
+            .iter()
+            .filter_map(|field| match field.as_str() {
+                "texture_hash" => Some(record.account.texture_hash.clone()),
+                "comment_hash" => Some(record.account.comment_hash.clone()),
+                _ => None,
+            })
+            .collect();
         // Refused before anything changes: the column is `VARCHAR(190)`, and a
         // key past it would fail the whole set's write on a strict backend,
         // leaving every later change to this account's settings in memory only.
@@ -1098,6 +1109,9 @@ impl Accounts {
         }
         if let Ok(mut cache) = self.cache.lock() {
             let _ = cache.insert((scope, request.id), record.clone());
+        }
+        for hash in replaced {
+            self.release_blob(&hash).await;
         }
         Ok(record.account)
     }
@@ -1425,8 +1439,14 @@ impl Accounts {
     /// Its settings go with it. Ids are handed out again after a restart, and
     /// rows left behind would load as the next holder's preferences.
     pub async fn delete(&self, scope: u32, id: u64) {
-        if let Ok(mut cache) = self.cache.lock() {
-            let _ = cache.remove(&(scope, id));
+        let removed = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.remove(&(scope, id)));
+        if let Some(removed) = removed {
+            self.release_blob(&removed.account.comment_hash).await;
+            self.release_blob(&removed.account.texture_hash).await;
         }
         for statement in [
             "DELETE FROM account WHERE server_id = ? AND id = ?",
@@ -1439,6 +1459,27 @@ impl Accounts {
                 .execute(self.store.pool())
                 .await
                 .inspect_err(|error| tracing::error!(%error, "could not delete an account"));
+        }
+    }
+
+    /// Drop one reference to a blob, deleting it with the last.
+    ///
+    /// The other half of [`Self::put_blob`]. Without it every comment and
+    /// avatar ever set stayed stored for the life of the server: a guest's
+    /// after they left, an account's after it was replaced.
+    pub async fn release_blob(&self, hash: &[u8]) {
+        if hash.is_empty() {
+            return;
+        }
+        for statement in [
+            "UPDATE blob SET refs = refs - 1 WHERE hash = ? AND refs > 0",
+            "DELETE FROM blob WHERE hash = ? AND refs <= 0",
+        ] {
+            let _ = sqlx::query(statement)
+                .bind(hash)
+                .execute(self.store.pool())
+                .await
+                .inspect_err(|error| tracing::warn!(%error, "could not release a blob"));
         }
     }
 
@@ -2608,6 +2649,74 @@ mod tests {
         assert_eq!(
             accounts.blob(1, &first.hash).await,
             Some(b"an avatar".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blob_goes_with_the_last_reference_to_it_and_not_before() {
+        // Nothing released a blob, so every comment and avatar ever set stayed
+        // stored. Two holders of one avatar: the first letting go keeps it.
+        let accounts = accounts().await;
+        let held = accounts.put_blob(1, b"an avatar").await;
+        let _ = accounts.put_blob(1, b"an avatar").await;
+        accounts.release_blob(&held.hash).await;
+        assert!(
+            accounts.blob(1, &held.hash).await.is_some(),
+            "one holder left"
+        );
+        accounts.release_blob(&held.hash).await;
+        assert_eq!(
+            accounts.blob(1, &held.hash).await,
+            None,
+            "the last one let go"
+        );
+        accounts.release_blob(&held.hash).await;
+        accounts.release_blob(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn an_account_lets_go_of_the_content_it_replaces_and_of_all_of_it_when_deleted() {
+        let accounts = accounts().await;
+        let id = accounts
+            .register(1, named("erin"), "")
+            .await
+            .expect("registered")
+            .id;
+        let set = |hash: Vec<u8>| UpdateRequest {
+            scope: None,
+            actor: None,
+            id,
+            fields: vec!["texture_hash".to_owned()],
+            values: Some(Account {
+                texture_hash: hash,
+                ..Account::default()
+            }),
+            password: String::new(),
+            current_password: String::new(),
+        };
+        let old = accounts.put_blob(1, b"old face").await;
+        let _ = accounts
+            .update(1, set(old.hash.clone()))
+            .await
+            .expect("set");
+        let new = accounts.put_blob(1, b"new face").await;
+        let _ = accounts
+            .update(1, set(new.hash.clone()))
+            .await
+            .expect("replaced");
+        assert_eq!(accounts.blob(1, &old.hash).await, None, "the old face went");
+        assert!(accounts.blob(1, &new.hash).await.is_some());
+
+        // Set to the same picture again: one put, one release, still there.
+        let again = accounts.put_blob(1, b"new face").await;
+        let _ = accounts.update(1, set(again.hash)).await.expect("again");
+        assert!(accounts.blob(1, &new.hash).await.is_some(), "kept");
+
+        accounts.delete(1, id).await;
+        assert_eq!(
+            accounts.blob(1, &new.hash).await,
+            None,
+            "and with the account"
         );
     }
 

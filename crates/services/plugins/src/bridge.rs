@@ -161,7 +161,11 @@ impl StarlingBridge {
     fn addressed(&self, sessions: Vec<u32>, type_id: u16, payload: Vec<u8>) -> Vec<ServerAction> {
         let mut conns = Vec::with_capacity(sessions.len());
         let mut unresolved = Vec::new();
-        for session in sessions {
+        // Session 0 is nobody, so a plugin naming it addresses nobody.
+        for session in sessions
+            .into_iter()
+            .filter(|session| *session != starling_runtime::roster::NOBODY)
+        {
             match self.roster.conn_of(session) {
                 Some(conn) => conns.push(conn),
                 None => unresolved.push(session),
@@ -342,6 +346,10 @@ impl HostBridge for StarlingBridge {
     }
 
     fn has_permission(&self, _server_id: u32, session: u32, channel: u32, flags: u32) -> bool {
+        // Session 0 has not authenticated: nobody, and nothing to ask about.
+        if session == starling_runtime::roster::NOBODY {
+            return false;
+        }
         let Ok(transport) = self.dial("permissions") else {
             // Fails closed, the same way `Permit` does. An unreachable ACL
             // engine must never read as a grant.
@@ -855,5 +863,45 @@ mod tests {
         assert_eq!(bridge.resolved(&[7]), vec![7]);
         roster.remove(7);
         assert_eq!(bridge.resolved(&[7]), vec![9]);
+    }
+
+    #[tokio::test]
+    async fn session_zero_is_nobody_to_a_plugin() {
+        // A plugin replying to the sender of a frame from a connection that
+        // never authenticated was handed session 0, and the bridge addressed it
+        // and asked permissions about it as though it were a user.
+        let store = starling_runtime::storage::Store::open(
+            "sqlite:file:bridge-nobody-test?mode=memory&cache=shared",
+            1,
+        )
+        .await
+        .expect("in-memory database");
+        let device = |session: u32| starling_proto_fancy::sessionview::Session {
+            session,
+            conn: u64::from(session) * 10,
+            presented_as: 7,
+            ..Default::default()
+        };
+        let roster = Arc::new(Roster::of(vec![device(7), device(9)]));
+        let bridge = StarlingBridge::new(
+            tokio::runtime::Handle::current(),
+            Resolver::new(
+                Arc::new(starling_runtime::config::Config::with_defaults(
+                    std::path::Path::new("/run/starling"),
+                )),
+                starling_runtime::inproc::Broker::new(),
+            ),
+            roster,
+            Fanout::default(),
+            store.kv(),
+            1,
+            BTreeMap::new(),
+        );
+
+        assert!(bridge.addressed(vec![0], 26, Vec::new()).is_empty());
+        assert!(!bridge.has_permission(1, 0, 0, 0x4));
+        assert!(bridge.resolved(&[0]).is_empty());
+        // The user on two devices is still reached on the one named.
+        assert_eq!(bridge.addressed(vec![9], 26, Vec::new()).len(), 1);
     }
 }

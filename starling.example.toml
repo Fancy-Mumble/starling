@@ -163,8 +163,11 @@ url_ttl = "15m"
 
 # [services.screenshare]
 # public_url = "203.0.113.9:64740"
-# UDP port for media. 0 or absent = OS-assigned.
-# options = { media_port = "64740" }
+# UDP port for media. 0 or absent = OS-assigned. The local address the media
+# socket binds, `media_listen`, defaults to the one `[gateway] listen_tcp`
+# names, so a server on loopback keeps its media on loopback; set it when the
+# media should listen somewhere else.
+# options = { media_port = "64740", media_listen = "0.0.0.0" }
 
 
 # -- Push notifications -----------------------------------------------------

@@ -87,6 +87,8 @@ use starling_runtime::roster::Roster;
 use starling_runtime::serve::{Serve, ServiceContext, ServiceError};
 use starling_sfu::{SfuConfig, SfuEvent, SfuHandle};
 
+mod media_bind;
+
 /// One live share.
 #[derive(Debug, Clone)]
 struct Share {
@@ -520,7 +522,7 @@ impl ScreenshareService {
     /// The answer does not come back here: the SFU produces it asynchronously
     /// and `pump` delivers it. What comes back from this is nothing at all,
     /// which is why the canon says offers retry until answered.
-    fn on_offer(&self, inbound: &Inbound, offer: &Offer) -> Actions {
+    async fn on_offer(&self, inbound: &Inbound, offer: &Offer) -> Actions {
         let Some(sfu) = self.sfu.as_ref() else {
             // No media plane configured. The endpoint-only answer, as before.
             return vec![to_conn(
@@ -553,6 +555,11 @@ impl ScreenshareService {
         match role_of(inbound.session, &share) {
             Role::Broadcaster => sfu.broadcaster_offer(share.presenter, offer.sdp.clone()),
             Role::Viewer => {
+                // A viewer's offer is a join, held to the rule the viewer list
+                // is (`may_view`); unmet, it is dropped as an unknown share's is.
+                if !self.may_view(inbound, &offer.share_id).await {
+                    return Actions::new();
+                }
                 sfu.viewer_offer(share.presenter, inbound.session, offer.sdp.clone());
             }
         }
@@ -790,10 +797,18 @@ impl ScreenshareService {
 
     /// Somebody ending a share.
     async fn on_stop(&self, inbound: &Inbound, stop: &Stop) -> Actions {
+        // One refusal for a share that is not there and one that is not the
+        // caller's to stop, naming the caller's own channel: it named the
+        // share's, which said both that the share existed and where.
+        let refusal = || {
+            vec![starling_runtime::permit::permission_denied(
+                inbound,
+                Perm::MUTE_DEAFEN,
+                self.roster.channel_of(inbound.session).unwrap_or_default(),
+            )]
+        };
         let Some(share) = self.share(&stop.share_id) else {
-            // Already gone, or never there. Silence either way: a reply that
-            // told the two apart would let anyone enumerate live share ids.
-            return Actions::new();
+            return refusal();
         };
         if !self.may_stop(inbound, &share).await {
             tracing::warn!(
@@ -802,23 +817,43 @@ impl ScreenshareService {
                 presenter = share.presenter,
                 "screen share stop refused: not the presenter, and no MuteDeafen here"
             );
-            return vec![starling_runtime::permit::permission_denied(
-                inbound,
-                Perm::MUTE_DEAFEN,
-                share.channel,
-            )];
+            return refusal();
         }
         self.end(&stop.share_id, &share, inbound.session)
     }
 
     /// The viewer list, which asking for is also how a client joins.
-    fn on_viewers(&self, inbound: &Inbound, request: &Viewers) -> Actions {
+    ///
+    /// Only from where the share can be watched: anybody else is answered as
+    /// for a share that is not there. Anybody could join any share's viewers
+    /// and read who was watching it, a hidden room's included.
+    async fn on_viewers(&self, inbound: &Inbound, request: &Viewers) -> Actions {
+        let viewers = if self.may_view(inbound, &request.share_id).await {
+            self.join(inbound, request)
+        } else {
+            Vec::new()
+        };
+        self.viewers_reply(inbound, request, viewers)
+    }
+
+    /// Whether `inbound` may watch this share: its presenter on any device,
+    /// somebody standing in its channel, or somebody allowed to enter it.
+    async fn may_view(&self, inbound: &Inbound, share_id: &str) -> bool {
+        let Some(share) = self.share(share_id) else {
+            return false;
+        };
+        self.roster.same_user(inbound.session, share.presenter)
+            || self.roster.channel_of(inbound.session) == Some(share.channel)
+            || self.allows(inbound, share.channel, Perm::ENTER).await
+    }
+
+    /// Join `request`'s share as a viewer, and list who is watching.
+    fn join(&self, inbound: &Inbound, request: &Viewers) -> Vec<u32> {
         // Joining is implicit in asking: a client that wants the viewer list is
         // watching, and the presenter's own request is not a join, which is why
         // the presenter is compared out here rather than filtered on the way to
         // the SFU.
-        let viewers = self
-            .shares
+        self.shares
             .lock()
             .ok()
             .map(|mut shares| {
@@ -841,7 +876,11 @@ impl ScreenshareService {
                 self.gauges.observe(&shares);
                 listed
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// The `Viewers` answer naming `viewers`.
+    fn viewers_reply(&self, inbound: &Inbound, request: &Viewers, viewers: Vec<u32>) -> Actions {
         // Named as the asker knows them, and once per user: two devices of
         // one viewer are one viewer to everybody else.
         let mut sessions: Vec<u32> = Vec::with_capacity(viewers.len());
@@ -965,6 +1004,10 @@ impl ScreenshareService {
 }
 
 impl ClientService for ScreenshareService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         if inbound.type_id != ServiceKind::Screenshare.outer_type() {
             return Actions::new();
@@ -984,10 +1027,10 @@ impl ClientService for ScreenshareService {
 
         match envelope.body {
             Some(screenshare_envelope::Body::Start(start)) => self.on_start(&inbound, start).await,
-            Some(screenshare_envelope::Body::Offer(offer)) => self.on_offer(&inbound, &offer),
+            Some(screenshare_envelope::Body::Offer(offer)) => self.on_offer(&inbound, &offer).await,
             Some(screenshare_envelope::Body::Stop(stop)) => self.on_stop(&inbound, &stop).await,
             Some(screenshare_envelope::Body::Viewers(request)) => {
-                self.on_viewers(&inbound, &request)
+                self.on_viewers(&inbound, &request).await
             }
             Some(screenshare_envelope::Body::Signal(signal)) => {
                 self.on_signal(&inbound, &signal).await
@@ -1078,6 +1121,10 @@ impl Serve for ScreenshareService {
                 let config = SfuConfig {
                     udp_port: service.option::<u16>("media_port").unwrap_or(0),
                     public_ip,
+                    bind_ip: media_bind::media_bind(
+                        service.options.get("media_listen").map(String::as_str),
+                        &ctx.config.gateway.listen_tcp,
+                    ),
                 };
                 match SfuHandle::start(config) {
                     Ok(handle) => Some(Arc::new(handle)),
@@ -1352,11 +1399,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopping_a_share_that_does_not_exist_says_nothing_at_all() {
+    async fn stopping_a_share_that_is_not_there_is_refused_like_one_that_is_not_yours() {
         // Answering differently for "no such share" and "not yours" would let
-        // anyone enumerate live share ids by asking.
-        let service = permissive();
-        assert!(service.frame(frame(4, &stop_of("never"))).await.is_empty());
+        // anyone enumerate live share ids, and the refusal once named the
+        // share's channel, which said where. 5 is in channel 7, the share in 3.
+        let service = strict();
+        seat(&service, &[(4, 3), (5, 7)]);
+        let permitted = permissive();
+        let _ = permitted.frame(frame(4, &start_of("s4", 3))).await;
+        if let (Ok(mut theirs), Ok(mine)) = (service.shares.lock(), permitted.shares.lock()) {
+            theirs.clone_from(&mine);
+        }
+
+        let not_yours = service.frame(frame(5, &stop_of("s4"))).await;
+        let not_there = service.frame(frame(5, &stop_of("never"))).await;
+        assert_eq!(not_yours, not_there);
+        assert_eq!(not_yours.len(), 1, "a refusal, the same one");
+        assert!(service.share("s4").is_some(), "still running");
+    }
+
+    #[tokio::test]
+    async fn a_share_is_watched_only_from_where_it_can_be_seen() {
+        // Anybody could join any share's viewers and read who was watching,
+        // a hidden room's included. 4 presents in room 3; 6 is in room 3; 5
+        // is in room 7 and may not enter 3; 10 is 4's second device.
+        let service = strict();
+        service.roster.replace(
+            [(4, 3, 4), (6, 3, 6), (5, 7, 5), (10, 3, 4)]
+                .iter()
+                .map(|(session, channel, shown)| Session {
+                    session: *session,
+                    channel: *channel,
+                    presented_as: *shown,
+                    ..Session::default()
+                })
+                .collect(),
+        );
+        let permitted = permissive();
+        permitted.roster.replace(vec![Session {
+            session: 4,
+            channel: 3,
+            ..Session::default()
+        }]);
+        let _ = permitted.frame(frame(4, &start_of("s4", 3))).await;
+        if let (Ok(mut theirs), Ok(mine)) = (service.shares.lock(), permitted.shares.lock()) {
+            theirs.clone_from(&mine);
+        }
+        let ask = |share: &str| ScreenshareEnvelope {
+            body: Some(screenshare_envelope::Body::Viewers(Viewers {
+                share_id: share.to_owned(),
+                sessions: Vec::new(),
+            })),
+        };
+        let listed = |actions: &Actions| -> Vec<u32> {
+            let starling_proto_fancy::control::server_action::Action::Send(send) =
+                actions[0].action.as_ref().expect("an action")
+            else {
+                panic!("a send");
+            };
+            match ScreenshareEnvelope::decode(send.payload.as_slice())
+                .expect("an envelope")
+                .body
+            {
+                Some(screenshare_envelope::Body::Viewers(viewers)) => viewers.sessions,
+                other => panic!("not a viewer list: {other:?}"),
+            }
+        };
+
+        let _ = service.frame(frame(6, &ask("s4"))).await;
+        let outsider = service.frame(frame(5, &ask("s4"))).await;
+        let nothing = service.frame(frame(5, &ask("never"))).await;
+        assert!(listed(&outsider).is_empty(), "nobody named to an outsider");
+        assert_eq!(
+            listed(&outsider),
+            listed(&nothing),
+            "as for no share at all"
+        );
+        assert_eq!(
+            service.share("s4").expect("live").viewers,
+            vec![6],
+            "the one in the room joined; the outsider did not"
+        );
+        let presenter = service.frame(frame(10, &ask("s4"))).await;
+        assert!(
+            listed(&presenter).contains(&6),
+            "the presenter's other device is let in"
+        );
     }
 
     /// Defect 9: the SFU had no per-viewer removal at all.

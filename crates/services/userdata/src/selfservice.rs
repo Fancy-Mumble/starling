@@ -646,6 +646,10 @@ impl UserdataService {
         scope: u32,
         session: u32,
     ) -> Option<starling_proto_fancy::sessionview::Session> {
+        // Session 0 has not authenticated: nobody, whatever the view holds.
+        if session == starling_runtime::roster::NOBODY {
+            return None;
+        }
         self.sessions(scope)
             .await
             .into_iter()

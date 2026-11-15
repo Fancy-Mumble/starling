@@ -737,6 +737,10 @@ impl PluginsService {
 }
 
 impl ClientService for PluginsService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Plugins.outer_type();
         match inbound.type_id {

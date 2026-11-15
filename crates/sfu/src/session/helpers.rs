@@ -107,6 +107,7 @@ mod tests {
         let config = super::super::SfuConfig {
             udp_port: 0,
             public_ip: "127.0.0.1".parse().expect("valid IP"),
+            bind_ip: "127.0.0.1".parse().expect("valid IP"),
         };
         let _ = format!("{config:?}");
     }

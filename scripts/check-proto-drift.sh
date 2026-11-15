@@ -57,7 +57,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 root="${1:-$(cd "$here/../.." && pwd)}"
 
 ours="$here/crates/proto/classic/proto"
-client="$root/vendor/client/crates/mumble-protocol/proto"
+client="$root/vendor/client/src/crates/mumble-protocol/proto"
 
 # Reduce a .proto to the syntax that determines the wire format: strip both
 # comment styles, collapse whitespace, normalise spacing around punctuation, and

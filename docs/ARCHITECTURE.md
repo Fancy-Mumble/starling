@@ -24,8 +24,40 @@ in the framing, not in the protobuf**, `vendor/server/src/murmur/Server.cpp:2040
 writes it with `qToBigEndian(static_cast<quint16>(...))`.
 
 So the gateway reads two bytes, looks up a route, and forwards the payload
-**verbatim**. It never parses a protobuf field, never links a service's generated
-stubs, and never recompiles when a service is added.
+**verbatim**. It parses one protobuf field and no other (below), never links a
+service's generated stubs, and never recompiles when a service is added.
+
+### The one field it reads: the client's wire epoch
+
+The gateway decodes `Version.fancy_protocol` from a client's `Version` (type
+0, upstream and frozen) as it passes, in `crates/gateway/src/epoch.rs`, and
+nothing else from any payload. An undecodable `Version` reads as epoch 0.
+
+It reads it because the epoch decides what the gateway itself may write
+(`PROTOCOL-COMPATIBILITY.md` 2a: a service outer type kills the connection
+of a peer on epoch 0), and the gateway is the only component that sees a
+connection's frames in order. A Fancy client asks for a server's livery
+without joining: `Version`, then `LiveryQuery`, no `Authenticate`. The two go
+to different services, and nothing orders session-lifecycle's reading of the
+first before server-config's answer to the second; the gateway has read the
+`Version` before it forwards the query.
+
+What that reading allows is narrow. Before a session exists a service outer
+type is written only to a peer that announced our epoch **and** only if the
+type is on `epoch::BEFORE_SESSION`, the short list of what may be said to
+somebody who has proved nothing: today server-config's alone, which in turn
+answers a sessionless connection with the livery and nothing else. Most
+services answer a sessionless frame with something that is not public, and
+the epoch, never known before `SessionUp`, was what kept that off the wire.
+After `SessionUp`, session-lifecycle's record of the epoch is the one in force
+and the rule is the one it always was.
+
+Two things keep that narrow. Services themselves handle nothing from a
+connection without a session unless they say so (`plane::dispatch`,
+`SERVICES.md` "Before a session exists"), so the gateway's list is the second
+line, not the only one. And what is on the list is charged to its route's
+bucket before a session exists, since it is the one answer worth asking for
+over and over: a few bytes of question for up to ~600 KiB of livery.
 
 ### One outer type per service, nested envelope inside
 

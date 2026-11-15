@@ -25,6 +25,8 @@
 //! for none of them again.
 
 pub mod breaker;
+/// Asking `session-view` about a session a roster has not heard of yet.
+mod catch_up;
 pub mod channel;
 pub mod channel_modes;
 pub mod config;
@@ -57,6 +59,8 @@ pub mod settings;
 pub mod shutdown;
 pub mod storage;
 pub mod telemetry;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tier;
 pub mod trail;
 pub mod transport;

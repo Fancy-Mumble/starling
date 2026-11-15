@@ -15,7 +15,12 @@
 //! development and hangs in the wild (`docs/PORTING-PLAN.md` R4).
 
 pub mod announce;
+pub mod ban;
+pub mod before_session;
+mod comment_limit;
 pub mod ids;
+mod refusals;
+mod released;
 pub mod session;
 
 pub mod handshake;
@@ -94,6 +99,8 @@ pub struct SessionLifecycleService {
     /// nothing. An operator asking "who muted them" got an empty log, which
     /// reads exactly like "nobody did".
     trail: Trail,
+    /// Orders every decision about who holds a connection's content.
+    content_gate: released::ContentGate,
 }
 
 impl SessionLifecycleService {
@@ -180,15 +187,28 @@ impl ClientService for SessionLifecycleService {
         }
     }
 
+    fn before_session(&self, inbound: &Inbound) -> bool {
+        before_session::handled(inbound)
+    }
+
     async fn closed(&self, conn: u64, reason: &str) -> Actions {
         // Asked before the close, which is what drops the entry the name lives
         // in, afterwards there is only a session number to report. The account
         // goes with it, and it is needed after the close, so both are taken now.
+        let _content = self.content_gate.hold(conn).await;
         let departing = self.connections.get(conn);
         let name = departing
             .as_ref()
             .map(|pending| pending.name.clone())
             .unwrap_or_default();
+        // A guest's content was held by this connection alone. See `released`.
+        if let Some(guest) = departing
+            .as_ref()
+            .filter(|pending| pending.account.is_none())
+        {
+            self.release_content(&[&guest.comment_hash, &guest.texture_hash])
+                .await;
+        }
         let Some((session, departure)) = self.connections.close(conn) else {
             // No session means the connection never finished the handshake, so
             // nobody ever "left"; the gateway already recorded the disconnect.
@@ -779,12 +799,17 @@ impl SessionLifecycleService {
     async fn on_speak_state(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
         let devices = self.connections.named(target_session);
+        // A refusal names the caller's own channel. It named the target's,
+        // which told anybody where a user in a hidden room was; and a target
+        // that is not here is refused the same way, or the difference says
+        // who is online.
+        let refused = || vec![self.refused_speak_state(inbound)];
         let Some(target) = devices.first().cloned() else {
             tracing::debug!(
                 session = target_session,
                 "speak-state for an unknown session"
             );
-            return Actions::new();
+            return refused();
         };
 
         // The administrator cannot be muted, deafened or suppressed by anybody
@@ -817,11 +842,7 @@ impl SessionLifecycleService {
                 session = inbound.session,
                 "refusing a client-set suppress; it is server-owned"
             );
-            return vec![permission_denied(
-                inbound,
-                Perm::MUTE_DEAFEN,
-                target.channel,
-            )];
+            return refused();
         }
 
         if !self
@@ -835,11 +856,7 @@ impl SessionLifecycleService {
                 channel = target.channel,
                 "speak-state change refused"
             );
-            return vec![permission_denied(
-                inbound,
-                Perm::MUTE_DEAFEN,
-                target.channel,
-            )];
+            return refused();
         }
 
         // Every device of the user: a mute that silenced only the laptop would
@@ -908,15 +925,18 @@ impl SessionLifecycleService {
     /// path stores no password, so a certificate-less account is one its owner
     /// can never claim, with the name taken for good.
     async fn on_register(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
-        use starling_proto_fancy::userdata::user_data_client::UserDataClient;
-        use starling_proto_fancy::userdata::{Account, RegisterRequest};
-
         let target_session = state.session.unwrap_or(inbound.session);
-        let Some(target) = self.connections.by_session(target_session) else {
+        let Some(found) = self.connections.by_session(target_session) else {
             tracing::debug!(
                 session = target_session,
                 "registration for an unknown session"
             );
+            return Actions::new();
+        };
+        // Held to the hand-over: the hashes sent to the new account are the
+        // ones the connection still holds when it becomes the account's.
+        let _content = self.content_gate.hold(found.conn).await;
+        let Some(target) = self.connections.get(found.conn) else {
             return Actions::new();
         };
         let own = target_session == inbound.session;
@@ -960,47 +980,9 @@ impl SessionLifecycleService {
             )];
         }
 
-        let Ok(channel) = self.handshake.context().resolver.channel("userdata") else {
-            tracing::warn!("userdata is unreachable; cannot register");
-            return vec![refused(inbound, "the account service is unavailable")];
-        };
-        let registered = UserDataClient::new(channel)
-            .register(RegisterRequest {
-                scope: Some(starling_proto_fancy::common::Scope {
-                    instance: inbound.scope,
-                }),
-                // Whose action this was, for userdata's own record. Self- and
-                // other-registration are the same call, and only this
-                // distinguishes them once it has left here.
-                actor: Some(starling_proto_fancy::common::Actor {
-                    who: Some(actor::Who::Session(inbound.session)),
-                }),
-                account: Some(Account {
-                    name: target.name.clone(),
-                    // What the account is claimed by on every later connection.
-                    // Omitting it is the dead-account case in this method's
-                    // documentation.
-                    cert_hash: target.cert_hash.clone(),
-                    ..Account::default()
-                }),
-                password: String::new(),
-            })
-            .await;
-
-        let account = match registered {
-            Ok(account) => account.into_inner(),
-            Err(status) => {
-                // The name is taken, most likely. Said to the client rather
-                // than dropped: a register button that does nothing at all is
-                // the failure this whole path exists to remove.
-                tracing::info!(
-                    session = target_session,
-                    name = %target.name,
-                    %status,
-                    "userdata refused the registration"
-                );
-                return vec![refused(inbound, status.message())];
-            }
+        let account = match self.register_with_userdata(inbound, &target).await {
+            Ok(account) => account,
+            Err(refusal) => return refusal,
         };
 
         let Some(session) = self.connections.set_account(target.conn, account.id) else {
@@ -1033,6 +1015,66 @@ impl SessionLifecycleService {
             ..tcp::UserState::default()
         };
         announce::user_state(&self.connections, session, &echo)
+    }
+
+    /// Ask `userdata` for the account, handing it what `target` holds.
+    ///
+    /// `Err` is the refusal to send the asker.
+    async fn register_with_userdata(
+        &self,
+        inbound: &Inbound,
+        target: &PendingConnection,
+    ) -> Result<starling_proto_fancy::userdata::Account, Actions> {
+        use starling_proto_fancy::userdata::user_data_client::UserDataClient;
+        use starling_proto_fancy::userdata::{Account, RegisterRequest};
+
+        let Ok(channel) = self.handshake.context().resolver.channel("userdata") else {
+            tracing::warn!("userdata is unreachable; cannot register");
+            return Err(vec![refused(inbound, "the account service is unavailable")]);
+        };
+        let registered = UserDataClient::new(channel)
+            .register(RegisterRequest {
+                scope: Some(starling_proto_fancy::common::Scope {
+                    instance: inbound.scope,
+                }),
+                // Whose action this was, for userdata's own record. Self- and
+                // other-registration are the same call, and only this
+                // distinguishes them once it has left here.
+                actor: Some(starling_proto_fancy::common::Actor {
+                    who: Some(actor::Who::Session(inbound.session)),
+                }),
+                account: Some(Account {
+                    name: target.name.clone(),
+                    // What the account is claimed by on every later connection.
+                    // Omitting it is the dead-account case in this method's
+                    // documentation.
+                    cert_hash: target.cert_hash.clone(),
+                    // The guest's comment and avatar become the account's, as
+                    // murmur's `registerUser` keeps them, and so does the
+                    // reference this connection held for each. See `released`.
+                    comment_hash: target.comment_hash.clone(),
+                    texture_hash: target.texture_hash.clone(),
+                    ..Account::default()
+                }),
+                password: String::new(),
+            })
+            .await;
+
+        match registered {
+            Ok(account) => Ok(account.into_inner()),
+            Err(status) => {
+                // The name is taken, most likely. Said to the client rather
+                // than dropped: a register button that does nothing at all is
+                // the failure this whole path exists to remove.
+                tracing::info!(
+                    session = target.session,
+                    name = %target.name,
+                    %status,
+                    "userdata refused the registration"
+                );
+                Err(vec![refused(inbound, status.message())])
+            }
+        }
     }
 
     /// Bring a user's other devices into `target` after `moved` went there,
@@ -1069,25 +1111,23 @@ impl SessionLifecycleService {
         target: u32,
         tokens: Vec<String>,
     ) -> Actions {
+        // Somebody not here is refused as somebody one may not move is: the
+        // difference would say who is online. See `refusals`.
         let Some(subject) = self.connections.named(moved).into_iter().next() else {
             tracing::debug!(session = moved, "move for an unknown session");
-            return Actions::new();
+            return vec![self.refused_move(inbound)];
         };
         // A user's devices share one row in everyone else's tree, so they share
         // one channel: moving any of them moves them all.
         let devices = self.connections.devices_of(subject.presented_as);
         let moved = subject.session;
         let moves_self = subject.presented_as == self.connections.shown_of(inbound.session);
-        // Already there. murmur returns early on this rather than re-entering,
-        // and re-entering would broadcast a move that did not happen.
-        if subject.channel == target {
-            return Actions::new();
-        }
 
         // Dragging *somebody else* takes `Move` on the channel they are in
         // now (`vendor/server/src/murmur/Messages.cpp:1075`), the power is
         // over the room they are being taken out of, which is why it is checked
-        // there and not on the mover.
+        // there and not on the mover. Before the "already there" answer below,
+        // which otherwise told anybody whether a user stood in a room.
         if !moves_self
             && !self
                 .permit
@@ -1100,7 +1140,12 @@ impl SessionLifecycleService {
                 from = subject.channel,
                 "move refused: no Move in the channel they are in"
             );
-            return vec![permission_denied(inbound, Perm::MOVE, subject.channel)];
+            return vec![self.refused_move(inbound)];
+        }
+        // Already there. murmur returns early on this rather than re-entering,
+        // and re-entering would broadcast a move that did not happen.
+        if subject.channel == target {
+            return Actions::new();
         }
 
         // The destination rule is an *or* (`Messages.cpp:1080`): the mover may
@@ -1211,6 +1256,16 @@ impl SessionLifecycleService {
         let Ok(state) = tcp::UserState::decode(inbound.payload.as_slice()) else {
             return Actions::new();
         };
+        // Before a session, only the client's own flags, kept for the login to
+        // apply: there is nobody to move, register or announce yet.
+        if inbound.session == 0 {
+            if before_session::is_own_flags_only(&state) {
+                let _ =
+                    self.connections
+                        .set_self_flags(inbound.conn, state.self_mute, state.self_deaf);
+            }
+            return Actions::new();
+        }
         // Registering somebody else is the *point* of `Register`, so this is
         // routed ahead of the cross-session refusal below rather than falling
         // foul of it, exactly as the speak-state flags are. It comes first
@@ -1458,11 +1513,15 @@ impl SessionLifecycleService {
     /// is `TextTooLong`, upstream's choice: the permitted length here is zero.
     async fn on_reset_content(&self, inbound: &Inbound, state: &tcp::UserState) -> Actions {
         let target_session = state.session.unwrap_or(inbound.session);
-        let Some(target) = self.connections.by_session(target_session) else {
+        let Some(found) = self.connections.by_session(target_session) else {
             tracing::debug!(
                 session = target_session,
                 "content reset for an unknown session"
             );
+            return Actions::new();
+        };
+        let _content = self.content_gate.hold(found.conn).await;
+        let Some(target) = self.connections.get(found.conn) else {
             return Actions::new();
         };
 
@@ -1512,6 +1571,19 @@ impl SessionLifecycleService {
         if let Some(account) = target.account {
             self.clear_stored_content(inbound, account, cleared_comment, cleared_texture)
                 .await;
+        } else {
+            // A guest's connection held it; see `released`.
+            let comment: &[u8] = if cleared_comment {
+                &target.comment_hash
+            } else {
+                &[]
+            };
+            let texture: &[u8] = if cleared_texture {
+                &target.texture_hash
+            } else {
+                &[]
+            };
+            self.release_content(&[comment, texture]).await;
         }
 
         self.handshake.context().logger.log(
@@ -1649,12 +1721,17 @@ impl SessionLifecycleService {
         // also every self-mute toggle, and a round trip on that path would be
         // a gRPC call per keypress on a push-to-mute binding.
         let limits = self.handshake.config(inbound.scope).await;
+        let _content = self.content_gate.hold(inbound.conn).await;
         let before = self.connections.get(inbound.conn);
 
         let mut comment_hash = None;
         let mut texture_hash = None;
         if let Some(comment) = &state.comment {
-            if over(comment.len(), limits.text_message_length) {
+            if !comment_limit::fits(
+                comment,
+                limits.text_message_length,
+                limits.image_message_length,
+            ) {
                 return Err(too_long(inbound));
             }
             comment_hash = self
@@ -1696,6 +1773,18 @@ impl SessionLifecycleService {
         let _ =
             self.connections
                 .set_content(inbound.conn, comment_hash.clone(), texture_hash.clone());
+        // A guest's connection held what it replaced; an account's old content
+        // is `userdata`'s to release. See `released`.
+        if let Some(before) = before.filter(|before| before.account.is_none()) {
+            let comment = comment_hash
+                .as_ref()
+                .map(|_| before.comment_hash.as_slice());
+            let texture = texture_hash
+                .as_ref()
+                .map(|_| before.texture_hash.as_slice());
+            self.release_content(&[comment.unwrap_or_default(), texture.unwrap_or_default()])
+                .await;
+        }
         Ok((comment_hash, texture_hash))
     }
 
@@ -1818,7 +1907,7 @@ impl SessionLifecycleService {
 /// step here: comments were handled, and avatars were decoded and dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UserContent {
-    /// `UserState.comment`, bounded by `text_message_length`.
+    /// `UserState.comment`, bounded as [`comment_limit`] says.
     Comment,
     /// `UserState.texture` (the avatar) bounded by `image_message_length`.
     Texture,
@@ -1887,6 +1976,7 @@ impl Serve for SessionLifecycleService {
             fanout,
             permit: Permit::new(ctx.resolver.clone()),
             trail: Trail::new(ctx.resolver.clone()),
+            content_gate: released::ContentGate::default(),
         }))
     }
 

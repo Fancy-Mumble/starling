@@ -49,6 +49,8 @@
 //!
 //! [`Send`]: starling_proto_fancy::control::Send
 
+mod admission;
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -71,6 +73,9 @@ use starling_runtime::storage::{Migration, Store};
 /// A whiteboard stroke is a few hundred points; an unbounded list from a peer
 /// is an allocation attack with a friendly name.
 pub const MAX_STROKE_POINTS: usize = 4096;
+
+/// Longest stroke id relayed, in bytes. A client mints a short token.
+pub const MAX_STROKE_ID: usize = 64;
 
 /// Most options a poll may carry.
 pub const MAX_POLL_OPTIONS: usize = 32;
@@ -468,6 +473,16 @@ impl SocialService {
             expires_at_ms: poll_expiry(&poll, now_ms),
         };
         let _serial = self.poll_writes.lock().await;
+        // A poll is created once. Its id is the client's, and a second `Poll`
+        // under it replaced the first outright, ballots and author included,
+        // whoever sent it; no client re-sends one to change or close it.
+        let key = (scope, poll.poll_id.clone());
+        if self.cached(&key, now_ms)
+            || matches!(self.load(scope, &poll.poll_id, now_ms).await, Ok(Some(_)))
+        {
+            tracing::info!(scope, poll = %poll.poll_id, "a poll that already exists was not replaced");
+            return None;
+        }
         // Relayed and cached even when the write fails: the poll still works
         // until a restart, which is no worse than before it was stored.
         if let Err(error) = self.write_poll(scope, &record, now_ms).await {
@@ -747,7 +762,7 @@ impl SocialService {
                     poll = %vote.poll_id,
                     "vote refused: no such poll, or it is past its retention"
                 );
-                refuse_vote(inbound, "That poll no longer exists on this server.")
+                refuse_vote(inbound, admission::NO_SUCH_POLL)
             }
             Ballot::Closed => {
                 tracing::debug!(
@@ -958,6 +973,10 @@ impl SocialService {
 }
 
 impl ClientService for SocialService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn closed(&self, conn: u64, _reason: &str) -> Actions {
         // The one client-facing service that did not implement this. Its watch
         // map is keyed by a *client-supplied* 64-byte string and only shrank on
@@ -988,6 +1007,9 @@ impl ClientService for SocialService {
             );
             return Actions::new();
         };
+        if let Some(answer) = self.admission(&inbound, envelope.body.as_ref()).await {
+            return answer;
+        }
 
         match envelope.body {
             // Relayed to the channel *and* the sender: the client renders what
@@ -1048,6 +1070,13 @@ impl ClientService for SocialService {
                 stroke.actor = inbound.session;
                 // Bounded before it is relayed. Flat x,y pairs, hence twice.
                 stroke.points.truncate(MAX_STROKE_POINTS * 2);
+                // An id is a short token a client mints; one longer than that
+                // is dropped rather than cut, since a cut one could name a
+                // different stroke.
+                if stroke.stroke_id.len() > MAX_STROKE_ID {
+                    stroke.stroke_id.clear();
+                }
+                stroke.alpha = stroke.alpha.min(u32::from(u8::MAX));
                 self.relay(sessions, &social_envelope::Body::Stroke(stroke))
             }
             Some(social_envelope::Body::Clear(mut clear)) => {
@@ -1106,7 +1135,7 @@ impl Serve for SocialService {
 mod tests {
     use super::*;
     use starling_proto_fancy::control::server_action;
-    use starling_proto_fancy::fancy::social::{DrawStroke, ReadReceipt, Typing};
+    use starling_proto_fancy::fancy::social::{DrawClear, DrawStroke, ReadReceipt, Typing};
     use starling_proto_fancy::sessionview::Session;
 
     /// The server instance every test uses.
@@ -1142,6 +1171,18 @@ mod tests {
     /// As [`service`], on `store`: a second call on the same store is the
     /// service after a restart, with nothing in memory.
     fn on_store(store: Store, sessions: &[u32]) -> Arc<SocialService> {
+        on_store_holding(store, sessions, Perm::all())
+    }
+
+    /// As [`service`], with sessions holding exactly `held` everywhere.
+    async fn service_holding(sessions: &[u32], held: Perm) -> Arc<SocialService> {
+        on_store_holding(memory_store().await, sessions, held)
+    }
+
+    /// As [`on_store`], with sessions holding exactly `held` everywhere.
+    fn on_store_holding(store: Store, sessions: &[u32], held: Perm) -> Arc<SocialService> {
+        let (resolver, _granting) =
+            starling_runtime::testing::Granting::serve(held.bits()).expect("a permissions double");
         let roster = Roster::new();
         roster.replace(
             sessions
@@ -1160,14 +1201,9 @@ mod tests {
             watches: Mutex::new(HashMap::new()),
             watches_gauge: starling_runtime::pressure::Pressure::new().gauge("watches", 0),
             roster: Arc::new(roster),
-            // Points at a `permissions` nothing is serving, so every check
-            // denies. Only reactions ask, and the reaction test says so.
-            permit: Permit::new(starling_runtime::channel::Resolver::new(
-                Arc::new(starling_runtime::config::Config::with_defaults(
-                    std::path::Path::new("/run/starling"),
-                )),
-                starling_runtime::inproc::Broker::new(),
-            )),
+            // A `permissions` granting exactly `held`, so a refusal under
+            // test is the real check saying no.
+            permit: Permit::new(resolver),
             fanout: Fanout::default(),
         })
     }
@@ -1405,9 +1441,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_reaction_without_the_enter_permission_reaches_nobody() {
-        // The `permissions` service is unreachable in these tests, and an
-        // unreachable check denies. murmur gates reactions the same way.
-        let service = service(&[7, 8]).await;
+        // murmur gates reactions the same way.
+        let service = service_holding(&[7, 8], Perm::all().difference(Perm::ENTER)).await;
         let envelope = SocialEnvelope {
             body: Some(social_envelope::Body::Reaction(Reaction {
                 channel: CHANNEL,
@@ -1423,6 +1458,130 @@ mod tests {
             })),
         };
         assert!(service.frame(frame(7, &envelope)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typing_and_a_new_poll_need_text_message_in_their_channel() {
+        // murmur's Fancy server relayed both from anybody to any room.
+        let service = service_holding(&[7, 8], Perm::all().difference(Perm::TEXT_MESSAGE)).await;
+        let typing = SocialEnvelope {
+            body: Some(social_envelope::Body::Typing(Typing {
+                channel: CHANNEL,
+                actor: 0,
+                typing: true,
+            })),
+        };
+        assert!(service.frame(frame(7, &typing)).await.is_empty());
+        assert!(service.frame(frame(7, &poll("p1", false))).await.is_empty());
+        assert!(
+            service.polls.lock().expect("lock").by_id.is_empty(),
+            "nothing stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_receipt_needs_enter_in_its_channel() {
+        let service = service_holding(&[7, 8], Perm::all().difference(Perm::ENTER)).await;
+        let receipt = SocialEnvelope {
+            body: Some(social_envelope::Body::Receipt(ReadReceipt {
+                channel: CHANNEL,
+                message_id: "m1".to_owned(),
+                ..ReadReceipt::default()
+            })),
+        };
+        assert!(service.frame(frame(7, &receipt)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_vote_on_a_poll_the_voter_may_not_see_is_answered_as_one_that_is_not_there() {
+        // Telling the two apart would say a poll exists in a room the voter
+        // cannot enter.
+        let service = service_holding(&[7, 8], Perm::all().difference(Perm::ENTER)).await;
+        let Some(social_envelope::Body::Poll(created)) = poll("hidden", false).body else {
+            panic!("a poll");
+        };
+        let now = starling_runtime::ids::now_ms();
+        let _ = service
+            .create(SCOPE, created, 7, now)
+            .await
+            .expect("created");
+
+        let on_hidden = service.frame(frame(8, &vote_frame("hidden", 0))).await;
+        let on_nothing = service.frame(frame(8, &vote_frame("nothing", 0))).await;
+        assert_eq!(on_hidden, on_nothing);
+        assert_eq!(on_hidden.len(), 1, "a refusal, the same one");
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_exists_is_not_replaced_by_anybody() {
+        // A second `Poll` under the same id replaced the first outright:
+        // question, author and every ballot cast.
+        let service = service(&[7, 8]).await;
+        assert_eq!(service.frame(frame(7, &poll("p1", false))).await.len(), 1);
+        assert_eq!(service.frame(frame(8, &vote_frame("p1", 1))).await.len(), 1);
+
+        let mut hijack = poll("p1", true);
+        if let Some(social_envelope::Body::Poll(p)) = hijack.body.as_mut() {
+            p.question = "mine now".to_owned();
+        }
+        assert!(service.frame(frame(8, &hijack)).await.is_empty());
+        assert!(
+            service.frame(frame(7, &poll("p1", false))).await.is_empty(),
+            "nor its author"
+        );
+
+        let polls = service.polls.lock().expect("lock");
+        let record = polls
+            .by_id
+            .get(&(SCOPE, "p1".to_owned()))
+            .expect("still there");
+        assert_eq!(record.poll.creator, 7);
+        assert_eq!(record.poll.question, "which?");
+        assert_eq!(record.ballots.len(), 1, "the ballot survived");
+    }
+
+    #[tokio::test]
+    async fn drawing_and_watching_need_standing_in_the_channel() {
+        // 9 is elsewhere; 10 is 7's second device, in the room.
+        let service = service(&[7, 8]).await;
+        service.roster.upsert(&Session {
+            session: 9,
+            channel: CHANNEL + 1,
+            ..Session::default()
+        });
+        second_device(&service, 10, 7);
+        let stroke = SocialEnvelope {
+            body: Some(social_envelope::Body::Stroke(DrawStroke {
+                channel: CHANNEL,
+                points: vec![1.0, 2.0],
+                ..DrawStroke::default()
+            })),
+        };
+        let clear = SocialEnvelope {
+            body: Some(social_envelope::Body::Clear(DrawClear {
+                channel: CHANNEL,
+                ..DrawClear::default()
+            })),
+        };
+        let start = SocialEnvelope {
+            body: Some(social_envelope::Body::Watch(WatchSync {
+                session_id: "w1".to_owned(),
+                channel: CHANNEL,
+                kind: watch_sync::Kind::Start as i32,
+                url: "https://example.org/v".to_owned(),
+                ..WatchSync::default()
+            })),
+        };
+        for envelope in [&stroke, &clear, &start] {
+            assert!(
+                service.frame(frame(9, envelope)).await.is_empty(),
+                "{envelope:?}"
+            );
+        }
+        assert!(
+            !service.frame(frame(10, &stroke)).await.is_empty(),
+            "a device in the room draws"
+        );
     }
 
     #[tokio::test]
@@ -1544,6 +1703,7 @@ mod tests {
                 colour: "#fff".to_owned(),
                 width: 2.0,
                 points: vec![0.0; MAX_STROKE_POINTS * 4],
+                ..DrawStroke::default()
             })),
         };
         let actions = service.frame(frame(7, &envelope)).await;
@@ -1804,5 +1964,81 @@ mod tests {
         };
         assert_eq!(seen.host, 7, "others know the host by the id shown");
         assert_eq!(seen.viewers, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn a_stroke_reaches_the_others_whole_and_its_drawer_named_as_the_user() {
+        // A stroke without its id, end, pixel width and alpha is a line a
+        // receiver cannot separate from the drawer's next one.
+        // 9 is a second device of the user everyone else knows as 7.
+        let service = service(&[7, 8]).await;
+        second_device(&service, 9, 7);
+        let sent = DrawStroke {
+            channel: CHANNEL,
+            colour: "#0088ff".to_owned(),
+            width: 0.01,
+            points: vec![0.25, 0.5, 0.75, 0.5],
+            stroke_id: "s-1".to_owned(),
+            end: true,
+            width_px: 6.0,
+            alpha: 0x80,
+            ..DrawStroke::default()
+        };
+        let envelope = SocialEnvelope {
+            body: Some(social_envelope::Body::Stroke(sent.clone())),
+        };
+        let relayed = per_recipient(&service.frame(frame(9, &envelope)).await);
+        let stroke = |session: u32| match &relayed[&session].body {
+            Some(social_envelope::Body::Stroke(stroke)) => stroke.clone(),
+            _ => panic!("expected a stroke"),
+        };
+        assert_eq!(
+            stroke(8),
+            DrawStroke {
+                actor: 7,
+                ..sent.clone()
+            },
+            "field for field"
+        );
+        assert_eq!(stroke(7).actor, 7, "a sibling device sees itself");
+        assert!(!relayed.contains_key(&9), "the drawer already has it");
+    }
+
+    #[tokio::test]
+    async fn an_overlong_stroke_id_is_dropped_and_alpha_is_one_byte() {
+        let service = service(&[7, 8]).await;
+        let envelope = SocialEnvelope {
+            body: Some(social_envelope::Body::Stroke(DrawStroke {
+                channel: CHANNEL,
+                stroke_id: "x".repeat(MAX_STROKE_ID + 1),
+                alpha: 4096,
+                ..DrawStroke::default()
+            })),
+        };
+        let (_, relayed) = sent(&service.frame(frame(7, &envelope)).await);
+        let Some(social_envelope::Body::Stroke(stroke)) = relayed.body else {
+            panic!("expected a stroke");
+        };
+        assert!(stroke.stroke_id.is_empty());
+        assert_eq!(stroke.alpha, 255);
+    }
+
+    #[tokio::test]
+    async fn a_clear_of_everything_says_so_to_the_others() {
+        let service = service(&[7, 8]).await;
+        let envelope = SocialEnvelope {
+            body: Some(social_envelope::Body::Clear(DrawClear {
+                channel: CHANNEL,
+                actor: 0,
+                all: true,
+            })),
+        };
+        let (sessions, relayed) = sent(&service.frame(frame(7, &envelope)).await);
+        assert_eq!(sessions, vec![8]);
+        let Some(social_envelope::Body::Clear(clear)) = relayed.body else {
+            panic!("expected a clear");
+        };
+        assert!(clear.all);
+        assert_eq!(clear.actor, 7);
     }
 }

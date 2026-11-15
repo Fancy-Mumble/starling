@@ -172,6 +172,7 @@ impl Acls {
                     add: Vec::new(),
                     remove: Vec::new(),
                     inherited_members: Vec::new(),
+                    presentation: None,
                 });
             }
         }
@@ -540,6 +541,7 @@ pub fn from_wire(acl: &tcp::Acl) -> AclSet {
                 add: group.add.iter().map(|id| u64::from(*id)).collect(),
                 remove: group.remove.iter().map(|id| u64::from(*id)).collect(),
                 inherited_members: Vec::new(),
+                presentation: crate::presentation::from_wire(group),
             })
             .collect(),
         acls: acl
@@ -569,22 +571,23 @@ pub fn to_wire(set: &AclSet) -> tcp::Acl {
         groups: set
             .groups
             .iter()
-            .map(|group| tcp::acl::ChanGroup {
-                name: group.name.clone(),
-                inherited: Some(group.inherited),
-                inherit: Some(group.inherit),
-                inheritable: Some(group.inheritable),
-                add: group.add.iter().map(|id| *id as u32).collect(),
-                remove: group.remove.iter().map(|id| *id as u32).collect(),
-                inherited_members: group
-                    .inherited_members
-                    .iter()
-                    .map(|id| *id as u32)
-                    .collect(),
-                // Fancy group presentation fields, which this service does not
-                // own: they are set through the group's own surface, and
-                // echoing a default here would blank whatever is stored.
-                ..tcp::acl::ChanGroup::default()
+            .map(|group| {
+                let mut wire = tcp::acl::ChanGroup {
+                    name: group.name.clone(),
+                    inherited: Some(group.inherited),
+                    inherit: Some(group.inherit),
+                    inheritable: Some(group.inheritable),
+                    add: group.add.iter().map(|id| *id as u32).collect(),
+                    remove: group.remove.iter().map(|id| *id as u32).collect(),
+                    inherited_members: group
+                        .inherited_members
+                        .iter()
+                        .map(|id| *id as u32)
+                        .collect(),
+                    ..tcp::acl::ChanGroup::default()
+                };
+                crate::presentation::to_wire(group.presentation.as_ref(), &mut wire);
+                wire
             })
             .collect(),
         acls: set
@@ -1194,6 +1197,63 @@ mod tests {
             !acls.groups_of(1, &member, 5).contains(&"staff".to_owned()),
             "a declaration that is not inheritable is not held below it"
         );
+    }
+
+    #[test]
+    fn a_roles_colour_icon_style_and_metadata_survive_being_saved_and_read() {
+        // Seen live: a role saved with a colour, a style and a motto came back
+        // with all three empty, because neither direction carried them.
+        use tcp::acl::chan_group::KeyValue;
+        let written = tcp::Acl {
+            channel_id: 0,
+            groups: vec![tcp::acl::ChanGroup {
+                name: "crew".to_owned(),
+                inherited: Some(false),
+                color: Some("#3f9fd8".to_owned()),
+                icon: Some(vec![0x89, b'P', b'N', b'G']),
+                style_preset: Some("neon".to_owned()),
+                metadata: vec![
+                    KeyValue {
+                        key: "motto".to_owned(),
+                        value: Some("keep".to_owned()),
+                    },
+                    KeyValue {
+                        key: "badge".to_owned(),
+                        value: Some(String::new()),
+                    },
+                ],
+                ..tcp::acl::ChanGroup::default()
+            }],
+            ..tcp::Acl::default()
+        };
+        let read = to_wire(&from_wire(&written));
+        let group = &read.groups[0];
+        assert_eq!(group.color.as_deref(), Some("#3f9fd8"));
+        assert_eq!(group.icon.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+        assert_eq!(group.style_preset.as_deref(), Some("neon"));
+        assert_eq!(group.metadata, written.groups[0].metadata, "in order");
+    }
+
+    #[test]
+    fn a_role_nobody_styled_reads_back_with_nothing_set_as_before() {
+        // What a classic client writes, and what an old server sent: absent
+        // fields, never empty ones, so an older reader sees exactly what it did.
+        let written = tcp::Acl {
+            groups: vec![tcp::acl::ChanGroup {
+                name: "plain".to_owned(),
+                inherited: Some(false),
+                ..tcp::acl::ChanGroup::default()
+            }],
+            ..tcp::Acl::default()
+        };
+        let set = from_wire(&written);
+        assert_eq!(set.groups[0].presentation, None);
+        let group = &to_wire(&set).groups[0];
+        assert_eq!(
+            (&group.color, &group.icon, &group.style_preset),
+            (&None, &None, &None)
+        );
+        assert!(group.metadata.is_empty());
     }
 
     /// A channel gated on a named group: `Enter` denied to everybody, granted

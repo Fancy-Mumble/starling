@@ -540,6 +540,7 @@ fn acl_sets(read: &Server, report: &mut Report) -> Vec<AclSet> {
                 // recorded list would be a snapshot of an inheritance that
                 // changes whenever a parent's group does.
                 inherited_members: Vec::new(),
+                presentation: None,
             });
         }
     }

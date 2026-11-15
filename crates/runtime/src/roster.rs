@@ -43,6 +43,9 @@ use crate::serve::ServiceContext;
 /// How long to wait before re-subscribing.
 const RETRY: Duration = Duration::from_secs(2);
 
+/// The session id of a connection that has not authenticated: nobody.
+pub const NOBODY: u32 = 0;
+
 /// Every session on the server and the channel it is in, as `session-view` last
 /// described it.
 #[derive(Debug, Default)]
@@ -106,6 +109,9 @@ pub struct Roster {
     /// the device it was first handed to, so it is not always a key here.
     presented: Mutex<HashMap<u32, u32>>,
     warm: AtomicBool,
+    /// Where to ask about a session this roster has not heard of yet: the
+    /// resolver it follows `session-view` through. See `catch_up`.
+    pub(crate) authority: std::sync::OnceLock<crate::channel::Resolver>,
 }
 
 impl Roster {
@@ -162,6 +168,10 @@ impl Roster {
     /// sessions that went away while the stream was down are forgotten only
     /// because this replaces rather than merges.
     pub fn replace(&self, sessions: Vec<Session>) {
+        let sessions: Vec<Session> = sessions
+            .into_iter()
+            .filter(|session| session.session != NOBODY)
+            .collect();
         if let Ok(mut held) = self.accounts.lock() {
             *held = sessions
                 .iter()
@@ -210,7 +220,13 @@ impl Roster {
     }
 
     /// Add or move one session.
+    ///
+    /// Session 0 is nobody, and is never held: a record for it would make an
+    /// unauthenticated connection a user to everything that reads this.
     pub fn upsert(&self, session: &Session) {
+        if session.session == NOBODY {
+            return;
+        }
         if let Ok(mut held) = self.accounts.lock() {
             let _ = held.insert(
                 session.session,
@@ -280,6 +296,9 @@ impl Roster {
     /// what a cold roster or a single-device user needs.
     #[must_use]
     pub fn devices_of(&self, presented: u32) -> Vec<u32> {
+        if presented == NOBODY {
+            return Vec::new();
+        }
         let Ok(held) = self.presented.lock() else {
             return vec![presented];
         };
@@ -578,6 +597,7 @@ impl Roster {
         subscriber: &'static str,
         gate: &'static str,
     ) -> tokio::task::JoinHandle<()> {
+        let _ = self.authority.set(ctx.resolver.clone());
         tokio::spawn(async move {
             let scope = ctx.instances().first().copied().unwrap_or(1);
             loop {
@@ -866,6 +886,31 @@ mod tests {
             presented_as,
             ..Session::default()
         }
+    }
+
+    #[test]
+    fn session_zero_is_nobody_however_it_arrives() {
+        // An unauthenticated connection was once announced as session 0, and
+        // every service following the view then treated it as a user in the
+        // root channel: reachable by connection, a sender, a listener.
+        let roster = Roster::new();
+        let mut phantom = session(NOBODY, 0);
+        phantom.conn = 77;
+        phantom.cert_hash = vec![1, 2, 3];
+        let _ = roster.apply(ViewEvent {
+            event: Some(view_event::Event::Upsert(phantom.clone())),
+        });
+        let _ = roster.apply(snapshot(vec![phantom, device(4, 4), device(5, 4)]));
+
+        assert_eq!(roster.conn_of(NOBODY), None);
+        assert_eq!(roster.channel_of(NOBODY), None);
+        assert_eq!(roster.cert_of(NOBODY), None);
+        assert!(roster.devices_of(NOBODY).is_empty());
+        assert!(!roster.in_channel(0, 4).contains(&NOBODY));
+        assert_eq!(roster.sessions(), vec![4, 5]);
+        // And a user on two devices is still one user, untouched by it.
+        assert_eq!(roster.devices_of(4), vec![4, 5]);
+        assert_eq!(roster.presented_as(5), 4);
     }
 
     #[test]

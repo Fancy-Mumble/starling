@@ -694,6 +694,10 @@ impl Files for FilesRpc {
 }
 
 impl ClientService for FilesService {
+    fn roster(&self) -> Option<&Roster> {
+        Some(&self.roster)
+    }
+
     async fn frame(&self, inbound: Inbound) -> Actions {
         let outer = ServiceKind::Files.outer_type();
         if inbound.type_id != outer {
@@ -924,16 +928,20 @@ impl FilesService {
 
     /// Remove one stored file, if it is the caller's or they may remove others'.
     async fn answer_forget(&self, inbound: &Inbound, request: ForgetRequest) -> FilesEnvelope {
+        // One answer for "there is no such file" and "it is somebody else's":
+        // two would let anybody test which keys exist.
+        let nothing_of_yours = || {
+            refused(
+                &request.request_id,
+                refusal::Kind::Invalid,
+                "no such file of yours",
+            )
+        };
         if client_channel_of(&request.key).is_none() {
-            // Not the caller's to remove, and not theirs to learn about. Said
-            // the same way a key that names nothing is said.
-            return refused(&request.request_id, refusal::Kind::Invalid, "no such file");
+            return nothing_of_yours();
         }
         let Some(owner) = self.owner_of(&request.key).await else {
-            // Absent rather than refused: a key that names nothing is not a
-            // permission question, and answering it as one would say which
-            // keys exist.
-            return refused(&request.request_id, refusal::Kind::Invalid, "no such file");
+            return nothing_of_yours();
         };
         let mine = owner.matches(&self.identity_of(inbound.session));
         if !mine
@@ -941,11 +949,7 @@ impl FilesService {
                 .allows(inbound, ROOT_CHANNEL, Perm::RESET_USER_CONTENT)
                 .await
         {
-            return refused(
-                &request.request_id,
-                refusal::Kind::Permission,
-                "that file is not yours to remove",
-            );
+            return nothing_of_yours();
         }
         self.forget_object(&request.key).await;
         self.logger.log(
@@ -3323,53 +3327,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_somebody_elses_file_needs_the_permission_for_it() {
+    async fn removing_somebody_elses_file_is_refused_as_if_it_were_not_there() {
         // The uploads here carry no identity, so none of them are the caller's
-        // - which makes this exactly the "somebody else's" path.
+        // - which makes this exactly the "somebody else's" path. It was
+        // refused as "not yours" and a missing key as "no such file", which
+        // told anybody which keys exist.
         let service = service_holding(Perm::SHARE_FILES.union(READ_CHANNEL)).await;
         let grant = grant_for(&service, upload_as(Visibility::Session, "", 2)).await;
         assert_eq!(put_through(&service, &grant, b"hi").await, 201);
 
-        let envelope = ask_body(
-            &service,
+        let forget = |key: String| {
             files_envelope::Body::Forget(ForgetRequest {
                 request_id: "f1".to_owned(),
-                key: grant.key.clone(),
-            }),
-        )
-        .await;
-        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
-            panic!("expected a refusal, got {:?}", envelope.body);
+                key,
+            })
         };
-        assert_eq!(
-            refused.refusal.expect("a refusal").kind,
-            refusal::Kind::Permission as i32
+        let theirs = ask_body(&service, forget(grant.key.clone())).await;
+        let nothing = ask_body(&service, forget("4/nothing/here.txt".to_owned())).await;
+        assert!(
+            matches!(theirs.body, Some(files_envelope::Body::Refused(_))),
+            "expected a refusal, got {:?}",
+            theirs.body
         );
+        assert_eq!(theirs, nothing, "the same answer either way");
         assert_eq!(
             service.listing(4, 50).await.len(),
             1,
             "and it is still there"
-        );
-    }
-
-    #[tokio::test]
-    async fn removing_a_file_that_does_not_exist_says_so_without_asking_permission() {
-        let service = service_holding(Perm::SHARE_FILES).await;
-        let envelope = ask_body(
-            &service,
-            files_envelope::Body::Forget(ForgetRequest {
-                request_id: "f1".to_owned(),
-                key: "4/nothing/here.txt".to_owned(),
-            }),
-        )
-        .await;
-        let Some(files_envelope::Body::Refused(refused)) = envelope.body else {
-            panic!("expected a refusal, got {:?}", envelope.body);
-        };
-        assert_eq!(
-            refused.refusal.expect("a refusal").kind,
-            refusal::Kind::Invalid as i32,
-            "a key that names nothing is not a permission question"
         );
     }
 

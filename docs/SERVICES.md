@@ -376,6 +376,14 @@ coalescing does not. Publishes a revocation to subscribers before acknowledging
 it, for the stale-deny/stale-grant rule. Charged to the `acl` bucket, because the
 ACL editor emits one query per channel when it opens the tree.
 
+A group is also a role: its colour, icon, style preset and metadata
+(`ACL.ChanGroup` 1000-1003) are kept with it in the stored set and sent back
+on every read, unset fields absent as murmur sends them
+(`permissions/src/presentation.rs`). An icon over `image_message_length` is
+dropped and the rest of the role kept, as in murmur. The operator API's ACL
+body does not carry them, so a write there keeps those of every group it keeps
+by name.
+
 ### `metadata` — the channel tree and who is in it
 
 One actor per server instance, sharded by server id. Because it is the single
@@ -463,6 +471,13 @@ named, which trusted a client about its own history — survivable while every
 mode was end-to-end and the bytes were opaque either way, and not survivable
 once a mode exists where this server holds the key.
 
+**Pins are kept with the messages** in a channel that keeps its messages
+(`pchat/src/pins.rs`): one per stored row, so deleting the message deletes its
+pin. Who pinned and when are stamped from the connection and this server's
+clock, never taken from the client, and the whole list goes to whoever fetches
+the first page of the channel's history (`PinList`, after the page). In a
+channel that keeps nothing a pin is told to who is there and kept nowhere.
+
 ### `moderation` — bans and kicks
 
 A ban outlives the session it was issued against, which is why it is stored here
@@ -471,7 +486,27 @@ useful precisely when its subject is not. `UserRemove` (8) is a kick or a ban, s
 it is moderation's and not userdata's. Both are checked on the **root** channel,
 because removal is from the server and not from a room: `Ban` to ban, `Ban` or
 `Kick` to kick. Keyed to **address and certificate**, since either alone is
-trivially evaded. See §8 for what is not yet wired.
+trivially evaded.
+
+The ban list is read and written from a client's ban editor with `BanList`
+(10), both taking `Ban` on the root; a write replaces the whole list, as
+murmur's does (`moderation/src/written.rs`). An entry whose mask would cover
+every address, which is what a client counting an IPv4 mask in IPv4 terms
+sends (32 for one address, where the wire's sixteen-byte count is 128), makes
+the whole list refused with a `PermissionDenied` the client can show. A ban
+the list already held keeps its start; each entry says when it began.
+
+A login is checked against the list in `session-lifecycle`, before any password
+is looked at (`session-lifecycle/src/ban.rs`), and refused with a `Reject` of
+type `None` that says so, why, and until when. murmur checks the address at
+accept and the certificate once TLS is up, and closes the socket without a word;
+asking at `Authenticate` is the first moment a refusal can be said, and a client
+told it is banned stops retrying. Nobody is exempt, the SuperUser included, as
+in murmur. A ban matches by address under its mask (counted over the sixteen
+v6-mapped bytes), by certificate, or, for a ban naming nothing else, by name
+(`moderation/src/covering.rs`). A ban written while its subject is connected
+disconnects every device of that user. `moderation` is core, so while it is down
+logins are not checked, as `Tier::Core` admits logins.
 
 ## 6.3 Optional — nobody notices
 
@@ -534,6 +569,14 @@ how an onboarded user gets the questionnaire on every connect. Each choice names
 the channels it reveals and the groups it joins, so the questionnaire is a way of
 asking which grants somebody wants, not a survey.
 
+Nothing is pushed at arrival (a service hears of a session before the gateway
+may write to it): a client asks after `ServerSync` with a `FlowQuery`, and is
+answered with its answers first and the questions second, so it never sees
+questions it seems not to have answered. Saving the questions takes `Write` on
+the root and is refused out loud; a saved flow goes to everybody connected,
+and an answer to every device of the account that gave it. The flow is kept
+per server instance.
+
 ### `social` — reactions, receipts, typing, polls, watch-together, drawing
 
 One service rather than six: each is a few hundred bytes of state and a fan-out,
@@ -544,6 +587,12 @@ unauthenticated peer. **The server writes the actor**, always: the client leaves
 it empty and murmur fills it in on relay, and a shipped client drops a typing
 indicator whose actor is 0, so relaying the peer's bytes verbatim meant the
 feature did nothing at all. It is also the only way the actor cannot be spoofed.
+
+Every body passes one admission check before its handler (`social/src/admission.rs`),
+which murmur's Fancy server never made: typing and a new poll need `TextMessage`
+in the channel, a receipt and a vote `Enter`, and watch-sync and drawing need
+standing in the channel. A vote on a poll the voter may not see is answered as
+one on a poll that does not exist, and a poll id, once used, is never replaced.
 
 ### `link-preview` — previews fetched by the server, never by the client
 
@@ -909,7 +958,8 @@ password-protected server. Both rules are murmur's.
 
 It holds the socket and it is the only component that does. Tier `core`, which it
 would only ever consult about itself. It routes on the 16-bit type in the frame
-header, never parses a payload, is a **single writer per client socket** — so
+header, parses no payload but the wire epoch in `Version` (`ARCHITECTURE.md`
+§1), is a **single writer per client socket** — so
 per-client ordering holds by construction — and keeps a circuit breaker per
 service and a rate-limit bucket per route. Its parts are in
 [`diagrams/gateway-internals.puml`](diagrams/gateway-internals.puml).
@@ -921,6 +971,17 @@ wrong: **essential** would reject logins over a lost *optimisation*, and
 worst possible moment and the resulting reconnect herd can saturate `metadata`,
 which *is* essential. It is reported in readiness as a warning and never as
 unready.
+
+### Before a session exists
+
+A connection that has not authenticated is nobody. `plane::dispatch` hands a
+frame with session 0 to a service only if the service says it handles such
+frames (`ClientService::before_session`), and two do: `session-lifecycle`, for
+the handshake and the client's own mute and deafen sent beside `Authenticate`,
+and `server-config`, for the livery. Every other service never sees such a
+frame, so it does no work for it, and the gateway's own rule on what it writes
+to such a connection (`ARCHITECTURE.md` §1) is a second line. Session 0 is
+never recorded in `session-view` and never held by a `Roster`.
 
 ---
 
@@ -947,20 +1008,14 @@ Marked, rather than left for a reader to discover:
 |---|---|
 | Audio routing | The router, codecs and fan-out are written and tested. Nothing attaches a peer to it yet, so no audio flows |
 | Whisper and shout | `VoiceTarget` (19) is a stub, so only channel speech routes |
-| The screen-share SFU | No `str0m` dependency exists; `screenshare` is signalling only |
+| The screen-share SFU | Built (`crates/sfu`, on `str0m`), started when `[services.screenshare] public_url` names an IP; binds `media_listen`, or where the gateway listens |
 | A durable session store | The resume ring is in-process, so it does not outlive a gateway pod and RESUME cannot cross one |
 | `zstd` on the Fancy stream | A workspace dependency no source file uses |
 | Sharding | Every shard key in `scaling.puml` is a design decision. Nothing is sharded yet |
 | `UserList` (18) | Routed to `userdata`, not implemented |
 
-**One gap is worth stating separately, because it is not a missing feature but a
-missing call.** `Moderation.CheckBan` is implemented and served, and
-`moderation`'s own crate doc says the gateway asks it on accept "before anything
-is spent on a peer that is not allowed in". Nothing in the workspace calls it:
-`moderation` does not implement the client plane's `opened` hook, and no ban
-check appears on the login path in `session-lifecycle` or in the gateway. Banning
-a connected user disconnects that session; it does not by itself refuse the
-reconnect. The RPC's only callers today are `operator-api` and the tests.
+A gap stated here until recently, `Moderation.CheckBan` having no caller so
+that a stored ban turned nobody away, is closed: see `moderation` in §6.2.
 
 ---
 

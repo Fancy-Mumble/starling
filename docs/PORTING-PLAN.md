@@ -36,7 +36,7 @@ This is the part that makes the project tractable, and it is why this port is
 worth doing *now* rather than in a year:
 
 1. **The wire protocol is already implemented in Rust.**
-   `vendor/client/crates/mumble-protocol` (12.8 kLOC) already contains the framing
+   `vendor/client/src/crates/mumble-protocol` (12.8 kLOC) already contains the framing
    codec, the full `Mumble.proto` / `MumbleUDP.proto` bindings including all Fancy
    extensions, the OCB2-AES128 `CryptState`, and the legacy+protobuf UDP audio
    codec. It is written from the client's perspective, but the *wire* half is
@@ -79,7 +79,7 @@ crate names did not.
 
 The `.proto` files are the contract and they already exist twice
 (`vendor/server/src/Mumble.proto` and
-`vendor/client/crates/mumble-protocol/proto/Mumble.proto`). Options considered:
+`vendor/client/src/crates/mumble-protocol/proto/Mumble.proto`). Options considered:
 
 | Option | Verdict |
 |---|---|

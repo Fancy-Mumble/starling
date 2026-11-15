@@ -147,6 +147,34 @@ pub fn apply_fields(
     Ok(())
 }
 
+/// The fields that name artwork in `userdata`'s blob store.
+///
+/// Each holds the one reference the upload took (`PUT /v1/livery/banner`),
+/// so only an upload may set one: a key named by hand would point at a blob
+/// the document holds no reference to, and replacing it would release one.
+pub const ART_FIELDS: &[&str] = &["banner_key", "icon_key"];
+
+/// Whether `field` names artwork.
+#[must_use]
+pub fn is_art(field: &str) -> bool {
+    ART_FIELDS.contains(&field)
+}
+
+/// The art keys in `current` that a write of `fields` replaces, and so the
+/// references the document stops holding. Empty keys hold nothing, and a
+/// field named twice is still one key.
+#[must_use]
+pub fn replaced_art(current: &Livery, fields: &[String]) -> Vec<String> {
+    [
+        ("banner_key", &current.banner_key),
+        ("icon_key", &current.icon_key),
+    ]
+    .into_iter()
+    .filter(|(field, key)| !key.is_empty() && fields.iter().any(|named| named == field))
+    .map(|(_, key)| key.clone())
+    .collect()
+}
+
 /// Whether `livery` may be stored, and the first reason it may not.
 ///
 /// # Errors
@@ -762,6 +790,28 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(digest(&before), digest(&after));
+    }
+
+    #[test]
+    fn a_write_naming_art_replaces_only_the_keys_it_names() {
+        let current = Livery {
+            banner_key: "aa".to_owned(),
+            icon_key: "bb".to_owned(),
+            ..Default::default()
+        };
+        let named = |fields: &[&str]| -> Vec<String> {
+            let fields: Vec<String> = fields.iter().map(|&field| field.to_owned()).collect();
+            replaced_art(&current, &fields)
+        };
+        assert_eq!(named(&["tagline", "banner_key"]), ["aa"]);
+        assert_eq!(named(&["icon_key", "banner_key", "icon_key"]), ["aa", "bb"]);
+        assert!(named(&["tagline"]).is_empty());
+        assert!(
+            replaced_art(&Livery::default(), &["banner_key".to_owned()]).is_empty(),
+            "an empty key holds nothing"
+        );
+        assert!(ART_FIELDS.iter().all(|field| is_art(field)));
+        assert!(!is_art("tagline"));
     }
 
     #[test]

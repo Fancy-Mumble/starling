@@ -1416,6 +1416,7 @@ async fn a_pin_reaches_the_channel_including_whoever_set_it() {
             message_id: PINNED.to_owned(),
             channel: 0,
             unpin: false,
+            ..fancy::pchat::Pin::default()
         })),
     };
     alice
@@ -2343,6 +2344,86 @@ async fn a_client_holding_write_can_save_an_acl_table_and_read_it_back() {
         "the saved table did not survive to the next read: {reread:?}"
     );
     assert_eq!(reread.groups[0].add, vec![4]);
+
+    deployment.stop().await;
+}
+
+#[tokio::test]
+async fn a_roles_colour_icon_style_and_metadata_survive_a_save_and_a_restart() {
+    // Seen live: a role saved from a client with a colour, a style and a
+    // motto came back with all three empty, while its members survived.
+    use starling_proto_fancy::perm::Perm;
+    use starling_proto_fancy::permissions::AclSet;
+    use tcp::acl::chan_group::KeyValue;
+
+    let data_dir = TempDir::new("acl-role-looks");
+    let mut deployment = Deployment::start(data_dir.path()).await;
+    deployment
+        .set_acl(AclSet {
+            channel: 0,
+            inherit: true,
+            acls: vec![entry("all", Perm::WRITE, Perm::empty())],
+            groups: Vec::new(),
+        })
+        .await;
+    let mut alice = Client::connect(deployment.port).await;
+    let _ = handshake(&mut alice, "alice").await;
+
+    let role = tcp::acl::ChanGroup {
+        name: "crew".to_owned(),
+        inherited: Some(false),
+        add: vec![4],
+        color: Some("#3f9fd8".to_owned()),
+        icon: Some(b"\x89PNG".to_vec()),
+        style_preset: Some("neon".to_owned()),
+        metadata: vec![KeyValue {
+            key: "motto".to_owned(),
+            value: Some("keep".to_owned()),
+        }],
+        ..tcp::acl::ChanGroup::default()
+    };
+    let saved = tcp::Acl {
+        channel_id: 0,
+        inherit_acls: Some(true),
+        query: Some(false),
+        groups: vec![role.clone()],
+        acls: vec![tcp::acl::ChanAcl {
+            apply_here: Some(true),
+            apply_subs: Some(true),
+            group: Some("all".to_owned()),
+            grant: Some(Perm::WRITE.bits()),
+            ..tcp::acl::ChanAcl::default()
+        }],
+    };
+    alice.send(13, &saved).await;
+    let _ = timeout(FRAME_TIMEOUT, alice.recv_until(13))
+        .await
+        .expect("the save was never answered");
+
+    deployment.restart("permissions").await;
+    let read = tcp::Acl {
+        channel_id: 0,
+        query: Some(true),
+        ..tcp::Acl::default()
+    };
+    let mut reread = None;
+    for _ in 0..10 {
+        alice.send(13, &read).await;
+        if let Ok((_, payload)) = timeout(FRAME_TIMEOUT, alice.recv_until(13)).await {
+            reread = Some(tcp::Acl::decode(payload.as_slice()).expect("a well-formed ACL"));
+            break;
+        }
+    }
+    let reread = reread.expect("the restarted service answers");
+    let kept = reread
+        .groups
+        .iter()
+        .find(|group| group.name == "crew")
+        .expect("the role is kept");
+    assert_eq!(kept.color, role.color);
+    assert_eq!(kept.icon, role.icon);
+    assert_eq!(kept.style_preset, role.style_preset);
+    assert_eq!(kept.metadata, role.metadata);
 
     deployment.stop().await;
 }

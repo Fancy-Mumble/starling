@@ -14,6 +14,7 @@
 pub mod ids;
 
 pub mod accounts;
+mod announced;
 pub mod devices;
 mod directory;
 pub mod records;
@@ -22,6 +23,7 @@ pub mod secret;
 pub mod selfservice;
 
 pub use accounts::{Accounts, Import};
+use announced::{Announced, Content};
 pub use ids::UserId;
 pub use records::Records;
 pub use secret::{Secret, verify_totp};
@@ -33,6 +35,7 @@ use starling_proto_fancy::common::{Ack, Scope};
 use starling_proto_fancy::identity;
 use starling_proto_fancy::metadata::TreeRequest;
 use starling_proto_fancy::metadata::metadata_client::MetadataClient;
+use starling_proto_fancy::perm::Perm;
 use starling_proto_fancy::sessionview::session_view_client::SessionViewClient;
 use starling_proto_fancy::types::ServiceKind;
 use starling_proto_fancy::userdata::user_data_server::{UserData, UserDataServer};
@@ -58,6 +61,9 @@ const REQUEST_BLOB: u16 = 23;
 
 /// The root channel, where the server-wide permissions live.
 const ROOT_CHANNEL: u32 = 0;
+
+/// `Channel.flags` bit for a hidden channel, as `metadata.proto` documents it.
+const FLAG_HIDDEN: u32 = 1;
 
 /// One `RequestBlob` answer, bounded by what the client can hold.
 ///
@@ -372,6 +378,14 @@ impl UserData for UserdataRpc {
         let reference = self.0.accounts.put_blob(scope, &blob.bytes).await;
         Ok(Response::new(reference))
     }
+
+    async fn release_blob(&self, request: Request<BlobRef>) -> Result<Response<Ack>, Status> {
+        self.0
+            .accounts
+            .release_blob(&request.into_inner().hash)
+            .await;
+        Ok(Response::new(Ack {}))
+    }
 }
 
 impl ClientService for UserdataService {
@@ -429,13 +443,7 @@ impl UserdataService {
 
         // Through any device of the user: the id a client asks about may be one
         // shown for a user whose first device has since left.
-        let everyone = starling_runtime::roster::Roster::of(self.sessions(inbound.scope).await);
-        let account_of = |session: u32| {
-            everyone
-                .devices_of(session)
-                .into_iter()
-                .find_map(|device| everyone.account_of(device))
-        };
+        let announced = Announced::new(self.sessions(inbound.scope).await);
 
         // Half the budget, not all of it: this reply shares the lane with
         // whatever else is in flight for that client -- the tail of a
@@ -443,36 +451,28 @@ impl UserdataService {
         // queue would be the overflow it is here to avoid.
         let mut reply = BlobReply::new(inbound.conn, self.resolver.control_bytes() / 2);
 
+        // A session that set nothing, or left between asking and answering, is
+        // answered with nothing: murmur answers what it can and says nothing
+        // about the rest.
         let mut states = Vec::new();
         for session in &request.session_texture {
-            let Some(id) = account_of(*session) else {
-                // A guest, or a session that left between asking and answering.
-                // Neither is an error: murmur answers what it can and says
-                // nothing about the rest.
-                continue;
-            };
-            if let Some(account) = self.accounts.by_id(inbound.scope, id) {
-                let texture = self
-                    .accounts
-                    .blob(inbound.scope, &account.texture_hash)
-                    .await;
+            if let Some(texture) = self
+                .announced_blob(inbound.scope, &announced, *session, Content::Texture)
+                .await
+            {
                 states.push(starling_proto::proto::tcp::UserState {
                     session: Some(*session),
-                    texture,
+                    texture: Some(texture),
                     ..starling_proto::proto::tcp::UserState::default()
                 });
             }
         }
         for session in &request.session_comment {
-            let Some(id) = account_of(*session) else {
-                continue;
-            };
-            if let Some(account) = self.accounts.by_id(inbound.scope, id) {
-                let comment = self
-                    .accounts
-                    .blob(inbound.scope, &account.comment_hash)
-                    .await
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
+            let comment = self
+                .announced_blob(inbound.scope, &announced, *session, Content::Comment)
+                .await
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            if comment.is_some() {
                 states.push(starling_proto::proto::tcp::UserState {
                     session: Some(*session),
                     comment,
@@ -514,9 +514,32 @@ impl UserdataService {
         }
         // Channel descriptions travel as a hash in the flood, so the client
         // redeems the body here just as it redeems avatars and comments above.
-        self.channel_descriptions(inbound.scope, &request.channel_description, &mut reply)
+        self.channel_descriptions(inbound, &request.channel_description, &mut reply)
             .await;
         reply.finish()
+    }
+
+    /// The body of what `session` was announced with, for anybody who asks.
+    ///
+    /// The hash on the session's own record first, because that is what was
+    /// announced, a guest's included; the account's where the record names
+    /// none, for a record written before it carried hashes.
+    async fn announced_blob(
+        &self,
+        scope: u32,
+        announced: &Announced,
+        session: u32,
+        what: Content,
+    ) -> Option<Vec<u8>> {
+        let hash = announced.hash(session, what).or_else(|| {
+            let account = self.accounts.by_id(scope, announced.account(session)?)?;
+            Some(match what {
+                Content::Texture => account.texture_hash,
+                Content::Comment => account.comment_hash,
+            })
+            .filter(|hash| !hash.is_empty())
+        })?;
+        self.accounts.blob(scope, &hash).await
     }
 
     /// Answer `RequestBlob.channel_description`: the full body of a description
@@ -531,10 +554,15 @@ impl UserdataService {
     ///
     /// Answered into `reply`, so the descriptions share one budget with the
     /// avatars and comments of the same request.
-    async fn channel_descriptions(&self, scope: u32, ids: &[u32], reply: &mut BlobReply) {
+    ///
+    /// A hidden channel's description goes only to a session that may see the
+    /// channel, the rule the flood applies (`session-lifecycle`,
+    /// `channel_flood`): naming its id must not be a way round it.
+    async fn channel_descriptions(&self, inbound: &Inbound, ids: &[u32], reply: &mut BlobReply) {
         if ids.is_empty() {
             return;
         }
+        let scope = inbound.scope;
         let Ok(transport) = self.resolver.channel("metadata") else {
             return;
         };
@@ -552,6 +580,14 @@ impl UserdataService {
             let Some(channel) = channels.iter().find(|channel| channel.id == *id) else {
                 continue;
             };
+            if channel.flags & FLAG_HIDDEN != 0
+                && !self
+                    .permit
+                    .allows(inbound, channel.id, Perm::SEE_CHANNEL.bits())
+                    .await
+            {
+                continue;
+            }
             let state = starling_proto::proto::tcp::ChannelState {
                 channel_id: Some(channel.id),
                 description: Some(channel.description.clone()),

@@ -10,8 +10,8 @@
 //! * **the wire type is in the framing, not the protobuf**
 //!   (`vendor/server/src/murmur/Server.cpp:2040` writes it as a big-endian
 //!   `u16`), so routing is two bytes and a lookup. The gateway parses no
-//!   payload, links no service's stubs, and never recompiles when a service is
-//!   added.
+//!   payload but one field of the client's `Version` (see `epoch`), links no
+//!   service's stubs, and never recompiles when a service is added.
 //!
 //! # Five parts
 //!
@@ -34,6 +34,7 @@ pub mod certs;
 /// Compressing the control stream for peers that asked for it.
 pub mod compress;
 mod connection;
+mod epoch;
 pub mod limiter;
 pub mod limits;
 pub mod listener;

@@ -12,6 +12,7 @@
 //! memory; writes leave behind it (`docs/STORAGE.md` L7, D1).
 
 pub mod channel;
+mod channel_password;
 pub mod ids;
 pub mod import;
 pub mod persist;
@@ -1228,6 +1229,72 @@ impl MetadataService {
         }
     }
 
+    /// Give a channel its password, and its maker the grant murmur gives.
+    ///
+    /// `password` is what the channel form sent: `None` leaves the password
+    /// as it is, empty removes it. On creation the maker is granted `Write`
+    /// unless they hold it already, or a password would lock them out of the
+    /// room they just made. Either way the edit itself was authorised by the
+    /// caller: `MakeChannel` on the parent, or `Write` here, which is the
+    /// power over this channel's ACL.
+    async fn guard(&self, inbound: &Inbound, channel: u32, creating: bool, password: Option<&str>) {
+        let maker = if creating && !self.allows(inbound, channel, Perm::WRITE).await {
+            self.sessions(inbound.scope)
+                .await
+                .iter()
+                .find(|session| session.session == inbound.session)
+                .and_then(channel_password::maker)
+        } else {
+            None
+        };
+        if maker.is_none() && password.is_none() {
+            return;
+        }
+        let Some(mut acls) = self.acl_of(inbound.scope, channel).await else {
+            tracing::error!(
+                channel,
+                "the channel's ACL could not be read; no password set"
+            );
+            return;
+        };
+        acls.channel = channel;
+        acls.acls.retain(|entry| !entry.inherited);
+        if let Some(password) = password {
+            acls.acls = channel_password::with_password(std::mem::take(&mut acls.acls), password);
+        }
+        acls.acls.extend(maker);
+        if self.write_acl(inbound.scope, acls).await {
+            self.trail.record(
+                inbound.scope,
+                Record::new(trail::category::ACL, "channel password")
+                    .actor(session_actor(inbound.session), String::new())
+                    .target_channel(channel)
+                    .detail(match password {
+                        Some("") => "removed",
+                        Some(_) => "set",
+                        None => "maker granted write",
+                    }),
+            );
+        }
+    }
+
+    /// An edit of an existing channel's password alone.
+    ///
+    /// A password lives in the ACL, not on the channel, so such an edit is a
+    /// no-op to the tree and still has to reach the ACL. The caller asked for
+    /// `Write` on the channel.
+    async fn password_only(
+        &self,
+        inbound: &Inbound,
+        state: &starling_proto::proto::tcp::ChannelState,
+    ) {
+        if let (Some(id), Some(password)) =
+            (state.channel_id, state.channel_info_password.as_deref())
+        {
+            self.guard(inbound, id, false, Some(password)).await;
+        }
+    }
+
     /// A channel's ACL table as `permissions` holds it.
     ///
     /// `None` on any failure, and the two callers below both treat that as
@@ -1672,6 +1739,31 @@ impl MetadataService {
 
     /// An inbound `ChannelState`: create when it names no channel, otherwise
     /// update. murmur reads the same message both ways.
+    /// The permission that putting a channel somewhere takes, murmur's
+    /// (`Messages.cpp:2025`): a temporary one has its own.
+    const fn make_permission_for(temporary: bool) -> Perm {
+        if temporary {
+            Perm::MAKE_TEMP_CHANNEL
+        } else {
+            Perm::MAKE_CHANNEL
+        }
+    }
+
+    /// The refusal for a `ChannelState` that may not be applied at all:
+    /// `needed` missing on `channel`, or a password that does not fit.
+    async fn admit_edit(
+        &self,
+        inbound: &Inbound,
+        state: &starling_proto::proto::tcp::ChannelState,
+        channel: u32,
+        needed: Perm,
+    ) -> Option<starling_proto_fancy::control::ServerAction> {
+        if !self.allows(inbound, channel, needed).await {
+            return Some(permission_denied(inbound, needed, channel));
+        }
+        channel_password::too_long(inbound, state, channel)
+    }
+
     async fn on_channel_state(&self, inbound: &Inbound) -> Actions {
         let Ok(state) =
             starling_proto::proto::tcp::ChannelState::decode(inbound.payload.as_slice())
@@ -1698,17 +1790,15 @@ impl MetadataService {
         // authorised on the channel being edited.
         let (channel_asked_about, needed) = if creating {
             let parent = state.parent.unwrap_or(ROOT_CHANNEL.0);
-            let make = if temporary {
-                Perm::MAKE_TEMP_CHANNEL
-            } else {
-                Perm::MAKE_CHANNEL
-            };
-            (parent, make)
+            (parent, Self::make_permission_for(temporary))
         } else {
             (state.channel_id.unwrap_or(ROOT_CHANNEL.0), Perm::WRITE)
         };
-        if !self.allows(inbound, channel_asked_about, needed).await {
-            return vec![permission_denied(inbound, needed, channel_asked_about)];
+        if let Some(no) = self
+            .admit_edit(inbound, &state, channel_asked_about, needed)
+            .await
+        {
+            return vec![no];
         }
 
         // Re-parenting is a second question, asked of the *new parent*: murmur
@@ -1722,11 +1812,8 @@ impl MetadataService {
             && let Some(current) = self.trees.parent_of(inbound.scope, id)
             && current != new_parent
         {
-            let make = if self.trees.transient(inbound.scope, &[id]).contains(&id) {
-                Perm::MAKE_TEMP_CHANNEL
-            } else {
-                Perm::MAKE_CHANNEL
-            };
+            let make =
+                Self::make_permission_for(self.trees.transient(inbound.scope, &[id]).contains(&id));
             if !self.allows(inbound, new_parent, make).await {
                 return vec![permission_denied(inbound, make, new_parent)];
             }
@@ -1789,6 +1876,7 @@ impl MetadataService {
             _ => Actions::new(),
         };
         let Some(channel) = result.channel else {
+            self.password_only(inbound, &state).await;
             // Refused for a reason that is not a limit, a duplicate name, a
             // parent that has gone, or a no-op. The client is told nothing
             // either way, so this is the only record that it was attempted.
@@ -1844,6 +1932,15 @@ impl MetadataService {
         if creating && !state.invitee_user_ids.is_empty() {
             self.invite(inbound.scope, channel.id, &state.invitee_user_ids)
                 .await;
+        }
+        if creating || state.channel_info_password.is_some() {
+            self.guard(
+                inbound,
+                channel.id,
+                creating,
+                state.channel_info_password.as_deref(),
+            )
+            .await;
         }
         // The subscribers, not only the clients. `permissions` learns the shape
         // of the tree from this stream and walks it for every ACL check, so a

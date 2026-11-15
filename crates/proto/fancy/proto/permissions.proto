@@ -158,6 +158,25 @@ message Group {
   repeated uint64 add = 5;
   repeated uint64 remove = 6;
   repeated uint64 inherited_members = 7;
+  // How a client shows the group as a role, kept as the client wrote it
+  // (`ACL.ChanGroup` fields 1000-1003). Absent for a group nobody styled.
+  RolePresentation presentation = 8;
+}
+
+// A role's colour, icon, style and free-form metadata. Evaluation never reads
+// it; it is stored so that what an editor saves is what every reader gets.
+message RolePresentation {
+  string color = 1;
+  bytes icon = 2;
+  string style_preset = 3;
+  // In the order the client sent them.
+  repeated RoleMetadata metadata = 4;
+}
+
+// One key of a role's metadata.
+message RoleMetadata {
+  string key = 1;
+  string value = 2;
 }
 
 message SetAclRequest {

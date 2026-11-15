@@ -702,6 +702,107 @@ mod tests {
             .collect()
     }
 
+    /// What reaches a connection that has not authenticated, through `apply`.
+    mod before_a_session {
+        use super::*;
+        use prost::Message as _;
+        use starling_proto_fancy::types::{FANCY_PROTOCOL_EPOCH, ServiceKind};
+
+        const LIVERY: u16 = ServiceKind::ServerConfig.outer_type();
+        const WITHHELD: &str = "starling_gateway_frames_withheld_by_epoch";
+
+        /// A registered connection with no session that announced `epoch`.
+        fn peer(
+            ctx: &AttachContext,
+            epoch: Option<u32>,
+        ) -> (
+            Arc<crate::connection::ClientHandle>,
+            mpsc::Receiver<Outbound>,
+        ) {
+            let limits = Arc::new(crate::limits::Limits::from_config(
+                &starling_runtime::config::GatewayConfig::default(),
+            ));
+            let gauge = starling_runtime::pressure::Pressure::new().gauge("test", 0);
+            let (handle, rx) = crate::connection::channel(9, "tok".to_owned(), limits, gauge);
+            handle.heard_version(
+                &starling_proto::proto::tcp::Version {
+                    fancy_protocol: epoch,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            );
+            ctx.registry.insert(Arc::clone(&handle));
+            (handle, rx)
+        }
+
+        fn send_to_conn(type_id: u16) -> ServerAction {
+            starling_runtime::plane::to_conn(9, type_id, b"payload".to_vec())
+        }
+
+        #[test]
+        fn the_livery_reaches_a_peer_that_announced_our_epoch() {
+            let ctx = ctx();
+            let (_handle, mut rx) = peer(&ctx, Some(FANCY_PROTOCOL_EPOCH));
+            apply(&send_to_conn(LIVERY), &ctx);
+            assert_eq!(
+                rx.try_recv().expect("delivered").payload.as_ref(),
+                b"payload"
+            );
+            assert_eq!(ctx.metrics.counter(WITHHELD).get(), 0);
+        }
+
+        #[test]
+        fn the_livery_is_withheld_from_a_peer_on_no_epoch_or_an_older_one() {
+            for epoch in [None, Some(0)] {
+                let ctx = ctx();
+                let (handle, mut rx) = peer(&ctx, epoch);
+                apply(&send_to_conn(LIVERY), &ctx);
+                assert!(rx.try_recv().is_err(), "{epoch:?}");
+                assert_eq!(ctx.metrics.counter(WITHHELD).get(), 1, "{epoch:?}");
+                // Withheld, not punished: the peer is still connected.
+                assert!(ctx.registry.by_conn(handle.conn).is_some(), "{epoch:?}");
+            }
+        }
+
+        #[test]
+        fn any_other_service_is_withheld_even_from_a_peer_on_our_epoch() {
+            let ctx = ctx();
+            let (_handle, mut rx) = peer(&ctx, Some(FANCY_PROTOCOL_EPOCH));
+            for kind in [ServiceKind::Gifs, ServiceKind::Invites, ServiceKind::Text] {
+                apply(&send_to_conn(kind.outer_type()), &ctx);
+                assert!(
+                    rx.try_recv().is_err(),
+                    "{kind:?} reached a sessionless peer"
+                );
+            }
+            assert_eq!(ctx.metrics.counter(WITHHELD).get(), 3);
+        }
+
+        #[test]
+        fn after_session_up_every_service_reaches_the_peer_as_before() {
+            let ctx = ctx();
+            let (_handle, mut rx) = peer(&ctx, None);
+            apply(
+                &ServerAction {
+                    action: Some(server_action::Action::SessionUp(
+                        starling_proto_fancy::control::SessionUp {
+                            conn: 9,
+                            session: 7,
+                            fancy_protocol: FANCY_PROTOCOL_EPOCH,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                &ctx,
+            );
+            apply(&send_to_conn(ServiceKind::Text.outer_type()), &ctx);
+            assert!(
+                rx.try_recv().is_ok(),
+                "SessionUp's epoch is the one in force"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_service_added_to_the_table_is_attached_without_a_restart() {
         // "Three lines, no gateway release" (`docs/CONFIGURATION.md`), and now

@@ -899,7 +899,9 @@ impl Gateway {
         // murmur applies `RATELIMIT` in named handlers rather than to a
         // connection wholesale (`Messages.cpp:47`), so the set below is that
         // list. Anything outside it is delivered without being charged.
-        if is_rate_limited(frame.type_id) {
+        let charged = is_rate_limited(frame.type_id)
+            || (handle.session() == 0 && crate::epoch::charged_before_session(frame.type_id));
+        if charged {
             match limiter.check(&route.bucket, now_ms()) {
                 Verdict::Allow => {}
                 Verdict::Throttle { retry_after_ms } => {
@@ -931,6 +933,14 @@ impl Gateway {
                     return true;
                 }
             }
+        }
+
+        // Before the frame leaves, so the epoch is in place before anything the
+        // peer pipelined behind it can be answered; after the limiter, so a
+        // `Version` session-lifecycle was not sent is not read either. See
+        // `crate::epoch`.
+        if frame.type_id == crate::epoch::VERSION {
+            handle.heard_version(&frame.payload);
         }
 
         let Some(link) = self.attachments.get(&route.service) else {
@@ -1420,6 +1430,120 @@ mod tests {
             0,
             "with nobody connected there is no worst client, and reporting the \
              queue of one that has gone is worse than reporting nothing"
+        );
+    }
+
+    /// A frame as it comes off a client's socket.
+    fn raw_version(fancy_protocol: Option<u32>) -> codec::RawFrame {
+        use prost::Message as _;
+        codec::RawFrame {
+            type_id: crate::epoch::VERSION,
+            payload: starling_proto::proto::tcp::Version {
+                fancy_protocol,
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        }
+    }
+
+    #[test]
+    fn a_version_is_read_before_the_question_pipelined_behind_it_is_forwarded() {
+        // The order that makes this safe without any help from a service: a
+        // client pipelines `Version` and `LiveryQuery`, and the reply to the
+        // second comes back on another attachment than the first. The epoch is
+        // in place once `dispatch` returns for the `Version`, which is before
+        // the next frame on this connection is read at all.
+        let pressure = Pressure::new();
+        let (gateway, _data) = shipped_gateway(&pressure);
+        let (handle, _rx) = connection::channel(
+            1,
+            String::new(),
+            Arc::clone(&gateway.limits),
+            pressure.gauge("test", 0),
+        );
+        let mut limiter = Limiter::live(
+            &gateway.buckets,
+            now_ms(),
+            Arc::clone(&gateway.message_limit),
+        );
+        let livery = ServiceKind::ServerConfig.outer_type();
+
+        assert!(!handle.accepts(livery));
+        assert!(gateway.dispatch(&handle, &raw_version(Some(1)), &mut limiter));
+        assert!(handle.accepts(livery));
+    }
+
+    #[test]
+    fn the_livery_is_charged_to_a_bucket_before_a_session_and_not_after() {
+        // Unauthenticated, one connection asked for the livery twenty times
+        // and was answered twenty times: up to ~600 KiB each for a few bytes.
+        let pressure = Pressure::new();
+        let (gateway, _data) = shipped_gateway(&pressure);
+        let (handle, _rx) = connection::channel(
+            1,
+            String::new(),
+            Arc::clone(&gateway.limits),
+            pressure.gauge("test", 0),
+        );
+        let mut limiter = Limiter::new(
+            &std::collections::BTreeMap::from([(
+                "control".to_owned(),
+                starling_runtime::config::LimitConfig {
+                    rate: starling_runtime::ratelimit::Rate::per_second(1.0),
+                    burst: 5,
+                },
+            )]),
+            now_ms(),
+        );
+        let query = codec::RawFrame {
+            type_id: ServiceKind::ServerConfig.outer_type(),
+            payload: bytes::Bytes::from_static(&[0x22, 0x00]),
+        };
+        let throttled = || gateway.metrics.counter("starling_gateway_throttled").get();
+
+        for _ in 0..20 {
+            assert!(gateway.dispatch(&handle, &query, &mut limiter));
+        }
+        assert_eq!(throttled(), 15, "the burst of five, and no more");
+
+        // With a session it is a settings frame like any other, as before.
+        handle.set_session(7);
+        for _ in 0..20 {
+            assert!(gateway.dispatch(&handle, &query, &mut limiter));
+        }
+        assert_eq!(throttled(), 15, "not charged once a session exists");
+    }
+
+    #[test]
+    fn a_throttled_version_is_not_read() {
+        // session-lifecycle never sees it, so the gateway must not either: the
+        // two readings of the epoch stay readings of the same frames.
+        let pressure = Pressure::new();
+        let (gateway, _data) = shipped_gateway(&pressure);
+        let (handle, _rx) = connection::channel(
+            1,
+            String::new(),
+            Arc::clone(&gateway.limits),
+            pressure.gauge("test", 0),
+        );
+        let mut limiter = Limiter::new(
+            &std::collections::BTreeMap::from([(
+                "control".to_owned(),
+                starling_runtime::config::LimitConfig {
+                    rate: starling_runtime::ratelimit::Rate::per_second(1.0),
+                    burst: 1,
+                },
+            )]),
+            now_ms(),
+        );
+        let livery = ServiceKind::ServerConfig.outer_type();
+
+        assert!(gateway.dispatch(&handle, &raw_version(None), &mut limiter));
+        assert!(gateway.dispatch(&handle, &raw_version(Some(1)), &mut limiter));
+        assert!(
+            !handle.accepts(livery),
+            "the second Version was over the burst and must not count"
         );
     }
 
